@@ -1,0 +1,11 @@
+node_modules
+dist
+.git
+tests
+docs
+scripts
+*.mjs
+demo*.mjs
+.github
+.nvmrc
+*.md
