@@ -20,13 +20,15 @@ export interface GraphEdge {
 
 export class DependencyGraph {
   private nodes = new Map<string, GraphNode>();
-  private outEdges = new Map<string, Map<string, GraphEdge>>(); // from → { to → edge }
-  private inEdges = new Map<string, Map<string, GraphEdge>>();  // to → { from → edge }
+  private outEdges = new Map<string, Map<string, GraphEdge>>(); // from -> { to -> edge }
+  private inEdges = new Map<string, Map<string, GraphEdge>>();  // to -> { from -> edge }
+  private nodeLookup = new Map<string, GraphNode>();
 
   addNode(node: GraphNode): void {
     this.nodes.set(node.id, node);
     if (!this.outEdges.has(node.id)) this.outEdges.set(node.id, new Map());
     if (!this.inEdges.has(node.id)) this.inEdges.set(node.id, new Map());
+    this.registerNodeLookups(node);
   }
 
   addEdge(edge: GraphEdge): void {
@@ -48,12 +50,12 @@ export class DependencyGraph {
     return this.nodes.get(id);
   }
 
-  /** Get direct dependencies OF a node (outgoing edges — what it imports) */
+  /** Get direct dependencies OF a node (outgoing edges - what it imports) */
   getDependencies(nodeId: string): GraphEdge[] {
     return [...(this.outEdges.get(nodeId)?.values() ?? [])];
   }
 
-  /** Get direct dependents ON a node (incoming edges — who imports it) */
+  /** Get direct dependents ON a node (incoming edges - who imports it) */
   getDependents(nodeId: string): GraphEdge[] {
     return [...(this.inEdges.get(nodeId)?.values() ?? [])];
   }
@@ -63,9 +65,10 @@ export class DependencyGraph {
     const results: Array<{ nodeId: string; via: string[]; depth: number }> = [];
     const visited = new Set<string>([nodeId]);
     const queue: Array<{ id: string; path: string[]; depth: number }> = [{ id: nodeId, path: [], depth: 0 }];
+    let head = 0;
 
-    while (queue.length > 0) {
-      const current = queue.shift()!;
+    while (head < queue.length) {
+      const current = queue[head++]!;
       if (current.depth >= maxDepth) continue;
 
       const dependents = this.getDependents(current.id);
@@ -87,9 +90,10 @@ export class DependencyGraph {
     const results: Array<{ nodeId: string; via: string[]; depth: number }> = [];
     const visited = new Set<string>([nodeId]);
     const queue: Array<{ id: string; path: string[]; depth: number }> = [{ id: nodeId, path: [], depth: 0 }];
+    let head = 0;
 
-    while (queue.length > 0) {
-      const current = queue.shift()!;
+    while (head < queue.length) {
+      const current = queue[head++]!;
       if (current.depth >= maxDepth) continue;
 
       const deps = this.getDependencies(current.id);
@@ -118,6 +122,13 @@ export class DependencyGraph {
     return edges;
   }
 
+  clear(): void {
+    this.nodes.clear();
+    this.outEdges.clear();
+    this.inEdges.clear();
+    this.nodeLookup.clear();
+  }
+
   getInDegree(nodeId: string): number {
     return this.inEdges.get(nodeId)?.size ?? 0;
   }
@@ -142,27 +153,25 @@ export class DependencyGraph {
     return count;
   }
 
-  /** Find node by partial match on id, name, or path — handles backslashes and missing extensions */
+  /** Find node by partial match on id, name, or path - handles backslashes and missing extensions */
   findNode(query: string): GraphNode | undefined {
-    // Exact match first
     if (this.nodes.has(query)) return this.nodes.get(query);
 
     const normQuery = query.replace(/\\/g, '/');
+    const indexed = this.nodeLookup.get(normQuery);
+    if (indexed) return indexed;
 
     for (const node of this.nodes.values()) {
       const normId = node.id.replace(/\\/g, '/');
       const normPath = node.path.replace(/\\/g, '/');
       const basename = normId.split('/').pop() ?? '';
 
-      // Exact name / path match (normalized)
       if (normId === normQuery || normPath === normQuery) return node;
-
-      // Basename match: PaymentService.java ≈ PaymentService
       if (basename === normQuery) return node;
+
       const baseSansExt = basename.replace(/\.[^.]+$/, '');
       if (baseSansExt === normQuery) return node;
 
-      // ID/path ends with /query or /query.ext
       if (normId.endsWith('/' + normQuery) || normId.endsWith('/' + normQuery + '.java')
         || normId.endsWith('/' + normQuery + '.ts') || normId.endsWith('/' + normQuery + '.tsx')
         || normId.endsWith('/' + normQuery + '.py') || normId.endsWith('/' + normQuery + '.js')) {
@@ -171,5 +180,46 @@ export class DependencyGraph {
       if (normPath.endsWith(normQuery)) return node;
     }
     return undefined;
+  }
+
+  private registerNodeLookups(node: GraphNode): void {
+    const normalizedValues = new Set([
+      node.id.replace(/\\/g, '/'),
+      node.path.replace(/\\/g, '/'),
+      node.name,
+    ]);
+
+    for (const value of normalizedValues) {
+      this.registerNormalizedVariants(value, node);
+    }
+  }
+
+  private registerNormalizedVariants(value: string, node: GraphNode): void {
+    if (!value) return;
+
+    this.registerLookup(value, node);
+
+    const normalized = value.replace(/\\/g, '/');
+    const segments = normalized.split('/').filter(Boolean);
+    const maxSuffixSegments = Math.min(segments.length, 4);
+    let suffix = '';
+    for (let i = segments.length - 1; i >= segments.length - maxSuffixSegments; i--) {
+      suffix = suffix ? `${segments[i]}/${suffix}` : segments[i];
+      this.registerLookup(suffix, node);
+      this.registerLookup(this.stripExtension(suffix), node);
+    }
+
+    const basename = segments[segments.length - 1] ?? normalized;
+    this.registerLookup(basename, node);
+    this.registerLookup(this.stripExtension(basename), node);
+  }
+
+  private registerLookup(query: string, node: GraphNode): void {
+    if (!query || this.nodeLookup.has(query)) return;
+    this.nodeLookup.set(query, node);
+  }
+
+  private stripExtension(value: string): string {
+    return value.replace(/\.[^.\/]+$/, '');
   }
 }

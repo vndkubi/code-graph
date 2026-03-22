@@ -1,6 +1,7 @@
 import type { ParseResult, ImportInfo, TypeRefInfo } from '../analyzers/base-analyzer.js';
 import { DependencyGraph, type GraphNode } from './dependency-graph.js';
 import { CallGraph } from './call-graph.js';
+import { detectLayer } from '../utils/layer-detection.js';
 
 interface PendingImport {
   from: string;
@@ -27,6 +28,12 @@ export class GraphBuilder {
   private resolvedImportCount = 0;
   private totalImportCount = 0;
 
+  // ─── Lookup indexes built once in resolveEdges() ──────────
+  /** Map from normalized suffix segments to node IDs for O(1) suffix matching */
+  private suffixIndex = new Map<string, string>();
+  /** Map from className (file basename without extension) to node ID */
+  private classNameIndex = new Map<string, string>();
+
   /** Add parsed file results to both graphs */
   addParseResult(result: ParseResult): void {
     // Register file as a node in dependency graph
@@ -34,7 +41,7 @@ export class GraphBuilder {
       id: result.file,
       name: this.extractFileName(result.file),
       type: 'file',
-      layer: this.detectLayer(result.file),
+      layer: detectLayer(result.file),
       path: result.file,
     };
     this.depGraph.addNode(fileNode);
@@ -80,6 +87,9 @@ export class GraphBuilder {
    * Resolves import sources to node IDs and adds dependency edges.
    */
   resolveEdges(): void {
+    // Build lookup indexes once — turns O(M×N) resolution into O(M)
+    this.buildLookupIndexes();
+
     this.resolvedImportCount = 0;
     let localCandidateCount = 0;
 
@@ -97,7 +107,7 @@ export class GraphBuilder {
         // Imports to stdlib/third-party (java.util.*, org.springframework.*) won't match any node
         // and should not penalise the resolution rate.
         const className = imp.source.split('.').pop() ?? '';
-        if (className !== '*' && className.length > 0 && this.findNodeByClassName(className)) {
+        if (className !== '*' && className.length > 0 && this.classNameIndex.has(className)) {
           localCandidateCount++;
         }
       }
@@ -109,7 +119,7 @@ export class GraphBuilder {
     // Supplement with type-reference edges (field/param/return types).
     // These cover same-package usage and wildcard imports that couldn't be resolved above.
     for (const { from, ref, edgeType } of this.pendingTypeRefs) {
-      const targetId = this.findNodeByClassName(ref.referencedType);
+      const targetId = this.classNameIndex.get(ref.referencedType);
       if (targetId && targetId !== from && !resolvedEdges.has(`${from}→${targetId}`)) {
         this.depGraph.addEdge({ from, to: targetId, type: edgeType, weight: 1 });
         resolvedEdges.add(`${from}→${targetId}`);
@@ -118,17 +128,57 @@ export class GraphBuilder {
     this.pendingTypeRefs = [];
   }
 
+  clear(): void {
+    this.depGraph.clear();
+    this.callGraph.clear();
+    this.pendingImports = [];
+    this.pendingTypeRefs = [];
+    this.resolvedImportCount = 0;
+    this.totalImportCount = 0;
+    this.suffixIndex.clear();
+    this.classNameIndex.clear();
+  }
+
   /**
-   * Find a node whose file name (without extension) matches the given class name.
-   * Used to resolve same-package / wildcard-import type references.
+   * Build suffix and className lookup indexes from all registered nodes.
+   * Called once before edge resolution.
    */
-  private findNodeByClassName(className: string): string | undefined {
+  private buildLookupIndexes(): void {
+    this.suffixIndex.clear();
+    this.classNameIndex.clear();
+
     for (const node of this.depGraph.getAllNodes()) {
       const normId = node.id.replace(/\\/g, '/');
-      const fileName = normId.substring(normId.lastIndexOf('/') + 1).replace(/\.[^.]+$/, '');
-      if (fileName === className) return node.id;
+
+      // Build className index: basename without extension → node.id
+      const lastSlash = normId.lastIndexOf('/');
+      const basename = normId.substring(lastSlash + 1);
+      const basenameNoExt = basename.replace(/\.[^.]+$/, '');
+      // First registration wins (consistent with previous linear scan behavior)
+      if (!this.classNameIndex.has(basenameNoExt)) {
+        this.classNameIndex.set(basenameNoExt, node.id);
+      }
+
+      // Build suffix index: progressively longer suffixes from path segments
+      // e.g., "src/com/example/Foo.java" registers:
+      //   "Foo.java", "example/Foo.java", "com/example/Foo.java", "src/com/example/Foo.java"
+      const segments = normId.split('/');
+      let suffix = '';
+      for (let i = segments.length - 1; i >= 0; i--) {
+        suffix = suffix ? segments[i] + '/' + suffix : segments[i];
+        if (!this.suffixIndex.has(suffix)) {
+          this.suffixIndex.set(suffix, node.id);
+        }
+      }
     }
-    return undefined;
+  }
+
+  /**
+   * Find a node whose file name (without extension) matches the given class name.
+   * Uses pre-built className index for O(1) lookup.
+   */
+  private findNodeByClassName(className: string): string | undefined {
+    return this.classNameIndex.get(className);
   }
 
   /** Fraction of local imports that could be resolved to a known file (0–1). */
@@ -183,34 +233,16 @@ export class GraphBuilder {
     return this.matchNodeBySuffix(source);
   }
 
-  /** Find a node whose normalized ID ends with the given suffix. */
+  /** Find a node whose normalized ID ends with the given suffix. Uses pre-built suffix index for O(1) lookup. */
   private matchNodeBySuffix(suffix: string): string | undefined {
     const normSuffix = suffix.replace(/\\/g, '/');
-    for (const node of this.depGraph.getAllNodes()) {
-      const normId = node.id.replace(/\\/g, '/');
-      if (normId === normSuffix || normId.endsWith('/' + normSuffix)) {
-        return node.id;
-      }
-    }
-    return undefined;
+    // Direct lookup in suffix index
+    return this.suffixIndex.get(normSuffix);
   }
 
   private extractFileName(filePath: string): string {
     const parts = filePath.replace(/\\/g, '/').split('/');
     return parts[parts.length - 1];
-  }
-
-  private detectLayer(filePath: string): string {
-    const lower = filePath.toLowerCase();
-    if (lower.includes('controller') || lower.includes('resource') || lower.includes('route')) return 'api';
-    if (lower.includes('service') || lower.includes('usecase')) return 'service';
-    if (lower.includes('repository') || lower.includes('dao')) return 'repository';
-    if (lower.includes('model') || lower.includes('entity') || lower.includes('domain')) return 'domain';
-    if (lower.includes('dto') || lower.includes('schema') || lower.includes('request') || lower.includes('response')) return 'dto';
-    if (lower.includes('util') || lower.includes('helper') || lower.includes('common')) return 'utility';
-    if (lower.includes('config') || lower.includes('setting')) return 'config';
-    if (lower.includes('test') || lower.includes('spec')) return 'test';
-    return 'other';
   }
 
   private isTestFile(filePath: string): boolean {

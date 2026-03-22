@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { TreeSitterAnalyzer } from '../analyzers/tree-sitter-analyzer.js';
 import { detectFrameworkRoles, synthesizeLombokSymbols } from '../analyzers/java-framework-detector.js';
@@ -30,6 +31,12 @@ export interface IndexState {
   indexTimeMs: number;
   parseErrorCount: number;
   importResolutionRate: number;
+}
+
+interface IndexedFile {
+  path: string;
+  mtimeMs: number;
+  size: number;
 }
 
 /**
@@ -68,19 +75,52 @@ export class FileIndexer {
   async buildIndex(): Promise<void> {
     const start = Date.now();
 
+    this.indexed = false;
+    this.graphBuilder.clear();
     this.symbolIndex.clear();
     this.importIndex.clear();
     this.allReferences = [];
     this.filesIndexed = 0;
+    this.parseErrorCount = 0;
 
     const files = this.walkDirectory(this.rootDir);
 
-    for (const filePath of files) {
-      try {
-        this.indexFile(filePath);
-      } catch (err) {
-        // Graceful degradation: skip files that fail to parse
-        console.warn(`[mcp-code-graph] Failed to parse ${filePath}: ${err instanceof Error ? err.message : String(err)}`);
+    // Read files in parallel batches, parse sequentially (tree-sitter is not thread-safe)
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < files.length; i += BATCH_SIZE) {
+      const batch = files.slice(i, i + BATCH_SIZE);
+      const uncached: IndexedFile[] = [];
+      const now = Date.now();
+
+      for (const file of batch) {
+        const cached = this.cache.getIfCurrent(file.path, file.mtimeMs, file.size, now);
+        if (cached) {
+          if (cached.hasParseErrors) this.parseErrorCount++;
+          this.addToIndexes(cached);
+          this.filesIndexed++;
+        } else {
+          uncached.push(file);
+        }
+      }
+
+      const contents = await Promise.all(
+        uncached.map(async (file) => {
+          try {
+            const content = await fsp.readFile(file.path, 'utf-8');
+            return { file, content };
+          } catch {
+            return { file, content: null };
+          }
+        })
+      );
+
+      for (const { file, content } of contents) {
+        if (content === null) continue;
+        try {
+          this.indexFileFromContent(file.path, content, file.mtimeMs, file.size);
+        } catch (err) {
+          console.warn(`[mcp-code-graph] Failed to parse ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
     }
 
@@ -91,16 +131,8 @@ export class FileIndexer {
     this.indexTimeMs = Date.now() - start;
   }
 
-  private indexFile(absolutePath: string): void {
-    const cached = this.cache.get(absolutePath);
-    if (cached) {
-      if (cached.hasParseErrors) this.parseErrorCount++;
-      this.addToIndexes(cached);
-      this.filesIndexed++;
-      return;
-    }
-
-    const content = fs.readFileSync(absolutePath, 'utf-8');
+  /** Index a file with content already loaded into memory */
+  private indexFileFromContent(absolutePath: string, content: string, mtimeMs: number, sizeBytes: number): void {
     const result = this.analyzer.parse(absolutePath, content, this.rootDir);
 
     // Apply framework role detection + Lombok synthesis for Java files
@@ -111,7 +143,7 @@ export class FileIndexer {
     }
 
     if (result.hasParseErrors) this.parseErrorCount++;
-    this.cache.set(absolutePath, result);
+    this.cache.set(absolutePath, result, mtimeMs, sizeBytes);
     this.addToIndexes(result);
     this.filesIndexed++;
   }
@@ -131,13 +163,17 @@ export class FileIndexer {
   }
 
   /** Recursively walk directory, filtering by extensions and exclude patterns */
-  private walkDirectory(dir: string): string[] {
-    const results: string[] = [];
-    this.walkRecursive(dir, results);
+  private walkDirectory(dir: string): IndexedFile[] {
+    const results: IndexedFile[] = [];
+    // Pre-compile exclude patterns for faster matching
+    const excludeMatchers = this.excludePatterns.map(
+      (pattern) => (relPath: string) => minimatch(relPath, pattern, { dot: true })
+    );
+    this.walkRecursive(dir, results, excludeMatchers);
     return results;
   }
 
-  private walkRecursive(dir: string, results: string[]): void {
+  private walkRecursive(dir: string, results: IndexedFile[], excludeMatchers: Array<(relPath: string) => boolean>): void {
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -149,28 +185,27 @@ export class FileIndexer {
       const fullPath = path.join(dir, entry.name);
       const relPath = path.relative(this.rootDir, fullPath).replace(/\\/g, '/');
 
-      if (this.isExcluded(relPath)) continue;
+      // Inline exclude check to avoid function call overhead
+      let excluded = false;
+      for (const matcher of excludeMatchers) {
+        if (matcher(relPath)) { excluded = true; break; }
+      }
+      if (excluded) continue;
 
       if (entry.isDirectory()) {
-        this.walkRecursive(fullPath, results);
+        this.walkRecursive(fullPath, results, excludeMatchers);
       } else if (entry.isFile() && isSourceFile(entry.name)) {
+        // Use stat only when needed for size check
         try {
           const stat = fs.statSync(fullPath);
           if (stat.size <= this.maxFileSizeBytes) {
-            results.push(fullPath);
+            results.push({ path: fullPath, mtimeMs: stat.mtimeMs, size: stat.size });
           }
         } catch {
           // Skip inaccessible files
         }
       }
     }
-  }
-
-  private isExcluded(relPath: string): boolean {
-    for (const pattern of this.excludePatterns) {
-      if (minimatch(relPath, pattern, { dot: true })) return true;
-    }
-    return false;
   }
 
   // ─── Accessors ──────────────────────────────────────────

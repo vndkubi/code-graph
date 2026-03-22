@@ -49,6 +49,10 @@ export class SymbolIndex {
     return this.byFile.get(file) ?? [];
   }
 
+  getAllSymbols(): readonly SymbolInfo[] {
+    return this.allSymbols;
+  }
+
   /** Find symbols that carry a specific annotation (e.g. "Service", "Transactional") */
   findByAnnotation(annotation: string, limit = 100): SymbolInfo[] {
     const results: SymbolInfo[] = [];

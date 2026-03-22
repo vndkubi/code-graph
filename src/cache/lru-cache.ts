@@ -3,6 +3,7 @@ import fs from 'node:fs';
 interface CacheEntry<T> {
   value: T;
   mtime: number;
+  size: number;
   accessTime: number;
 }
 
@@ -20,6 +21,10 @@ export class LruCache<T> {
     this.ttlMs = ttlMs;
   }
 
+  /**
+   * Lookup with automatic file-mtime validation (calls statSync internally).
+   * For batch operations where mtime is already known, use {@link getIfCurrent} instead.
+   */
   get(key: string): T | undefined {
     const entry = this.cache.get(key);
     if (!entry) return undefined;
@@ -30,10 +35,11 @@ export class LruCache<T> {
       return undefined;
     }
 
-    // File mtime check — invalidate if file changed
+    // File mtime+size check — invalidate if file changed.
+    // Size guards against same-mtime rewrites (Windows timestamp granularity).
     try {
       const stat = fs.statSync(key);
-      if (stat.mtimeMs !== entry.mtime) {
+      if (stat.mtimeMs !== entry.mtime || stat.size !== entry.size) {
         this.cache.delete(key);
         return undefined;
       }
@@ -48,20 +54,47 @@ export class LruCache<T> {
     return entry.value;
   }
 
-  set(key: string, value: T): void {
+  /**
+   * Fast-path lookup when the caller already knows the current file mtime.
+   * Avoids an extra statSync during batch rebuilds.
+   */
+  getIfCurrent(key: string, mtimeMs: number, sizeBytes: number, now: number = Date.now()): T | undefined {
+    const entry = this.cache.get(key);
+    if (!entry) return undefined;
+
+    if (now - entry.accessTime > this.ttlMs) {
+      this.cache.delete(key);
+      return undefined;
+    }
+
+    if (entry.mtime !== mtimeMs || entry.size !== sizeBytes) {
+      this.cache.delete(key);
+      return undefined;
+    }
+
+    entry.accessTime = now;
+    return entry.value;
+  }
+
+  set(key: string, value: T, mtimeMs?: number, sizeBytes?: number): void {
     // Evict LRU entries if at capacity
     if (this.cache.size >= this.maxSize && !this.cache.has(key)) {
       this.evictLru();
     }
 
-    let mtime = 0;
-    try {
-      mtime = fs.statSync(key).mtimeMs;
-    } catch {
-      // Non-file keys get mtime 0
+    let mtime = mtimeMs ?? 0;
+    let size = sizeBytes ?? 0;
+    if (mtime === 0) {
+      try {
+        const stat = fs.statSync(key);
+        mtime = stat.mtimeMs;
+        size = stat.size;
+      } catch {
+        // Non-file keys get mtime/size 0
+      }
     }
 
-    this.cache.set(key, { value, mtime, accessTime: Date.now() });
+    this.cache.set(key, { value, mtime, size, accessTime: Date.now() });
   }
 
   has(key: string): boolean {

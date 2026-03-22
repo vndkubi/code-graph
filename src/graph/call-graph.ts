@@ -33,7 +33,7 @@ export interface CallGraphEdge {
   line: number;
 }
 
-/** True if "ClassName.ClassName" — i.e. a constructor entry in the call graph. */
+/** True if "ClassName.ClassName" - i.e. a constructor entry in the call graph. */
 function isConstructorSymbol(symbol: string): boolean {
   const dot = symbol.lastIndexOf('.');
   if (dot === -1) return false;
@@ -42,11 +42,14 @@ function isConstructorSymbol(symbol: string): boolean {
 
 export class CallGraph {
   private nodes = new Map<string, CallGraphNode>();
-  private outEdges = new Map<string, CallGraphEdge[]>();  // caller → [callees]
-  private inEdges = new Map<string, CallGraphEdge[]>();   // callee → [callers]
+  private outEdges = new Map<string, CallGraphEdge[]>();  // caller -> [callees]
+  private inEdges = new Map<string, CallGraphEdge[]>();   // callee -> [callers]
+  private ownerIndex = new Map<string, string[]>();
+  private methodIndex = new Map<string, string[]>();
 
   addNode(node: CallGraphNode): void {
     this.nodes.set(node.symbol, node);
+    this.indexSymbol(node.symbol);
   }
 
   addEdge(edge: CallGraphEdge): void {
@@ -70,10 +73,18 @@ export class CallGraph {
     return this.inEdges.get(symbol) ?? [];
   }
 
+  clear(): void {
+    this.nodes.clear();
+    this.outEdges.clear();
+    this.inEdges.clear();
+    this.ownerIndex.clear();
+    this.methodIndex.clear();
+  }
+
   /**
-   * BFS to find shortest call chain from → to.
+   * BFS to find shortest call chain from -> to.
    * Returns all paths if allPaths=true, up to maxDepth.
-   * Each result includes a `confidence` score (0–1) reflecting how reliable
+   * Each result includes a `confidence` score (0-1) reflecting how reliable
    * the symbol resolutions are (exact matches score higher than fuzzy).
    */
   findCallChain(
@@ -88,7 +99,6 @@ export class CallGraph {
 
     if (startMatches.length === 0 || targetSet.size === 0) return [];
 
-    // Track min confidence of start/end resolution to propagate into chain confidence
     const startConfidence = Math.min(...startMatches.map(m => m.confidence));
     const targetConfidence = Math.min(...targetMatches.map(m => m.confidence));
 
@@ -103,12 +113,12 @@ export class CallGraph {
     const results: Array<{ path: CallGraphNode[]; depth: number; isShortest: boolean; confidence: number; resolutionNotes: string[] }> = [];
     let shortestDepth = Infinity;
 
-    // BFS from all start nodes simultaneously
     const queue: Array<{ symbol: string; path: string[] }> = startMatches.map(m => ({ symbol: m.symbol, path: [m.symbol] }));
     const visited = allPaths ? undefined : new Set<string>(startMatches.map(m => m.symbol));
+    let head = 0;
 
-    while (queue.length > 0) {
-      const current = queue.shift()!;
+    while (head < queue.length) {
+      const current = queue[head++]!;
 
       if (current.path.length - 1 > maxDepth) continue;
 
@@ -117,7 +127,6 @@ export class CallGraph {
         const isShortest = depth <= shortestDepth;
         if (isShortest) shortestDepth = depth;
 
-        // Chain confidence = endpoint resolutions × small depth penalty
         const depthPenalty = depth > 3 ? 0.05 * (depth - 3) : 0;
         const chainConfidence = Math.max(0.1, startConfidence * targetConfidence - depthPenalty);
 
@@ -129,17 +138,16 @@ export class CallGraph {
           resolutionNotes: [...resolutionNotes],
         });
 
-        if (!allPaths) return results; // Only need shortest
+        if (!allPaths) return results;
         continue;
       }
 
       const callees = this.getCallees(current.symbol);
       for (const edge of callees) {
-        // Resolve raw callee (may be "methodName" or "var.methodName") to registered symbol
         const resolved = this.resolveSymbol(edge.to) ?? edge.to;
 
         if (!allPaths && visited?.has(resolved)) continue;
-        if (current.path.includes(resolved)) continue; // Prevent cycles
+        if (current.path.includes(resolved)) continue;
 
         if (!allPaths) visited?.add(resolved);
         queue.push({ symbol: resolved, path: [...current.path, resolved] });
@@ -155,38 +163,23 @@ export class CallGraph {
       return [{ symbol: name, matchType: 'exact', confidence: MATCH_CONFIDENCE.exact }];
     }
 
+    const suffixMatches = this.collectIndexedMatches(name);
+    if (suffixMatches.length > 0) {
+      return this.sortConstructorMatchesLast(suffixMatches)
+        .map(symbol => ({ symbol, matchType: 'suffix' as const, confidence: MATCH_CONFIDENCE.suffix }));
+    }
+
     const results: ResolvedSymbol[] = [];
 
-    // Suffix match: class prefix "OrderController" → "OrderController.create"
-    // or method suffix "createOrder" → "OrderService.createOrder"
-    for (const key of this.nodes.keys()) {
-      if (key.startsWith(name + '.') || key.endsWith('.' + name)) {
-        results.push({ symbol: key, matchType: 'suffix', confidence: MATCH_CONFIDENCE.suffix });
-      }
-    }
-    if (results.length > 0) {
-      // De-prioritize constructor matches (ClassName.ClassName) — put real methods first
-      // so resolution notes and BFS start nodes favour actual behaviour over boilerplate.
-      return results.sort((a, b) => {
-        const aIsConstructor = isConstructorSymbol(a.symbol);
-        const bIsConstructor = isConstructorSymbol(b.symbol);
-        if (aIsConstructor === bIsConstructor) return 0;
-        return aIsConstructor ? 1 : -1;  // constructors go last
-      });
-    }
-
-    // Method-part match: "var.save" → try just "save" part
     if (name.includes('.')) {
       const methodPart = name.substring(name.lastIndexOf('.') + 1);
-      for (const key of this.nodes.keys()) {
-        if (key.endsWith('.' + methodPart)) {
-          results.push({ symbol: key, matchType: 'method-part', confidence: MATCH_CONFIDENCE['method-part'] });
-        }
+      const indexedMethodMatches = this.methodIndex.get(methodPart) ?? [];
+      for (const key of indexedMethodMatches) {
+        results.push({ symbol: key, matchType: 'method-part', confidence: MATCH_CONFIDENCE['method-part'] });
       }
       if (results.length > 0) return results;
     }
 
-    // Contains fallback
     for (const key of this.nodes.keys()) {
       if (key.includes(name)) {
         results.push({ symbol: key, matchType: 'contains', confidence: MATCH_CONFIDENCE.contains });
@@ -204,20 +197,15 @@ export class CallGraph {
   resolveSymbol(name: string): string | undefined {
     if (this.nodes.has(name)) return name;
 
-    // Exact suffix match: "createOrder" → "OrderService.createOrder"
-    for (const key of this.nodes.keys()) {
-      if (key.endsWith('.' + name) || key === name) return key;
-    }
+    const indexed = this.collectIndexedMatches(name)[0];
+    if (indexed) return indexed;
 
-    // If "var.method", try just the method part
     if (name.includes('.')) {
       const methodPart = name.substring(name.lastIndexOf('.') + 1);
-      for (const key of this.nodes.keys()) {
-        if (key.endsWith('.' + methodPart)) return key;
-      }
+      const methodMatch = this.methodIndex.get(methodPart)?.[0];
+      if (methodMatch) return methodMatch;
     }
 
-    // Contains fallback
     for (const key of this.nodes.keys()) {
       if (key.includes(name)) return key;
     }
@@ -231,5 +219,57 @@ export class CallGraph {
 
   get nodeCount(): number {
     return this.nodes.size;
+  }
+
+  private indexSymbol(symbol: string): void {
+    const dot = symbol.lastIndexOf('.');
+    if (dot === -1) return;
+
+    const owner = symbol.substring(0, dot);
+    const method = symbol.substring(dot + 1);
+    this.addIndexEntry(this.ownerIndex, owner, symbol);
+    this.addIndexEntry(this.methodIndex, method, symbol);
+  }
+
+  private addIndexEntry(index: Map<string, string[]>, key: string, symbol: string): void {
+    if (!key) return;
+    const bucket = index.get(key);
+    if (bucket) {
+      bucket.push(symbol);
+    } else {
+      index.set(key, [symbol]);
+    }
+  }
+
+  private collectIndexedMatches(name: string): string[] {
+    const matches: string[] = [];
+    const seen = new Set<string>();
+    const ownerMatches = this.ownerIndex.get(name) ?? [];
+    const methodMatches = this.methodIndex.get(name) ?? [];
+
+    for (const symbol of ownerMatches) {
+      if (!seen.has(symbol)) {
+        seen.add(symbol);
+        matches.push(symbol);
+      }
+    }
+
+    for (const symbol of methodMatches) {
+      if (!seen.has(symbol)) {
+        seen.add(symbol);
+        matches.push(symbol);
+      }
+    }
+
+    return matches;
+  }
+
+  private sortConstructorMatchesLast(matches: string[]): string[] {
+    return [...matches].sort((a, b) => {
+      const aIsConstructor = isConstructorSymbol(a);
+      const bIsConstructor = isConstructorSymbol(b);
+      if (aIsConstructor === bIsConstructor) return 0;
+      return aIsConstructor ? 1 : -1;
+    });
   }
 }
