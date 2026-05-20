@@ -1,16 +1,17 @@
 {
   "name": "mcp-code-graph",
   "version": "1.0.0",
-  "description": "MCP server exposing real-time codebase dependency graph as queryable tools for GitHub Copilot agents",
+  "description": "CodeGraph v2 MCP proxy and persistent semantic indexer for Copilot/Codex agents",
   "type": "module",
-  "main": "dist/server.js",
+  "main": "dist/cli.js",
   "bin": {
-    "mcp-code-graph": "dist/server.js"
+    "mcp-code-graph": "dist/cli.js",
+    "codegraph": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/server.js",
-    "dev": "tsx src/server.ts",
+    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit"
@@ -28,15 +29,18 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^12.10.0",
+    "chokidar": "^4.0.3",
     "glob": "^11.0.1",
     "minimatch": "^10.2.4",
-    "tree-sitter": "^0.22.4",
+    "tree-sitter": "^0.21.1",
     "tree-sitter-java": "^0.23.5",
-    "tree-sitter-python": "^0.23.6",
+    "tree-sitter-python": "0.23.4",
     "tree-sitter-typescript": "^0.23.2",
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.17.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",

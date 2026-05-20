@@ -31,9 +31,7 @@ COPY --from=builder /app/dist ./dist
 # Default mount point for the project being analyzed
 VOLUME ["/workspace"]
 
-EXPOSE 3100
-
-# Use HTTP transport by default in Docker (stdio is for direct Copilot integration)
-# Override via CMD or environment variables
-ENTRYPOINT ["node", "dist/server.js"]
-CMD ["--root", "/workspace", "--transport", "http", "--port", "3100"]
+# v2 is stdio-proxy/daemon based. Use `index` to prewarm a mounted workspace,
+# or `mcp` when an MCP client launches the container over stdio.
+ENTRYPOINT ["node", "dist/cli.js"]
+CMD ["mcp", "--root", "/workspace"]

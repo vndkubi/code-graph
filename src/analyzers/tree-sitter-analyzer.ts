@@ -62,6 +62,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   // Temporary accumulators reset on each parse() call (Java only)
   private parseTypeRefs: TypeRefInfo[] = [];
   private parsePackageName: string | undefined;
+  private javaStringConstants = new Map<string, string>();
 
   parse(filePath: string, content: string, rootDir: string): ParseResult {
     const lang = detectLanguage(filePath);
@@ -95,6 +96,10 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     // Reset Java-specific accumulators
     this.parseTypeRefs = [];
     this.parsePackageName = undefined;
+    this.javaStringConstants = new Map();
+    if (lang === 'java') {
+      this.javaStringConstants = this.collectJavaStringConstants(tree.rootNode);
+    }
 
     const symbols: SymbolInfo[] = [];
     const imports: ImportInfo[] = [];
@@ -214,7 +219,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
               implementsNames = this.extractJavaTypeList(extendsNode);
             }
 
-            const classHttpPath = this.extractAnnotationPath(child);
+            const classHttpMeta = this.extractHttpAnnotationMeta(child);
             symbols.push({
               name: nameNode.text,
               kind,
@@ -231,7 +236,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
               isStatic: isStatic || undefined,
               extends: extendsName,
               implements: implementsNames && implementsNames.length > 0 ? implementsNames : undefined,
-              frameworkMeta: classHttpPath ? { path: classHttpPath } : undefined,
+              frameworkMeta: Object.keys(classHttpMeta).length > 0 ? classHttpMeta : undefined,
             });
 
             // Recurse into body with class context
@@ -310,7 +315,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             // Merge parameter annotations (e.g. @Observes) into method annotations
             const allAnnotations = [...new Set([...annotations, ...paramAnnotations])];
 
-            const methodHttpPath = this.extractAnnotationPath(child);
+            const methodHttpMeta = this.extractHttpAnnotationMeta(child);
             symbols.push({
               name: nameNode.text,
               kind: 'method',
@@ -327,7 +332,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
               isStatic: isStatic || undefined,
               returnType: returnType ?? undefined,
               parameterTypes: parameterTypes.length > 0 ? parameterTypes : undefined,
-              frameworkMeta: methodHttpPath ? { path: methodHttpPath } : undefined,
+              frameworkMeta: Object.keys(methodHttpMeta).length > 0 ? methodHttpMeta : undefined,
             });
 
             // Track non-primitive return type
@@ -497,7 +502,42 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
    * e.g. @GetMapping("/api/notes/{id}") → "/api/notes/{id}"
    * Returns undefined if no HTTP mapping annotation with a path is found.
    */
-  private extractAnnotationPath(node: SyntaxNode): string | undefined {
+  private collectJavaStringConstants(root: SyntaxNode): Map<string, string> {
+    const candidates: Array<{ name: string; value: SyntaxNode }> = [];
+
+    const visit = (node: SyntaxNode): void => {
+      if (node.type === 'field_declaration') {
+        const modifiers = node.children.find(c => c.type === 'modifiers')?.text ?? '';
+        const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
+        if (typeName === 'String' && /\bfinal\b/.test(modifiers)) {
+          for (const declarator of node.children.filter(c => c.type === 'variable_declarator')) {
+            const nameNode = declarator.childForFieldName('name') ?? declarator.children.find(c => c.type === 'identifier');
+            const valueNode = declarator.childForFieldName('value');
+            if (nameNode && valueNode) candidates.push({ name: nameNode.text, value: valueNode });
+          }
+        }
+      }
+      for (const child of node.children) visit(child);
+    };
+    visit(root);
+
+    const constants = new Map<string, string>();
+    for (let pass = 0; pass < 4; pass++) {
+      let changed = false;
+      for (const candidate of candidates) {
+        if (constants.has(candidate.name)) continue;
+        const value = this.evaluateJavaStringExpression(candidate.value, constants);
+        if (value !== undefined) {
+          constants.set(candidate.name, value);
+          changed = true;
+        }
+      }
+      if (!changed) break;
+    }
+    return constants;
+  }
+
+  private extractHttpAnnotationMeta(node: SyntaxNode): Record<string, string> {
     const HTTP_ANNOTATIONS = new Set([
       // Spring MVC
       'RequestMapping', 'GetMapping', 'PostMapping', 'PutMapping', 'DeleteMapping', 'PatchMapping',
@@ -507,6 +547,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       'WebServlet', 'WebFilter',
     ]);
 
+    const meta: Record<string, string> = {};
     for (const child of node.children) {
       if (child.type !== 'modifiers') continue;
       for (const mod of child.children) {
@@ -517,39 +558,141 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         const simpleName = rawName.includes('.') ? rawName.substring(rawName.lastIndexOf('.') + 1) : rawName;
         if (!HTTP_ANNOTATIONS.has(simpleName)) continue;
 
+        const impliedMethod = this.httpMethodForAnnotation(simpleName);
+        if (impliedMethod) meta['httpMethod'] = impliedMethod;
+
         const argsNode = mod.childForFieldName('arguments');
         if (argsNode) {
           const path = this.extractFirstStringArgument(argsNode);
-          if (path !== undefined) return path;
+          if (path !== undefined) {
+            meta['path'] = path;
+          } else if (this.hasPathLikeAnnotationArgument(argsNode)) {
+            meta['pathResolution'] = 'partial';
+            meta['pathResolutionReason'] = `Could not resolve ${simpleName} path expression: ${argsNode.text}`;
+          }
+          const requestMethod = this.extractRequestMappingMethod(argsNode);
+          if (requestMethod) meta['httpMethod'] = requestMethod;
         }
       }
     }
-    return undefined;
+    return meta;
+  }
+
+  private httpMethodForAnnotation(annotationName: string): string | undefined {
+    switch (annotationName) {
+      case 'GetMapping':
+      case 'GET':
+        return 'GET';
+      case 'PostMapping':
+      case 'POST':
+        return 'POST';
+      case 'PutMapping':
+      case 'PUT':
+        return 'PUT';
+      case 'DeleteMapping':
+      case 'DELETE':
+        return 'DELETE';
+      case 'PatchMapping':
+      case 'PATCH':
+        return 'PATCH';
+      case 'HEAD':
+        return 'HEAD';
+      case 'OPTIONS':
+        return 'OPTIONS';
+      default:
+        return undefined;
+    }
   }
 
   /** Extract the first string literal value from annotation_argument_list. */
   private extractFirstStringArgument(argsNode: SyntaxNode): string | undefined {
     for (const child of argsNode.namedChildren) {
       // Direct string: @GetMapping("/api")
-      if (child.type === 'string_literal') {
-        return child.text.replace(/^"|"$/g, '');
-      }
+      const direct = this.evaluateJavaStringExpression(child, this.javaStringConstants);
+      if (direct !== undefined) return direct;
       // Named pair: @RequestMapping(value = "/api"), @WebServlet(urlPatterns = "/foo")
       if (child.type === 'element_value_pair') {
         const key = child.childForFieldName('key')?.text;
         if (key === 'value' || key === 'path' || key === 'urlPatterns') {
           const val = child.childForFieldName('value');
-          if (val?.type === 'string_literal') return val.text.replace(/^"|"$/g, '');
+          const resolved = val ? this.evaluateJavaStringExpression(val, this.javaStringConstants) : undefined;
+          if (resolved !== undefined) return resolved;
           if (val?.type === 'array_initializer') {
-            const first = val.namedChildren.find(c => c.type === 'string_literal');
-            if (first) return first.text.replace(/^"|"$/g, '');
+            for (const item of val.namedChildren) {
+              const arrayValue = this.evaluateJavaStringExpression(item, this.javaStringConstants);
+              if (arrayValue !== undefined) return arrayValue;
+            }
           }
         }
       }
     }
     // Last resort: first string_literal anywhere under args
     const anyStr = argsNode.namedChildren.find(c => c.type === 'string_literal');
-    return anyStr ? anyStr.text.replace(/^"|"$/g, '') : undefined;
+    return anyStr ? this.unquoteJavaString(anyStr.text) : undefined;
+  }
+
+  private hasPathLikeAnnotationArgument(argsNode: SyntaxNode): boolean {
+    for (const child of argsNode.namedChildren) {
+      if (child.type !== 'element_value_pair') return true;
+      const key = child.childForFieldName('key')?.text;
+      if (key === 'value' || key === 'path' || key === 'urlPatterns') return true;
+    }
+    return false;
+  }
+
+  private extractRequestMappingMethod(argsNode: SyntaxNode): string | undefined {
+    for (const child of argsNode.namedChildren) {
+      if (child.type !== 'element_value_pair') continue;
+      const key = child.childForFieldName('key')?.text;
+      if (key !== 'method') continue;
+      const value = child.childForFieldName('value');
+      if (!value) continue;
+      const text = value.text;
+      const match = text.match(/RequestMethod\.([A-Z]+)/) ?? text.match(/\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b/);
+      if (match) return match[1];
+    }
+    return undefined;
+  }
+
+  private evaluateJavaStringExpression(node: SyntaxNode, constants: Map<string, string>): string | undefined {
+    switch (node.type) {
+      case 'string_literal':
+        return this.unquoteJavaString(node.text);
+      case 'identifier':
+        return constants.get(node.text);
+      case 'field_access':
+      case 'scoped_identifier': {
+        const text = node.text;
+        return constants.get(text) ?? constants.get(text.substring(text.lastIndexOf('.') + 1));
+      }
+      case 'parenthesized_expression':
+        return node.namedChildren.length === 1
+          ? this.evaluateJavaStringExpression(node.namedChildren[0], constants)
+          : undefined;
+      case 'binary_expression': {
+        if (!node.text.includes('+')) return undefined;
+        const parts = node.namedChildren;
+        if (parts.length < 2) return undefined;
+        let combined = '';
+        for (const part of parts) {
+          const value = this.evaluateJavaStringExpression(part, constants);
+          if (value === undefined) return undefined;
+          combined += value;
+        }
+        return combined;
+      }
+      default:
+        return undefined;
+    }
+  }
+
+  private unquoteJavaString(value: string): string {
+    if (!value.startsWith('"') || !value.endsWith('"')) return value;
+    try {
+      return JSON.parse(value) as string;
+    } catch {
+      return value.replace(/^"|"$/g, '');
+    }
   }
 
   /** Extract parameter type names from formal_parameters. */

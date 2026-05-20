@@ -6,8 +6,7 @@
 #   ./docker-build.sh                              # build only
 #   ./docker-build.sh --export                     # build + export to mcp-code-graph.tar.gz
 #   ./docker-build.sh --export --out /tmp/img.tar.gz
-#   ./docker-build.sh --run /path/to/project       # build + run HTTP server
-#   ./docker-build.sh --run /path/to/project --port 3100
+#   ./docker-build.sh --run /path/to/project       # build + run v2 MCP stdio proxy
 #
 # Load exported image on another machine (WSL / Linux):
 #   docker load -i mcp-code-graph.tar.gz
@@ -15,7 +14,6 @@
 set -euo pipefail
 
 IMAGE="mcp-code-graph:latest"
-PORT=3100
 RUN_MODE=false
 EXPORT_MODE=false
 PROJECT_PATH=""
@@ -37,10 +35,6 @@ while [[ $# -gt 0 ]]; do
       OUT_FILE="$2"
       shift 2
       ;;
-    --port)
-      PORT="$2"
-      shift 2
-      ;;
     --image)
       IMAGE="$2"
       shift 2
@@ -50,10 +44,9 @@ while [[ $# -gt 0 ]]; do
 Usage: $0 [OPTIONS]
 
 Options:
-  --run <path>       Build then start HTTP server, mounting <path> as the project
+  --run <path>       Build then start v2 MCP stdio proxy, mounting <path> as the project
   --export           Build then export image to tar.gz (transfer to WSL/Linux)
   --out <file>       Output path for --export (default: ./mcp-code-graph.tar.gz)
-  --port <port>      HTTP port for --run (default: 3100)
   --image <name:tag> Docker image name (default: mcp-code-graph:latest)
   -h, --help         Show this help
 
@@ -61,7 +54,6 @@ Examples:
   ./docker-build.sh --export
   ./docker-build.sh --export --out /mnt/d/transfer/mcp-code-graph.tar.gz
   ./docker-build.sh --run /mnt/d/Projects/myapp
-  ./docker-build.sh --run /mnt/d/Projects/myapp --port 3200
 EOF
       exit 0
       ;;
@@ -99,7 +91,7 @@ if $EXPORT_MODE; then
   echo "  docker load -i \"$OUT_FILE\""
   echo ""
   echo "To run after loading:"
-  echo "  docker run --rm -v \"/path/to/project:/workspace:ro\" -p ${PORT}:3100 ${IMAGE}"
+  echo "  docker run --rm -i -v \"/path/to/project:/workspace:ro\" ${IMAGE} mcp --root /workspace"
 fi
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
@@ -112,17 +104,14 @@ if $RUN_MODE; then
   ABS_PATH="$(realpath "$PROJECT_PATH")"
 
   echo ""
-  echo "▶ Starting mcp-code-graph server"
+  echo "▶ Starting mcp-code-graph v2 MCP proxy"
   echo "  Project  : $ABS_PATH"
-  echo "  HTTP port: $PORT"
-  echo "  URL      : http://localhost:$PORT"
   echo ""
 
-  docker run --rm -it \
+  docker run --rm -i \
     -v "${ABS_PATH}:/workspace:ro" \
-    -p "${PORT}:3100" \
     "$IMAGE" \
-    --root /workspace --transport http --port 3100
+    mcp --root /workspace
 fi
 
 # ─── Usage hint (build-only mode) ─────────────────────────────────────────────
@@ -134,12 +123,12 @@ if ! $RUN_MODE && ! $EXPORT_MODE; then
   echo "    $0 --export"
   echo "    $0 --export --out /mnt/d/transfer/mcp-code-graph.tar.gz"
   echo ""
-  echo "  Run directly:"
-  echo "    docker run --rm -v \"/path/to/project:/workspace:ro\" -p ${PORT}:3100 ${IMAGE}"
+  echo "  Run MCP stdio proxy directly:"
+  echo "    docker run --rm -i -v \"/path/to/project:/workspace:ro\" ${IMAGE} mcp --root /workspace"
   echo ""
   echo "  WSL example (D:\\Projects\\myapp → /mnt/d/Projects/myapp):"
-  echo "    docker run --rm -v \"/mnt/d/Projects/myapp:/workspace:ro\" -p ${PORT}:3100 ${IMAGE}"
+  echo "    docker run --rm -i -v \"/mnt/d/Projects/myapp:/workspace:ro\" ${IMAGE} mcp --root /workspace"
   echo ""
   echo "  VS Code .vscode/settings.json:"
-  echo '    { "mcp": { "servers": { "code-graph": { "type": "http", "url": "http://localhost:'${PORT}'" } } } }'
+  echo '    { "mcp": { "servers": { "code-graph": { "type": "stdio", "command": "docker", "args": ["run", "--rm", "-i", "-v", "${workspaceFolder}:/workspace:ro", "'${IMAGE}'", "mcp", "--root", "/workspace"] } } } }'
 fi
