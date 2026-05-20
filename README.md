@@ -12,20 +12,23 @@ Java/Jakarta EE is the primary semantic target. TypeScript/JavaScript and Python
 
 | Tool | Description |
 |------|-------------|
-| `search_symbol` | Search indexed symbols by name/kind |
-| `search_files` | Find relevant files with top symbols/endpoints and rank evidence |
-| `search_code` | Mixed retrieval across files, symbols, endpoints, references, and dependencies |
+| `explain_endpoint` | Return an endpoint slice: controller, call chain, service/repository/entity/DTO candidates, top files, and likely tests |
+| `find_endpoints` | Find Java/Jakarta/Spring endpoint handlers with composed class+method paths and resolution metadata |
 | `find_references` | Find definitions, imports, and call references |
-| `get_file_summary` | Summarize symbols, imports, dependencies, and dependents for a file |
+| `find_tests_for` | Find tests likely relevant to a symbol using test names, test symbols, and indexed call edges |
+| `get_callees` | Find symbols called by a caller symbol |
+| `get_callers` | Find call sites that call a symbol |
 | `get_dependencies` | List direct dependencies for a file/module |
 | `get_dependents` | List direct dependents for a file/module |
-| `trace_dependencies` | Trace direct/transitive dependencies or dependents |
-| `get_callers` | Find callers of a symbol |
-| `get_callees` | Find callees from a symbol |
-| `find_endpoints` | Find Jakarta/Spring endpoint handlers |
+| `get_file_summary` | Summarize symbols, imports, dependencies, and dependents for a file |
 | `get_impact_radius` | Estimate blast radius for a target |
-| `get_research_pack` | Return compact ranked evidence for agent research |
 | `get_index_stats` | Inspect current snapshot counts and file roles |
+| `get_research_pack` | Return a token-budgeted research pack with definitions, callers, callees, impacted endpoints, top files, and confidence notes |
+| `impact_of_symbol` | Return an impact slice for a symbol: definitions, callers, callees, affected endpoints, likely tests, and top files |
+| `search_code` | Mixed retrieval across files, symbols, endpoints, references, and dependencies |
+| `search_files` | Find relevant files with top symbols/endpoints, facets, pagination, and rank evidence |
+| `search_symbol` | Search indexed symbols with intent-aware ranking, pagination, facets, and optional rank explanations |
+| `trace_dependencies` | Trace direct/transitive dependencies or dependents with seed files, graph edges, impacted endpoints, and cycle hints |
 
 Graph edges and research packs include confidence notes when resolution is fuzzy or incomplete.
 
