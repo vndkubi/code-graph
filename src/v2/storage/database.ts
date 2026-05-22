@@ -7,7 +7,7 @@ export interface OpenCodeGraphDbResult {
   paths: CodeGraphPaths;
 }
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export function openCodeGraphDb(homeOverride?: string): OpenCodeGraphDbResult {
   const paths = getCodeGraphPaths(homeOverride);
@@ -33,6 +33,7 @@ export function migrate(db: DatabaseType): void {
       CREATE TABLE IF NOT EXISTS workspaces (
         id TEXT PRIMARY KEY,
         root TEXT NOT NULL,
+        workspace_key TEXT,
         git_remote TEXT,
         git_common_dir TEXT,
         created_at TEXT NOT NULL,
@@ -212,6 +213,7 @@ export function migrate(db: DatabaseType): void {
       CREATE INDEX IF NOT EXISTS idx_beans_type ON beans(snapshot_id, bean_type);
       CREATE INDEX IF NOT EXISTS idx_inheritance_parent ON inheritance(snapshot_id, parent_type);
     `);
+    ensureColumn(db, 'workspaces', 'workspace_key', 'TEXT');
     ensureColumn(db, 'endpoints', 'path_resolution', "TEXT NOT NULL DEFAULT 'exact'");
     ensureColumn(db, 'endpoints', 'path_resolution_reason', 'TEXT');
     db.pragma(`user_version = ${SCHEMA_VERSION}`);

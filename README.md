@@ -32,6 +32,23 @@ Java/Jakarta EE is the primary semantic target. TypeScript/JavaScript and Python
 
 Graph edges and research packs include confidence notes when resolution is fuzzy or incomplete.
 
+Common retrieval options:
+
+- `explainRank: true` adds a standard `debug` block plus per-result `rankExplanation` where ranking applies.
+- `includeSnippets: true` returns short source slices near matched symbols/endpoints; tune with `snippetLines` and `snippetTokenBudget`.
+- `autoRefresh: true` refreshes the workspace snapshot before answering; stale snapshots otherwise return `indexFreshness` when the on-disk tree changed.
+
+### Ask your agent these questions
+
+Use prompts like these to make the agent reach for graph tools before opening many files:
+
+- "Use `search_files` first: which files are relevant to creating a notebook?"
+- "Use `search_code` with `explainRank: true`: find files, symbols, endpoints, references, and dependencies for payment flow."
+- "Use `trace_dependencies`: if I change `UserEntity`, what files and endpoints are affected?"
+- "Use `find_tests_for`: which tests are likely relevant for `NotebookController.createNotebook`?"
+- "Use `explain_endpoint` with snippets: explain `GET /notebooks` from controller to service/repository/DTO/tests."
+- "Use `impact_of_symbol`: who calls `RecallService`, what does it call, and which tests should I run?"
+
 ---
 
 ## Quick Start
@@ -509,6 +526,9 @@ Docker is optional. v2 normally runs best as a local stdio command from VS Code/
 # Build only
 ./docker-build.sh
 
+# Build with a corporate/internal root CA certificate
+./docker-build.sh --ca-cert /path/to/corp-root-ca.crt
+
 # Build + export to tar.gz (for transfer to WSL / another machine)
 ./docker-build.sh --export
 
@@ -523,8 +543,25 @@ docker build -t mcp-code-graph .
 
 docker run --rm -i \
   -v "/absolute/path/to/project:/workspace:ro" \
+  -v codegraph-cache:/codegraph-home \
+  -e CODEGRAPH_WORKSPACE_KEY="/absolute/path/to/project" \
   mcp-code-graph \
-  mcp --root /workspace
+  mcp --root /workspace --auto-refresh
+```
+
+When Docker sees every project as `/workspace`, set `CODEGRAPH_WORKSPACE_KEY` to the host project path or another stable unique key. This prevents multiple repositories from sharing the same workspace identity in a persistent Docker cache. Use `--auto-refresh` if you change branches with `git checkout` in the same folder; CodeGraph will refresh only when the snapshot is stale.
+
+If your machine or company network requires a custom trusted root certificate for `npm ci`, export the certificate as PEM/CRT and pass it at build time:
+
+```powershell
+# Windows example: export a trusted root certificate by thumbprint, then PEM-encode it
+$cert = Get-ChildItem Cert:\CurrentUser\Root | Where-Object Thumbprint -eq "<THUMBPRINT>"
+Export-Certificate -Cert $cert -FilePath C:\temp\corp-root-ca.cer | Out-Null
+certutil -encode C:\temp\corp-root-ca.cer C:\temp\corp-root-ca.crt
+```
+
+```bash
+DOCKER_BUILDKIT=1 ./docker-build.sh --ca-cert /mnt/c/temp/corp-root-ca.crt
 ```
 
 VS Code MCP config using Docker:
@@ -542,10 +579,15 @@ VS Code MCP config using Docker:
           "-i",
           "-v",
           "${workspaceFolder}:/workspace:ro",
+          "-v",
+          "codegraph-cache:/codegraph-home",
+          "-e",
+          "CODEGRAPH_WORKSPACE_KEY=${workspaceFolder}",
           "mcp-code-graph:latest",
           "mcp",
           "--root",
-          "/workspace"
+          "/workspace",
+          "--auto-refresh"
         ]
       }
     }
@@ -563,12 +605,16 @@ codegraph daemon start|stop|status     Manage local daemon
 codegraph daemon run                   Run daemon in the foreground
 codegraph index --root <workspace>     Prewarm persistent index
 codegraph doctor                       Inspect local configuration
-codegraph benchmark generate|index     Generate synthetic Java repos and measure indexing
+codegraph benchmark generate|index|eval
+                                      Generate synthetic repos, measure indexing, or run golden evals
 
 Options:
   --root <path>                        Workspace root
   --home <path>                        Override CODEGRAPH_HOME
   --port <number>                      Daemon port for daemon run
+  --tasks <path>                       Golden eval task JSON file
+  --workspace-key <key>                Stable workspace identity key for Docker/WSL path remapping
+  --auto-refresh                       Refresh stale snapshots automatically before MCP tool calls
 ```
 
 **Examples:**
@@ -582,6 +628,9 @@ node dist/cli.js mcp --root /path/to/project
 
 # Use an isolated cache for benchmark/proof runs
 node dist/cli.js benchmark index --root /path/to/project --home /tmp/codegraph-proof-home
+
+# Run golden eval tasks against a project
+node dist/cli.js benchmark eval --root /path/to/project --tasks examples/golden-eval-tasks.example.json --home /tmp/codegraph-proof-home
 ```
 
 ---
@@ -646,7 +695,12 @@ node dist/cli.js benchmark generate --root /tmp/synth-java --files 10000 --modul
 
 # Measure persistent index performance
 node dist/cli.js benchmark index --root /tmp/synth-java
+
+# Compare baseline text retrieval vs CodeGraph on an agent-style task set
+node dist/cli.js benchmark eval --root /path/to/project --tasks examples/golden-eval-tasks.example.json
 ```
+
+The golden eval task file is a JSON array. Start from `examples/golden-eval-tasks.example.json`, replace names like `OrderService` or `/orders` with terms from your project, and keep the same file for every baseline-vs-CodeGraph run.
 
 ### v2 Operating Principle
 
@@ -772,6 +826,21 @@ Minimum evaluation dataset:
 4. Which bean implementations can satisfy this interface injection?
 5. Which tests are most relevant for this service method?
 ```
+
+For a useful agent benchmark, keep 20-50 project-specific questions in one JSON file. Each task should name:
+
+- `question`: what the agent needs to answer.
+- `codegraphTool` and `codegraphArgs`: the first graph tool call to compare.
+- `baselineSearchTerms`: terms used by the baseline scanner to estimate files/tokens opened.
+- `expectedContains`: short strings that must appear in the CodeGraph response for a lightweight correctness check.
+
+Run it with:
+
+```bash
+node dist/cli.js benchmark eval --root /path/to/project --tasks examples/golden-eval-tasks.example.json --home /tmp/codegraph-proof-home
+```
+
+The output includes per-task correctness, estimated tokens, baseline files opened, CodeGraph response size, and aggregate `tokenSavingPct`.
 
 Metrics to report:
 

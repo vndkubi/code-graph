@@ -348,7 +348,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             // Extract calls within the method body
             const body = child.childForFieldName('body');
             if (body) {
-              this.extractCallsFromNode(body, file, lines, calls, references, methodName);
+              const receiverTypes = this.extractMethodParamTypeMap(paramsNode);
+              this.collectJavaLocalVariableTypes(body, receiverTypes, file);
+              this.extractCallsFromNode(body, file, lines, calls, references, methodName, receiverTypes);
             }
           }
           break;
@@ -720,6 +722,44 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     return types;
   }
 
+  /** Map Java method parameter names to their declared type for receiver call resolution. */
+  private extractMethodParamTypeMap(paramsNode: SyntaxNode | null | undefined): Map<string, string> {
+    const types = new Map<string, string>();
+    if (!paramsNode) return types;
+    for (const child of paramsNode.children) {
+      if (child.type !== 'formal_parameter' && child.type !== 'spread_parameter') continue;
+      const typeName = this.extractJavaTypeName(child.childForFieldName('type'));
+      const nameNode = child.childForFieldName('name')
+        ?? [...child.namedChildren].reverse().find(node => node.type === 'identifier');
+      if (typeName && nameNode) types.set(nameNode.text, typeName);
+    }
+    return types;
+  }
+
+  /** Add local Java variable declarations to the receiver type scope. */
+  private collectJavaLocalVariableTypes(node: SyntaxNode, receiverTypes: Map<string, string>, file: string): void {
+    if (node.type === 'local_variable_declaration' || node.type === 'resource') {
+      const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
+      if (typeName) {
+        for (const declarator of node.children.filter(child => child.type === 'variable_declarator')) {
+          const nameNode = declarator.childForFieldName('name') ?? declarator.children.find(child => child.type === 'identifier');
+          if (nameNode) receiverTypes.set(nameNode.text, typeName);
+        }
+        if (this.isReferenceType(typeName)) {
+          this.parseTypeRefs.push({
+            file,
+            referencedType: typeName,
+            context: 'parameter',
+            line: node.startPosition.row + 1,
+          });
+        }
+      }
+    }
+    for (const child of node.children) {
+      this.collectJavaLocalVariableTypes(child, receiverTypes, file);
+    }
+  }
+
   /** True if a type name represents a reference type (not a primitive or void). */
   private isReferenceType(name: string): boolean {
     const primitives = new Set(['void', 'int', 'long', 'double', 'float', 'boolean', 'char', 'byte', 'short', 'String', 'Object']);
@@ -1035,6 +1075,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     calls: CallInfo[],
     references: ReferenceInfo[],
     callerName: string,
+    receiverTypes?: Map<string, string>,
   ): void {
     // Java: method invocation — obj.method(args)
     if (node.type === 'method_invocation' || node.type === 'object_creation_expression') {
@@ -1043,7 +1084,8 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         let calleeName = '';
         const objectNode = node.childForFieldName('object');
         if (objectNode) {
-          calleeName = `${objectNode.text}.${funcNode.text}`;
+          const receiverType = resolveReceiverType(objectNode.text, receiverTypes);
+          calleeName = `${receiverType ?? objectNode.text}.${funcNode.text}`;
         } else {
           calleeName = funcNode.text;
         }
@@ -1067,7 +1109,8 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       if (children.length >= 2) {
         const typePart = children[0].text;
         const methodPart = children[1].text;
-        const calleeName = methodPart === 'new' ? `${typePart}.new` : `${typePart}.${methodPart}`;
+        const receiverType = resolveReceiverType(typePart, receiverTypes) ?? typePart;
+        const calleeName = methodPart === 'new' ? `${receiverType}.new` : `${receiverType}.${methodPart}`;
         calls.push({ caller: callerName, callee: calleeName, file, line: node.startPosition.row + 1 });
         references.push({
           file,
@@ -1119,7 +1162,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     }
 
     for (const child of node.children) {
-      this.extractCallsFromNode(child, file, lines, calls, references, callerName);
+      this.extractCallsFromNode(child, file, lines, calls, references, callerName, receiverTypes);
     }
   }
 
@@ -1144,4 +1187,11 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     const end = Math.min(lines.length - 1, row + contextSize);
     return lines.slice(start, end + 1).join('\n');
   }
+}
+
+function resolveReceiverType(receiver: string, receiverTypes?: Map<string, string>): string | undefined {
+  if (!receiverTypes) return undefined;
+  if (receiverTypes.has(receiver)) return receiverTypes.get(receiver);
+  const lastSegment = receiver.split('.').pop();
+  return lastSegment ? receiverTypes.get(lastSegment) : undefined;
 }

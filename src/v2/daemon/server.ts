@@ -40,11 +40,12 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         const startedAt = Date.now();
         const body = await readJson(req);
         const root = requireString(body.root, 'root');
-        const workspace = indexer.registerWorkspace(root);
+        const workspaceKey = optionalString(body.workspaceKey);
+        const workspace = indexer.registerWorkspace(root, workspaceKey);
         if (!watchers.has(workspace.root)) {
           watchers.set(workspace.root, watchWorkspace(workspace.root, () => {
             try {
-              indexer.indexWorkspace({ root: workspace.root });
+              indexer.indexWorkspace({ root: workspace.root, workspaceKey });
             } catch (error) {
               process.stderr.write(`[codegraph] watcher refresh failed: ${error instanceof Error ? error.message : String(error)}\n`);
             }
@@ -53,6 +54,7 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         logEvent(paths.daemonLogPath, {
           event: 'workspace.register',
           root: workspace.root,
+          workspaceKey,
           workspaceId: workspace.workspaceId,
           hasSnapshot: Boolean(workspace.currentSnapshotId),
           durationMs: Date.now() - startedAt,
@@ -65,10 +67,12 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         const startedAt = Date.now();
         const body = await readJson(req);
         const root = requireString(body.root, 'root');
-        const result = indexer.indexWorkspace({ root });
+        const workspaceKey = optionalString(body.workspaceKey);
+        const result = indexer.indexWorkspace({ root, workspaceKey });
         logEvent(paths.daemonLogPath, {
           event: 'workspace.refresh',
           root,
+          workspaceKey,
           workspaceId: result.workspaceId,
           snapshotId: result.snapshotId,
           filesTotal: result.filesTotal,
@@ -165,6 +169,10 @@ function requireString(value: unknown, name: string): string {
     throw new Error(`Missing required field: ${name}`);
   }
   return value;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

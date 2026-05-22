@@ -1,5 +1,16 @@
 import { z } from 'zod';
 
+const FreshnessOptions = {
+  autoRefresh: z.boolean().optional(),
+  warnStale: z.boolean().optional(),
+};
+
+const SnippetOptions = {
+  includeSnippets: z.boolean().optional(),
+  snippetLines: z.number().min(3).max(80).optional(),
+  snippetTokenBudget: z.number().min(100).max(12000).optional(),
+};
+
 export const V2ToolSchemas = {
   search_symbol: z.object({
     query: z.string().default('*'),
@@ -13,6 +24,8 @@ export const V2ToolSchemas = {
     explainRank: z.boolean().default(false),
     annotation: z.string().optional(),
     frameworkRole: z.string().optional(),
+    ...SnippetOptions,
+    ...FreshnessOptions,
   }),
   search_files: z.object({
     query: z.string().default('*'),
@@ -24,6 +37,8 @@ export const V2ToolSchemas = {
     explainRank: z.boolean().default(false),
     fileRole: z.string().optional(),
     language: z.string().optional(),
+    ...SnippetOptions,
+    ...FreshnessOptions,
   }),
   find_references: z.object({
     symbol: z.string(),
@@ -35,32 +50,43 @@ export const V2ToolSchemas = {
     includeTests: z.boolean().optional(),
     includeGenerated: z.boolean().optional(),
     includeFixtures: z.boolean().optional(),
+    ...FreshnessOptions,
   }),
   get_file_summary: z.object({
     file: z.string(),
+    ...SnippetOptions,
+    ...FreshnessOptions,
   }),
   get_dependencies: z.object({
     module: z.string(),
+    ...FreshnessOptions,
   }),
   get_dependents: z.object({
     module: z.string(),
+    ...FreshnessOptions,
   }),
   get_callers: z.object({
     symbol: z.string(),
     limit: z.number().min(1).max(200).default(100),
+    ...FreshnessOptions,
   }),
   get_callees: z.object({
     symbol: z.string(),
     limit: z.number().min(1).max(200).default(100),
+    ...FreshnessOptions,
   }),
   find_endpoints: z.object({
     method: z.string().default('all'),
     path: z.string().optional(),
     limit: z.number().min(1).max(500).default(200),
     cursor: z.string().optional(),
+    explainRank: z.boolean().default(false),
+    ...SnippetOptions,
+    ...FreshnessOptions,
   }),
   get_impact_radius: z.object({
     target: z.string(),
+    ...FreshnessOptions,
   }),
   trace_dependencies: z.object({
     target: z.string(),
@@ -72,24 +98,32 @@ export const V2ToolSchemas = {
     includeFixtures: z.boolean().optional(),
     fileRole: z.string().optional(),
     language: z.string().optional(),
+    ...FreshnessOptions,
   }),
   explain_endpoint: z.object({
     path: z.string(),
     method: z.string().default('all'),
     depth: z.number().min(1).max(5).default(3),
+    ...SnippetOptions,
+    ...FreshnessOptions,
   }),
   impact_of_symbol: z.object({
     symbol: z.string(),
     limit: z.number().min(1).max(50).default(10),
+    ...SnippetOptions,
+    ...FreshnessOptions,
   }),
   find_tests_for: z.object({
     symbol: z.string(),
     limit: z.number().min(1).max(200).default(50),
+    ...FreshnessOptions,
   }),
   get_research_pack: z.object({
     target: z.string(),
     taskType: z.string().default('research'),
     tokenBudget: z.number().min(1000).max(12000).default(4000),
+    ...SnippetOptions,
+    ...FreshnessOptions,
   }),
   search_code: z.object({
     query: z.string(),
@@ -104,8 +138,12 @@ export const V2ToolSchemas = {
     groupBy: z.enum(['none', 'file', 'kind', 'caller']).default('file'),
     depth: z.number().min(1).max(5).default(1),
     method: z.string().default('all'),
+    ...SnippetOptions,
+    ...FreshnessOptions,
   }),
-  get_index_stats: z.object({}),
+  get_index_stats: z.object({
+    ...FreshnessOptions,
+  }),
 };
 
 export type V2ToolName = keyof typeof V2ToolSchemas;

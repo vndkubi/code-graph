@@ -1,7 +1,7 @@
 import path from 'node:path';
 import type { Database as DatabaseType } from 'better-sqlite3';
 import type { ParseResult, SymbolInfo } from '../../analyzers/base-analyzer.js';
-import { getGitInfo } from '../git.js';
+import { getGitInfo, type GitInfo } from '../git.js';
 import { sha256Json, stableId } from '../hash.js';
 import { scanManifest, type ManifestFile } from './manifest.js';
 import { parseFile, symbolFqName } from './parse.js';
@@ -9,6 +9,7 @@ import { roleRank } from './file-role.js';
 
 export interface IndexWorkspaceOptions {
   root: string;
+  workspaceKey?: string;
   maxFileSizeBytes?: number;
   force?: boolean;
 }
@@ -26,6 +27,7 @@ export interface IndexWorkspaceResult {
 interface WorkspaceRow {
   id: string;
   root: string;
+  workspace_key?: string;
   current_snapshot_id?: string;
   last_indexed_head?: string;
 }
@@ -66,35 +68,33 @@ const BEAN_ANNOTATIONS = new Set([
 export class V2Indexer {
   constructor(private readonly db: DatabaseType) {}
 
-  registerWorkspace(root: string): { workspaceId: string; root: string; currentSnapshotId?: string } {
+  registerWorkspace(root: string, workspaceKey?: string): { workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string } {
     const realRoot = path.resolve(root);
     const git = getGitInfo(realRoot);
-    const workspaceId = stableId([
-      realRoot.toLowerCase(),
-      git.remoteUrl,
-      git.gitCommonDir,
-    ]);
+    const resolvedWorkspaceKey = normalizeWorkspaceKey(workspaceKey ?? process.env.CODEGRAPH_WORKSPACE_KEY);
+    const workspaceId = stableId(workspaceIdentityParts(realRoot, git, resolvedWorkspaceKey));
     const now = new Date().toISOString();
 
     this.db.prepare(`
-      INSERT INTO workspaces (id, root, git_remote, git_common_dir, created_at, last_seen_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO workspaces (id, root, workspace_key, git_remote, git_common_dir, created_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         root = excluded.root,
+        workspace_key = excluded.workspace_key,
         git_remote = excluded.git_remote,
         git_common_dir = excluded.git_common_dir,
         last_seen_at = excluded.last_seen_at
-    `).run(workspaceId, realRoot, git.remoteUrl, git.gitCommonDir, now, now);
+    `).run(workspaceId, realRoot, resolvedWorkspaceKey, git.remoteUrl, git.gitCommonDir, now, now);
 
     const row = this.db.prepare('SELECT current_snapshot_id FROM workspaces WHERE id = ?')
       .get(workspaceId) as { current_snapshot_id?: string } | undefined;
 
-    return { workspaceId, root: realRoot, currentSnapshotId: row?.current_snapshot_id };
+    return { workspaceId, root: realRoot, workspaceKey: resolvedWorkspaceKey, currentSnapshotId: row?.current_snapshot_id };
   }
 
   indexWorkspace(options: IndexWorkspaceOptions): IndexWorkspaceResult {
     const start = Date.now();
-    const workspace = this.registerWorkspace(options.root);
+    const workspace = this.registerWorkspace(options.root, options.workspaceKey);
     const git = getGitInfo(workspace.root);
     const manifest = scanManifest(workspace.root, { maxFileSizeBytes: options.maxFileSizeBytes });
     const snapshotId = stableId([
@@ -443,10 +443,17 @@ export class V2Indexer {
 
   private resolveCallEdges(snapshotId: string): void {
     const rows = this.db.prepare(`
-      SELECT rowid AS row_id, callee, file
+      SELECT rowid AS row_id, caller, callee, file, line, file_role
       FROM call_edges
       WHERE snapshot_id = ? AND resolution_kind = 'name-only' AND callee LIKE '%.%'
-    `).all(snapshotId) as Array<{ row_id: number; callee: string; file: string }>;
+    `).all(snapshotId) as Array<{
+      row_id: number;
+      caller: string;
+      callee: string;
+      file: string;
+      line: number;
+      file_role: string;
+    }>;
 
     const fieldsByFile = new Map<string, Map<string, string>>();
     const fields = this.db.prepare(`
@@ -463,24 +470,71 @@ export class V2Indexer {
       byName.set(field.simple_name, field.return_type);
     }
 
+    const implementationsByInterface = new Map<string, string[]>();
+    const implementations = this.db.prepare(`
+      SELECT parent_type, child_type
+      FROM inheritance
+      WHERE snapshot_id = ? AND kind = 'implements'
+    `).all(snapshotId) as Array<{ parent_type: string; child_type: string }>;
+    for (const impl of implementations) {
+      const parent = simpleTypeName(impl.parent_type);
+      const child = simpleTypeName(impl.child_type);
+      const current = implementationsByInterface.get(parent) ?? [];
+      current.push(child);
+      implementationsByInterface.set(parent, current);
+    }
+
+    const methodOwners = new Set(
+      (this.db.prepare(`
+        SELECT parent, simple_name
+        FROM symbols
+        WHERE snapshot_id = ? AND kind = 'method' AND parent IS NOT NULL
+      `).all(snapshotId) as Array<{ parent: string; simple_name: string }>)
+        .map(row => `${row.parent}.${row.simple_name}`),
+    );
+
     const update = this.db.prepare(`
       UPDATE call_edges
       SET callee = ?, confidence = ?, resolution_kind = ?
       WHERE rowid = ?
     `);
+    const insert = this.db.prepare(`
+      INSERT INTO call_edges (
+        snapshot_id, caller, callee, file, line, confidence, resolution_kind, file_role
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertedImplementationEdges = new Set<string>();
+    const insertImplementationEdges = (
+      row: typeof rows[number],
+      receiverType: string,
+      method: string,
+    ): void => {
+      const implementations = implementationsByInterface.get(simpleTypeName(receiverType)) ?? [];
+      for (const implementation of implementations) {
+        if (!methodOwners.has(`${implementation}.${method}`)) continue;
+        const callee = `${implementation}.${method}`;
+        const key = `${row.caller}\0${callee}\0${row.file}\0${row.line}`;
+        if (insertedImplementationEdges.has(key)) continue;
+        insertedImplementationEdges.add(key);
+        insert.run(snapshotId, row.caller, callee, row.file, row.line, 0.65, 'interface-implementation', row.file_role);
+      }
+    };
 
     for (const row of rows) {
       const dot = row.callee.lastIndexOf('.');
       if (dot <= 0) continue;
       const receiver = row.callee.substring(0, dot);
+      const normalizedReceiver = receiver.startsWith('this.') ? receiver.substring('this.'.length) : receiver;
       const method = row.callee.substring(dot + 1);
-      const fieldType = fieldsByFile.get(row.file)?.get(receiver);
+      const fieldType = fieldsByFile.get(row.file)?.get(normalizedReceiver);
       if (fieldType) {
         update.run(`${fieldType}.${method}`, 0.8, 'receiver-field', row.row_id);
+        insertImplementationEdges(row, fieldType, method);
         continue;
       }
       if (/^[A-Z]/.test(receiver)) {
         update.run(row.callee, 0.8, 'static-or-type-receiver', row.row_id);
+        insertImplementationEdges(row, receiver, method);
       }
     }
   }
@@ -531,4 +585,25 @@ function composeEndpointPath(classPath: string | undefined, methodPath: string |
     .filter(Boolean)
     .join('/');
   return joined.startsWith('/') ? joined : `/${joined}`;
+}
+
+function simpleTypeName(typeName: string): string {
+  const withoutParams = typeName.replace(/\([^)]*\)$/, '');
+  const parts = withoutParams.split('.').filter(Boolean);
+  return parts[parts.length - 1] ?? withoutParams;
+}
+
+function normalizeWorkspaceKey(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed.toLowerCase().replace(/\\/g, '/') : undefined;
+}
+
+function workspaceIdentityParts(realRoot: string, git: GitInfo, workspaceKey: string | undefined): Array<string | undefined> {
+  if (workspaceKey) return ['workspace-key', workspaceKey];
+  return [
+    'workspace-path',
+    realRoot.toLowerCase().replace(/\\/g, '/'),
+    git.remoteUrl,
+    git.gitCommonDir,
+  ];
 }

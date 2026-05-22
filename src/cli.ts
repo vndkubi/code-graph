@@ -9,6 +9,7 @@ import { runMcpProxy } from './v2/mcp/proxy.js';
 import { getCodeGraphPaths } from './v2/paths.js';
 import { generateSyntheticJavaRepo } from './v2/benchmark/synthetic-java.js';
 import { runIndexBenchmark } from './v2/benchmark/run.js';
+import { loadGoldenEvalTasks, runGoldenEval } from './v2/benchmark/golden-eval.js';
 
 interface ParsedArgs {
   command: string[];
@@ -25,6 +26,8 @@ async function main(): Promise<void> {
         root: getFlag(parsed, 'root') ?? process.cwd(),
         homeDir: getFlag(parsed, 'home'),
         prewarm: parsed.flags.get('no-prewarm') !== true,
+        workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
+        autoRefresh: parsed.flags.get('auto-refresh') === true || envFlag('CODEGRAPH_AUTO_REFRESH'),
       });
       return;
     case 'daemon':
@@ -65,8 +68,19 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       console.log(JSON.stringify(runIndexBenchmark(root, getFlag(parsed, 'home')), null, 2));
       return;
     }
+    case 'eval': {
+      const root = getFlag(parsed, 'root') ?? process.cwd();
+      const { db } = openCodeGraphDb(getFlag(parsed, 'home'));
+      try {
+        const tasks = loadGoldenEvalTasks(getFlag(parsed, 'tasks'));
+        console.log(JSON.stringify(runGoldenEval(db, root, tasks), null, 2));
+      } finally {
+        db.close();
+      }
+      return;
+    }
     default:
-      throw new Error('Usage: codegraph benchmark generate|index');
+      throw new Error('Usage: codegraph benchmark generate|index|eval');
   }
 }
 
@@ -99,7 +113,10 @@ async function runIndexCommand(parsed: ParsedArgs): Promise<void> {
   const root = getFlag(parsed, 'root') ?? process.cwd();
   const { db, paths } = openCodeGraphDb(getFlag(parsed, 'home'));
   const indexer = new V2Indexer(db);
-  const result = indexer.indexWorkspace({ root });
+  const result = indexer.indexWorkspace({
+    root,
+    workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
+  });
   console.log(JSON.stringify({ ...result, dbPath: paths.dbPath }, null, 2));
 }
 
@@ -167,6 +184,10 @@ function getNumberFlag(args: ParsedArgs, name: string): number | undefined {
   return value ? Number(value) : undefined;
 }
 
+function envFlag(name: string): boolean {
+  return /^(1|true|yes|on)$/i.test(process.env[name] ?? '');
+}
+
 function printHelp(): void {
   console.log(`
 codegraph
@@ -177,12 +198,15 @@ Usage:
   codegraph index --root <workspace>     Prewarm persistent index
   codegraph doctor                       Inspect local configuration
   codegraph logs --tail <number>         Print recent daemon query/index events
-  codegraph benchmark generate|index     Generate synthetic Java repos and measure indexing
+  codegraph benchmark generate|index|eval Generate synthetic repos, measure indexing, or run golden evals
 
 Options:
   --root <path>                          Workspace root
   --home <path>                          Override CODEGRAPH_HOME
   --port <number>                        Daemon port for daemon run
+  --tasks <path>                         Golden eval task JSON file
+  --workspace-key <key>                  Stable workspace identity key, useful when Docker always mounts roots at /workspace
+  --auto-refresh                         Refresh stale snapshots automatically before MCP tool calls
 `);
 }
 

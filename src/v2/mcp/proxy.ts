@@ -8,14 +8,16 @@ export interface RunMcpProxyOptions {
   root: string;
   homeDir?: string;
   prewarm?: boolean;
+  workspaceKey?: string;
+  autoRefresh?: boolean;
 }
 
 export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
   const daemon = await DaemonClient.ensure(options.homeDir);
-  let workspace = await daemon.registerWorkspace(options.root);
+  let workspace = await daemon.registerWorkspace(options.root, options.workspaceKey);
   if (options.prewarm !== false && !workspace.currentSnapshotId) {
-    await daemon.refreshWorkspace(workspace.root);
-    workspace = await daemon.registerWorkspace(workspace.root);
+    await daemon.refreshWorkspace(workspace.root, options.workspaceKey);
+    workspace = await daemon.registerWorkspace(workspace.root, options.workspaceKey);
   }
 
   const server = new Server(
@@ -30,6 +32,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     try {
       const args = parseToolArgs(request.params.name, request.params.arguments);
+      if (options.autoRefresh && args.autoRefresh === undefined) args.autoRefresh = true;
       const result = await daemon.query(workspace.workspaceId, request.params.name, args);
       return {
         content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],

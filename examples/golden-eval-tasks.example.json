@@ -1,0 +1,194 @@
+[
+  {
+    "id": "endpoint-calls-service",
+    "question": "Which endpoints call OrderService.createOrder?",
+    "codegraphTool": "find_references",
+    "codegraphArgs": { "symbol": "OrderService.createOrder", "kind": "call", "groupBy": "file", "limit": 50 },
+    "baselineSearchTerms": ["OrderService", "createOrder"],
+    "expectedContains": ["createOrder"]
+  },
+  {
+    "id": "endpoint-slice-post-orders",
+    "question": "Explain the controller to service to repository slice for POST /orders.",
+    "codegraphTool": "explain_endpoint",
+    "codegraphArgs": { "method": "POST", "path": "/orders", "depth": 3, "includeSnippets": true, "snippetLines": 12 },
+    "baselineSearchTerms": ["/orders", "PostMapping", "POST"],
+    "expectedContains": ["orders"]
+  },
+  {
+    "id": "impact-user-email",
+    "question": "What changes are likely affected if UserEntity.email is renamed?",
+    "codegraphTool": "impact_of_symbol",
+    "codegraphArgs": { "symbol": "UserEntity.email", "limit": 20, "includeSnippets": true },
+    "baselineSearchTerms": ["UserEntity", "email"],
+    "expectedContains": ["UserEntity"]
+  },
+  {
+    "id": "tests-for-create-order",
+    "question": "Which tests are most relevant for OrderController.create?",
+    "codegraphTool": "find_tests_for",
+    "codegraphArgs": { "symbol": "OrderController.create", "limit": 50 },
+    "baselineSearchTerms": ["OrderController", "create", "should"],
+    "expectedContains": ["OrderController"]
+  },
+  {
+    "id": "files-for-payment-flow",
+    "question": "Which files are related to the payment flow?",
+    "codegraphTool": "search_files",
+    "codegraphArgs": { "query": "payment flow service controller repository", "limit": 20, "explainRank": true },
+    "baselineSearchTerms": ["payment", "PaymentService", "PaymentController"],
+    "expectedContains": ["payment"]
+  },
+  {
+    "id": "gateway-callers",
+    "question": "Who calls PaymentGateway.processPayment?",
+    "codegraphTool": "get_callers",
+    "codegraphArgs": { "symbol": "PaymentGateway.processPayment", "limit": 100 },
+    "baselineSearchTerms": ["PaymentGateway", "processPayment"],
+    "expectedContains": ["processPayment"]
+  },
+  {
+    "id": "service-callees",
+    "question": "What does PaymentService.charge call?",
+    "codegraphTool": "get_callees",
+    "codegraphArgs": { "symbol": "PaymentService.charge", "limit": 100 },
+    "baselineSearchTerms": ["PaymentService", "charge"],
+    "expectedContains": ["charge"]
+  },
+  {
+    "id": "dependency-impact-service",
+    "question": "What files depend on PaymentService?",
+    "codegraphTool": "trace_dependencies",
+    "codegraphArgs": { "target": "PaymentService", "direction": "dependents", "depth": 2, "limit": 100 },
+    "baselineSearchTerms": ["PaymentService"],
+    "expectedContains": ["PaymentService"]
+  },
+  {
+    "id": "repository-dependencies",
+    "question": "What does UserRepository depend on?",
+    "codegraphTool": "trace_dependencies",
+    "codegraphArgs": { "target": "UserRepository", "direction": "dependencies", "depth": 1, "limit": 100 },
+    "baselineSearchTerms": ["UserRepository"],
+    "expectedContains": ["UserRepository"]
+  },
+  {
+    "id": "mixed-search-notebook-create",
+    "question": "Find the files, symbols, endpoint, and references for creating a notebook.",
+    "codegraphTool": "search_code",
+    "codegraphArgs": { "query": "create notebook endpoint service", "limit": 10, "explainRank": true, "includeSnippets": true },
+    "baselineSearchTerms": ["Notebook", "create", "endpoint"],
+    "expectedContains": ["notebook"]
+  },
+  {
+    "id": "entry-point",
+    "question": "Where is the main application entry point?",
+    "codegraphTool": "search_symbol",
+    "codegraphArgs": { "query": "main application entry point", "limit": 10, "explainRank": true, "includeSnippets": true },
+    "baselineSearchTerms": ["SpringBootApplication", "main", "CommandLineRunner"],
+    "expectedContains": ["Application"]
+  },
+  {
+    "id": "controller-files",
+    "question": "Which controller files expose user management routes?",
+    "codegraphTool": "search_files",
+    "codegraphArgs": { "query": "user management controller route", "limit": 20, "explainRank": true },
+    "baselineSearchTerms": ["UserController", "user", "route"],
+    "expectedContains": ["User"]
+  },
+  {
+    "id": "endpoint-list-users",
+    "question": "Which handler serves GET /users?",
+    "codegraphTool": "find_endpoints",
+    "codegraphArgs": { "method": "GET", "path": "/users", "limit": 20, "explainRank": true, "includeSnippets": true },
+    "baselineSearchTerms": ["/users", "GetMapping", "GET"],
+    "expectedContains": ["users"]
+  },
+  {
+    "id": "endpoint-update-user",
+    "question": "Which handler serves PUT /users/{id}?",
+    "codegraphTool": "find_endpoints",
+    "codegraphArgs": { "method": "PUT", "path": "/users", "limit": 20, "explainRank": true, "includeSnippets": true },
+    "baselineSearchTerms": ["/users", "PutMapping", "PUT"],
+    "expectedContains": ["users"]
+  },
+  {
+    "id": "dto-impact",
+    "question": "What code is affected by changing CreateOrderRequest?",
+    "codegraphTool": "impact_of_symbol",
+    "codegraphArgs": { "symbol": "CreateOrderRequest", "limit": 20 },
+    "baselineSearchTerms": ["CreateOrderRequest"],
+    "expectedContains": ["CreateOrderRequest"]
+  },
+  {
+    "id": "entity-impact",
+    "question": "What endpoints or services are affected by changing OrderEntity?",
+    "codegraphTool": "impact_of_symbol",
+    "codegraphArgs": { "symbol": "OrderEntity", "limit": 20 },
+    "baselineSearchTerms": ["OrderEntity"],
+    "expectedContains": ["OrderEntity"]
+  },
+  {
+    "id": "bean-interface",
+    "question": "Which implementations can satisfy NotificationSender injection?",
+    "codegraphTool": "search_code",
+    "codegraphArgs": { "query": "NotificationSender implementation bean", "limit": 10, "includeReferences": true, "includeDependencies": true },
+    "baselineSearchTerms": ["NotificationSender", "implements", "Service"],
+    "expectedContains": ["NotificationSender"]
+  },
+  {
+    "id": "transactional-service",
+    "question": "Which service methods are transactional in the order flow?",
+    "codegraphTool": "search_symbol",
+    "codegraphArgs": { "query": "order transactional service", "kind": "method", "limit": 20, "annotation": "Transactional", "explainRank": true },
+    "baselineSearchTerms": ["Transactional", "OrderService"],
+    "expectedContains": ["Transactional"]
+  },
+  {
+    "id": "generated-noise-check",
+    "question": "Search user profile behavior without returning Lombok generated getters first.",
+    "codegraphTool": "search_symbol",
+    "codegraphArgs": { "query": "user profile behavior", "limit": 20, "explainRank": true },
+    "baselineSearchTerms": ["UserProfile", "getUserProfile"],
+    "expectedContains": ["UserProfile"]
+  },
+  {
+    "id": "tests-for-repository",
+    "question": "Which tests cover UserRepository.findByEmail?",
+    "codegraphTool": "find_tests_for",
+    "codegraphArgs": { "symbol": "UserRepository.findByEmail", "limit": 50 },
+    "baselineSearchTerms": ["UserRepository", "findByEmail", "should"],
+    "expectedContains": ["UserRepository"]
+  },
+  {
+    "id": "module-dependencies-auth",
+    "question": "What modules/files does the auth package depend on?",
+    "codegraphTool": "trace_dependencies",
+    "codegraphArgs": { "target": "auth", "direction": "dependencies", "depth": 2, "limit": 100 },
+    "baselineSearchTerms": ["auth", "Authentication", "Authorization"],
+    "expectedContains": ["auth"]
+  },
+  {
+    "id": "module-dependents-auth",
+    "question": "What modules/files depend on the auth package?",
+    "codegraphTool": "trace_dependencies",
+    "codegraphArgs": { "target": "auth", "direction": "dependents", "depth": 2, "limit": 100 },
+    "baselineSearchTerms": ["auth", "Authentication", "Authorization"],
+    "expectedContains": ["auth"]
+  },
+  {
+    "id": "research-pack-checkout",
+    "question": "Build a compact research pack for checkout behavior.",
+    "codegraphTool": "get_research_pack",
+    "codegraphArgs": { "target": "checkout", "taskType": "research", "tokenBudget": 4000, "includeSnippets": true, "snippetLines": 8 },
+    "baselineSearchTerms": ["checkout", "CheckoutService", "CheckoutController"],
+    "expectedContains": ["checkout"]
+  },
+  {
+    "id": "health-diagnostics",
+    "question": "Are there parse failures, stale files, unresolved calls, or unresolved endpoint paths?",
+    "codegraphTool": "get_index_stats",
+    "codegraphArgs": {},
+    "baselineSearchTerms": ["@RequestMapping", "TODO"],
+    "expectedContains": ["diagnostics"]
+  }
+]

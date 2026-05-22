@@ -43,16 +43,17 @@ export class DaemonClient {
     }
   }
 
-  async registerWorkspace(root: string): Promise<{ workspaceId: string; root: string; currentSnapshotId?: string }> {
-    return this.request('/workspaces/register', 'POST', { root }) as Promise<{
+  async registerWorkspace(root: string, workspaceKey?: string): Promise<{ workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string }> {
+    return this.request('/workspaces/register', 'POST', { root, workspaceKey }) as Promise<{
       workspaceId: string;
       root: string;
+      workspaceKey?: string;
       currentSnapshotId?: string;
     }>;
   }
 
-  async refreshWorkspace(root: string): Promise<unknown> {
-    return this.request('/workspaces/refresh', 'POST', { root });
+  async refreshWorkspace(root: string, workspaceKey?: string): Promise<unknown> {
+    return this.request('/workspaces/refresh', 'POST', { root, workspaceKey });
   }
 
   async query(workspaceId: string, toolName: string, args: Record<string, unknown>): Promise<unknown> {

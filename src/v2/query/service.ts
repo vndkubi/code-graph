@@ -1,7 +1,10 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import type { Database as DatabaseType } from 'better-sqlite3';
 import { V2Indexer } from '../index/indexer.js';
 import { roleRank, type FileRole } from '../index/file-role.js';
 import { scanManifest } from '../index/manifest.js';
+import { getGitInfo } from '../git.js';
 
 export interface QueryEnvelope {
   workspaceId: string;
@@ -17,42 +20,60 @@ export class V2QueryService {
   }
 
   query(envelope: QueryEnvelope): unknown {
-    const snapshotId = this.requireSnapshot(envelope.workspaceId);
+    let snapshotId = this.requireSnapshot(envelope.workspaceId);
+    if (envelope.args.autoRefresh === true) {
+      const freshnessBeforeRefresh = this.indexFreshness(snapshotId);
+      const workspace = this.workspaceInfo(envelope.workspaceId);
+      if (freshnessBeforeRefresh?.isStale && workspace?.root) {
+        snapshotId = this.indexer.indexWorkspace({
+          root: workspace.root,
+          workspaceKey: workspace.workspaceKey,
+        }).snapshotId;
+      }
+    }
+    const freshness = envelope.args.warnStale === false ? undefined : this.indexFreshness(snapshotId);
+    const withFreshness = (result: unknown): unknown => {
+      if (!freshness || !freshness.isStale || !isPlainObject(result)) return result;
+      return {
+        ...result,
+        indexFreshness: freshness,
+      };
+    };
     switch (envelope.toolName) {
       case 'search_symbol':
-        return this.searchSymbol(snapshotId, envelope.args);
+        return withFreshness(this.searchSymbol(snapshotId, envelope.args));
       case 'search_files':
-        return this.searchFiles(snapshotId, envelope.args);
+        return withFreshness(this.searchFiles(snapshotId, envelope.args));
       case 'find_references':
-        return this.findReferences(snapshotId, envelope.args);
+        return withFreshness(this.findReferences(snapshotId, envelope.args));
       case 'get_file_summary':
-        return this.getFileSummary(snapshotId, envelope.args);
+        return withFreshness(this.getFileSummary(snapshotId, envelope.args));
       case 'get_dependencies':
-        return this.getDependencies(snapshotId, envelope.args);
+        return withFreshness(this.getDependencies(snapshotId, envelope.args));
       case 'get_dependents':
-        return this.getDependents(snapshotId, envelope.args);
+        return withFreshness(this.getDependents(snapshotId, envelope.args));
       case 'get_callers':
-        return this.getCallers(snapshotId, envelope.args);
+        return withFreshness(this.getCallers(snapshotId, envelope.args));
       case 'get_callees':
-        return this.getCallees(snapshotId, envelope.args);
+        return withFreshness(this.getCallees(snapshotId, envelope.args));
       case 'find_endpoints':
-        return this.findEndpoints(snapshotId, envelope.args);
+        return withFreshness(this.findEndpoints(snapshotId, envelope.args));
       case 'get_impact_radius':
-        return this.getImpactRadius(snapshotId, envelope.args);
+        return withFreshness(this.getImpactRadius(snapshotId, envelope.args));
       case 'trace_dependencies':
-        return this.traceDependencies(snapshotId, envelope.args);
+        return withFreshness(this.traceDependencies(snapshotId, envelope.args));
       case 'explain_endpoint':
-        return this.explainEndpoint(snapshotId, envelope.args);
+        return withFreshness(this.explainEndpoint(snapshotId, envelope.args));
       case 'impact_of_symbol':
-        return this.impactOfSymbol(snapshotId, envelope.args);
+        return withFreshness(this.impactOfSymbol(snapshotId, envelope.args));
       case 'find_tests_for':
-        return this.findTestsFor(snapshotId, envelope.args);
+        return withFreshness(this.findTestsFor(snapshotId, envelope.args));
       case 'get_research_pack':
-        return this.getResearchPack(snapshotId, envelope.args);
+        return withFreshness(this.getResearchPack(snapshotId, envelope.args));
       case 'search_code':
-        return this.searchCode(snapshotId, envelope.args);
+        return withFreshness(this.searchCode(snapshotId, envelope.args));
       case 'get_index_stats':
-        return this.getIndexStats(snapshotId);
+        return withFreshness(this.getIndexStats(snapshotId));
       default:
         throw new Error(`Unknown v2 tool: ${envelope.toolName}`);
     }
@@ -71,6 +92,84 @@ export class V2QueryService {
     return row.current_snapshot_id;
   }
 
+  private workspaceRoot(workspaceId: string): string | undefined {
+    return this.workspaceInfo(workspaceId)?.root;
+  }
+
+  private workspaceInfo(workspaceId: string): { root?: string; workspaceKey?: string } | undefined {
+    const row = this.db.prepare('SELECT root, workspace_key FROM workspaces WHERE id = ?')
+      .get(workspaceId) as { root?: string; workspace_key?: string } | undefined;
+    if (!row) return undefined;
+    return { root: row.root, workspaceKey: row.workspace_key };
+  }
+
+  private workspaceRootForSnapshot(snapshotId: string): string | undefined {
+    const row = this.db.prepare(`
+      SELECT w.root
+      FROM snapshots s
+      JOIN workspaces w ON w.id = s.workspace_id
+      WHERE s.id = ?
+    `).get(snapshotId) as { root?: string } | undefined;
+    return row?.root;
+  }
+
+  private indexFreshness(snapshotId: string): Record<string, unknown> | undefined {
+    const row = this.db.prepare(`
+      SELECT s.created_at, s.head_commit, s.dirty_hash, w.root
+      FROM snapshots s
+      JOIN workspaces w ON w.id = s.workspace_id
+      WHERE s.id = ?
+    `).get(snapshotId) as {
+      created_at?: string;
+      head_commit?: string;
+      dirty_hash?: string;
+      root?: string;
+    } | undefined;
+    if (!row?.root) return undefined;
+
+    const git = getGitInfo(row.root);
+    const gitDirty = git.available
+      ? git.headCommit !== row.head_commit || git.dirtyHash !== row.dirty_hash
+      : false;
+    const dirtyFiles = !git.available || gitDirty ? this.computeDirtyFiles(snapshotId) : undefined;
+    const dirtyCounts = (dirtyFiles ?? {}) as {
+      addedCount?: number;
+      modifiedCount?: number;
+      deletedCount?: number;
+    };
+    const fileDirty = Number(dirtyCounts.addedCount ?? 0) > 0
+      || Number(dirtyCounts.modifiedCount ?? 0) > 0
+      || Number(dirtyCounts.deletedCount ?? 0) > 0;
+    const isStale = fileDirty || gitDirty;
+
+    return {
+      isStale,
+      snapshotCreatedAt: row.created_at,
+      snapshotHeadCommit: row.head_commit,
+      currentHeadCommit: git.headCommit,
+      snapshotDirtyHash: row.dirty_hash,
+      currentDirtyHash: git.dirtyHash,
+      dirtyFiles,
+      warning: isStale
+        ? 'Index may be stale. Pass autoRefresh=true on the query or run codegraph index --root <workspace>.'
+        : undefined,
+    };
+  }
+
+  private snippetOptions(snapshotId: string, args: Record<string, unknown>): SnippetOptions | undefined {
+    if (args.includeSnippets !== true) return undefined;
+    const root = this.workspaceRootForSnapshot(snapshotId);
+    if (!root) return undefined;
+    const lines = clampInt(Number(args.snippetLines ?? 12), 3, 80);
+    const tokenBudget = clampInt(Number(args.snippetTokenBudget ?? 1200), 100, 12000);
+    return {
+      root,
+      lines,
+      budgetChars: tokenBudget * 4,
+      usedChars: 0,
+    };
+  }
+
   private searchSymbol(snapshotId: string, args: Record<string, unknown>) {
     const query = String(args.query ?? '*').trim();
     const kind = String(args.kind ?? 'all');
@@ -83,6 +182,7 @@ export class V2QueryService {
     const kindFilter = kindFilterFor(kind);
     const intent = detectSearchIntent(query);
     const filters = searchFiltersFor(args, query);
+    const snippets = this.snippetOptions(snapshotId, args);
     const baseClauses = [
       'snapshot_id = ?',
       kindFilter.sql,
@@ -115,7 +215,7 @@ export class V2QueryService {
       `).all(...baseParams, limit, cursorOffset) as SymbolRow[];
 
       return {
-        symbols: rows.map(symbolDto),
+        symbols: rows.map(row => symbolDto(row, snippets)),
         totalFound,
         truncated: cursorOffset + rows.length < totalFound,
         nextCursor: cursorOffset + rows.length < totalFound ? String(cursorOffset + rows.length) : undefined,
@@ -123,6 +223,10 @@ export class V2QueryService {
         filters: filters.effective,
         queryTokens: [],
         searchMode: 'list',
+        ...(explainRank ? { debug: rankDebug('search_symbol', [
+          'List mode: ordered by file role, then symbol name.',
+          'No query tokens were supplied, so no per-result ranking score was computed.',
+        ]) } : {}),
         confidence: 0.8,
         confidenceNotes: ['SQLite-backed symbol lookup; exact Java semantic confidence is shown on graph edges.'],
       };
@@ -182,7 +286,7 @@ export class V2QueryService {
 
     return {
       symbols: selected.map(candidate => ({
-        ...symbolDto(candidate.row),
+        ...symbolDto(candidate.row, snippets),
         searchScore: candidate.score.score,
         matchedTokens: candidate.score.matchedTokens,
         matchReason: candidate.score.reason,
@@ -196,6 +300,10 @@ export class V2QueryService {
       intent: intent.kind === 'none' ? undefined : intent.kind,
       queryTokens: tokens,
       searchMode: intent.kind !== 'none' ? 'intent-ranked' : tokens.length > 1 ? 'multi-token-ranked' : 'token-ranked',
+      ...(explainRank ? { debug: rankDebug('search_symbol', [
+        'Ranking order: exact/phrase/camel-case matches, intent boosts, file-role boost, synthetic/test/generated penalties from default filters.',
+        `Candidate window: ${rows.length}; returned page offset ${cursorOffset}.`,
+      ]) } : {}),
       confidence: ranked.some(candidate => candidate.score.score >= 90) ? 0.85 : 0.65,
       confidenceNotes: [
         'Search ranks exact/phrase matches first, then intent-aware framework entry points, then compact/camel-case and multi-token matches.',
@@ -212,6 +320,7 @@ export class V2QueryService {
     const explainRank = Boolean(args.explainRank ?? false);
     const tokens = tokenizeSearchQuery(query);
     const filters = fileFiltersFor(args, query);
+    const snippets = this.snippetOptions(snapshotId, args);
     const baseClauses = ['f.snapshot_id = ?', ...filters.sql.map(sql => sql.replace(/\bfile_role\b/g, 'f.file_role'))];
     const baseParams: unknown[] = [snapshotId, ...filters.params];
     const baseWhere = baseClauses.map(clause => `(${clause})`).join(' AND ');
@@ -238,7 +347,7 @@ export class V2QueryService {
       `).all(...baseParams, limit, cursorOffset) as FileRow[];
       const evidence = this.fileEvidence(snapshotId, rows.map(row => row.path));
       return {
-        files: rows.map(row => fileDto(row, evidence.get(row.path), undefined, explainRank)),
+        files: rows.map(row => fileDto(row, evidence.get(row.path), undefined, explainRank, snippets)),
         totalFound,
         truncated: cursorOffset + rows.length < totalFound,
         nextCursor: cursorOffset + rows.length < totalFound ? String(cursorOffset + rows.length) : undefined,
@@ -246,6 +355,10 @@ export class V2QueryService {
         filters: filters.effective,
         queryTokens: [],
         searchMode: 'file-list',
+        ...(explainRank ? { debug: rankDebug('search_files', [
+          'List mode: ordered by file role, then file path.',
+          'No query tokens were supplied, so no per-result ranking score was computed.',
+        ]) } : {}),
         confidence: 0.8,
       };
     }
@@ -354,7 +467,7 @@ export class V2QueryService {
     const selected = ranked.slice(cursorOffset, cursorOffset + limit);
 
     return {
-      files: selected.map(candidate => fileDto(candidate.row, evidence.get(candidate.row.path), candidate.score, explainRank)),
+      files: selected.map(candidate => fileDto(candidate.row, evidence.get(candidate.row.path), candidate.score, explainRank, snippets)),
       totalFound: ranked.length,
       truncated: cursorOffset + selected.length < ranked.length,
       nextCursor: cursorOffset + selected.length < ranked.length ? String(cursorOffset + selected.length) : undefined,
@@ -362,6 +475,10 @@ export class V2QueryService {
       filters: filters.effective,
       queryTokens: tokens,
       searchMode: 'file-ranked',
+      ...(explainRank ? { debug: rankDebug('search_files', [
+        'Ranking order: file path/name phrase, all-token path match, symbol evidence, endpoint evidence, dependency graph signal, file-role boost.',
+        `Candidate window: ${rows.length}; returned page offset ${cursorOffset}.`,
+      ]) } : {}),
       confidence: ranked.some(candidate => candidate.score.score >= 80) ? 0.8 : 0.6,
       confidenceNotes: [
         'File search ranks path matches, symbols, endpoints, imports, dependency signal, and file role together.',
@@ -471,6 +588,7 @@ export class V2QueryService {
     const file = String(args.file ?? '');
     const resolved = this.resolveFile(snapshotId, file);
     if (!resolved) return { error: `File "${file}" not found in index.` };
+    const snippets = this.snippetOptions(snapshotId, args);
 
     const symbols = this.db.prepare(`
       SELECT * FROM symbols WHERE snapshot_id = ? AND file = ? ORDER BY line
@@ -484,9 +602,9 @@ export class V2QueryService {
 
     return {
       file: resolved,
-      classes: symbols.filter(s => s.kind === 'class' || s.kind === 'interface').map(symbolDto),
-      methods: symbols.filter(s => s.kind === 'method' || s.kind === 'function').map(symbolDto),
-      fields: symbols.filter(s => s.kind === 'field' || s.kind === 'variable').map(symbolDto),
+      classes: symbols.filter(s => s.kind === 'class' || s.kind === 'interface').map(row => symbolDto(row, snippets)),
+      methods: symbols.filter(s => s.kind === 'method' || s.kind === 'function').map(row => symbolDto(row, snippets)),
+      fields: symbols.filter(s => s.kind === 'field' || s.kind === 'variable').map(row => symbolDto(row, snippets)),
       imports: imports.map(row => ({
         source: row.source,
         symbols: parseJson<string[]>(row.imported_symbols_json, []),
@@ -547,6 +665,8 @@ export class V2QueryService {
     const pathPattern = args.path ? `%${escapeLike(String(args.path))}%` : '%';
     const limit = Math.min(Number(args.limit ?? 200), 500);
     const cursorOffset = parseCursor(args.cursor);
+    const explainRank = Boolean(args.explainRank ?? false);
+    const snippets = this.snippetOptions(snapshotId, args);
     const rows = this.db.prepare(`
       SELECT method, path, path_resolution, path_resolution_reason,
              handler_symbol, controller, file, line, framework, confidence, file_role
@@ -569,11 +689,19 @@ export class V2QueryService {
         AND path LIKE ? ESCAPE '\\'
     `, snapshotId, method, method, pathPattern);
     return {
-      endpoints: rows.map(endpointDto),
+      endpoints: rows.map(row => endpointDto(
+        row,
+        snippets,
+        explainRank ? endpointRankExplanation(row, method, args.path ? String(args.path) : undefined) : undefined,
+      )),
       totalCount,
       truncated: cursorOffset + rows.length < totalCount,
       nextCursor: cursorOffset + rows.length < totalCount ? String(cursorOffset + rows.length) : undefined,
       facets: buildEndpointFacets(rows),
+      ...(explainRank ? { debug: rankDebug('find_endpoints', [
+        'Ranking order: main-source endpoints, confidence, path, then HTTP method.',
+        'Path search uses indexed composed paths; partial paths include pathResolutionReason.',
+      ]) } : {}),
     };
   }
 
@@ -671,6 +799,7 @@ export class V2QueryService {
   private explainEndpoint(snapshotId: string, args: Record<string, unknown>) {
     const path = String(args.path ?? '');
     const method = String(args.method ?? 'all').toUpperCase();
+    const snippets = this.snippetOptions(snapshotId, args);
     const endpointRows = this.db.prepare(`
       SELECT method, path, path_resolution, path_resolution_reason,
              handler_symbol, controller, file, line, framework, confidence, file_role
@@ -693,11 +822,11 @@ export class V2QueryService {
 
     const callChain = this.traceCallees(snapshotId, endpoint.handler_symbol, Number(args.depth ?? 3));
     const graphFiles = rankFiles([endpoint.file, ...callChain.map(edge => edge.file)]).slice(0, 30);
-    const relatedSymbols = this.symbolsForFiles(snapshotId, graphFiles);
+    const relatedSymbols = this.symbolsForFiles(snapshotId, graphFiles, snippets);
     const tests = this.findRelevantTests(snapshotId, endpoint.handler_symbol, 20);
 
     return {
-      endpoint: endpointDto(endpoint),
+      endpoint: endpointDto(endpoint, snippets),
       controller: {
         symbol: endpoint.handler_symbol,
         className: endpoint.controller,
@@ -721,6 +850,7 @@ export class V2QueryService {
   private impactOfSymbol(snapshotId: string, args: Record<string, unknown>) {
     const target = String(args.symbol ?? args.target ?? '');
     const definitions = (this.searchSymbol(snapshotId, {
+      ...args,
       query: target,
       limit: Number(args.limit ?? 10),
       includeTests: false,
@@ -765,11 +895,11 @@ export class V2QueryService {
   private getResearchPack(snapshotId: string, args: Record<string, unknown>) {
     const target = String(args.target ?? '');
     const tokenBudget = Math.max(1000, Math.min(Number(args.tokenBudget ?? 4000), 12000));
-    const definitions = (this.searchSymbol(snapshotId, { query: target, limit: 10 }) as { symbols: unknown[] }).symbols;
+    const definitions = (this.searchSymbol(snapshotId, { ...args, query: target, limit: 10 }) as { symbols: unknown[] }).symbols;
     const callers = (this.getCallers(snapshotId, { symbol: target, limit: 30 }) as { callers: CallEdgeRow[] }).callers;
     const callees = (this.getCallees(snapshotId, { symbol: target, limit: 30 }) as { callees: CallEdgeRow[] }).callees;
     const impact = this.getImpactRadius(snapshotId, { target }) as Record<string, unknown>;
-    const endpoints = this.findEndpoints(snapshotId, { path: target }) as { endpoints: unknown[] };
+    const endpoints = this.findEndpoints(snapshotId, { ...args, path: target }) as { endpoints: unknown[] };
 
     return {
       target,
@@ -809,9 +939,11 @@ export class V2QueryService {
       explainRank: Boolean(args.explainRank ?? false),
     }) as Record<string, unknown>;
     const endpointResults = this.findEndpoints(snapshotId, {
+      ...args,
       path: query,
       method: args.method ?? 'all',
       limit,
+      explainRank: Boolean(args.explainRank ?? false),
     }) as Record<string, unknown>;
     const references = includeReferences && query
       ? this.findReferences(snapshotId, {
@@ -846,6 +978,10 @@ export class V2QueryService {
         referenceMatches: references ? Number(references.totalCount ?? 0) : undefined,
         dependencyEdges: dependencies ? ((dependencies.edges as unknown[]) ?? []).length : undefined,
       },
+      ...(Boolean(args.explainRank) ? { debug: rankDebug('search_code', [
+        'Mixed search delegates ranking to search_files, search_symbol, find_endpoints, find_references, and trace_dependencies.',
+        'Use the section-specific nextCursor values when one result type needs deeper pagination.',
+      ]) } : {}),
       confidenceNotes: [
         'search_code is a mixed retrieval view; use the section-specific tools when you need deeper pagination or fewer result types.',
       ],
@@ -1048,7 +1184,7 @@ export class V2QueryService {
     return edges;
   }
 
-  private symbolsForFiles(snapshotId: string, files: string[]): Array<Record<string, unknown>> {
+  private symbolsForFiles(snapshotId: string, files: string[], snippets?: SnippetOptions): Array<Record<string, unknown>> {
     const unique = [...new Set(files.filter(Boolean))].slice(0, 200);
     if (unique.length === 0) return [];
     const placeholders = unique.map(() => '?').join(', ');
@@ -1061,7 +1197,7 @@ export class V2QueryService {
       ORDER BY file, line
       LIMIT 1000
     `).all(snapshotId, ...unique) as SymbolRow[];
-    return rows.map(symbolDto);
+    return rows.map(row => symbolDto(row, snippets));
   }
 
   private fileEvidence(snapshotId: string, files: string[]): Map<string, FileEvidence> {
@@ -1278,7 +1414,7 @@ export class V2QueryService {
       ORDER BY confidence DESC, path
       LIMIT 100
     `).all(snapshotId, ...unique) as EndpointRow[];
-    return rows.map(endpointDto);
+    return rows.map(row => endpointDto(row));
   }
 }
 
@@ -1366,7 +1502,14 @@ interface SearchScore {
   factors: string[];
 }
 
-function symbolDto(row: SymbolRow): Record<string, unknown> {
+interface SnippetOptions {
+  root: string;
+  lines: number;
+  budgetChars: number;
+  usedChars: number;
+}
+
+function symbolDto(row: SymbolRow, snippets?: SnippetOptions): Record<string, unknown> {
   const frameworkMeta = parseJson<Record<string, string>>(row.framework_meta_json, {});
   return {
     name: row.simple_name,
@@ -1386,10 +1529,15 @@ function symbolDto(row: SymbolRow): Record<string, unknown> {
     synthetic: frameworkMeta.synthetic === 'true',
     fileRole: row.file_role,
     rank: roleRank(row.file_role),
+    snippet: sourceSnippet(row.file, row.line, snippets),
   };
 }
 
-function endpointDto(row: EndpointRow): Record<string, unknown> {
+function endpointDto(
+  row: EndpointRow,
+  snippets?: SnippetOptions,
+  rankExplanation?: string[],
+): Record<string, unknown> {
   return {
     method: row.method,
     path: row.path,
@@ -1402,6 +1550,8 @@ function endpointDto(row: EndpointRow): Record<string, unknown> {
     framework: row.framework,
     confidence: row.confidence,
     fileRole: row.file_role,
+    rankExplanation,
+    snippet: sourceSnippet(row.file, row.line, snippets),
   };
 }
 
@@ -1410,6 +1560,7 @@ function fileDto(
   evidence: FileEvidence | undefined,
   score: FileSearchScore | undefined,
   explainRank: boolean,
+  snippets?: SnippetOptions,
 ): Record<string, unknown> {
   const topSymbols = (evidence?.symbols ?? [])
     .filter(symbol => symbol.kind === 'class' || symbol.kind === 'interface' || symbol.kind === 'method' || symbol.kind === 'function')
@@ -1424,6 +1575,7 @@ function fileDto(
     matchedTokens: score?.matchedTokens,
     matchReason: score?.reason,
     ...(explainRank && score ? { rankExplanation: score.factors } : {}),
+    snippet: fileEvidenceSnippet(row, evidence, snippets),
     topSymbols,
     endpoints: (evidence?.endpoints ?? []).slice(0, 12),
     dependencyCounts: evidence?.dependencyCounts ?? { outgoing: 0, incoming: 0 },
@@ -1449,6 +1601,89 @@ function referenceDto(row: Record<string, unknown>): Record<string, unknown> {
     resolutionKind: row.resolution_kind,
     fileRole: row.file_role,
   };
+}
+
+function fileEvidenceSnippet(
+  row: FileRow,
+  evidence: FileEvidence | undefined,
+  snippets?: SnippetOptions,
+): Record<string, unknown> | undefined {
+  if (!snippets) return undefined;
+  const endpoint = evidence?.endpoints.find(item => Number(item.line ?? 0) > 0);
+  if (endpoint) return sourceSnippet(row.path, Number(endpoint.line), snippets);
+  const symbol = evidence?.symbols.find(item => Number(item.line ?? 0) > 0);
+  if (symbol) return sourceSnippet(row.path, Number(symbol.line), snippets);
+  return sourceSnippet(row.path, 1, snippets);
+}
+
+function sourceSnippet(
+  file: string | undefined,
+  line: number | undefined,
+  snippets?: SnippetOptions,
+): Record<string, unknown> | undefined {
+  if (!snippets || !file || !line || line < 1) return undefined;
+  if (snippets.usedChars >= snippets.budgetChars) return undefined;
+
+  const absolutePath = safeResolve(snippets.root, file);
+  if (!absolutePath) return undefined;
+
+  let content: string;
+  try {
+    content = fs.readFileSync(absolutePath, 'utf-8');
+  } catch {
+    return undefined;
+  }
+
+  const sourceLines = content.split(/\r?\n/);
+  const target = Math.min(Math.max(line, 1), sourceLines.length);
+  const before = Math.floor((snippets.lines - 1) / 2);
+  let start = Math.max(1, target - before);
+  let end = Math.min(sourceLines.length, start + snippets.lines - 1);
+  start = Math.max(1, end - snippets.lines + 1);
+
+  const text = sourceLines
+    .slice(start - 1, end)
+    .map((sourceLine, index) => `${start + index}: ${sourceLine}`)
+    .join('\n');
+  if (snippets.usedChars + text.length > snippets.budgetChars) return undefined;
+  snippets.usedChars += text.length;
+
+  return {
+    startLine: start,
+    endLine: end,
+    highlightLine: target,
+    text,
+  };
+}
+
+function safeResolve(root: string, file: string): string | undefined {
+  const normalizedRoot = path.resolve(root);
+  const absolutePath = path.resolve(normalizedRoot, file.replace(/\\/g, '/'));
+  const relative = path.relative(normalizedRoot, absolutePath);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) return undefined;
+  return absolutePath;
+}
+
+function rankDebug(tool: string, notes: string[]): Record<string, unknown> {
+  return {
+    tool,
+    explainRank: true,
+    notes,
+  };
+}
+
+function endpointRankExplanation(row: EndpointRow, requestedMethod: string, requestedPath?: string): string[] {
+  const factors = [
+    `file role ${row.file_role} ordered before lower-priority roles`,
+    `endpoint confidence ${row.confidence}`,
+    `path resolution ${row.path_resolution}`,
+  ];
+  if (requestedMethod !== 'ALL' && row.method === requestedMethod) factors.push(`HTTP method matched ${requestedMethod}`);
+  if (requestedPath && row.path.includes(requestedPath)) factors.push(`composed endpoint path matched "${requestedPath}"`);
+  if (row.path_resolution !== 'exact' && row.path_resolution_reason) {
+    factors.push(`partial path reason: ${row.path_resolution_reason}`);
+  }
+  return factors;
 }
 
 interface SearchIntent {
@@ -1813,6 +2048,15 @@ function parseCursor(value: unknown): number {
   if (value === undefined || value === null || value === '') return 0;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(Math.max(Math.floor(value), min), max);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 function buildFacets(rows: SymbolRow[]): Record<string, Record<string, number>> {

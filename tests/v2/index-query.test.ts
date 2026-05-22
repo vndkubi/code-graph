@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Database } from 'better-sqlite3';
 import { openCodeGraphDb } from '../../src/v2/storage/database.js';
@@ -315,6 +316,251 @@ public class PartialController {
     expect(mixed.sections.dependencies?.edges.length).toBeGreaterThan(0);
   });
 
+  it('returns bounded source snippets for symbols, files, and endpoints', () => {
+    const home = tempDir('codegraph-home-');
+    const { db } = openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = indexer.indexWorkspace({ root: JAVA_FIXTURE });
+    const queries = new V2QueryService(db);
+
+    const symbolSearch = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'PaymentService', limit: 1, includeSnippets: true, snippetLines: 5 },
+    }) as { symbols: Array<{ snippet?: { text: string; startLine: number; endLine: number } }> };
+
+    expect(symbolSearch.symbols[0]?.snippet?.text).toContain('PaymentService');
+    expect(symbolSearch.symbols[0]?.snippet?.endLine).toBeGreaterThanOrEqual(symbolSearch.symbols[0]?.snippet?.startLine ?? 0);
+
+    const fileSearch = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_files',
+      args: { query: 'Payment Gateway', limit: 1, includeSnippets: true, snippetLines: 5 },
+    }) as { files: Array<{ snippet?: { text: string } }> };
+
+    expect(fileSearch.files[0]?.snippet?.text).toContain('PaymentGateway');
+
+    const endpointRepo = tempDir('codegraph-snippet-endpoint-');
+    writeFile(endpointRepo, 'src/main/java/com/example/OrderResource.java', `package com.example;
+
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.Path;
+
+@Path("/orders")
+public class OrderResource {
+    @POST
+    @Path("/create")
+    public String create() {
+        return "ok";
+    }
+}
+`);
+    const endpointIndex = indexer.indexWorkspace({ root: endpointRepo });
+    const endpoints = queries.query({
+      workspaceId: endpointIndex.workspaceId,
+      toolName: 'find_endpoints',
+      args: { method: 'POST', path: '/orders/create', limit: 1, includeSnippets: true, snippetLines: 5 },
+    }) as { endpoints: Array<{ snippet?: { text: string } }> };
+
+    expect(endpoints.endpoints[0]?.snippet?.text).toContain('@POST');
+  });
+
+  it('resolves Java parameter and local-variable receiver calls', () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-receiver-types-');
+    writeFile(repo, 'src/main/java/com/example/LocalCallService.java', `package com.example;
+
+public class LocalCallService {
+    public void execute(PaymentGateway gateway, PaymentInfo paymentInfo) {
+        gateway.processPayment(paymentInfo.getAmount());
+        PaymentGateway localGateway = gateway;
+        localGateway.processRefund("tx-1");
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/PaymentGateway.java', `package com.example;
+
+public interface PaymentGateway {
+    void processPayment(double amount);
+    void processRefund(String transactionId);
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/InMemoryPaymentGateway.java', `package com.example;
+
+public class InMemoryPaymentGateway implements PaymentGateway {
+    public void processPayment(double amount) {
+    }
+
+    public void processRefund(String transactionId) {
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/PaymentInfo.java', `package com.example;
+
+public class PaymentInfo {
+    public double getAmount() {
+        return 10.0;
+    }
+}
+`);
+
+    const { db } = openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const paymentCallers = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'PaymentGateway.processPayment' },
+    }) as { callers: Array<{ callee: string; resolution_kind: string }> };
+
+    expect(paymentCallers.callers).toContainEqual(expect.objectContaining({
+      callee: 'PaymentGateway.processPayment',
+      resolution_kind: 'static-or-type-receiver',
+    }));
+
+    const refundCallers = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'PaymentGateway.processRefund' },
+    }) as { callers: Array<{ callee: string; resolution_kind: string }> };
+
+    expect(refundCallers.callers).toContainEqual(expect.objectContaining({
+      callee: 'PaymentGateway.processRefund',
+      resolution_kind: 'static-or-type-receiver',
+    }));
+
+    const amountCallers = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'PaymentInfo.getAmount' },
+    }) as { callers: Array<{ callee: string; resolution_kind: string }> };
+
+    expect(amountCallers.callers).toContainEqual(expect.objectContaining({
+      callee: 'PaymentInfo.getAmount',
+      resolution_kind: 'static-or-type-receiver',
+    }));
+
+    const implementationCallers = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'InMemoryPaymentGateway.processPayment' },
+    }) as { callers: Array<{ callee: string; resolution_kind: string }> };
+
+    expect(implementationCallers.callers).toContainEqual(expect.objectContaining({
+      callee: 'InMemoryPaymentGateway.processPayment',
+      resolution_kind: 'interface-implementation',
+    }));
+  });
+
+  it('warns about stale snapshots and can auto-refresh on query', () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-stale-');
+    writeFile(repo, 'src/main/java/com/example/Demo.java', `package com.example;
+
+public class Demo {
+}
+`);
+
+    const { db } = openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = indexer.indexWorkspace({ root: repo });
+    writeFile(repo, 'src/main/java/com/example/Demo.java', `package com.example;
+
+public class DemoChanged {
+}
+`);
+
+    const queries = new V2QueryService(db);
+    const staleSearch = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'Demo', limit: 5 },
+    }) as { indexFreshness?: { isStale: boolean; dirtyFiles?: { modifiedCount: number } } };
+
+    expect(staleSearch.indexFreshness?.isStale).toBe(true);
+    expect(staleSearch.indexFreshness?.dirtyFiles?.modifiedCount).toBe(1);
+
+    const refreshedSearch = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'DemoChanged', limit: 5, autoRefresh: true },
+    }) as { symbols: Array<{ name: string }>; indexFreshness?: { isStale: boolean } };
+
+    expect(refreshedSearch.symbols.some(symbol => symbol.name === 'DemoChanged')).toBe(true);
+    expect(refreshedSearch.indexFreshness).toBeUndefined();
+  });
+
+  it('uses workspace keys to distinguish Docker-mounted repositories with the same container root', () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-workspace-key-');
+    writeFile(repo, 'src/main/java/com/example/Demo.java', `package com.example;
+
+public class Demo {
+}
+`);
+
+    const { db } = openDb(home);
+    const indexer = new V2Indexer(db);
+    const first = indexer.indexWorkspace({ root: repo, workspaceKey: 'C:/repos/app-main' });
+    const same = indexer.indexWorkspace({ root: repo, workspaceKey: 'c:/repos/app-main' });
+    const second = indexer.indexWorkspace({ root: repo, workspaceKey: 'C:/repos/app-feature' });
+
+    expect(same.workspaceId).toBe(first.workspaceId);
+    expect(second.workspaceId).not.toBe(first.workspaceId);
+  });
+
+  it('refreshes after git checkout when autoRefresh is enabled', () => {
+    if (!hasGit()) return;
+
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-git-checkout-');
+    runGit(repo, 'init');
+    runGit(repo, 'config', 'user.email', 'codegraph@example.test');
+    runGit(repo, 'config', 'user.name', 'CodeGraph Test');
+    writeFile(repo, 'src/main/java/com/example/BranchMarker.java', `package com.example;
+
+public class MainBranchMarker {
+}
+`);
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'main branch');
+    const initialBranch = gitOutput(repo, 'rev-parse', '--abbrev-ref', 'HEAD');
+    runGit(repo, 'checkout', '-b', 'feature');
+    writeFile(repo, 'src/main/java/com/example/BranchMarker.java', `package com.example;
+
+public class FeatureBranchMarker {
+}
+`);
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'feature branch');
+    runGit(repo, 'checkout', initialBranch);
+
+    const { db } = openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = indexer.indexWorkspace({ root: repo, workspaceKey: 'checkout-same-folder' });
+    const queries = new V2QueryService(db);
+
+    const mainSearch = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'MainBranchMarker', limit: 5 },
+    }) as { symbols: Array<{ name: string }> };
+    expect(mainSearch.symbols.some(symbol => symbol.name === 'MainBranchMarker')).toBe(true);
+
+    runGit(repo, 'checkout', 'feature');
+
+    const featureSearch = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'FeatureBranchMarker', limit: 5, autoRefresh: true },
+    }) as { symbols: Array<{ name: string }>; indexFreshness?: { isStale: boolean } };
+
+    expect(featureSearch.symbols.some(symbol => symbol.name === 'FeatureBranchMarker')).toBe(true);
+    expect(featureSearch.indexFreshness).toBeUndefined();
+  });
+
   it('reuses parse cache on a second snapshot', () => {
     const home = tempDir('codegraph-home-');
     const { db } = openDb(home);
@@ -361,4 +607,21 @@ function writeFile(root: string, relPath: string, content: string): void {
   const absPath = path.join(root, relPath);
   fs.mkdirSync(path.dirname(absPath), { recursive: true });
   fs.writeFileSync(absPath, content);
+}
+
+function hasGit(): boolean {
+  try {
+    execFileSync('git', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runGit(cwd: string, ...args: string[]): void {
+  execFileSync('git', args, { cwd, stdio: 'ignore' });
+}
+
+function gitOutput(cwd: string, ...args: string[]): string {
+  return execFileSync('git', args, { cwd, encoding: 'utf-8' }).trim();
 }
