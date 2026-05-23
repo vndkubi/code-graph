@@ -10,7 +10,7 @@ import { getCodeGraphPaths } from './v2/paths.js';
 import { generateSyntheticJavaRepo } from './v2/benchmark/synthetic-java.js';
 import { runIndexBenchmark } from './v2/benchmark/run.js';
 import { loadGoldenEvalTasks, runGoldenEval } from './v2/benchmark/golden-eval.js';
-import { loadContextProofTasks, runContextProofEval } from './v2/benchmark/context-proof.js';
+import { deriveContextProofTasks, loadContextProofTasks, runContextProofEval } from './v2/benchmark/context-proof.js';
 
 interface ParsedArgs {
   command: string[];
@@ -84,8 +84,12 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       const root = getFlag(parsed, 'root') ?? process.cwd();
       const { db } = openCodeGraphDb(getFlag(parsed, 'home'));
       try {
-        const tasks = loadContextProofTasks(getFlag(parsed, 'tasks'));
-        console.log(JSON.stringify(runContextProofEval(db, root, tasks), null, 2));
+        const tasks = shouldUseAutoTasks(parsed)
+          ? deriveContextProofTasks(root, { limit: getNumberFlag(parsed, 'task-count') })
+          : loadContextProofTasks(getFlag(parsed, 'tasks'));
+        console.log(JSON.stringify(runContextProofEval(db, root, tasks, {
+          skipIndex: parsed.flags.get('no-index') === true,
+        }), null, 2));
       } finally {
         db.close();
       }
@@ -196,6 +200,10 @@ function getNumberFlag(args: ParsedArgs, name: string): number | undefined {
   return value ? Number(value) : undefined;
 }
 
+function shouldUseAutoTasks(args: ParsedArgs): boolean {
+  return args.flags.get('auto-tasks') === true || getFlag(args, 'tasks') === 'auto';
+}
+
 function envFlag(name: string): boolean {
   return /^(1|true|yes|on)$/i.test(process.env[name] ?? '');
 }
@@ -218,6 +226,9 @@ Options:
   --home <path>                          Override CODEGRAPH_HOME
   --port <number>                        Daemon port for daemon run
   --tasks <path>                         Golden eval task JSON file
+  --tasks auto                           Derive context-proof tasks from indexed-looking source files
+  --task-count <number>                  Number of auto-derived context-proof tasks
+  --no-index                             Reuse the current context-proof snapshot instead of refreshing first
   --workspace-key <key>                  Stable workspace identity key, useful when Docker always mounts roots at /workspace
   --auto-refresh                         Refresh stale snapshots automatically before MCP tool calls
 `);

@@ -936,6 +936,10 @@ public class FeatureBranchMarker {
 
     expect(first.filesParsed).toBeGreaterThan(0);
     expect(second.parseCacheHits).toBeGreaterThan(0);
+    expect(second.filesParsed).toBe(0);
+    expect(second.filesHashed).toBe(0);
+    expect(second.hashCacheHits).toBe(second.filesTotal);
+    expect(second.skippedUnchanged).toBe(true);
   });
 
   it('discovers synthetic Jakarta endpoints', () => {

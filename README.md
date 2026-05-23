@@ -515,9 +515,10 @@ Each editor window normally starts its own stdio proxy, so you usually do not ru
 
 - SQLite is the source of truth; the daemon does not load the full graph object model into memory.
 - Cold indexing scans the manifest, classifies `file_role`, hashes files, parses cache misses, and materializes symbols/imports/calls/endpoints into SQLite.
-- Warm indexing reuses unchanged snapshot rows and `parse_cache` entries keyed by `blob_hash`.
+- Warm indexing reuses previous `blob_hash` values when `mtime_ms` and `size` match, reuses `parse_cache` entries keyed by `blob_hash`, and skips rebuilding a new snapshot when the manifest, HEAD, and dirty state are unchanged.
 - Multiple windows/repositories share the same daemon and global cache, but each `--root` has its own workspace snapshot.
 - Search is fastest and most accurate when agents use graph tools first, especially `get_research_pack`, then fall back to broad text search only for unresolved names.
+- On very large repositories, Docker Desktop bind mounts from Windows paths are usually slower than local NTFS or WSL/ext4. Prewarm large repos from the same environment where the MCP server will run, and prefer persistent `CODEGRAPH_HOME`/Docker volumes so warm runs can reuse hashes and snapshots.
 
 ---
 
@@ -660,6 +661,16 @@ Recent Windows Docker multi-project smoke report:
 
 The smoke test used one shared Docker volume, `codegraph-cache`, with separate `CODEGRAPH_WORKSPACE_KEY` values. MCP startup was also verified through Docker for both projects, exposing 19 tools. Docker Desktop bind mounts from `D:\...` are noticeably slower than local or WSL/Linux filesystems; for very large repositories, prewarm from WSL/ext4 when possible.
 
+Recent Docker context-proof report, run on 2026-05-23 with a warmed CodeGraph index:
+
+| Repo | Tasks | Baseline correct | CodeGraph correct | Baseline input tokens | CodeGraph input tokens | Input reduction | Baseline output tokens | CodeGraph output tokens | Baseline files | CodeGraph slices |
+|------|------:|-----------------:|------------------:|----------------------:|-----------------------:|----------------:|-----------------------:|------------------------:|---------------:|-----------------:|
+| `doughnut` | 3 | 3/3 | 3/3 | 44,012 | 21,270 | 51.7% | 412 | 411 | 25 | 4 |
+| `hadoop` | 2 | 1/2 | 2/2 | 397,875 | 16,956 | 95.7% | 443 | 461 | 120 | 4 |
+| `elasticsearch` | 2 | 0/2 | 2/2 | 346,710 | 15,939 | 95.4% | 482 | 398 | 120 | 4 |
+
+These token numbers are local estimates using `ceil(character_count / 4)` over the task and retrieved evidence. They are useful for comparing context size, but they are not actual model/API usage. The output-token column is the deterministic benchmark summary size, not real LLM completion tokens.
+
 ---
 
 ## CLI Reference
@@ -678,6 +689,9 @@ Options:
   --home <path>                        Override CODEGRAPH_HOME
   --port <number>                      Daemon port for daemon run
   --tasks <path>                       Golden eval task JSON file
+  --tasks auto                         Derive context-proof tasks from indexed-looking source files
+  --task-count <number>                Number of auto-derived context-proof tasks
+  --no-index                           Reuse the current context-proof snapshot instead of refreshing first
   --workspace-key <key>                Stable workspace identity key for Docker/WSL path remapping
   --auto-refresh                       Refresh stale snapshots automatically before MCP tool calls
 ```

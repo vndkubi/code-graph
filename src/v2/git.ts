@@ -31,7 +31,7 @@ export function getGitInfo(root: string): GitInfo {
   const branch = git(root, ['rev-parse', '--abbrev-ref', 'HEAD']);
   const headCommit = git(root, ['rev-parse', 'HEAD']);
   const treeHash = git(root, ['rev-parse', `${headCommit ?? 'HEAD'}^{tree}`]);
-  const dirty = git(root, ['status', '--porcelain=v1', '-uall']) ?? '';
+  const dirty = git(root, ['status', '--porcelain=v1', '--untracked-files=normal']) ?? '';
 
   return {
     root: path.resolve(topLevel),

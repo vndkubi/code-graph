@@ -1028,6 +1028,7 @@ export class V2QueryService {
       12000,
     );
     const query = [domain, task].filter(Boolean).join(' ');
+    const explicitContext = this.explicitContextMatches(snapshotId, task, domain, maxFiles);
 
     const files = this.searchFiles(snapshotId, {
       ...args,
@@ -1080,12 +1081,18 @@ export class V2QueryService {
       endpoints: [endpoint],
     }));
 
+    const fuzzyFileCandidates = files.files
+      .map(row => compactFileCandidate(row))
+      .filter(candidate => explicitContext.topFiles.length === 0
+        || isCompatibleExplicitFileCandidate(candidate.file, explicitContext.topFiles));
     const candidateFiles = uniqueFileCandidates([
+      ...explicitContext.candidateFiles,
       ...myBatisContext.candidateFiles,
       ...endpointFileCandidates,
-      ...files.files.map(row => compactFileCandidate(row)),
+      ...fuzzyFileCandidates,
     ]).slice(0, maxFiles);
     const relevantSymbols = uniqueSymbolCandidates([
+      ...explicitContext.relevantSymbols,
       ...myBatisContext.relevantSymbols,
       ...symbols.symbols.map(row => compactSymbolCandidate(row)),
     ]).slice(0, maxSymbols);
@@ -1094,6 +1101,7 @@ export class V2QueryService {
       ...files.files.flatMap(row => Array.isArray(row.endpoints) ? row.endpoints as Array<Record<string, unknown>> : []),
     ]).slice(0, Math.min(maxFiles, 10));
     const topFiles = uniqueFilesInOrder([
+      ...explicitContext.topFiles,
       ...candidateFiles.map(row => row.file),
       ...endpointCandidates.map(row => row.file),
       ...relevantSymbols.map(row => row.file),
@@ -1144,6 +1152,7 @@ export class V2QueryService {
       confidence: packetConfidence(candidateFiles, relevantSymbols, testsLikelyRelevant),
       confidenceNotes: [
         'Candidate ranking combines path, symbol, endpoint, file-role, and graph evidence available in the local index.',
+        ...(explicitContext.topFiles.length > 0 ? ['Exact file/class path mentions in the task were promoted ahead of fuzzy matches.'] : []),
         'Confidence is lower for broad natural-language tasks without exact symbol, path, endpoint, or test matches.',
       ],
     };
@@ -1723,6 +1732,73 @@ export class V2QueryService {
         score: candidate.score,
         reasons: [...candidate.reasons],
       }));
+  }
+
+  private explicitContextMatches(
+    snapshotId: string,
+    task: string,
+    domain: string | undefined,
+    limit: number,
+  ): {
+    candidateFiles: Array<ReturnType<typeof compactFileCandidate>>;
+    relevantSymbols: Array<ReturnType<typeof compactSymbolCandidate>>;
+    topFiles: string[];
+  } {
+    const resolvedFiles = uniqueFilesInOrder(
+      explicitFileNeedles(task, domain)
+        .map(needle => this.resolveFile(snapshotId, needle))
+        .filter((file): file is string => Boolean(file)),
+    ).slice(0, limit);
+    if (resolvedFiles.length === 0) {
+      return { candidateFiles: [], relevantSymbols: [], topFiles: [] };
+    }
+
+    const placeholders = resolvedFiles.map(() => '?').join(', ');
+    const rows = this.db.prepare(`
+      SELECT path, language, file_role, parse_status, size
+      FROM files
+      WHERE snapshot_id = ? AND path IN (${placeholders})
+    `).all(snapshotId, ...resolvedFiles) as FileRow[];
+    const rowsByPath = new Map(rows.map(row => [row.path, row]));
+    const symbolsByFile = new Map<string, Array<Record<string, unknown>>>();
+    for (const symbol of this.symbolsForFiles(snapshotId, resolvedFiles)) {
+      const file = String(symbol.file ?? '');
+      const current = symbolsByFile.get(file) ?? [];
+      current.push(symbol);
+      symbolsByFile.set(file, current);
+    }
+
+    const candidateFiles: Array<ReturnType<typeof compactFileCandidate>> = [];
+    const relevantSymbols: Array<ReturnType<typeof compactSymbolCandidate>> = [];
+    for (const file of resolvedFiles) {
+      const row = rowsByPath.get(file);
+      if (!row) continue;
+      const basename = path.basename(file, path.extname(file));
+      const symbols = symbolsByFile.get(file) ?? [];
+      const compactSymbols = symbols
+        .map(symbol => compactSymbolCandidate(symbol, `explicit task/domain file match: ${file}`))
+        .slice(0, 6);
+      const primarySymbol = compactSymbols.find(symbol => symbol.name === basename) ?? compactSymbols[0];
+      candidateFiles.push({
+        file,
+        language: row.language,
+        fileRole: row.file_role,
+        lines: primarySymbol?.lines ?? '1-80',
+        whyRelevant: `explicit task/domain file match: ${file}`,
+        confidence: 0.95,
+        matchedTokens: [basename],
+        snippet: undefined,
+        topSymbols: compactSymbols,
+        endpoints: [],
+      });
+      relevantSymbols.push(...compactSymbols.slice(0, 4));
+    }
+
+    return {
+      candidateFiles,
+      relevantSymbols: uniqueSymbolCandidates(relevantSymbols).slice(0, limit * 4),
+      topFiles: resolvedFiles,
+    };
   }
 
   private findRelevantTestsForSeeds(snapshotId: string, seeds: string[], limit: number): Array<Record<string, unknown>> {
@@ -2311,6 +2387,62 @@ function endpointNeedleForTask(task: string, domain?: string): string {
   if (domain?.includes('/')) return domain;
   return '';
 }
+
+function explicitFileNeedles(task: string, domain?: string): string[] {
+  const text = [task, domain ?? ''].join(' ');
+  const needles = new Set<string>();
+  for (const match of text.matchAll(/[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+/g)) {
+    const value = match[0]?.replace(/\\/g, '/').replace(/[),.;:]+$/g, '');
+    if (value && value.includes('/')) needles.add(value);
+  }
+  for (const match of text.matchAll(/\b[A-Z][A-Za-z0-9_$]{3,}\b/g)) {
+    const name = match[0];
+    if (!EXPLICIT_FILENAME_STOP_WORDS.has(name) && !/\.(java|ts|tsx|js|jsx|py|xml|json|ya?ml|properties)$/i.test(name)) {
+      needles.add(`${name}.java`);
+      needles.add(`${name}.ts`);
+      needles.add(`${name}.py`);
+    }
+  }
+  return [...needles].filter(needle => needle.length >= 4);
+}
+
+function isCompatibleExplicitFileCandidate(file: string, explicitFiles: string[]): boolean {
+  const normalizedFile = file.replace(/\\/g, '/');
+  const fileExt = path.posix.extname(normalizedFile).toLowerCase();
+  return explicitFiles.some(explicitFile => {
+    const normalizedExplicit = explicitFile.replace(/\\/g, '/');
+    if (normalizedFile === normalizedExplicit) return true;
+    const explicitExt = path.posix.extname(normalizedExplicit).toLowerCase();
+    if (fileExt && explicitExt && fileExt !== explicitExt) return false;
+    return sharedPrefixSegments(normalizedFile, normalizedExplicit) >= 4;
+  });
+}
+
+function sharedPrefixSegments(left: string, right: string): number {
+  const leftParts = left.split('/').filter(Boolean);
+  const rightParts = right.split('/').filter(Boolean);
+  const length = Math.min(leftParts.length, rightParts.length);
+  let shared = 0;
+  for (let index = 0; index < length; index++) {
+    if (leftParts[index] !== rightParts[index]) break;
+    shared++;
+  }
+  return shared;
+}
+
+const EXPLICIT_FILENAME_STOP_WORDS = new Set([
+  'Find',
+  'Implementation',
+  'Context',
+  'Callers',
+  'Likely',
+  'Tests',
+  'Test',
+  'The',
+  'This',
+  'That',
+  'With',
+]);
 
 function inferDomain(task: string, files: string[]): string {
   if (files.length > 0) {

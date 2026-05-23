@@ -3,7 +3,7 @@ import type { Database as DatabaseType } from 'better-sqlite3';
 import type { ParseResult, SymbolInfo } from '../../analyzers/base-analyzer.js';
 import { getGitInfo, type GitInfo } from '../git.js';
 import { sha256Json, stableId } from '../hash.js';
-import { scanManifest, type ManifestFile } from './manifest.js';
+import { scanManifest, type ManifestFile, type ManifestPreviousFile } from './manifest.js';
 import { parseFile, symbolFqName } from './parse.js';
 import { roleRank } from './file-role.js';
 
@@ -20,6 +20,9 @@ export interface IndexWorkspaceResult {
   filesTotal: number;
   filesParsed: number;
   parseCacheHits: number;
+  filesHashed: number;
+  hashCacheHits: number;
+  skippedUnchanged: boolean;
   manifestScanMs: number;
   indexTimeMs: number;
 }
@@ -34,6 +37,11 @@ interface WorkspaceRow {
 
 interface ParseCacheRow {
   parse_json: string;
+}
+
+interface SnapshotSummaryRow {
+  head_commit?: string | null;
+  dirty_hash: string;
 }
 
 const HTTP_METHOD_ANNOTATIONS = new Map([
@@ -71,6 +79,11 @@ export class V2Indexer {
   registerWorkspace(root: string, workspaceKey?: string): { workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string } {
     const realRoot = path.resolve(root);
     const git = getGitInfo(realRoot);
+    return this.registerWorkspaceWithGit(realRoot, workspaceKey, git);
+  }
+
+  private registerWorkspaceWithGit(root: string, workspaceKey: string | undefined, git: GitInfo): { workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string } {
+    const realRoot = path.resolve(root);
     const resolvedWorkspaceKey = normalizeWorkspaceKey(workspaceKey ?? process.env.CODEGRAPH_WORKSPACE_KEY);
     const workspaceId = stableId(workspaceIdentityParts(realRoot, git, resolvedWorkspaceKey));
     const now = new Date().toISOString();
@@ -94,9 +107,42 @@ export class V2Indexer {
 
   indexWorkspace(options: IndexWorkspaceOptions): IndexWorkspaceResult {
     const start = Date.now();
-    const workspace = this.registerWorkspace(options.root, options.workspaceKey);
-    const git = getGitInfo(workspace.root);
-    const manifest = scanManifest(workspace.root, { maxFileSizeBytes: options.maxFileSizeBytes });
+    const realRoot = path.resolve(options.root);
+    const git = getGitInfo(realRoot);
+    const workspace = this.registerWorkspaceWithGit(realRoot, options.workspaceKey, git);
+    const latestSnapshotId = this.getWorkspace(workspace.workspaceId)?.current_snapshot_id;
+    const previousFiles = latestSnapshotId && !options.force ? this.previousFilesForSnapshot(latestSnapshotId) : undefined;
+    const manifest = scanManifest(workspace.root, {
+      maxFileSizeBytes: options.maxFileSizeBytes,
+      previousFiles,
+    });
+    const latestSnapshot = latestSnapshotId ? this.snapshotSummary(latestSnapshotId) : undefined;
+    if (!options.force
+      && latestSnapshotId
+      && latestSnapshot
+      && optionalStringsEqual(latestSnapshot.head_commit, git.headCommit)
+      && latestSnapshot.dirty_hash === git.dirtyHash
+      && previousFiles
+      && manifestMatchesPreviousFiles(manifest.files, previousFiles)) {
+      this.db.prepare(`
+        UPDATE workspaces
+        SET last_seen_at = ?
+        WHERE id = ?
+      `).run(new Date().toISOString(), workspace.workspaceId);
+
+      return {
+        workspaceId: workspace.workspaceId,
+        snapshotId: latestSnapshotId,
+        filesTotal: manifest.files.length,
+        filesParsed: 0,
+        parseCacheHits: manifest.files.length,
+        filesHashed: manifest.filesHashed,
+        hashCacheHits: manifest.hashCacheHits,
+        skippedUnchanged: true,
+        manifestScanMs: manifest.scanTimeMs,
+        indexTimeMs: Date.now() - start,
+      };
+    }
     const snapshotId = stableId([
       workspace.workspaceId,
       git.headCommit,
@@ -109,7 +155,6 @@ export class V2Indexer {
 
     let filesParsed = 0;
     let parseCacheHits = 0;
-    const latestSnapshotId = this.getWorkspace(workspace.workspaceId)?.current_snapshot_id;
 
     const tx = this.db.transaction(() => {
       this.db.prepare(`
@@ -198,6 +243,9 @@ export class V2Indexer {
       filesTotal: manifest.files.length,
       filesParsed,
       parseCacheHits,
+      filesHashed: manifest.filesHashed,
+      hashCacheHits: manifest.hashCacheHits,
+      skippedUnchanged: false,
       manifestScanMs: manifest.scanTimeMs,
       indexTimeMs: Date.now() - start,
     };
@@ -205,6 +253,25 @@ export class V2Indexer {
 
   private getWorkspace(workspaceId: string): WorkspaceRow | undefined {
     return this.db.prepare('SELECT * FROM workspaces WHERE id = ?').get(workspaceId) as WorkspaceRow | undefined;
+  }
+
+  private snapshotSummary(snapshotId: string): SnapshotSummaryRow | undefined {
+    return this.db.prepare('SELECT head_commit, dirty_hash FROM snapshots WHERE id = ?')
+      .get(snapshotId) as SnapshotSummaryRow | undefined;
+  }
+
+  private previousFilesForSnapshot(snapshotId: string): ManifestPreviousFile[] {
+    const rows = this.db.prepare(`
+      SELECT path, blob_hash, mtime_ms, size
+      FROM files
+      WHERE snapshot_id = ?
+    `).all(snapshotId) as Array<{ path: string; blob_hash: string; mtime_ms: number; size: number }>;
+    return rows.map(row => ({
+      path: row.path,
+      blobHash: row.blob_hash,
+      mtimeMs: row.mtime_ms,
+      size: row.size,
+    }));
   }
 
   private insertFile(snapshotId: string, file: ManifestFile, parseStatus: string): void {
@@ -668,6 +735,16 @@ function parseJsonObject(value: string | undefined): Record<string, unknown> {
 function normalizeWorkspaceKey(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed.toLowerCase().replace(/\\/g, '/') : undefined;
+}
+
+function manifestMatchesPreviousFiles(files: ManifestFile[], previousFiles: ManifestPreviousFile[]): boolean {
+  if (files.length !== previousFiles.length) return false;
+  const previousByPath = new Map(previousFiles.map(file => [file.path, file]));
+  return files.every(file => previousByPath.get(file.relPath)?.blobHash === file.blobHash);
+}
+
+function optionalStringsEqual(left: string | null | undefined, right: string | null | undefined): boolean {
+  return (left ?? undefined) === (right ?? undefined);
 }
 
 function workspaceIdentityParts(realRoot: string, git: GitInfo, workspaceKey: string | undefined): Array<string | undefined> {
