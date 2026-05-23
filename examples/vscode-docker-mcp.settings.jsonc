@@ -1,0 +1,30 @@
+{
+  // Example: .vscode/settings.json
+  //
+  // Use this in each VS Code/Copilot workspace. ${workspaceFolder} makes the
+  // same config work for different projects opened in separate windows.
+  "mcp": {
+    "servers": {
+      "code-graph": {
+        "type": "stdio",
+        "command": "docker",
+        "args": [
+          "run",
+          "--rm",
+          "-i",
+          "-v",
+          "${workspaceFolder}:/workspace:ro",
+          "-v",
+          "codegraph-cache:/codegraph-home",
+          "-e",
+          "CODEGRAPH_WORKSPACE_KEY=${workspaceFolder}",
+          "mcp-code-graph:latest",
+          "mcp",
+          "--root",
+          "/workspace",
+          "--auto-refresh"
+        ]
+      }
+    }
+  }
+}

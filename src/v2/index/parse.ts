@@ -3,11 +3,15 @@ import path from 'node:path';
 import { TreeSitterAnalyzer } from '../../analyzers/tree-sitter-analyzer.js';
 import { detectFrameworkRoles, synthesizeLombokSymbols } from '../../analyzers/java-framework-detector.js';
 import type { ParseResult } from '../../analyzers/base-analyzer.js';
+import { parseConfigFile } from './config-parser.js';
 
 const analyzer = new TreeSitterAnalyzer();
 
 export function parseFile(absPath: string, rootDir: string): ParseResult {
   const content = fs.readFileSync(absPath, 'utf-8');
+  const configResult = parseConfigFile(absPath, content, rootDir);
+  if (configResult) return configResult;
+
   let result: ParseResult;
   try {
     result = analyzer.parse(absPath, content, rootDir);

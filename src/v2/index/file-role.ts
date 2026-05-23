@@ -43,10 +43,10 @@ export function classifyFile(relPath: string): FileClassification {
     return { role: 'generated', language, indexable: true, parseable: Boolean(language) };
   }
   if (BUILD_CONFIG_FILES.has(basename)) {
-    return { role: 'build_config', indexable: true, parseable: false };
+    return { role: 'build_config', language, indexable: true, parseable: Boolean(language) };
   }
-  if (RESOURCE_EXTENSIONS.has(ext) && isResourcePath(lower)) {
-    return { role: 'resource_config', indexable: true, parseable: false };
+  if (RESOURCE_EXTENSIONS.has(ext)) {
+    return { role: 'resource_config', language, indexable: true, parseable: Boolean(language) };
   }
   if (!language) {
     return { role: 'resource_config', indexable: false, parseable: false };
@@ -107,12 +107,4 @@ function isMock(lowerPath: string): boolean {
     || lowerPath.includes('/testdata/')
     || lowerPath.includes('/stub/')
     || lowerPath.includes('/stubs/');
-}
-
-function isResourcePath(lowerPath: string): boolean {
-  return lowerPath.includes('/src/main/resources/')
-    || lowerPath.includes('/src/test/resources/')
-    || lowerPath.includes('/resources/')
-    || lowerPath.includes('/web-inf/')
-    || lowerPath.includes('/meta-inf/');
 }

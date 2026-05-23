@@ -57,6 +57,13 @@ export const V2ToolSchemas = {
     ...SnippetOptions,
     ...FreshnessOptions,
   }),
+  get_file_slice: z.object({
+    file: z.string().optional(),
+    lines: z.string().optional(),
+    symbol: z.string().optional(),
+    maxChars: z.number().min(200).max(30000).default(8000),
+    ...FreshnessOptions,
+  }),
   get_dependencies: z.object({
     module: z.string(),
     ...FreshnessOptions,
@@ -125,6 +132,16 @@ export const V2ToolSchemas = {
     ...SnippetOptions,
     ...FreshnessOptions,
   }),
+  get_context_packet: z.object({
+    task: z.string(),
+    domain: z.string().optional(),
+    tokenBudget: z.number().min(1000).max(30000).default(8000),
+    maxFiles: z.number().min(1).max(20).default(8),
+    maxSymbols: z.number().min(1).max(50).default(12),
+    includeTests: z.boolean().default(true),
+    ...SnippetOptions,
+    ...FreshnessOptions,
+  }),
   search_code: z.object({
     query: z.string(),
     limit: z.number().min(1).max(50).default(10),
@@ -164,6 +181,8 @@ function descriptionFor(name: V2ToolName): string {
   switch (name) {
     case 'get_research_pack':
       return 'Return a token-budgeted research pack for an agent: definitions, callers, callees, impacted endpoints, top files, and confidence notes.';
+    case 'get_context_packet':
+      return 'Route a natural-language task to a compact agent context packet with domain guess, candidate files/symbols, small snippets, likely tests, validation hints, confidence, omissions, and a next action.';
     case 'search_symbol':
       return 'Search indexed symbols with intent-aware ranking, pagination, facets, and optional rank explanations. Hides Lombok synthetic symbols, tests, generated files, and fixtures by default unless requested or implied by the query.';
     case 'search_files':
@@ -172,6 +191,8 @@ function descriptionFor(name: V2ToolName): string {
       return 'Find definitions, imports, and call references for a symbol with filters, pagination, and optional grouping by file, kind, or caller.';
     case 'get_file_summary':
       return 'Summarize a file using persistent symbols, imports, dependencies, and dependents.';
+    case 'get_file_slice':
+      return 'Return one bounded source slice by file and line range, or by indexed symbol, with exact line numbers and truncation metadata. Use this before editing instead of reading whole files.';
     case 'get_dependencies':
       return 'Return direct dependency edges for a file or module.';
     case 'get_dependents':

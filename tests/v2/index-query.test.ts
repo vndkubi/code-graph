@@ -8,6 +8,7 @@ import { openCodeGraphDb } from '../../src/v2/storage/database.js';
 import { V2Indexer } from '../../src/v2/index/indexer.js';
 import { V2QueryService } from '../../src/v2/query/service.js';
 import { generateSyntheticJavaRepo } from '../../src/v2/benchmark/synthetic-java.js';
+import { runContextProofEval } from '../../src/v2/benchmark/context-proof.js';
 
 const tempDirs: string[] = [];
 const dbs: Database[] = [];
@@ -363,6 +364,371 @@ public class OrderResource {
     }) as { endpoints: Array<{ snippet?: { text: string } }> };
 
     expect(endpoints.endpoints[0]?.snippet?.text).toContain('@POST');
+  });
+
+  it('builds compact context packets and exact file slices for agent routing', () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-context-packet-');
+    writeFile(repo, 'package.json', JSON.stringify({
+      scripts: {
+        test: 'vitest run',
+        typecheck: 'tsc --noEmit',
+      },
+    }, null, 2));
+    writeFile(repo, 'src/main/java/com/example/payment/PaymentGateway.java', `package com.example.payment;
+
+public interface PaymentGateway {
+    void processRefund(String transactionId);
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/payment/PaymentService.java', `package com.example.payment;
+
+public class PaymentService {
+    private final PaymentGateway gateway;
+
+    public PaymentService(PaymentGateway gateway) {
+        this.gateway = gateway;
+    }
+
+    public void refund(String transactionId) {
+        gateway.processRefund(transactionId);
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/payment/PaymentServiceTest.java', `package com.example.payment;
+
+import org.junit.jupiter.api.Test;
+
+public class PaymentServiceTest {
+    @Test
+    void refundDelegatesToGateway() {
+        PaymentService service = new PaymentService(null);
+        service.refund("tx-1");
+    }
+}
+`);
+
+    const { db } = openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const packet = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_context_packet',
+      args: {
+        task: 'fix duplicate refund timeout in payment service',
+        domain: 'payment',
+        maxFiles: 4,
+        maxSymbols: 6,
+        tokenBudget: 4000,
+        includeSnippets: true,
+        snippetLines: 5,
+      },
+    }) as {
+      candidateFiles: Array<{ file: string; snippet?: { text: string }; confidence: number }>;
+      relevantSymbols: Array<{ symbol: string; lines: string }>;
+      testsLikelyRelevant: Array<{ file: string }>;
+      validation: { targetedTestFiles: string[]; suggestedCommands: string[] };
+      nextAction: string;
+      budget: { estimatedResponseTokens: number };
+    };
+
+    expect(packet.candidateFiles.length).toBeGreaterThan(0);
+    expect(packet.candidateFiles.length).toBeLessThanOrEqual(4);
+    expect(packet.candidateFiles.some(file => file.file.endsWith('PaymentService.java'))).toBe(true);
+    expect(packet.candidateFiles.some(file => file.snippet?.text.includes('PaymentService'))).toBe(true);
+    expect(packet.relevantSymbols.some(symbol => symbol.symbol.includes('PaymentService'))).toBe(true);
+    expect(packet.relevantSymbols.every(symbol => symbol.lines.length > 0)).toBe(true);
+    expect(packet.testsLikelyRelevant.some(test => test.file.endsWith('PaymentServiceTest.java'))).toBe(true);
+    expect(packet.validation.targetedTestFiles.some(file => file.endsWith('PaymentServiceTest.java'))).toBe(true);
+    expect(packet.validation.suggestedCommands.some(command => command.includes('npm test'))).toBe(true);
+    expect(packet.nextAction).toContain('get_file_slice');
+    expect(packet.budget.estimatedResponseTokens).toBeGreaterThan(0);
+
+    const slice = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_file_slice',
+      args: { symbol: 'PaymentService.refund', maxChars: 1000 },
+    }) as { file: string; lines: string; text: string; truncated: boolean; resolvedSymbol?: { symbol: string } };
+
+    expect(slice.file.endsWith('PaymentService.java')).toBe(true);
+    expect(slice.lines).toMatch(/^\d+(-\d+)?$/);
+    expect(slice.text).toContain('processRefund');
+    expect(slice.truncated).toBe(false);
+    expect(slice.resolvedSymbol?.symbol).toContain('PaymentService.refund');
+  });
+
+  it('indexes XML, JSON, YAML, and properties config evidence', () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-config-files-');
+    writeFile(repo, 'src/main/java/com/example/mapper/OrderMapper.java', `package com.example.mapper;
+
+import com.example.model.Order;
+
+public interface OrderMapper {
+    Order selectById(Long id);
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/model/Order.java', `package com.example.model;
+
+public class Order {
+}
+`);
+    writeFile(repo, 'src/main/resources/com/example/mapper/OrderMapper.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<mapper namespace="com.example.mapper.OrderMapper">
+  <resultMap id="BaseResultMap" type="com.example.model.Order">
+    <id column="id" property="id"/>
+  </resultMap>
+  <select id="selectById" parameterType="java.lang.Long" resultMap="BaseResultMap">
+    select id from oms_order where id = #{id}
+  </select>
+</mapper>
+`);
+    writeFile(repo, 'src/main/resources/application.yml', `spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/mall
+server:
+  port: 8080
+`);
+    writeFile(repo, 'src/main/resources/openapi.json', JSON.stringify({
+      paths: {
+        '/orders': {
+          get: {
+            operationId: 'listOrders',
+          },
+        },
+      },
+    }, null, 2));
+    writeFile(repo, 'src/main/resources/rest-api-spec/api/cluster.health.json', JSON.stringify({
+      'cluster.health': {
+        documentation: {
+          description: 'Get the cluster health status',
+        },
+        headers: {
+          accept: ['application/json'],
+        },
+        url: {
+          paths: [
+            {
+              path: '/_cluster/health',
+              methods: ['GET'],
+            },
+          ],
+        },
+        params: {
+          wait_for_status: {
+            type: 'enum',
+            options: ['green', 'yellow', 'red'],
+            description: 'Wait until cluster is in a specific state',
+          },
+        },
+      },
+    }, null, 2));
+    writeFile(repo, 'src/yamlRestTest/resources/rest-api-spec/test/cluster.health/10_basic.yml', `---
+"cluster health basic test":
+  - do:
+      cluster.health:
+        wait_for_status: green
+`);
+    writeFile(repo, 'src/main/resources/docker-compose.yml', `services:
+  order-api:
+    image: example/order-api:latest
+    ports:
+      - "8080:8080"
+`);
+    writeFile(repo, 'src/main/resources/application.properties', `app.feature.order-cache=true
+`);
+
+    const { db } = openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const xmlFiles = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_files',
+      args: { query: 'OrderMapper selectById resultMap', limit: 10, explainRank: true },
+    }) as {
+      files: Array<{
+        path: string;
+        language?: string;
+        parseStatus: string;
+        topSymbols: Array<{ name: string; frameworkRole?: string }>;
+      }>;
+    };
+    const mapperXml = xmlFiles.files.find(file => file.path.endsWith('OrderMapper.xml'));
+    expect(mapperXml).toMatchObject({
+      language: 'xml',
+      parseStatus: 'ok',
+    });
+    expect(mapperXml?.topSymbols.some(symbol => symbol.name === 'selectById' && symbol.frameworkRole === 'mybatis:select')).toBe(true);
+
+    const yamlSymbols = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'spring datasource url', limit: 10 },
+    }) as { symbols: Array<{ name: string; file: string; frameworkRole?: string }> };
+    expect(yamlSymbols.symbols).toContainEqual(expect.objectContaining({
+      name: 'spring.datasource.url',
+      file: expect.stringContaining('application.yml'),
+      frameworkRole: 'spring:datasource',
+    }));
+
+    const openApiEndpoints = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'find_endpoints',
+      args: { method: 'GET', path: '/orders', limit: 10 },
+    }) as { endpoints: Array<{ path: string; method: string; framework: string; file: string }> };
+    expect(openApiEndpoints.endpoints).toContainEqual(expect.objectContaining({
+      path: '/orders',
+      method: 'GET',
+      framework: 'openapi',
+      file: expect.stringContaining('openapi.json'),
+    }));
+
+    const elasticEndpoints = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'find_endpoints',
+      args: { method: 'GET', path: '/_cluster/health', limit: 10 },
+    }) as { endpoints: Array<{ path: string; method: string; framework: string; file: string }> };
+    expect(elasticEndpoints.endpoints).toContainEqual(expect.objectContaining({
+      path: '/_cluster/health',
+      method: 'GET',
+      framework: 'elastic-rest',
+      file: expect.stringContaining('cluster.health.json'),
+    }));
+
+    const elasticParams = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'wait for status green cluster health', frameworkRole: 'elastic-rest:param', limit: 10 },
+    }) as { symbols: Array<{ name: string; file: string; frameworkRole?: string }> };
+    expect(elasticParams.symbols).toContainEqual(expect.objectContaining({
+      name: 'cluster.health.wait_for_status',
+      file: expect.stringContaining('cluster.health.json'),
+      frameworkRole: 'elastic-rest:param',
+    }));
+
+    const elasticYamlParams = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: {
+        query: 'cluster health basic wait for status green',
+        frameworkRole: 'elastic-rest:yaml-param',
+        includeTests: true,
+        limit: 10,
+      },
+    }) as { symbols: Array<{ name: string; file: string; frameworkRole?: string }> };
+    expect(elasticYamlParams.symbols).toContainEqual(expect.objectContaining({
+      name: 'cluster.health.wait_for_status',
+      file: expect.stringContaining('cluster.health/10_basic.yml'),
+      frameworkRole: 'elastic-rest:yaml-param',
+    }));
+
+    const dockerSymbols = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'order api image', frameworkRole: 'docker:service', limit: 10 },
+    }) as { symbols: Array<{ name: string; file: string; frameworkRole?: string }> };
+    expect(dockerSymbols.symbols).toContainEqual(expect.objectContaining({
+      name: 'services.order-api',
+      file: expect.stringContaining('docker-compose.yml'),
+      frameworkRole: 'docker:service',
+    }));
+
+    const propertiesSymbols = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'app feature order cache', limit: 10 },
+    }) as { symbols: Array<{ name: string; file: string; frameworkRole?: string }> };
+    expect(propertiesSymbols.symbols).toContainEqual(expect.objectContaining({
+      name: 'app.feature.order-cache',
+      file: expect.stringContaining('application.properties'),
+      frameworkRole: 'config:properties-key',
+    }));
+
+    const mapperTrace = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'trace_dependencies',
+      args: { target: 'OrderMapper.java', direction: 'dependencies', depth: 1 },
+    }) as { edges: Array<{ toFile: string; resolutionKind: string }> };
+    expect(mapperTrace.edges).toContainEqual(expect.objectContaining({
+      toFile: expect.stringContaining('OrderMapper.xml'),
+      resolutionKind: 'mybatis-namespace',
+    }));
+  });
+
+  it('runs a context proof benchmark comparing baseline file reads to MCP slices', () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-context-proof-');
+    writeFile(repo, 'src/main/java/com/example/payment/PaymentGateway.java', `package com.example.payment;
+
+public interface PaymentGateway {
+    void processRefund(String transactionId);
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/payment/PaymentService.java', `package com.example.payment;
+
+public class PaymentService {
+    private final PaymentGateway gateway;
+
+    public PaymentService(PaymentGateway gateway) {
+        this.gateway = gateway;
+    }
+
+    public void refund(String transactionId) {
+        gateway.processRefund(transactionId);
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/payment/PaymentServiceTest.java', `package com.example.payment;
+
+import org.junit.jupiter.api.Test;
+
+public class PaymentServiceTest {
+    @Test
+    void refundDelegatesToGateway() {
+        PaymentService service = new PaymentService(null);
+        service.refund("tx-1");
+    }
+}
+`);
+    for (let i = 0; i < 8; i++) {
+      writeFile(repo, `src/main/java/com/example/noise/NoisyPayment${i}.java`, `package com.example.noise;
+
+/*
+${'refund timeout payment noise '.repeat(250)}
+*/
+public class NoisyPayment${i} {
+    public String value() {
+        return "noise-${i}";
+    }
+}
+`);
+    }
+
+    const { db } = openDb(home);
+    const proof = runContextProofEval(db, repo, [{
+      id: 'payment-refund-proof',
+      task: 'Find PaymentService refund behavior and related tests.',
+      domain: 'payment',
+      baselineSearchTerms: ['refund', 'PaymentService'],
+      expectedContains: ['PaymentService', 'processRefund'],
+      expectedFiles: ['PaymentService.java'],
+      maxFiles: 4,
+      maxSymbols: 6,
+      tokenBudget: 4000,
+      sliceCount: 2,
+    }]);
+
+    expect(proof.totals.tasks).toBe(1);
+    expect(proof.totals.baselineCorrect).toBe(1);
+    expect(proof.totals.mcpCorrect).toBe(1);
+    expect(proof.totals.qualityMaintained).toBe(true);
+    expect(proof.totals.baselineFilesOpened).toBeGreaterThan(proof.totals.mcpSlicesOpened);
+    expect(proof.totals.tokenSavingPct).toBeGreaterThan(0);
+    expect(proof.tasks[0]?.mcp.slicedFiles.some(file => file.endsWith('PaymentService.java'))).toBe(true);
   });
 
   it('resolves Java parameter and local-variable receiver calls', () => {

@@ -262,7 +262,7 @@ export class V2Indexer {
     for (const sym of result.symbols) {
       const fqName = symbolFqName(sym);
       this.db.prepare(`
-        INSERT INTO symbols (
+        INSERT OR IGNORE INTO symbols (
           snapshot_id, fq_name, simple_name, kind, file, line, column, end_line, signature,
           visibility, parent, package_name, return_type, parameter_types_json, annotations_json,
           framework_role, framework_meta_json, file_role
@@ -371,6 +371,37 @@ export class V2Indexer {
     classesByName: Map<string, SymbolInfo>,
   ): void {
     if (sym.kind !== 'method') return;
+
+    if (
+      sym.frameworkRole === 'openapi:endpoint'
+      || sym.frameworkRole === 'postman:request'
+      || sym.frameworkRole === 'elastic-rest:endpoint'
+    ) {
+      const method = String(sym.frameworkMeta?.httpMethod ?? 'GET').toUpperCase();
+      const endpointPath = String(sym.frameworkMeta?.path ?? '/');
+      const framework = sym.frameworkRole === 'elastic-rest:endpoint'
+        ? 'elastic-rest'
+        : sym.frameworkRole.startsWith('openapi') ? 'openapi' : 'postman';
+      this.db.prepare(`
+        INSERT INTO endpoints (
+          snapshot_id, method, path, path_resolution, path_resolution_reason,
+          handler_symbol, controller, file, line, framework, confidence, file_role
+        ) VALUES (?, ?, ?, 'exact', NULL, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        snapshotId,
+        method,
+        endpointPath,
+        fqName,
+        sym.parent,
+        file.relPath,
+        sym.line,
+        framework,
+        0.75,
+        file.role,
+      );
+      return;
+    }
+
     const annotations = sym.annotations ?? [];
     const methodAnnotation = annotations.find(a => HTTP_METHOD_ANNOTATIONS.has(a));
     if (!methodAnnotation) return;
@@ -438,6 +469,35 @@ export class V2Indexer {
     }
     for (const ref of typeRefs) {
       addEdge(ref.file, classToFile.get(ref.referenced_type), 'compile', 0.6, 'type-ref');
+    }
+
+    const javaTypesByFqName = new Map<string, string[]>();
+    const javaTypes = this.db.prepare(`
+      SELECT fq_name, file
+      FROM symbols
+      WHERE snapshot_id = ?
+        AND kind IN ('class', 'interface')
+        AND file_role IN ('main_source', 'generated')
+    `).all(snapshotId) as Array<{ fq_name: string; file: string }>;
+    for (const row of javaTypes) {
+      const files = javaTypesByFqName.get(row.fq_name) ?? [];
+      files.push(row.file);
+      javaTypesByFqName.set(row.fq_name, files);
+    }
+
+    const mybatisXmlMappers = this.db.prepare(`
+      SELECT fq_name, file, framework_meta_json
+      FROM symbols
+      WHERE snapshot_id = ?
+        AND framework_role = 'mybatis:mapper-xml'
+    `).all(snapshotId) as Array<{ fq_name: string; file: string; framework_meta_json?: string }>;
+    for (const mapper of mybatisXmlMappers) {
+      const meta = parseJsonObject(mapper.framework_meta_json);
+      const namespace = typeof meta.namespace === 'string' && meta.namespace ? meta.namespace : mapper.fq_name;
+      for (const javaFile of javaTypesByFqName.get(namespace) ?? []) {
+        addEdge(mapper.file, javaFile, 'config', 0.95, 'mybatis-namespace');
+        addEdge(javaFile, mapper.file, 'config', 0.95, 'mybatis-namespace');
+      }
     }
   }
 
@@ -591,6 +651,18 @@ function simpleTypeName(typeName: string): string {
   const withoutParams = typeName.replace(/\([^)]*\)$/, '');
   const parts = withoutParams.split('.').filter(Boolean);
   return parts[parts.length - 1] ?? withoutParams;
+}
+
+function parseJsonObject(value: string | undefined): Record<string, unknown> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 function normalizeWorkspaceKey(value: string | undefined): string | undefined {

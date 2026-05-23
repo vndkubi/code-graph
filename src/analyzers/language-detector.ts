@@ -1,6 +1,18 @@
 import path from 'node:path';
 
-export type SupportedLanguage = 'java' | 'typescript' | 'javascript' | 'python' | 'kotlin' | 'swift' | 'csharp' | 'php';
+export type SupportedLanguage =
+  | 'java'
+  | 'typescript'
+  | 'javascript'
+  | 'python'
+  | 'kotlin'
+  | 'swift'
+  | 'csharp'
+  | 'php'
+  | 'xml'
+  | 'json'
+  | 'yaml'
+  | 'properties';
 
 const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   '.java': 'java',
@@ -14,6 +26,11 @@ const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   '.swift': 'swift',
   '.cs': 'csharp',
   '.php': 'php',
+  '.xml': 'xml',
+  '.json': 'json',
+  '.yaml': 'yaml',
+  '.yml': 'yaml',
+  '.properties': 'properties',
 };
 
 const SOURCE_EXTENSIONS = new Set(Object.keys(EXTENSION_MAP));

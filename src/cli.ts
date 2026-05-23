@@ -10,6 +10,7 @@ import { getCodeGraphPaths } from './v2/paths.js';
 import { generateSyntheticJavaRepo } from './v2/benchmark/synthetic-java.js';
 import { runIndexBenchmark } from './v2/benchmark/run.js';
 import { loadGoldenEvalTasks, runGoldenEval } from './v2/benchmark/golden-eval.js';
+import { loadContextProofTasks, runContextProofEval } from './v2/benchmark/context-proof.js';
 
 interface ParsedArgs {
   command: string[];
@@ -79,8 +80,19 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     }
+    case 'proof': {
+      const root = getFlag(parsed, 'root') ?? process.cwd();
+      const { db } = openCodeGraphDb(getFlag(parsed, 'home'));
+      try {
+        const tasks = loadContextProofTasks(getFlag(parsed, 'tasks'));
+        console.log(JSON.stringify(runContextProofEval(db, root, tasks), null, 2));
+      } finally {
+        db.close();
+      }
+      return;
+    }
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof');
   }
 }
 
@@ -198,7 +210,8 @@ Usage:
   codegraph index --root <workspace>     Prewarm persistent index
   codegraph doctor                       Inspect local configuration
   codegraph logs --tail <number>         Print recent daemon query/index events
-  codegraph benchmark generate|index|eval Generate synthetic repos, measure indexing, or run golden evals
+  codegraph benchmark generate|index|eval|proof
+                                             Generate synthetic repos, measure indexing, run golden evals, or prove context routing savings
 
 Options:
   --root <path>                          Workspace root

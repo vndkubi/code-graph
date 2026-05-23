@@ -18,8 +18,10 @@ Java/Jakarta EE is the primary semantic target. TypeScript/JavaScript and Python
 | `find_tests_for` | Find tests likely relevant to a symbol using test names, test symbols, and indexed call edges |
 | `get_callees` | Find symbols called by a caller symbol |
 | `get_callers` | Find call sites that call a symbol |
+| `get_context_packet` | Route a natural-language task to a compact packet with candidate files/symbols, line ranges, snippets, tests, validation hints, confidence, omissions, and a next action |
 | `get_dependencies` | List direct dependencies for a file/module |
 | `get_dependents` | List direct dependents for a file/module |
+| `get_file_slice` | Return one bounded source slice by file line range or indexed symbol before editing |
 | `get_file_summary` | Summarize symbols, imports, dependencies, and dependents for a file |
 | `get_impact_radius` | Estimate blast radius for a target |
 | `get_index_stats` | Inspect current snapshot counts and file roles |
@@ -44,6 +46,7 @@ Use prompts like these to make the agent reach for graph tools before opening ma
 
 - "Use `search_files` first: which files are relevant to creating a notebook?"
 - "Use `search_code` with `explainRank: true`: find files, symbols, endpoints, references, and dependencies for payment flow."
+- "Use `get_context_packet` for 'fix duplicate refund timeout in payment service' with tokenBudget 4000, then call `get_file_slice` for the top candidate before editing."
 - "Use `trace_dependencies`: if I change `UserEntity`, what files and endpoints are affected?"
 - "Use `find_tests_for`: which tests are likely relevant for `NotebookController.createNotebook`?"
 - "Use `explain_endpoint` with snippets: explain `GET /notebooks` from controller to service/repository/DTO/tests."
@@ -522,6 +525,24 @@ Each editor window normally starts its own stdio proxy, so you usually do not ru
 
 Docker is optional. v2 normally runs best as a local stdio command from VS Code/Codex, but the image can be used when the workspace must be mounted into a container.
 
+Windows PowerShell:
+
+```powershell
+# Build only
+.\docker-build.ps1
+
+# Build + run the MCP stdio proxy against one project
+.\docker-build.ps1 -Run -ProjectPath D:\Personal\Projects\mall
+
+# Build + export to tar.gz
+.\docker-build.ps1 -Export -Out D:\transfer\mcp-code-graph.tar.gz
+
+# Build with a corporate/internal root CA certificate
+.\docker-build.ps1 -CaCert C:\temp\corp-root-ca.crt
+```
+
+WSL, Linux, or macOS:
+
 ```bash
 # Build only
 ./docker-build.sh
@@ -595,6 +616,50 @@ VS Code MCP config using Docker:
 }
 ```
 
+Codex CLI config using Docker:
+
+```toml
+# C:/Users/<your-user>/.codex/config.toml
+[mcp_servers.code_graph_mall]
+command = "docker"
+args = [
+  "run",
+  "--rm",
+  "-i",
+  "-v",
+  "D:/Personal/Projects/mall:/workspace:ro",
+  "-v",
+  "codegraph-cache:/codegraph-home",
+  "-e",
+  "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/mall",
+  "mcp-code-graph:latest",
+  "mcp",
+  "--root",
+  "/workspace",
+  "--auto-refresh"
+]
+```
+
+For multiple projects, keep one MCP server entry per project or use the VS Code `${workspaceFolder}` config above. The container should keep the source mount read-only and store CodeGraph's SQLite cache in `codegraph-cache`.
+
+Multi-project examples:
+
+- VS Code/Copilot: [`examples/vscode-docker-mcp.settings.jsonc`](examples/vscode-docker-mcp.settings.jsonc)
+- Codex CLI: [`examples/docker-multi-project.codex.toml.example`](examples/docker-multi-project.codex.toml.example)
+
+For Docker, `/workspace` is the path inside every container. The important isolation key is `CODEGRAPH_WORKSPACE_KEY`; set it to the host project path or another stable unique value for each project/branch.
+
+Recent Windows Docker multi-project smoke report:
+
+| Project | Workspace ID prefix | Files | Files parsed | Parse cache hits | Wall time |
+|---------|---------------------|-------|--------------|------------------|-----------|
+| `mall` pass 1 | `df8f73` | 653 | 0 | 653 | 66.3s |
+| `mall` pass 2 | `df8f73` | 653 | 0 | 653 | 67.5s |
+| `doughnut` cold | `1da416` | 1345 | 1341 | 0 | 169.6s |
+| `doughnut` warm | `1da416` | 1345 | 0 | 1345 | 103.5s |
+
+The smoke test used one shared Docker volume, `codegraph-cache`, with separate `CODEGRAPH_WORKSPACE_KEY` values. MCP startup was also verified through Docker for both projects, exposing 19 tools. Docker Desktop bind mounts from `D:\...` are noticeably slower than local or WSL/Linux filesystems; for very large repositories, prewarm from WSL/ext4 when possible.
+
 ---
 
 ## CLI Reference
@@ -605,8 +670,8 @@ codegraph daemon start|stop|status     Manage local daemon
 codegraph daemon run                   Run daemon in the foreground
 codegraph index --root <workspace>     Prewarm persistent index
 codegraph doctor                       Inspect local configuration
-codegraph benchmark generate|index|eval
-                                      Generate synthetic repos, measure indexing, or run golden evals
+codegraph benchmark generate|index|eval|proof
+                                      Generate synthetic repos, measure indexing, run golden evals, or prove context routing savings
 
 Options:
   --root <path>                        Workspace root
@@ -631,6 +696,9 @@ node dist/cli.js benchmark index --root /path/to/project --home /tmp/codegraph-p
 
 # Run golden eval tasks against a project
 node dist/cli.js benchmark eval --root /path/to/project --tasks examples/golden-eval-tasks.example.json --home /tmp/codegraph-proof-home
+
+# Compare baseline file reads with get_context_packet + get_file_slice
+node dist/cli.js benchmark proof --root /path/to/project --tasks examples/context-proof-tasks.example.json --home /tmp/codegraph-proof-home
 ```
 
 ---
@@ -841,6 +909,23 @@ node dist/cli.js benchmark eval --root /path/to/project --tasks examples/golden-
 ```
 
 The output includes per-task correctness, estimated tokens, baseline files opened, CodeGraph response size, and aggregate `tokenSavingPct`.
+
+To prove the context-router workflow specifically, use `benchmark proof`. It compares a baseline scanner that opens matched files against CodeGraph calling `get_context_packet` and then `get_file_slice` for the top candidates:
+
+```bash
+node dist/cli.js benchmark proof --root /path/to/project --tasks examples/context-proof-tasks.example.json --home /tmp/codegraph-proof-home
+```
+
+Each proof task can include:
+
+- `task`: natural-language agent request.
+- `domain`: optional module/domain hint.
+- `baselineSearchTerms`: terms the baseline scanner uses.
+- `expectedContains`: strings that must appear in MCP evidence.
+- `expectedFiles`: files that should appear in `topFiles` or sliced files.
+- `maxFiles`, `maxSymbols`, `tokenBudget`, `sliceCount`, `includeSnippets`: context-router budget knobs. The proof runner defaults `includeSnippets` to `false`, then fetches exact slices separately with `get_file_slice`.
+
+The proof report includes `baselineCorrect`, `mcpCorrect`, `qualityMaintained`, `tokenSavingPct`, `fileOpenReductionPct`, `contextPacketP95Ms`, and `mcpWorkflowP95Ms`. Treat it as a retrieval proof; full coding proof still needs running the same edit tasks with an agent and validating patches/tests.
 
 Metrics to report:
 

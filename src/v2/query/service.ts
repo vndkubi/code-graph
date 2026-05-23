@@ -48,6 +48,8 @@ export class V2QueryService {
         return withFreshness(this.findReferences(snapshotId, envelope.args));
       case 'get_file_summary':
         return withFreshness(this.getFileSummary(snapshotId, envelope.args));
+      case 'get_file_slice':
+        return withFreshness(this.getFileSlice(snapshotId, envelope.args));
       case 'get_dependencies':
         return withFreshness(this.getDependencies(snapshotId, envelope.args));
       case 'get_dependents':
@@ -70,6 +72,8 @@ export class V2QueryService {
         return withFreshness(this.findTestsFor(snapshotId, envelope.args));
       case 'get_research_pack':
         return withFreshness(this.getResearchPack(snapshotId, envelope.args));
+      case 'get_context_packet':
+        return withFreshness(this.getContextPacket(snapshotId, envelope.args));
       case 'search_code':
         return withFreshness(this.searchCode(snapshotId, envelope.args));
       case 'get_index_stats':
@@ -194,7 +198,7 @@ export class V2QueryService {
     if (query === '*' || tokens.length === 0) {
       const totalFound = scalar(this.db, `SELECT COUNT(*) FROM symbols WHERE ${baseWhere}`, ...baseParams);
       const rows = this.db.prepare(`
-        SELECT fq_name, simple_name, kind, file, line, signature, visibility, parent,
+        SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
                package_name, return_type, parameter_types_json, annotations_json,
                framework_role, framework_meta_json, file_role
         FROM symbols
@@ -264,7 +268,7 @@ export class V2QueryService {
     const candidateLimit = Math.min(Math.max((cursorOffset + limit) * 50, 500), 5000);
 
     const rows = this.db.prepare(`
-      SELECT fq_name, simple_name, kind, file, line, signature, visibility, parent,
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
              package_name, return_type, parameter_types_json, annotations_json,
              framework_role, framework_meta_json, file_role
       FROM symbols
@@ -446,7 +450,10 @@ export class V2QueryService {
       matchParams.push(pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern);
     }
 
-    const candidateLimit = Math.min(Math.max((cursorOffset + limit) * 40, 500), 2000);
+    const broadConfigSearch = isApiSpecQuery(query) || /\b(config|yaml|json|xml|properties)\b/i.test(query);
+    const candidateLimit = broadConfigSearch
+      ? Math.min(Math.max((cursorOffset + limit) * 100, 1000), 5000)
+      : Math.min(Math.max((cursorOffset + limit) * 40, 500), 2000);
     const rows = this.db.prepare(`
       SELECT f.path, f.language, f.file_role, f.parse_status, f.size
       FROM files f
@@ -619,6 +626,89 @@ export class V2QueryService {
         dependencyCount: deps.length,
         dependentCount: dependents.length,
       },
+    };
+  }
+
+  private getFileSlice(snapshotId: string, args: Record<string, unknown>) {
+    const requestedFile = args.file ? String(args.file) : '';
+    const requestedSymbol = args.symbol ? String(args.symbol) : '';
+    const maxChars = clampInt(Number(args.maxChars ?? 8000), 200, 30000);
+    let resolved = requestedFile ? this.resolveFile(snapshotId, requestedFile) : undefined;
+    const symbol = requestedSymbol ? this.lookupBestSymbol(snapshotId, requestedSymbol, resolved) : undefined;
+    if (symbol) resolved = symbol.file;
+    if (!resolved) {
+      return {
+        error: requestedFile
+          ? `File "${requestedFile}" not found in index.`
+          : 'Provide a file path or a symbol that resolves to one indexed file.',
+      };
+    }
+
+    const requestedRange = args.lines ? parseLineRange(String(args.lines)) : undefined;
+    const symbolRange = symbol ? { start: symbol.line, end: symbol.end_line ?? symbol.line } : undefined;
+    const range = requestedRange ?? symbolRange;
+    if (!range) {
+      return {
+        file: resolved,
+        error: 'Provide lines such as "42-118" or a symbol to select a bounded slice.',
+      };
+    }
+
+    const root = this.workspaceRootForSnapshot(snapshotId);
+    const absolutePath = root ? safeResolve(root, resolved) : undefined;
+    if (!absolutePath) return { file: resolved, error: 'Could not safely resolve file under workspace root.' };
+
+    let content: string;
+    try {
+      content = fs.readFileSync(absolutePath, 'utf-8');
+    } catch (error) {
+      return {
+        file: resolved,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+
+    const sourceLines = content.split(/\r?\n/);
+    const startLine = clampInt(range.start, 1, Math.max(sourceLines.length, 1));
+    const endLine = clampInt(Math.max(range.end, startLine), startLine, Math.max(sourceLines.length, startLine));
+    const rendered: string[] = [];
+    let usedChars = 0;
+    let truncated = false;
+    for (let lineNo = startLine; lineNo <= endLine; lineNo++) {
+      const line = `${lineNo}: ${sourceLines[lineNo - 1] ?? ''}`;
+      const separator = rendered.length === 0 ? '' : '\n';
+      const nextChars = separator.length + line.length;
+      if (usedChars + nextChars > maxChars) {
+        if (rendered.length === 0) rendered.push(line.slice(0, maxChars));
+        truncated = true;
+        break;
+      }
+      rendered.push(line);
+      usedChars += nextChars;
+    }
+
+    const actualEndLine = rendered.length > 0 ? startLine + rendered.length - 1 : startLine;
+    return {
+      file: resolved,
+      requested: {
+        file: requestedFile || undefined,
+        lines: args.lines,
+        symbol: requestedSymbol || undefined,
+      },
+      resolvedSymbol: symbol ? compactSymbolCandidate(symbolDto(symbol), undefined) : undefined,
+      startLine,
+      endLine: actualEndLine,
+      lines: lineRangeString(startLine, actualEndLine),
+      maxChars,
+      truncated,
+      omittedLineCount: truncated ? Math.max(0, endLine - actualEndLine) : 0,
+      text: rendered.join('\n'),
+      confidence: symbol ? 0.9 : 0.85,
+      confidenceNotes: [
+        symbol
+          ? 'Slice was resolved from an indexed symbol line range.'
+          : 'Slice was resolved from an explicit file line range.',
+      ],
     };
   }
 
@@ -921,6 +1011,307 @@ export class V2QueryService {
     };
   }
 
+  private getContextPacket(snapshotId: string, args: Record<string, unknown>) {
+    const task = String(args.task ?? '').trim();
+    if (!task) return { error: 'get_context_packet requires a non-empty task.' };
+
+    const domain = args.domain ? String(args.domain).trim() : undefined;
+    const tokenBudget = clampInt(Number(args.tokenBudget ?? 8000), 1000, 30000);
+    const maxFiles = clampInt(Number(args.maxFiles ?? 8), 1, 20);
+    const maxSymbols = clampInt(Number(args.maxSymbols ?? 12), 1, 50);
+    const includeTests = args.includeTests !== false;
+    const includeSnippets = args.includeSnippets !== false;
+    const snippetLines = clampInt(Number(args.snippetLines ?? 12), 3, 40);
+    const snippetTokenBudget = clampInt(
+      Number(args.snippetTokenBudget ?? Math.min(6000, Math.max(800, Math.floor(tokenBudget * 0.45)))),
+      100,
+      12000,
+    );
+    const query = [domain, task].filter(Boolean).join(' ');
+
+    const files = this.searchFiles(snapshotId, {
+      ...args,
+      query,
+      limit: maxFiles,
+      includeTests: false,
+      includeGenerated: false,
+      includeFixtures: false,
+      explainRank: true,
+      includeSnippets,
+      snippetLines,
+      snippetTokenBudget,
+    }) as { files: Array<Record<string, unknown>>; totalFound?: number };
+    const symbols = this.searchSymbol(snapshotId, {
+      ...args,
+      query,
+      limit: maxSymbols,
+      includeTests: false,
+      includeGenerated: false,
+      includeFixtures: false,
+      includeSynthetic: false,
+      explainRank: true,
+      includeSnippets: false,
+    }) as { symbols: Array<Record<string, unknown>>; totalFound?: number };
+    const endpointNeedle = endpointNeedleForTask(task, domain);
+    const endpointSearch = endpointNeedle
+      ? this.findEndpoints(snapshotId, {
+        ...args,
+        path: endpointNeedle,
+        method: 'all',
+        limit: Math.min(maxFiles, 10),
+        explainRank: true,
+        includeSnippets: false,
+      }) as { endpoints: Array<Record<string, unknown>>; totalCount?: number }
+      : { endpoints: [], totalCount: 0 };
+    const myBatisContext = isMyBatisIntent(query)
+      ? this.myBatisContext(snapshotId, query, maxFiles, maxSymbols)
+      : { candidateFiles: [], relevantSymbols: [], topFiles: [] };
+    const directEndpointCandidates = compactEndpointCandidates(endpointSearch.endpoints);
+    const endpointFileCandidates = directEndpointCandidates.map(endpoint => ({
+      file: endpoint.file,
+      language: undefined,
+      fileRole: undefined,
+      lines: endpoint.lines,
+      whyRelevant: endpoint.whyRelevant,
+      confidence: endpoint.confidence,
+      matchedTokens: [],
+      snippet: undefined,
+      topSymbols: [],
+      endpoints: [endpoint],
+    }));
+
+    const candidateFiles = uniqueFileCandidates([
+      ...myBatisContext.candidateFiles,
+      ...endpointFileCandidates,
+      ...files.files.map(row => compactFileCandidate(row)),
+    ]).slice(0, maxFiles);
+    const relevantSymbols = uniqueSymbolCandidates([
+      ...myBatisContext.relevantSymbols,
+      ...symbols.symbols.map(row => compactSymbolCandidate(row)),
+    ]).slice(0, maxSymbols);
+    const endpointCandidates = compactEndpointCandidates([
+      ...directEndpointCandidates,
+      ...files.files.flatMap(row => Array.isArray(row.endpoints) ? row.endpoints as Array<Record<string, unknown>> : []),
+    ]).slice(0, Math.min(maxFiles, 10));
+    const topFiles = uniqueFilesInOrder([
+      ...candidateFiles.map(row => row.file),
+      ...endpointCandidates.map(row => row.file),
+      ...relevantSymbols.map(row => row.file),
+      ...myBatisContext.topFiles,
+    ].filter(Boolean)).slice(0, maxFiles);
+    const testSeeds = [
+      task,
+      domain ?? '',
+      ...relevantSymbols.slice(0, 8).flatMap(symbol => [symbol.symbol, symbol.name]),
+      ...topFiles.slice(0, 5).map(file => path.basename(file, path.extname(file))),
+    ].filter(seed => seed.length > 0);
+    const testsLikelyRelevant = includeTests
+      ? this.findRelevantTestsForSeeds(snapshotId, testSeeds, Math.max(10, maxFiles * 2))
+      : [];
+    const validation = this.validationHints(snapshotId, testsLikelyRelevant, topFiles);
+    const inferredDomain = domain ?? inferDomain(task, topFiles);
+
+    const result = {
+      task,
+      domain: inferredDomain,
+      query,
+      router: {
+        strategy: isMyBatisIntent(query)
+          ? 'mybatis-aware file/symbol/config retrieval over the persistent index'
+          : 'hybrid file/symbol/endpoint retrieval over the persistent index',
+        constraints: [
+          'No full-file content is returned by default.',
+          'Generated, fixture, and test files are excluded from implementation candidates by default.',
+          'Use get_file_slice for the exact edit range before changing a file.',
+        ],
+      },
+      myBatis: isMyBatisIntent(query) ? {
+        mapperFiles: myBatisContext.topFiles.filter(file => file.endsWith('.xml')).slice(0, maxFiles),
+        relatedJavaFiles: myBatisContext.topFiles.filter(file => file.endsWith('.java')).slice(0, maxFiles),
+      } : undefined,
+      candidateFiles,
+      relevantSymbols,
+      endpointCandidates,
+      testsLikelyRelevant,
+      validation,
+      topFiles,
+      omissions: {
+        fileCandidates: Math.max(0, Number(files.totalFound ?? candidateFiles.length) - candidateFiles.length),
+        symbolCandidates: Math.max(0, Number(symbols.totalFound ?? relevantSymbols.length) - relevantSymbols.length),
+        endpointCandidates: Math.max(0, Number(endpointSearch.totalCount ?? endpointCandidates.length) - endpointSearch.endpoints.length),
+      },
+      nextAction: nextContextAction(candidateFiles, relevantSymbols),
+      confidence: packetConfidence(candidateFiles, relevantSymbols, testsLikelyRelevant),
+      confidenceNotes: [
+        'Candidate ranking combines path, symbol, endpoint, file-role, and graph evidence available in the local index.',
+        'Confidence is lower for broad natural-language tasks without exact symbol, path, endpoint, or test matches.',
+      ],
+    };
+
+    return {
+      ...result,
+      budget: {
+        tokenBudget,
+        maxFiles,
+        maxSymbols,
+        includeSnippets,
+        snippetLines,
+        snippetTokenBudget,
+        estimatedResponseTokens: estimateTokens(JSON.stringify(result)),
+      },
+    };
+  }
+
+  private myBatisContext(
+    snapshotId: string,
+    query: string,
+    maxFiles: number,
+    maxSymbols: number,
+  ): {
+    candidateFiles: Array<ReturnType<typeof compactFileCandidate>>;
+    relevantSymbols: Array<ReturnType<typeof compactSymbolCandidate>>;
+    topFiles: string[];
+  } {
+    const xmlFiles = this.searchFiles(snapshotId, {
+      query,
+      limit: Math.max(maxFiles, 8),
+      fileRole: 'resource_config',
+      language: 'xml',
+      explainRank: true,
+      includeSnippets: false,
+    }) as { files: Array<Record<string, unknown>> };
+
+    const roles = [
+      'mybatis:select',
+      'mybatis:insert',
+      'mybatis:update',
+      'mybatis:delete',
+      'mybatis:mapper-xml',
+      'mybatis:resultMap',
+      'mybatis:sql',
+    ];
+    const myBatisSymbols: Array<Record<string, unknown>> = [];
+    for (const role of roles) {
+      const result = this.searchSymbol(snapshotId, {
+        query,
+        frameworkRole: role,
+        limit: Math.max(maxSymbols, 8),
+        includeTests: false,
+        includeGenerated: false,
+        includeFixtures: false,
+        explainRank: true,
+        includeSnippets: false,
+      }) as { symbols: Array<Record<string, unknown>> };
+      myBatisSymbols.push(...result.symbols);
+    }
+
+    const seedFiles = [
+      ...xmlFiles.files.map(file => String(file.path ?? '')),
+      ...myBatisSymbols.map(symbol => String(symbol.file ?? '')),
+    ].filter(Boolean);
+    const primaryXmlFiles = xmlFiles.files
+      .slice(0, 1)
+      .map(file => String(file.path ?? ''))
+      .filter(Boolean);
+    const primaryRelatedFiles = this.relatedMyBatisFiles(snapshotId, primaryXmlFiles, Math.max(maxFiles * 2, 8));
+    const relatedFiles = this.relatedMyBatisFiles(snapshotId, seedFiles, Math.max(maxFiles * 3, 12));
+    const primaryRelatedCandidates = this.fileCandidatesForPaths(snapshotId, primaryRelatedFiles, query);
+    const relatedCandidates = this.fileCandidatesForPaths(snapshotId, relatedFiles, query);
+    const xmlCandidates = xmlFiles.files.map(row => compactFileCandidate(row));
+
+    const candidateFiles = uniqueFileCandidates([
+      ...xmlCandidates.slice(0, 1),
+      ...primaryRelatedCandidates,
+      ...xmlCandidates.slice(1, 2),
+      ...relatedCandidates,
+      ...xmlCandidates.slice(2),
+    ]).slice(0, Math.max(maxFiles, 8));
+    const relevantSymbols = uniqueSymbolCandidates(
+      myBatisSymbols.map(row => compactSymbolCandidate(row, 'ranked MyBatis mapper XML evidence match')),
+    ).slice(0, Math.max(maxSymbols, 8));
+
+    return {
+      candidateFiles,
+      relevantSymbols,
+      topFiles: rankFiles([
+        ...candidateFiles.map(file => file.file),
+        ...relevantSymbols.map(symbol => symbol.file),
+        ...relatedFiles,
+      ]).slice(0, Math.max(maxFiles * 2, 12)),
+    };
+  }
+
+  private relatedMyBatisFiles(snapshotId: string, files: string[], limit: number): string[] {
+    const unique = [...new Set(files.filter(Boolean))].slice(0, 50);
+    if (unique.length === 0) return [];
+    const placeholders = unique.map(() => '?').join(', ');
+    const namespaceEdges = this.db.prepare(`
+      SELECT from_file, to_file, resolution_kind
+      FROM dependency_edges
+      WHERE snapshot_id = ?
+        AND (from_file IN (${placeholders}) OR to_file IN (${placeholders}))
+        AND resolution_kind = 'mybatis-namespace'
+      LIMIT ?
+    `).all(snapshotId, ...unique, ...unique, limit * 2) as Array<{
+      from_file: string;
+      to_file: string;
+      resolution_kind: string;
+    }>;
+    const neighbors = rankFiles([
+      ...namespaceEdges.flatMap(edge => [edge.from_file, edge.to_file]),
+    ]).filter(file => !unique.includes(file));
+
+    const javaMapperFiles = neighbors.filter(file => file.endsWith('.java')).slice(0, limit);
+    const targetFiles = [...new Set([...unique, ...javaMapperFiles])].slice(0, limit * 2);
+    if (targetFiles.length === 0) return neighbors.slice(0, limit);
+    const javaPlaceholders = targetFiles.map(() => '?').join(', ');
+    const dependents = this.db.prepare(`
+      SELECT from_file, to_file, resolution_kind
+      FROM dependency_edges
+      WHERE snapshot_id = ?
+        AND to_file IN (${javaPlaceholders})
+      LIMIT ?
+    `).all(snapshotId, ...targetFiles, limit * 6) as Array<{
+      from_file: string;
+      to_file: string;
+      resolution_kind: string;
+    }>;
+
+    return rankFiles([
+      ...neighbors,
+      ...dependents
+        .map(edge => edge.from_file)
+        .filter(file => file && !unique.includes(file)),
+    ]).slice(0, limit);
+  }
+
+  private fileCandidatesForPaths(
+    snapshotId: string,
+    files: string[],
+    query: string,
+  ): Array<ReturnType<typeof compactFileCandidate>> {
+    const unique = [...new Set(files.filter(Boolean))].slice(0, 100);
+    if (unique.length === 0) return [];
+    const placeholders = unique.map(() => '?').join(', ');
+    const rows = this.db.prepare(`
+      SELECT path, language, file_role, parse_status, size
+      FROM files
+      WHERE snapshot_id = ? AND path IN (${placeholders})
+    `).all(snapshotId, ...unique) as FileRow[];
+    const evidence = this.fileEvidence(snapshotId, rows.map(row => row.path));
+    const tokens = tokenizeSearchQuery(query);
+    return rows
+      .map((row) => {
+        const score = scoreFileSearch(row, evidence.get(row.path), query, tokens);
+        return {
+          candidate: compactFileCandidate(fileDto(row, evidence.get(row.path), score, false)),
+          score: score.score,
+        };
+      })
+      .sort((a, b) => b.score - a.score)
+      .map(item => item.candidate);
+  }
+
   private searchCode(snapshotId: string, args: Record<string, unknown>) {
     const query = String(args.query ?? '').trim();
     const limit = Math.min(Number(args.limit ?? 10), 50);
@@ -1189,7 +1580,7 @@ export class V2QueryService {
     if (unique.length === 0) return [];
     const placeholders = unique.map(() => '?').join(', ');
     const rows = this.db.prepare(`
-      SELECT fq_name, simple_name, kind, file, line, signature, visibility, parent,
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
              package_name, return_type, parameter_types_json, annotations_json,
              framework_role, framework_meta_json, file_role
       FROM symbols
@@ -1215,7 +1606,7 @@ export class V2QueryService {
     const placeholders = unique.map(() => '?').join(', ');
 
     const symbols = this.db.prepare(`
-      SELECT fq_name, simple_name, kind, file, line, signature, visibility, parent,
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
              package_name, return_type, parameter_types_json, annotations_json,
              framework_role, framework_meta_json, file_role
       FROM symbols
@@ -1334,6 +1725,102 @@ export class V2QueryService {
       }));
   }
 
+  private findRelevantTestsForSeeds(snapshotId: string, seeds: string[], limit: number): Array<Record<string, unknown>> {
+    const merged = new Map<string, { file: string; score: number; reasons: Set<string> }>();
+    for (const seed of [...new Set(seeds.map(item => item.trim()).filter(Boolean))].slice(0, 16)) {
+      for (const test of this.findRelevantTests(snapshotId, seed, limit)) {
+        const file = String(test.file ?? '');
+        if (!file) continue;
+        const existing = merged.get(file) ?? { file, score: 0, reasons: new Set<string>() };
+        existing.score += Number(test.score ?? 0);
+        for (const reason of (test.reasons as string[] | undefined) ?? []) existing.reasons.add(reason);
+        merged.set(file, existing);
+      }
+    }
+    return [...merged.values()]
+      .sort((a, b) => b.score - a.score || a.file.localeCompare(b.file))
+      .slice(0, limit)
+      .map(test => ({
+        file: test.file,
+        score: test.score,
+        reasons: [...test.reasons].slice(0, 8),
+      }));
+  }
+
+  private validationHints(
+    snapshotId: string,
+    tests: Array<Record<string, unknown>>,
+    topFiles: string[],
+  ): Record<string, unknown> {
+    const root = this.workspaceRootForSnapshot(snapshotId);
+    const testFiles = tests.map(test => String(test.file ?? '')).filter(Boolean).slice(0, 8);
+    const commands: string[] = [];
+    if (root) {
+      const packageInfo = readPackageInfo(root);
+      if (packageInfo) {
+        const runner = packageManagerCommand(root);
+        const scripts = packageInfo.scripts ?? {};
+        if (testFiles.length > 0 && scripts.test) {
+          commands.push(`${runner} test -- ${testFiles.map(quoteShellArg).join(' ')}`);
+        } else if (scripts.test) {
+          commands.push(`${runner} test`);
+        }
+        if (scripts.typecheck) commands.push(`${runner} run typecheck`);
+        else if (scripts.lint) commands.push(`${runner} run lint`);
+      }
+    }
+    return {
+      targetedTestFiles: testFiles,
+      changedFileHints: topFiles,
+      suggestedCommands: [...new Set(commands)].slice(0, 4),
+      notes: commands.length > 0
+        ? ['Run targeted tests before broad validation; inspect clipped failure output only.']
+        : ['No package-level validation command was inferred from the indexed workspace.'],
+    };
+  }
+
+  private lookupBestSymbol(snapshotId: string, symbol: string, file?: string): SymbolRow | undefined {
+    const query = symbol.trim();
+    if (!query) return undefined;
+    const pattern = `%${escapeLike(query)}%`;
+    const fileClause = file ? 'AND file = ?' : '';
+    const params: unknown[] = [snapshotId];
+    if (file) params.push(file);
+    params.push(query, query, pattern, pattern);
+    return this.db.prepare(`
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+             package_name, return_type, parameter_types_json, annotations_json,
+             framework_role, framework_meta_json, file_role
+      FROM symbols
+      WHERE snapshot_id = ?
+        ${fileClause}
+        AND (
+          fq_name = ?
+          OR simple_name = ?
+          OR fq_name LIKE ? ESCAPE '\\'
+          OR simple_name LIKE ? ESCAPE '\\'
+        )
+      ORDER BY
+        CASE
+          WHEN fq_name = ? THEN 0
+          WHEN simple_name = ? THEN 1
+          WHEN fq_name LIKE ? ESCAPE '\\' THEN 2
+          ELSE 3
+        END,
+        CASE file_role
+          WHEN 'main_source' THEN 0
+          WHEN 'resource_config' THEN 1
+          WHEN 'build_config' THEN 2
+          WHEN 'test_source' THEN 3
+          WHEN 'mock_source' THEN 4
+          WHEN 'generated' THEN 5
+          ELSE 6
+        END,
+        line
+      LIMIT 1
+    `).get(...params, query, query, pattern) as SymbolRow | undefined;
+  }
+
   private computeDirtyFiles(snapshotId: string): Record<string, unknown> {
     const snapshot = this.db.prepare(`
       SELECT w.root AS root
@@ -1424,6 +1911,7 @@ interface SymbolRow {
   kind: string;
   file: string;
   line: number;
+  end_line?: number;
   signature: string;
   visibility: string;
   parent?: string;
@@ -1517,6 +2005,8 @@ function symbolDto(row: SymbolRow, snippets?: SnippetOptions): Record<string, un
     kind: row.kind,
     file: row.file,
     line: row.line,
+    endLine: row.end_line,
+    lines: lineRangeString(row.line, row.end_line ?? row.line),
     signature: row.signature,
     visibility: row.visibility,
     parent: row.parent,
@@ -1563,7 +2053,16 @@ function fileDto(
   snippets?: SnippetOptions,
 ): Record<string, unknown> {
   const topSymbols = (evidence?.symbols ?? [])
-    .filter(symbol => symbol.kind === 'class' || symbol.kind === 'interface' || symbol.kind === 'method' || symbol.kind === 'function')
+    .filter((symbol) => {
+      const kind = String(symbol.kind ?? '');
+      return kind === 'class'
+        || kind === 'interface'
+        || kind === 'method'
+        || kind === 'function'
+        || kind === 'type'
+        || (row.file_role === 'resource_config' && kind === 'field');
+    })
+    .sort((a, b) => symbolDisplayPriority(b) - symbolDisplayPriority(a) || Number(a.line ?? 0) - Number(b.line ?? 0))
     .slice(0, 12);
   return {
     path: row.path,
@@ -1662,6 +2161,252 @@ function safeResolve(root: string, file: string): string | undefined {
   const relative = path.relative(normalizedRoot, absolutePath);
   if (relative.startsWith('..') || path.isAbsolute(relative)) return undefined;
   return absolutePath;
+}
+
+function parseLineRange(value: string): { start: number; end: number } | undefined {
+  const match = value.trim().match(/^(\d+)(?:\s*[-:]\s*(\d+))?$/);
+  if (!match) return undefined;
+  const start = Number(match[1]);
+  const end = Number(match[2] ?? match[1]);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < 1) return undefined;
+  return { start: Math.min(start, end), end: Math.max(start, end) };
+}
+
+function lineRangeString(start: number, end: number): string {
+  return start === end ? String(start) : `${start}-${end}`;
+}
+
+function compactFileCandidate(row: Record<string, unknown>): {
+  file: string;
+  language?: string;
+  fileRole?: string;
+  lines?: string;
+  whyRelevant: string;
+  confidence: number;
+  matchedTokens: string[];
+  snippet?: unknown;
+  topSymbols: Array<Record<string, unknown>>;
+  endpoints: Array<Record<string, unknown>>;
+} {
+  const snippet = row.snippet as Record<string, unknown> | undefined;
+  return {
+    file: String(row.path ?? ''),
+    language: stringOrUndefined(row.language),
+    fileRole: stringOrUndefined(row.fileRole),
+    lines: snippet ? lineRangeString(Number(snippet.startLine), Number(snippet.endLine)) : undefined,
+    whyRelevant: truncateString(String(row.matchReason ?? 'ranked file/path/symbol evidence match'), 240),
+    confidence: confidenceFromScore(row.searchScore),
+    matchedTokens: stringArray(row.matchedTokens),
+    snippet,
+    topSymbols: compactSymbolList(row.topSymbols).slice(0, 6),
+    endpoints: compactEndpointCandidates(Array.isArray(row.endpoints) ? row.endpoints as Array<Record<string, unknown>> : []).slice(0, 4),
+  };
+}
+
+function compactSymbolCandidate(row: Record<string, unknown>, why?: string): {
+  symbol: string;
+  name: string;
+  kind?: string;
+  file: string;
+  lines?: string;
+  signature?: string;
+  frameworkRole?: string;
+  whyRelevant: string;
+  confidence: number;
+  matchedTokens: string[];
+} {
+  return {
+    symbol: String(row.fqName ?? row.name ?? ''),
+    name: String(row.name ?? row.fqName ?? ''),
+    kind: stringOrUndefined(row.kind),
+    file: String(row.file ?? ''),
+    lines: String(row.lines ?? row.line ?? ''),
+    signature: truncateOptional(row.signature, 240),
+    frameworkRole: stringOrUndefined(row.frameworkRole),
+    whyRelevant: truncateString(why ?? String(row.matchReason ?? 'ranked symbol/name evidence match'), 240),
+    confidence: confidenceFromScore(row.searchScore),
+    matchedTokens: stringArray(row.matchedTokens),
+  };
+}
+
+function compactSymbolList(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value.map(item => compactSymbolCandidate(item as Record<string, unknown>));
+}
+
+function uniqueFileCandidates<T extends { file: string }>(candidates: T[]): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const candidate of candidates) {
+    if (!candidate.file || seen.has(candidate.file)) continue;
+    seen.add(candidate.file);
+    result.push(candidate);
+  }
+  return result;
+}
+
+function uniqueSymbolCandidates<T extends { symbol: string; file: string }>(candidates: T[]): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const candidate of candidates) {
+    const key = `${candidate.symbol}\0${candidate.file}`;
+    if (!candidate.symbol || seen.has(key)) continue;
+    seen.add(key);
+    result.push(candidate);
+  }
+  return result;
+}
+
+function compactEndpointCandidates(rows: Array<Record<string, unknown>>): Array<{
+  method: string;
+  path: string;
+  handlerSymbol: string;
+  file: string;
+  line: number;
+  lines: string;
+  framework?: string;
+  confidence: number;
+  whyRelevant: string;
+}> {
+  const seen = new Set<string>();
+  const result: Array<{
+    method: string;
+    path: string;
+    handlerSymbol: string;
+    file: string;
+    line: number;
+    lines: string;
+    framework?: string;
+    confidence: number;
+    whyRelevant: string;
+  }> = [];
+  for (const row of rows) {
+    const key = `${row.method}:${row.path}:${row.file}:${row.line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const line = Number(row.line ?? 0);
+    result.push({
+      method: String(row.method ?? 'ALL'),
+      path: String(row.path ?? ''),
+      handlerSymbol: String(row.handlerSymbol ?? row.handler_symbol ?? ''),
+      file: String(row.file ?? ''),
+      line,
+      lines: line > 0 ? String(line) : '',
+      framework: stringOrUndefined(row.framework),
+      confidence: typeof row.confidence === 'number' ? row.confidence : 0.65,
+      whyRelevant: truncateString(
+        Array.isArray(row.rankExplanation)
+          ? (row.rankExplanation as string[]).join('; ')
+          : 'indexed endpoint associated with candidate files',
+        240,
+      ),
+    });
+  }
+  return result;
+}
+
+function endpointNeedleForTask(task: string, domain?: string): string {
+  const explicitPath = task.match(/\/[A-Za-z0-9_{}:$.-][A-Za-z0-9_{}:$/.-]*/);
+  if (explicitPath) return explicitPath[0];
+  if (domain?.includes('/')) return domain;
+  return '';
+}
+
+function inferDomain(task: string, files: string[]): string {
+  if (files.length > 0) {
+    const first = files[0].split(/[\\/]/).filter(Boolean);
+    const srcIndex = first.findIndex(part => part === 'src');
+    if (srcIndex > 0) return first[srcIndex - 1];
+    if (first.length >= 2) return first.slice(0, 2).join('/');
+    if (first.length === 1) return first[0];
+  }
+  const tokens = tokenizeSearchQuery(task);
+  return tokens[0] ?? 'unknown';
+}
+
+function nextContextAction(
+  files: Array<{ file: string; lines?: string }>,
+  symbols: Array<{ symbol: string; file: string; lines?: string }>,
+): string {
+  const firstFile = files.find(file => file.file);
+  if (firstFile?.lines) {
+    return `Call get_file_slice with file="${firstFile.file}" lines="${firstFile.lines}" for exact edit context, then run the suggested targeted validation.`;
+  }
+  const firstSymbol = symbols.find(symbol => symbol.symbol);
+  if (firstSymbol) {
+    return `Call get_file_slice with symbol="${firstSymbol.symbol}" for exact edit context, then inspect related tests before editing.`;
+  }
+  return 'Broaden the task/domain query or call search_code with explainRank=true; current packet has no confident candidates.';
+}
+
+function packetConfidence(
+  files: Array<{ confidence: number }>,
+  symbols: Array<{ confidence: number }>,
+  tests: Array<Record<string, unknown>>,
+): number {
+  const scores = [
+    ...files.slice(0, 3).map(file => file.confidence),
+    ...symbols.slice(0, 3).map(symbol => symbol.confidence),
+  ].filter(score => Number.isFinite(score));
+  if (scores.length === 0) return 0.3;
+  const avg = scores.reduce((sum, score) => sum + score, 0) / scores.length;
+  const testBoost = tests.length > 0 ? 0.05 : 0;
+  return Math.min(0.95, Math.round((avg + testBoost) * 100) / 100);
+}
+
+function confidenceFromScore(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0.65;
+  if (value >= 100) return 0.9;
+  if (value >= 80) return 0.8;
+  if (value >= 60) return 0.7;
+  if (value >= 40) return 0.6;
+  return 0.45;
+}
+
+function estimateTokens(value: string): number {
+  return Math.ceil(value.length / 4);
+}
+
+function stringOrUndefined(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  return String(value);
+}
+
+function truncateOptional(value: unknown, maxChars: number): string | undefined {
+  const text = stringOrUndefined(value);
+  return text ? truncateString(text, maxChars) : undefined;
+}
+
+function truncateString(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, Math.max(0, maxChars - 13))}...<truncated>`;
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(item => String(item));
+}
+
+function readPackageInfo(root: string): { scripts?: Record<string, string> } | undefined {
+  const packagePath = path.join(root, 'package.json');
+  if (!fs.existsSync(packagePath)) return undefined;
+  try {
+    return JSON.parse(fs.readFileSync(packagePath, 'utf-8')) as { scripts?: Record<string, string> };
+  } catch {
+    return undefined;
+  }
+}
+
+function packageManagerCommand(root: string): string {
+  if (fs.existsSync(path.join(root, 'pnpm-lock.yaml'))) return 'pnpm';
+  if (fs.existsSync(path.join(root, 'yarn.lock'))) return 'yarn';
+  if (fs.existsSync(path.join(root, 'bun.lockb'))) return 'bun';
+  return 'npm';
+}
+
+function quoteShellArg(value: string): string {
+  if (/^[A-Za-z0-9_./:-]+$/.test(value)) return value;
+  return `"${value.replace(/"/g, '\\"')}"`;
 }
 
 function rankDebug(tool: string, notes: string[]): Record<string, unknown> {
@@ -1932,14 +2677,18 @@ function referenceFiltersFor(args: Record<string, unknown>, query: string): {
 function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined, query: string, tokens: string[]): FileSearchScore {
   const pathLower = row.path.toLowerCase();
   const basename = pathLower.substring(pathLower.lastIndexOf('/') + 1);
+  const basenameWithoutExt = basename.replace(/\.[^.]+$/, '');
   const queryLower = query.toLowerCase();
+  const queryIdentifiers = identifierSearchTerms(queryLower);
   const symbols = evidence?.symbols ?? [];
   const endpoints = evidence?.endpoints ?? [];
   const symbolText = symbols.map(symbol => [
     symbol.name,
     symbol.fqName,
     symbol.kind,
+    symbol.signature,
     symbol.frameworkRole,
+    JSON.stringify(symbol.frameworkMeta ?? {}),
     (symbol.annotations as string[] | undefined)?.join(' '),
   ].filter(Boolean).join(' ')).join(' ').toLowerCase();
   const endpointText = endpoints.map(endpoint => [
@@ -1974,6 +2723,24 @@ function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined, query
     score += 18 * pathMatches.length;
     factors.push(`${pathMatches.length} query tokens matched file path`);
   }
+  const exactBasenameMatches = tokens.filter(token => token === basenameWithoutExt);
+  if (exactBasenameMatches.length > 0) {
+    score += 90;
+    reason = 'query token exactly matched file basename';
+    factors.push('query token exactly matched file basename');
+  }
+  const basenameParts = basenameWithoutExt.split(/[._-]+/g).filter(Boolean);
+  const basenamePartMatches = tokens.filter(token => basenameParts.includes(token));
+  if (basenamePartMatches.length > 0) {
+    score += 45 * basenamePartMatches.length;
+    factors.push(`${basenamePartMatches.length} query tokens matched file basename parts`);
+  }
+  const identifierPathMatches = queryIdentifiers.filter(identifier => pathLower.includes(identifier));
+  if (identifierPathMatches.length > 0) {
+    score += 70 * identifierPathMatches.length;
+    reason = 'query identifier matched file path segment';
+    factors.push(`${identifierPathMatches.length} dotted/dashed query identifiers matched file path`);
+  }
 
   const symbolMatches = tokens.filter(token => symbolText.includes(token));
   if (symbolMatches.length > 0) {
@@ -2007,6 +2774,18 @@ function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined, query
   if (/\bentity|model\b/i.test(query) && symbols.some(isEntityLike)) {
     score += 32;
     factors.push('entity/model intent matched entity-like symbol');
+  }
+  if (isMyBatisIntent(query) && symbols.some(isMyBatisLike)) {
+    score += 60;
+    factors.push('MyBatis mapper/query intent matched MyBatis XML symbols');
+  }
+  if (isApiSpecQuery(query) && symbols.some(isApiSpecLike)) {
+    score += 55;
+    factors.push('API spec intent matched indexed API specification symbols');
+  }
+  if (/\b(docker|compose|container|port|service)\b/i.test(query) && symbols.some(isDockerConfigLike)) {
+    score += 45;
+    factors.push('Docker/config intent matched docker-compose YAML symbols');
   }
   if (evidence) {
     const graphSignal = Math.min(evidence.dependencyCounts.incoming + evidence.dependencyCounts.outgoing, 10);
@@ -2179,6 +2958,12 @@ function tokenizeSearchQuery(query: string): string[] {
   return [...new Set(tokens)];
 }
 
+function identifierSearchTerms(query: string): string[] {
+  return [...new Set((query.match(/[a-z0-9]+(?:[._-][a-z0-9]+)+/g) ?? [])
+    .map(term => term.trim().toLowerCase())
+    .filter(term => term.length >= 4))];
+}
+
 function compactSearchText(value: string): string {
   return value
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
@@ -2263,6 +3048,42 @@ function isRepositoryLike(symbol: Record<string, unknown>): boolean {
   return role.includes('repository') || name.endsWith('Repository') || name.endsWith('Dao');
 }
 
+function isMyBatisIntent(query: string): boolean {
+  return /\b(mybatis|mapper|sql|result\s*map|resultmap|mapper\s+xml|xml\s+mapper)\b/i.test(query);
+}
+
+function isMyBatisLike(symbol: Record<string, unknown>): boolean {
+  return String(symbol.frameworkRole ?? '').startsWith('mybatis:');
+}
+
+function isApiSpecLike(symbol: Record<string, unknown>): boolean {
+  const role = String(symbol.frameworkRole ?? '');
+  return role === 'openapi:endpoint' || role === 'postman:request' || role.startsWith('elastic-rest:');
+}
+
+function isApiSpecQuery(query: string): boolean {
+  return /\b(openapi|swagger|postman|api\s+doc|api\s+spec|rest\s+api|yaml\s+rest|endpoint)\b/i.test(query);
+}
+
+function isDockerConfigLike(symbol: Record<string, unknown>): boolean {
+  return String(symbol.frameworkRole ?? '').startsWith('docker:');
+}
+
+function symbolDisplayPriority(symbol: Record<string, unknown>): number {
+  const role = String(symbol.frameworkRole ?? '');
+  const kind = String(symbol.kind ?? '');
+  if (role === 'mybatis:mapper-xml') return 110;
+  if (/^mybatis:(select|insert|update|delete)$/.test(role)) return 105;
+  if (role === 'openapi:endpoint' || role === 'postman:request' || role === 'elastic-rest:endpoint') return 104;
+  if (/^elastic-rest:(param|header|yaml-test|yaml-do|yaml-param)$/.test(role)) return 96;
+  if (role.startsWith('docker:') || role.startsWith('spring:')) return 90;
+  if (role === 'mybatis:resultMap' || role === 'mybatis:sql') return 80;
+  if (kind === 'class' || kind === 'interface') return 70;
+  if (kind === 'method' || kind === 'function') return 65;
+  if (kind === 'type') return 55;
+  return 30;
+}
+
 function isEntityLike(symbol: Record<string, unknown>): boolean {
   const role = String(symbol.frameworkRole ?? '');
   const name = String(symbol.name ?? '');
@@ -2285,4 +3106,15 @@ function rankFiles(files: string[]): string[] {
     counts.set(file, (counts.get(file) ?? 0) + 1);
   }
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([file]) => file);
+}
+
+function uniqueFilesInOrder(files: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const file of files) {
+    if (!file || seen.has(file)) continue;
+    seen.add(file);
+    result.push(file);
+  }
+  return result;
 }
