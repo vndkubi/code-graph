@@ -28,6 +28,7 @@ export interface ManifestPreviousFile {
   blobHash: string;
   mtimeMs: number;
   size: number;
+  parseStatus?: string;
 }
 
 export interface ManifestScanOptions {

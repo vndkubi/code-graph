@@ -516,9 +516,33 @@ Each editor window normally starts its own stdio proxy, so you usually do not ru
 - SQLite is the source of truth; the daemon does not load the full graph object model into memory.
 - Cold indexing scans the manifest, classifies `file_role`, hashes files, parses cache misses, and materializes symbols/imports/calls/endpoints into SQLite.
 - Warm indexing reuses previous `blob_hash` values when `mtime_ms` and `size` match, reuses `parse_cache` entries keyed by `blob_hash`, and skips rebuilding a new snapshot when the manifest, HEAD, and dirty state are unchanged.
+- Cold or cache-miss parsing can fan out across worker threads after build; small updates use an in-place incremental path that reparses changed files, removes deleted file rows, and rebuilds dependency/call graph rows for affected files instead of copying and resolving the whole snapshot.
 - Multiple windows/repositories share the same daemon and global cache, but each `--root` has its own workspace snapshot.
 - Search is fastest and most accurate when agents use graph tools first, especially `get_research_pack`, then fall back to broad text search only for unresolved names.
 - On very large repositories, Docker Desktop bind mounts from Windows paths are usually slower than local NTFS or WSL/ext4. Prewarm large repos from the same environment where the MCP server will run, and prefer persistent `CODEGRAPH_HOME`/Docker volumes so warm runs can reuse hashes and snapshots.
+
+Index optimization benchmark, run on 2026-05-24 against a synthetic Java repo with 5,000 source files plus 11 build/config files. "Before" is commit `8b8e29e`; "after" is the worker-parse and changed-file incremental index path.
+
+| Case | Before wall | After wall | Wall change | Before index | After index | Index change | After mode |
+|------|------------:|-----------:|------------:|-------------:|------------:|-------------:|------------|
+| Cold index | 17,913ms | 10,164ms | 43.3% faster | 14,709ms | 9,276ms | 36.9% faster | 4 parse workers |
+| Warm unchanged | 1,313ms | 1,354ms | 3.1% slower | 558ms | 588ms | 5.4% slower | skipped unchanged |
+| Modify 1 file | 2,437ms | 1,542ms | 36.7% faster | 1,697ms | 706ms | 58.4% faster | incremental |
+| Delete 1 file | 2,566ms | 1,802ms | 29.8% faster | 1,783ms | 713ms | 60.0% faster | incremental |
+
+Real-project index benchmark, run on 2026-05-24 against local checkouts under `D:\Personal\Projects`. "Before" is commit `8b8e29e`; "after" is the worker-parse and changed-file incremental index path. The modify case appends and then restores one tracked source file byte-for-byte.
+
+| Repo | Case | Before wall | After wall | Wall change | Before index | After index | Index change | After mode |
+|------|------|------------:|-----------:|------------:|-------------:|------------:|-------------:|------------|
+| `doughnut` | Cold index | 20.6s | 12.8s | 37.8% faster | 17.9s | 12.0s | 33.0% faster | 4 parse workers |
+| `doughnut` | Warm unchanged | 1.1s | 1.1s | 0.3% faster | 0.3s | 0.3s | 7.7% slower | skipped unchanged |
+| `doughnut` | Modify 1 file | 3.0s | 1.4s | 53.6% faster | 2.2s | 0.5s | 77.8% faster | incremental |
+| `hadoop` | Cold index | 485.6s | 342.6s | 29.4% faster | 393.8s | 341.1s | 13.4% faster | 4 parse workers |
+| `hadoop` | Warm unchanged | 2.4s | 2.4s | 1.5% slower | 1.6s | 1.6s | 3.9% slower | skipped unchanged |
+| `hadoop` | Modify 1 file | 58.7s | 10.8s | 81.6% faster | 57.8s | 9.9s | 83.0% faster | incremental |
+| `elasticsearch` | Cold index | 1,314.6s | 663.1s | 49.6% faster | 1,024.0s | 660.9s | 35.5% faster | 4 parse workers |
+| `elasticsearch` | Warm unchanged | 19.8s | 9.6s | 51.7% faster | 17.7s | 7.5s | 57.9% faster | skipped unchanged |
+| `elasticsearch` | Modify 1 file | 404.0s | 22.2s | 94.5% faster | 403.3s | 20.8s | 94.8% faster | incremental |
 
 ---
 
@@ -692,6 +716,9 @@ Options:
   --tasks auto                         Derive context-proof tasks from indexed-looking source files
   --task-count <number>                Number of auto-derived context-proof tasks
   --no-index                           Reuse the current context-proof snapshot instead of refreshing first
+  --parse-workers <number>             Worker threads for cold/cache-miss parsing during index
+  --no-incremental                     Force changed-file index runs through full snapshot rebuild
+  --incremental-file-limit <number>    Max changed/deleted files for incremental index path
   --workspace-key <key>                Stable workspace identity key for Docker/WSL path remapping
   --auto-refresh                       Refresh stale snapshots automatically before MCP tool calls
 ```

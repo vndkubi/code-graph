@@ -942,6 +942,67 @@ public class FeatureBranchMarker {
     expect(second.skippedUnchanged).toBe(true);
   });
 
+  it('updates small changed-file indexes in place', () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-incremental-');
+    writeFile(repo, 'src/main/java/com/example/Feature.java', `package com.example;
+
+public class OriginalFeature {
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/Keep.java', `package com.example;
+
+public class Keep {
+}
+`);
+
+    const { db } = openDb(home);
+    const indexer = new V2Indexer(db);
+    const first = indexer.indexWorkspace({ root: repo });
+
+    writeFile(repo, 'src/main/java/com/example/Feature.java', `package com.example;
+
+public class ChangedFeature {
+}
+`);
+    const second = indexer.indexWorkspace({ root: repo });
+
+    expect(second.snapshotId).toBe(first.snapshotId);
+    expect(second.incrementalUpdated).toBe(true);
+    expect(second.filesChanged).toBe(1);
+    expect(second.filesDeleted).toBe(0);
+    expect(second.filesParsed).toBe(1);
+    expect(second.hashCacheHits).toBeGreaterThan(0);
+
+    const queries = new V2QueryService(db);
+    const changedSearch = queries.query({
+      workspaceId: second.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'ChangedFeature', limit: 5 },
+    }) as { symbols: Array<{ name: string }> };
+    expect(changedSearch.symbols.some(symbol => symbol.name === 'ChangedFeature')).toBe(true);
+
+    const originalSearch = queries.query({
+      workspaceId: second.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'OriginalFeature', limit: 5 },
+    }) as { symbols: Array<{ name: string }> };
+    expect(originalSearch.symbols.some(symbol => symbol.name === 'OriginalFeature')).toBe(false);
+
+    fs.rmSync(path.join(repo, 'src/main/java/com/example/Keep.java'));
+    const third = indexer.indexWorkspace({ root: repo });
+    expect(third.snapshotId).toBe(first.snapshotId);
+    expect(third.incrementalUpdated).toBe(true);
+    expect(third.filesDeleted).toBe(1);
+
+    const deletedSearch = queries.query({
+      workspaceId: third.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'Keep', limit: 5 },
+    }) as { symbols: Array<{ name: string }> };
+    expect(deletedSearch.symbols.some(symbol => symbol.name === 'Keep')).toBe(false);
+  });
+
   it('discovers synthetic Jakarta endpoints', () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-synthetic-');

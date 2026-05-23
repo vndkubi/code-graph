@@ -132,6 +132,9 @@ async function runIndexCommand(parsed: ParsedArgs): Promise<void> {
   const result = indexer.indexWorkspace({
     root,
     workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
+    parseWorkers: getNumberFlag(parsed, 'parse-workers'),
+    incremental: parsed.flags.get('no-incremental') === true ? false : undefined,
+    incrementalFileLimit: getNumberFlag(parsed, 'incremental-file-limit'),
   });
   console.log(JSON.stringify({ ...result, dbPath: paths.dbPath }, null, 2));
 }
@@ -229,6 +232,9 @@ Options:
   --tasks auto                           Derive context-proof tasks from indexed-looking source files
   --task-count <number>                  Number of auto-derived context-proof tasks
   --no-index                             Reuse the current context-proof snapshot instead of refreshing first
+  --parse-workers <number>               Worker threads for cold/cache-miss parsing during index
+  --no-incremental                       Force changed-file index runs through full snapshot rebuild
+  --incremental-file-limit <number>      Max changed/deleted files for incremental index path
   --workspace-key <key>                  Stable workspace identity key, useful when Docker always mounts roots at /workspace
   --auto-refresh                         Refresh stale snapshots automatically before MCP tool calls
 `);

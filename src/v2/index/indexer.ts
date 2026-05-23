@@ -4,7 +4,7 @@ import type { ParseResult, SymbolInfo } from '../../analyzers/base-analyzer.js';
 import { getGitInfo, type GitInfo } from '../git.js';
 import { sha256Json, stableId } from '../hash.js';
 import { scanManifest, type ManifestFile, type ManifestPreviousFile } from './manifest.js';
-import { parseFile, symbolFqName } from './parse.js';
+import { parseFilesBatch, symbolFqName } from './parse.js';
 import { roleRank } from './file-role.js';
 
 export interface IndexWorkspaceOptions {
@@ -12,6 +12,10 @@ export interface IndexWorkspaceOptions {
   workspaceKey?: string;
   maxFileSizeBytes?: number;
   force?: boolean;
+  parseWorkers?: number;
+  incremental?: boolean;
+  incrementalFileLimit?: number;
+  incrementalFileRatio?: number;
 }
 
 export interface IndexWorkspaceResult {
@@ -23,6 +27,10 @@ export interface IndexWorkspaceResult {
   filesHashed: number;
   hashCacheHits: number;
   skippedUnchanged: boolean;
+  incrementalUpdated: boolean;
+  filesChanged: number;
+  filesDeleted: number;
+  parseWorkers: number;
   manifestScanMs: number;
   indexTimeMs: number;
 }
@@ -42,6 +50,27 @@ interface ParseCacheRow {
 interface SnapshotSummaryRow {
   head_commit?: string | null;
   dirty_hash: string;
+}
+
+interface ManifestChangeSet {
+  changedFiles: ManifestFile[];
+  deletedPaths: string[];
+  unchangedFiles: ManifestFile[];
+}
+
+interface ParsePlan {
+  file: ManifestFile;
+  result?: ParseResult;
+  cacheHit: boolean;
+  cacheInsert: boolean;
+  parseStatus: string;
+}
+
+interface PreparedParseBatch {
+  plans: ParsePlan[];
+  filesParsed: number;
+  parseCacheHits: number;
+  parseWorkers: number;
 }
 
 const HTTP_METHOD_ANNOTATIONS = new Map([
@@ -139,10 +168,33 @@ export class V2Indexer {
         filesHashed: manifest.filesHashed,
         hashCacheHits: manifest.hashCacheHits,
         skippedUnchanged: true,
+        incrementalUpdated: false,
+        filesChanged: 0,
+        filesDeleted: 0,
+        parseWorkers: 0,
         manifestScanMs: manifest.scanTimeMs,
         indexTimeMs: Date.now() - start,
       };
     }
+
+    const changes = diffManifestFiles(manifest.files, previousFiles ?? []);
+    if (latestSnapshotId && shouldUseIncrementalUpdate(changes, manifest.files.length, options)) {
+      const prepared = this.prepareParseBatch(workspace.root, changes.changedFiles, options.parseWorkers);
+      return this.updateSnapshotIncrementally({
+        start,
+        workspaceId: workspace.workspaceId,
+        snapshotId: latestSnapshotId,
+        workspaceRoot: workspace.root,
+        git,
+        manifestFilesTotal: manifest.files.length,
+        manifestScanMs: manifest.scanTimeMs,
+        filesHashed: manifest.filesHashed,
+        hashCacheHits: manifest.hashCacheHits,
+        changes,
+        prepared,
+      });
+    }
+
     const snapshotId = stableId([
       workspace.workspaceId,
       git.headCommit,
@@ -155,6 +207,11 @@ export class V2Indexer {
 
     let filesParsed = 0;
     let parseCacheHits = 0;
+    const previousByPath = new Map((previousFiles ?? []).map(file => [file.path, file]));
+    const prepared = this.prepareParseBatch(workspace.root, changes.changedFiles, options.parseWorkers);
+    const parsePlanByPath = new Map(prepared.plans.map(plan => [plan.file.relPath, plan]));
+    filesParsed = prepared.filesParsed;
+    parseCacheHits = changes.unchangedFiles.length + prepared.parseCacheHits;
 
     const tx = this.db.transaction(() => {
       this.db.prepare(`
@@ -176,43 +233,17 @@ export class V2Indexer {
       );
 
       for (const file of manifest.files) {
-        const copied = latestSnapshotId ? this.copyUnchangedFile(latestSnapshotId, snapshotId, file) : false;
-        if (copied) {
-          parseCacheHits++;
+        const previous = previousByPath.get(file.relPath);
+        if (previous && previous.blobHash === file.blobHash) {
+          this.insertFile(snapshotId, file, previous.parseStatus ?? 'ok');
           continue;
         }
 
-        this.insertFile(snapshotId, file, file.parseable ? 'pending' : 'skipped');
-        if (!file.parseable || !file.language) continue;
-
-        const cached = this.db.prepare('SELECT parse_json FROM parse_cache WHERE blob_hash = ?')
-          .get(file.blobHash) as ParseCacheRow | undefined;
-        const parseResult = cached
-          ? JSON.parse(cached.parse_json) as ParseResult
-          : parseFile(file.absPath, workspace.root);
-
-        if (cached) {
-          parseCacheHits++;
-        } else {
-          filesParsed++;
-          this.db.prepare(`
-            INSERT INTO parse_cache (
-              blob_hash, language, parse_json, has_parse_errors, parse_confidence, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-          `).run(
-            file.blobHash,
-            file.language,
-            JSON.stringify(parseResult),
-            parseResult.hasParseErrors ? 1 : 0,
-            parseResult.parseConfidence,
-            now,
-          );
-        }
-
-        this.materializeParseResult(snapshotId, file, parseResult);
-        this.db.prepare(`
-          UPDATE files SET parse_status = ? WHERE snapshot_id = ? AND path = ?
-        `).run(parseResult.hasParseErrors ? 'error' : 'ok', snapshotId, file.relPath);
+        const plan = parsePlanByPath.get(file.relPath);
+        this.insertFile(snapshotId, file, plan?.parseStatus ?? 'skipped');
+        if (!plan?.result) continue;
+        if (plan.cacheInsert) this.insertParseCache(file, plan.result, now);
+        this.materializeParseResult(snapshotId, file, plan.result);
       }
 
       if (latestSnapshotId) {
@@ -246,6 +277,10 @@ export class V2Indexer {
       filesHashed: manifest.filesHashed,
       hashCacheHits: manifest.hashCacheHits,
       skippedUnchanged: false,
+      incrementalUpdated: false,
+      filesChanged: changes.changedFiles.length,
+      filesDeleted: changes.deletedPaths.length,
+      parseWorkers: prepared.parseWorkers,
       manifestScanMs: manifest.scanTimeMs,
       indexTimeMs: Date.now() - start,
     };
@@ -262,16 +297,230 @@ export class V2Indexer {
 
   private previousFilesForSnapshot(snapshotId: string): ManifestPreviousFile[] {
     const rows = this.db.prepare(`
-      SELECT path, blob_hash, mtime_ms, size
+      SELECT path, blob_hash, mtime_ms, size, parse_status
       FROM files
       WHERE snapshot_id = ?
-    `).all(snapshotId) as Array<{ path: string; blob_hash: string; mtime_ms: number; size: number }>;
+    `).all(snapshotId) as Array<{ path: string; blob_hash: string; mtime_ms: number; size: number; parse_status: string }>;
     return rows.map(row => ({
       path: row.path,
       blobHash: row.blob_hash,
       mtimeMs: row.mtime_ms,
       size: row.size,
+      parseStatus: row.parse_status,
     }));
+  }
+
+  private prepareParseBatch(root: string, files: ManifestFile[], requestedWorkers: number | undefined): PreparedParseBatch {
+    const plans: ParsePlan[] = [];
+    const workItems: Array<{ key: string; absPath: string; rootDir: string }> = [];
+    let parseCacheHits = 0;
+
+    for (const file of files) {
+      if (!file.parseable || !file.language) {
+        plans.push({
+          file,
+          cacheHit: false,
+          cacheInsert: false,
+          parseStatus: 'skipped',
+        });
+        continue;
+      }
+
+      const cached = this.db.prepare('SELECT parse_json FROM parse_cache WHERE blob_hash = ?')
+        .get(file.blobHash) as ParseCacheRow | undefined;
+      if (cached) {
+        const result = JSON.parse(cached.parse_json) as ParseResult;
+        parseCacheHits++;
+        plans.push({
+          file,
+          result,
+          cacheHit: true,
+          cacheInsert: false,
+          parseStatus: result.hasParseErrors ? 'error' : 'ok',
+        });
+        continue;
+      }
+
+      workItems.push({
+        key: file.relPath,
+        absPath: file.absPath,
+        rootDir: root,
+      });
+    }
+
+    const parsed = parseFilesBatch(workItems, { workers: requestedWorkers });
+    const parsedByPath = new Map(parsed.map(item => [item.key, item.result]));
+    for (const file of files) {
+      if (!file.parseable || !file.language) continue;
+      if (plans.some(plan => plan.file.relPath === file.relPath)) continue;
+      const result = parsedByPath.get(file.relPath);
+      if (!result) continue;
+      plans.push({
+        file,
+        result,
+        cacheHit: false,
+        cacheInsert: true,
+        parseStatus: result.hasParseErrors ? 'error' : 'ok',
+      });
+    }
+
+    const order = new Map(files.map((file, index) => [file.relPath, index]));
+    plans.sort((a, b) => (order.get(a.file.relPath) ?? 0) - (order.get(b.file.relPath) ?? 0));
+
+    return {
+      plans,
+      filesParsed: workItems.length,
+      parseCacheHits,
+      parseWorkers: parseFilesBatchWorkerCount(workItems.length, requestedWorkers),
+    };
+  }
+
+  private insertParseCache(file: ManifestFile, parseResult: ParseResult, now: string): void {
+    if (!file.language) return;
+    this.db.prepare(`
+      INSERT OR IGNORE INTO parse_cache (
+        blob_hash, language, parse_json, has_parse_errors, parse_confidence, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      file.blobHash,
+      file.language,
+      JSON.stringify(parseResult),
+      parseResult.hasParseErrors ? 1 : 0,
+      parseResult.parseConfidence,
+      now,
+    );
+  }
+
+  private updateSnapshotIncrementally(args: {
+    start: number;
+    workspaceId: string;
+    snapshotId: string;
+    workspaceRoot: string;
+    git: GitInfo;
+    manifestFilesTotal: number;
+    manifestScanMs: number;
+    filesHashed: number;
+    hashCacheHits: number;
+    changes: ManifestChangeSet;
+    prepared: PreparedParseBatch;
+  }): IndexWorkspaceResult {
+    const now = new Date().toISOString();
+    const changedPaths = new Set(args.changes.changedFiles.map(file => file.relPath));
+    const deletedPaths = new Set(args.changes.deletedPaths);
+    const affectedPaths = new Set([...changedPaths, ...deletedPaths]);
+    const dependencySources = this.affectedDependencySources(args.snapshotId, affectedPaths);
+    for (const file of changedPaths) dependencySources.add(file);
+    const parsePlanByPath = new Map(args.prepared.plans.map(plan => [plan.file.relPath, plan]));
+
+    const tx = this.db.transaction(() => {
+      this.db.prepare(`
+        UPDATE snapshots
+        SET status = 'indexing',
+            branch = ?,
+            head_commit = ?,
+            tree_hash = ?,
+            dirty_hash = ?,
+            manifest_scan_ms = ?,
+            files_total = ?
+        WHERE id = ?
+      `).run(
+        args.git.branch,
+        args.git.headCommit,
+        args.git.treeHash,
+        args.git.dirtyHash,
+        args.manifestScanMs,
+        args.manifestFilesTotal,
+        args.snapshotId,
+      );
+
+      this.deleteIndexedRowsForFiles(args.snapshotId, affectedPaths);
+      this.deleteDependencyEdgesForSources(args.snapshotId, dependencySources);
+
+      for (const file of args.changes.changedFiles) {
+        const plan = parsePlanByPath.get(file.relPath);
+        this.insertFile(args.snapshotId, file, plan?.parseStatus ?? 'skipped');
+        if (!plan?.result) continue;
+        if (plan.cacheInsert) this.insertParseCache(file, plan.result, now);
+        this.materializeParseResult(args.snapshotId, file, plan.result);
+      }
+
+      this.resolveCallEdges(args.snapshotId, changedPaths);
+      this.rebuildDependencyEdges(args.snapshotId, dependencySources);
+
+      this.db.prepare(`
+        UPDATE snapshots
+        SET status = 'ready',
+            index_time_ms = ?,
+            files_parsed = ?,
+            parse_cache_hits = ?
+        WHERE id = ?
+      `).run(Date.now() - args.start, args.prepared.filesParsed, args.prepared.parseCacheHits, args.snapshotId);
+      this.db.prepare(`
+        UPDATE workspaces
+        SET current_snapshot_id = ?, last_indexed_head = ?, last_seen_at = ?
+        WHERE id = ?
+      `).run(args.snapshotId, args.git.headCommit, now, args.workspaceId);
+    });
+
+    tx();
+
+    return {
+      workspaceId: args.workspaceId,
+      snapshotId: args.snapshotId,
+      filesTotal: args.manifestFilesTotal,
+      filesParsed: args.prepared.filesParsed,
+      parseCacheHits: args.prepared.parseCacheHits,
+      filesHashed: args.filesHashed,
+      hashCacheHits: args.hashCacheHits,
+      skippedUnchanged: false,
+      incrementalUpdated: true,
+      filesChanged: args.changes.changedFiles.length,
+      filesDeleted: args.changes.deletedPaths.length,
+      parseWorkers: args.prepared.parseWorkers,
+      manifestScanMs: args.manifestScanMs,
+      indexTimeMs: Date.now() - args.start,
+    };
+  }
+
+  private deleteIndexedRowsForFiles(snapshotId: string, files: Set<string>): void {
+    if (files.size === 0) return;
+    const values = [...files];
+    const placeholders = values.map(() => '?').join(', ');
+    for (const table of ['symbols', 'imports', 'type_refs', 'call_edges', 'annotations', 'endpoints', 'beans', 'inheritance']) {
+      this.db.prepare(`
+        DELETE FROM ${table}
+        WHERE snapshot_id = ? AND file IN (${placeholders})
+      `).run(snapshotId, ...values);
+    }
+    this.db.prepare(`
+      DELETE FROM files
+      WHERE snapshot_id = ? AND path IN (${placeholders})
+    `).run(snapshotId, ...values);
+  }
+
+  private affectedDependencySources(snapshotId: string, changedOrDeletedFiles: Set<string>): Set<string> {
+    const affected = new Set<string>();
+    if (changedOrDeletedFiles.size === 0) return affected;
+    const values = [...changedOrDeletedFiles];
+    const placeholders = values.map(() => '?').join(', ');
+    const rows = this.db.prepare(`
+      SELECT DISTINCT from_file
+      FROM dependency_edges
+      WHERE snapshot_id = ?
+        AND (from_file IN (${placeholders}) OR to_file IN (${placeholders}))
+    `).all(snapshotId, ...values, ...values) as Array<{ from_file: string }>;
+    for (const row of rows) affected.add(row.from_file);
+    return affected;
+  }
+
+  private deleteDependencyEdgesForSources(snapshotId: string, sourceFiles: Set<string>): void {
+    if (sourceFiles.size === 0) return;
+    const values = [...sourceFiles];
+    const placeholders = values.map(() => '?').join(', ');
+    this.db.prepare(`
+      DELETE FROM dependency_edges
+      WHERE snapshot_id = ? AND from_file IN (${placeholders})
+    `).run(snapshotId, ...values);
   }
 
   private insertFile(snapshotId: string, file: ManifestFile, parseStatus: string): void {
@@ -496,15 +745,25 @@ export class V2Indexer {
     );
   }
 
-  private rebuildDependencyEdges(snapshotId: string): void {
-    this.db.prepare('DELETE FROM dependency_edges WHERE snapshot_id = ?').run(snapshotId);
+  private rebuildDependencyEdges(snapshotId: string, sourceFiles?: Set<string>): void {
+    if (!sourceFiles) {
+      this.db.prepare('DELETE FROM dependency_edges WHERE snapshot_id = ?').run(snapshotId);
+    } else if (sourceFiles.size === 0) {
+      return;
+    }
 
+    const sourceFilter = sourceFiles ? [...sourceFiles] : undefined;
+    const sourcePlaceholders = sourceFilter?.map(() => '?').join(', ');
     const imports = this.db.prepare(`
-      SELECT file, source FROM imports WHERE snapshot_id = ? AND is_external = 0
-    `).all(snapshotId) as Array<{ file: string; source: string }>;
+      SELECT file, source FROM imports
+      WHERE snapshot_id = ? AND is_external = 0
+      ${sourceFilter ? `AND file IN (${sourcePlaceholders})` : ''}
+    `).all(...(sourceFilter ? [snapshotId, ...sourceFilter] : [snapshotId])) as Array<{ file: string; source: string }>;
     const typeRefs = this.db.prepare(`
-      SELECT file, referenced_type FROM type_refs WHERE snapshot_id = ?
-    `).all(snapshotId) as Array<{ file: string; referenced_type: string }>;
+      SELECT file, referenced_type FROM type_refs
+      WHERE snapshot_id = ?
+      ${sourceFilter ? `AND file IN (${sourcePlaceholders})` : ''}
+    `).all(...(sourceFilter ? [snapshotId, ...sourceFilter] : [snapshotId])) as Array<{ file: string; referenced_type: string }>;
 
     const classToFile = new Map<string, string>();
     const symbols = this.db.prepare(`
@@ -524,6 +783,7 @@ export class V2Indexer {
     const seen = new Set<string>();
     const addEdge = (from: string, to: string | undefined, kind: string, confidence: number, resolutionKind: string) => {
       if (!to || to === from) return;
+      if (sourceFiles && !sourceFiles.has(from)) return;
       const key = `${from}\0${to}\0${kind}`;
       if (seen.has(key)) return;
       seen.add(key);
@@ -568,12 +828,16 @@ export class V2Indexer {
     }
   }
 
-  private resolveCallEdges(snapshotId: string): void {
+  private resolveCallEdges(snapshotId: string, files?: Set<string>): void {
+    if (files && files.size === 0) return;
+    const fileFilter = files ? [...files] : undefined;
+    const filePlaceholders = fileFilter?.map(() => '?').join(', ');
     const rows = this.db.prepare(`
       SELECT rowid AS row_id, caller, callee, file, line, file_role
       FROM call_edges
       WHERE snapshot_id = ? AND resolution_kind = 'name-only' AND callee LIKE '%.%'
-    `).all(snapshotId) as Array<{
+      ${fileFilter ? `AND file IN (${filePlaceholders})` : ''}
+    `).all(...(fileFilter ? [snapshotId, ...fileFilter] : [snapshotId])) as Array<{
       row_id: number;
       caller: string;
       callee: string;
@@ -587,7 +851,8 @@ export class V2Indexer {
       SELECT file, simple_name, return_type
       FROM symbols
       WHERE snapshot_id = ? AND kind = 'field' AND return_type IS NOT NULL
-    `).all(snapshotId) as Array<{ file: string; simple_name: string; return_type: string }>;
+      ${fileFilter ? `AND file IN (${filePlaceholders})` : ''}
+    `).all(...(fileFilter ? [snapshotId, ...fileFilter] : [snapshotId])) as Array<{ file: string; simple_name: string; return_type: string }>;
     for (const field of fields) {
       let byName = fieldsByFile.get(field.file);
       if (!byName) {
@@ -741,6 +1006,45 @@ function manifestMatchesPreviousFiles(files: ManifestFile[], previousFiles: Mani
   if (files.length !== previousFiles.length) return false;
   const previousByPath = new Map(previousFiles.map(file => [file.path, file]));
   return files.every(file => previousByPath.get(file.relPath)?.blobHash === file.blobHash);
+}
+
+function diffManifestFiles(files: ManifestFile[], previousFiles: ManifestPreviousFile[]): ManifestChangeSet {
+  const previousByPath = new Map(previousFiles.map(file => [file.path, file]));
+  const currentPaths = new Set(files.map(file => file.relPath));
+  const changedFiles: ManifestFile[] = [];
+  const unchangedFiles: ManifestFile[] = [];
+  for (const file of files) {
+    const previous = previousByPath.get(file.relPath);
+    if (previous && previous.blobHash === file.blobHash) {
+      unchangedFiles.push(file);
+    } else {
+      changedFiles.push(file);
+    }
+  }
+  return {
+    changedFiles,
+    unchangedFiles,
+    deletedPaths: previousFiles
+      .map(file => file.path)
+      .filter(file => !currentPaths.has(file)),
+  };
+}
+
+function shouldUseIncrementalUpdate(changes: ManifestChangeSet, filesTotal: number, options: IndexWorkspaceOptions): boolean {
+  if (options.force || options.incremental === false) return false;
+  const changedCount = changes.changedFiles.length + changes.deletedPaths.length;
+  if (changedCount === 0) return false;
+  const fileLimit = options.incrementalFileLimit ?? 500;
+  const ratioLimit = Math.ceil(filesTotal * (options.incrementalFileRatio ?? 0.2));
+  return changedCount <= Math.max(1, Math.min(fileLimit, ratioLimit));
+}
+
+function parseFilesBatchWorkerCount(itemCount: number, requested: number | undefined): number {
+  if (itemCount <= 1) return 0;
+  if (requested !== undefined && Number.isFinite(requested)) {
+    return Math.max(1, Math.min(Math.floor(requested), 16, itemCount));
+  }
+  return Math.min(4, itemCount);
 }
 
 function optionalStringsEqual(left: string | null | undefined, right: string | null | undefined): boolean {
