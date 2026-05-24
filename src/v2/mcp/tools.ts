@@ -120,6 +120,27 @@ export const V2ToolSchemas = {
     ...SnippetOptions,
     ...FreshnessOptions,
   }),
+  simulate_patch_impact: z.object({
+    files: z.array(z.string()).optional(),
+    symbols: z.array(z.string()).optional(),
+    diff: z.string().optional(),
+    limit: z.number().min(1).max(200).default(50),
+    ...FreshnessOptions,
+  }),
+  review_patch: z.object({
+    files: z.array(z.string()).optional(),
+    symbols: z.array(z.string()).optional(),
+    diff: z.string().optional(),
+    focus: z.enum(['general', 'bug-risk', 'api-contract', 'tests', 'security']).default('general'),
+    outputMode: z.enum(['compact', 'balanced', 'full']).default('compact'),
+    includeLikelyTests: z.boolean().optional(),
+    maxFindings: z.number().min(1).max(50).optional(),
+    maxLineFocus: z.number().min(1).max(100).optional(),
+    maxEvidencePerFinding: z.number().min(1).max(20).optional(),
+    maxRequiredToolCalls: z.number().min(1).max(20).optional(),
+    limit: z.number().min(1).max(200).default(50),
+    ...FreshnessOptions,
+  }),
   find_tests_for: z.object({
     symbol: z.string(),
     limit: z.number().min(1).max(200).default(50),
@@ -211,6 +232,10 @@ function descriptionFor(name: V2ToolName): string {
       return 'Return an agent-ready endpoint slice: controller, call chain, service/repository/entity/DTO candidates, top files, and likely tests.';
     case 'impact_of_symbol':
       return 'Return an agent-ready impact slice for a symbol: definitions, callers, callees, affected endpoints, likely tests, and top files.';
+    case 'simulate_patch_impact':
+      return 'Simulate patch impact from changed files, symbols, or a unified diff. Returns touched symbols, dependency/call impact, endpoints, likely tests, validation commands, and risk flags before editing.';
+    case 'review_patch':
+      return 'Build a budgeted code review packet from changed files, symbols, or a unified diff: verdict, top findings, risky hunks, capped evidence, validation gaps, and next tool calls. Use outputMode=full only when the agent explicitly needs expanded evidence.';
     case 'find_tests_for':
       return 'Find tests likely relevant to a symbol using test file names, test symbols, and indexed call edges.';
     case 'search_code':

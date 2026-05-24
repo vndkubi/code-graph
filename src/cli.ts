@@ -11,6 +11,7 @@ import { generateSyntheticJavaRepo } from './v2/benchmark/synthetic-java.js';
 import { runIndexBenchmark } from './v2/benchmark/run.js';
 import { loadGoldenEvalTasks, runGoldenEval } from './v2/benchmark/golden-eval.js';
 import { deriveContextProofTasks, loadContextProofTasks, runContextProofEval } from './v2/benchmark/context-proof.js';
+import { deriveReviewProofTasks, loadReviewProofTasks, runReviewProofEval } from './v2/benchmark/review-proof.js';
 
 interface ParsedArgs {
   command: string[];
@@ -95,8 +96,23 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     }
+    case 'review': {
+      const root = getFlag(parsed, 'root') ?? process.cwd();
+      const { db } = openCodeGraphDb(getFlag(parsed, 'home'));
+      try {
+        const tasks = shouldUseAutoTasks(parsed)
+          ? deriveReviewProofTasks(root, { limit: getNumberFlag(parsed, 'task-count') })
+          : loadReviewProofTasks(getFlag(parsed, 'tasks'));
+        console.log(JSON.stringify(runReviewProofEval(db, root, tasks, {
+          skipIndex: parsed.flags.get('no-index') === true,
+        }), null, 2));
+      } finally {
+        db.close();
+      }
+      return;
+    }
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval|proof');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review');
   }
 }
 
@@ -221,17 +237,17 @@ Usage:
   codegraph index --root <workspace>     Prewarm persistent index
   codegraph doctor                       Inspect local configuration
   codegraph logs --tail <number>         Print recent daemon query/index events
-  codegraph benchmark generate|index|eval|proof
-                                             Generate synthetic repos, measure indexing, run golden evals, or prove context routing savings
+  codegraph benchmark generate|index|eval|proof|review
+                                             Generate synthetic repos, measure indexing, run evals, or prove context/review savings
 
 Options:
   --root <path>                          Workspace root
   --home <path>                          Override CODEGRAPH_HOME
   --port <number>                        Daemon port for daemon run
   --tasks <path>                         Golden eval task JSON file
-  --tasks auto                           Derive context-proof tasks from indexed-looking source files
-  --task-count <number>                  Number of auto-derived context-proof tasks
-  --no-index                             Reuse the current context-proof snapshot instead of refreshing first
+  --tasks auto                           Derive proof/review tasks from indexed-looking source files
+  --task-count <number>                  Number of auto-derived proof/review tasks
+  --no-index                             Reuse the current proof/review snapshot instead of refreshing first
   --parse-workers <number>               Worker threads for cold/cache-miss parsing during index
   --no-incremental                       Force changed-file index runs through full snapshot rebuild
   --incremental-file-limit <number>      Max changed/deleted files for incremental index path

@@ -9,6 +9,7 @@ import { V2Indexer } from '../../src/v2/index/indexer.js';
 import { V2QueryService } from '../../src/v2/query/service.js';
 import { generateSyntheticJavaRepo } from '../../src/v2/benchmark/synthetic-java.js';
 import { runContextProofEval } from '../../src/v2/benchmark/context-proof.js';
+import { runReviewProofEval } from '../../src/v2/benchmark/review-proof.js';
 
 const tempDirs: string[] = [];
 const dbs: Database[] = [];
@@ -459,6 +460,149 @@ public class PaymentServiceTest {
     expect(slice.resolvedSymbol?.symbol).toContain('PaymentService.refund');
   });
 
+  it('simulates patch impact from changed files, symbols, and diffs', () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-patch-impact-');
+    writeFile(repo, 'package.json', JSON.stringify({
+      scripts: {
+        test: 'vitest run',
+      },
+    }, null, 2));
+    writeFile(repo, 'src/main/java/com/example/orders/OrderController.java', `package com.example.orders;
+
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.Path;
+
+@Path("/orders")
+public class OrderController {
+    private final OrderService service = new OrderService();
+
+    @GET
+    public String list() {
+        return service.listOrders();
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/orders/OrderService.java', `package com.example.orders;
+
+public class OrderService {
+    public String listOrders() {
+        return "ok";
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/orders/OrderServiceTest.java', `package com.example.orders;
+
+public class OrderServiceTest {
+    void listOrders() {
+        new OrderService().listOrders();
+    }
+}
+`);
+
+    const { db } = openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+    const diff = [
+      'diff --git a/src/main/java/com/example/orders/OrderController.java b/src/main/java/com/example/orders/OrderController.java',
+      '--- a/src/main/java/com/example/orders/OrderController.java',
+      '+++ b/src/main/java/com/example/orders/OrderController.java',
+      '@@ -8,6 +8,7 @@ public class OrderController {',
+      '     @GET',
+      '     public String list() {',
+      '+        System.out.println("debug order list");',
+      '         return service.listOrders();',
+      '     }',
+    ].join('\n');
+
+    const impact = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'simulate_patch_impact',
+      args: {
+        files: ['src/main/java/com/example/orders/OrderService.java'],
+        symbols: ['OrderController.list'],
+        diff,
+        limit: 20,
+      },
+    }) as {
+      changedFiles: string[];
+      changedEndpoints: Array<{ path: string }>;
+      dependencyImpact: { dependents: Array<{ file: string }> };
+      callImpact: { callers: Array<{ file: string; callee: string }> };
+      testsLikelyRelevant: Array<{ file: string }>;
+      validation: { targetedTestFiles: string[]; suggestedCommands: string[] };
+      riskFlags: Array<{ type: string }>;
+      summary: { blastRadius: string; changedFileCount: number };
+    };
+
+    expect(impact.changedFiles.some(file => file.endsWith('OrderService.java'))).toBe(true);
+    expect(impact.changedFiles.some(file => file.endsWith('OrderController.java'))).toBe(true);
+    expect(impact.changedEndpoints.some(endpoint => endpoint.path === '/orders')).toBe(true);
+    expect(impact.dependencyImpact.dependents.some(row => row.file.endsWith('OrderController.java'))).toBe(true);
+    expect(impact.callImpact.callers.some(call => call.file.endsWith('OrderController.java') && call.callee.includes('listOrders'))).toBe(true);
+    expect(impact.testsLikelyRelevant.some(test => test.file.endsWith('OrderServiceTest.java'))).toBe(true);
+    expect(impact.validation.targetedTestFiles.some(file => file.endsWith('OrderServiceTest.java'))).toBe(true);
+    expect(impact.validation.suggestedCommands.some(command => command.includes('npm test'))).toBe(true);
+    expect(impact.riskFlags.some(flag => flag.type === 'endpoint-change')).toBe(true);
+    expect(impact.summary.changedFileCount).toBe(2);
+    expect(['medium', 'high']).toContain(impact.summary.blastRadius);
+
+    const review = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'review_patch',
+      args: {
+        files: ['src/main/java/com/example/orders/OrderService.java'],
+        symbols: ['OrderController.list'],
+        diff,
+        focus: 'api-contract',
+        limit: 20,
+      },
+    }) as {
+      outputMode: string;
+      reviewStatus: string;
+      reviewFindings: Array<{ id: string; priority: string }>;
+      lineFocus: Array<{ file: string; changeKinds: string[]; lineMappingConfidence?: string }>;
+      requiredToolCalls: Array<{ tool: string }>;
+      metrics: { findingCount: number; omittedHunks: number };
+    };
+
+    expect(review.outputMode).toBe('compact');
+    expect(review.reviewStatus).toBe('needs-attention');
+    expect(review.reviewFindings.some(finding => finding.id === 'review-endpoint-contract')).toBe(true);
+    expect(review.reviewFindings.some(finding => finding.id.includes('review-debug-output'))).toBe(true);
+    expect(review.lineFocus.some(hunk => hunk.file.endsWith('OrderController.java') && hunk.changeKinds.includes('debug-output'))).toBe(true);
+    expect(review.lineFocus.some(hunk => hunk.file.endsWith('OrderController.java') && hunk.lineMappingConfidence === 'low')).toBe(true);
+    expect(review.requiredToolCalls.some(call => call.tool === 'get_file_summary')).toBe(true);
+    expect(review.metrics.findingCount).toBeGreaterThan(0);
+    expect(review.metrics.omittedHunks).toBe(0);
+
+    const matchingDiff = [
+      'diff --git a/src/main/java/com/example/orders/OrderController.java b/src/main/java/com/example/orders/OrderController.java',
+      '--- a/src/main/java/com/example/orders/OrderController.java',
+      '+++ b/src/main/java/com/example/orders/OrderController.java',
+      '@@ -10,5 +10,6 @@ public class OrderController {',
+      '     @GET',
+      '     public String list() {',
+      '+        System.out.println("debug order list");',
+      '         return service.listOrders();',
+      '     }',
+    ].join('\n');
+    const matchingReview = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'review_patch',
+      args: {
+        diff: matchingDiff,
+        focus: 'bug-risk',
+      },
+    }) as {
+      lineFocus: Array<{ lineMappingConfidence?: string }>;
+      requiredToolCalls: Array<{ tool: string }>;
+    };
+    expect(matchingReview.lineFocus.some(hunk => hunk.lineMappingConfidence === 'high')).toBe(true);
+    expect(matchingReview.requiredToolCalls.some(call => call.tool === 'get_file_slice')).toBe(true);
+  });
+
   it('indexes XML, JSON, YAML, and properties config evidence', () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-config-files-');
@@ -729,6 +873,83 @@ public class NoisyPayment${i} {
     expect(proof.totals.baselineFilesOpened).toBeGreaterThan(proof.totals.mcpSlicesOpened);
     expect(proof.totals.tokenSavingPct).toBeGreaterThan(0);
     expect(proof.tasks[0]?.mcp.slicedFiles.some(file => file.endsWith('PaymentService.java'))).toBe(true);
+  });
+
+  it('runs a review proof benchmark comparing raw file reads to review packets', () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-review-proof-');
+    writeFile(repo, 'src/main/java/com/example/orders/OrderController.java', `package com.example.orders;
+
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.Path;
+
+@Path("/orders")
+public class OrderController {
+    private final OrderService service = new OrderService();
+
+    @GET
+    public String list() {
+        return service.listOrders();
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/orders/OrderService.java', `package com.example.orders;
+
+public class OrderService {
+    public String listOrders() {
+        return "ok";
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/orders/OrderServiceTest.java', `package com.example.orders;
+
+public class OrderServiceTest {
+    void listOrders() {
+        new OrderService().listOrders();
+    }
+}
+`);
+    for (let i = 0; i < 10; i++) {
+      writeFile(repo, `src/main/java/com/example/noise/NoisyOrder${i}.java`, `package com.example.noise;
+
+/*
+${'OrderService listOrders review noise '.repeat(220)}
+*/
+public class NoisyOrder${i} {
+}
+`);
+    }
+
+    const { db } = openDb(home);
+    const proof = runReviewProofEval(db, repo, [{
+      id: 'order-service-review-proof',
+      title: 'Review OrderService listOrders behavior.',
+      files: ['src/main/java/com/example/orders/OrderService.java'],
+      symbols: ['OrderService.listOrders'],
+      diff: [
+        'diff --git a/src/main/java/com/example/orders/OrderService.java b/src/main/java/com/example/orders/OrderService.java',
+        '--- a/src/main/java/com/example/orders/OrderService.java',
+        '+++ b/src/main/java/com/example/orders/OrderService.java',
+        '@@ -3,6 +3,7 @@ public class OrderService {',
+        '     public String listOrders() {',
+        '+        System.out.println("debug order list");',
+        '         return "ok";',
+        '     }',
+      ].join('\n'),
+      focus: 'bug-risk',
+      baselineSearchTerms: ['OrderService', 'listOrders'],
+      expectedContains: ['OrderService', 'System.out'],
+      expectedFiles: ['OrderService.java'],
+    }]);
+
+    expect(proof.totals.tasks).toBe(1);
+    expect(proof.totals.baselineCorrect).toBe(1);
+    expect(proof.totals.mcpCorrect).toBe(1);
+    expect(proof.totals.qualityMaintained).toBe(true);
+    expect(proof.totals.baselineFilesOpened).toBeGreaterThan(proof.totals.mcpToolCalls);
+    expect(proof.totals.inputTokenSavingPct).toBeGreaterThan(0);
+    expect(proof.tasks[0]?.mcp.findingCount).toBeGreaterThan(0);
+    expect(proof.tasks[0]?.mcp.changedFiles.some(file => file.endsWith('OrderService.java'))).toBe(true);
   });
 
   it('resolves Java parameter and local-variable receiver calls', () => {

@@ -68,6 +68,10 @@ export class V2QueryService {
         return withFreshness(this.explainEndpoint(snapshotId, envelope.args));
       case 'impact_of_symbol':
         return withFreshness(this.impactOfSymbol(snapshotId, envelope.args));
+      case 'simulate_patch_impact':
+        return withFreshness(this.simulatePatchImpact(snapshotId, envelope.args));
+      case 'review_patch':
+        return withFreshness(this.reviewPatch(snapshotId, envelope.args));
       case 'find_tests_for':
         return withFreshness(this.findTestsFor(snapshotId, envelope.args));
       case 'get_research_pack':
@@ -965,6 +969,268 @@ export class V2QueryService {
       blastRadius: impact.blastRadius,
       summary: impact.summary,
     };
+  }
+
+  private simulatePatchImpact(snapshotId: string, args: Record<string, unknown>) {
+    const limit = clampInt(Number(args.limit ?? 50), 1, 200);
+    const requestedFiles = stringArray(args.files).map(normalizePatchPath).filter(Boolean);
+    const diffFiles = parsePatchFilePaths(stringOrUndefined(args.diff) ?? '');
+    const fileInputs = uniqueFilesInOrder([...requestedFiles, ...diffFiles]);
+    const resolvedFileInputs: Array<{ input: string; file: string }> = [];
+    const unresolvedFiles: string[] = [];
+    for (const input of fileInputs) {
+      const resolved = this.resolveFile(snapshotId, input);
+      if (resolved) resolvedFileInputs.push({ input, file: resolved });
+      else unresolvedFiles.push(input);
+    }
+
+    const requestedSymbols = stringArray(args.symbols);
+    const resolvedSymbols: Array<Record<string, unknown>> = [];
+    const symbolRows: SymbolRow[] = [];
+    const unresolvedSymbols: string[] = [];
+    for (const symbol of requestedSymbols) {
+      const row = this.lookupBestSymbol(snapshotId, symbol);
+      if (!row) {
+        unresolvedSymbols.push(symbol);
+        continue;
+      }
+      symbolRows.push(row);
+      resolvedSymbols.push(compactSymbolCandidate(symbolDto(row), `explicit patch symbol input: ${symbol}`));
+    }
+
+    const changedFiles = uniqueFilesInOrder([
+      ...resolvedFileInputs.map(input => input.file),
+      ...symbolRows.map(row => row.file),
+    ]).slice(0, limit);
+    const touchedSymbols = uniqueSymbolCandidates(
+      this.symbolsForFiles(snapshotId, changedFiles)
+        .map(symbol => compactSymbolCandidate(symbol, 'symbol declared in a changed file')),
+    ).slice(0, limit);
+    const changedEndpoints = compactEndpointCandidates(this.impactedEndpoints(snapshotId, changedFiles));
+
+    const dependencyRows = uniqueRecordsBy(
+      changedFiles.flatMap(file => this.dependencyRows(snapshotId, file, 'from_file')),
+      row => `${row.file}:${row.type}:${row.resolutionKind}`,
+    );
+    const dependentRows = uniqueRecordsBy(
+      changedFiles.flatMap(file => this.dependencyRows(snapshotId, file, 'to_file')),
+      row => `${row.file}:${row.type}:${row.resolutionKind}`,
+    );
+
+    const callSeedLimit = clampInt(Number(args.callSeedLimit ?? Math.min(12, limit)), 0, 30);
+    const callSeeds = uniqueStrings([
+      ...requestedSymbols,
+      ...resolvedSymbols.flatMap(symbol => [String(symbol.symbol ?? ''), String(symbol.name ?? '')]),
+      ...touchedSymbols.flatMap(symbol => [symbol.symbol, symbol.name]),
+    ]).slice(0, callSeedLimit);
+    const callers = uniqueCallEdges(
+      callSeeds.flatMap(symbol => (this.getCallers(snapshotId, { symbol, limit: 25 }) as { callers: CallEdgeRow[] }).callers),
+    ).slice(0, limit * 2);
+    const callees = uniqueCallEdges(
+      callSeeds.flatMap(symbol => (this.getCallees(snapshotId, { symbol, limit: 25 }) as { callees: CallEdgeRow[] }).callees),
+    ).slice(0, limit * 2);
+
+    const impactedFiles = rankFiles([
+      ...changedFiles,
+      ...dependentRows.map(row => String(row.file ?? row.modulePath ?? '')),
+      ...dependencyRows.map(row => String(row.file ?? row.modulePath ?? '')),
+      ...callers.map(call => call.file),
+      ...callees.map(call => call.file),
+    ]).slice(0, limit);
+    const impactedEndpoints = compactEndpointCandidates(this.impactedEndpoints(snapshotId, impactedFiles)).slice(0, limit);
+    const testSeeds = uniqueStrings([
+      ...requestedSymbols,
+      ...changedFiles.map(file => path.posix.basename(file, path.posix.extname(file))),
+      ...touchedSymbols.flatMap(symbol => [symbol.symbol, symbol.name]),
+    ]).slice(0, 32);
+    const tests = args.skipLikelyTests === true ? [] : this.findRelevantTestsForSeeds(snapshotId, testSeeds, limit);
+    const validation = this.validationHints(snapshotId, tests, impactedFiles.length > 0 ? impactedFiles : changedFiles);
+    const riskFlags = patchRiskFlags({
+      changedFiles,
+      touchedSymbols,
+      changedEndpoints,
+      impactedEndpoints,
+      directDependentCount: dependentRows.length,
+      callerCount: callers.length,
+      testsCount: tests.length,
+      unresolvedInputCount: unresolvedFiles.length + unresolvedSymbols.length,
+    });
+    const blastRadius = patchBlastRadius({
+      changedFiles,
+      directDependentCount: dependentRows.length,
+      callerCount: callers.length,
+      changedEndpointCount: changedEndpoints.length,
+      impactedEndpointCount: impactedEndpoints.length,
+      testsCount: tests.length,
+      riskFlags,
+    });
+
+    return {
+      inputs: {
+        files: requestedFiles,
+        diffFiles,
+        symbols: requestedSymbols,
+        resolvedFileInputs,
+        resolvedSymbols,
+        unresolvedFiles,
+        unresolvedSymbols,
+      },
+      changedFiles,
+      touchedSymbols,
+      changedEndpoints,
+      dependencyImpact: {
+        dependencies: dependencyRows.slice(0, limit),
+        dependents: dependentRows.slice(0, limit),
+        dependencyCount: dependencyRows.length,
+        dependentCount: dependentRows.length,
+      },
+      callImpact: {
+        queriedSymbols: callSeeds,
+        callers,
+        callees,
+        callerCount: callers.length,
+        calleeCount: callees.length,
+      },
+      impactedFiles,
+      impactedEndpoints,
+      testsLikelyRelevant: tests,
+      validation,
+      riskFlags,
+      summary: {
+        blastRadius,
+        changedFileCount: changedFiles.length,
+        touchedSymbolCount: touchedSymbols.length,
+        directDependentCount: dependentRows.length,
+        callerCount: callers.length,
+        impactedEndpointCount: impactedEndpoints.length,
+        likelyTestCount: tests.length,
+        unresolvedInputCount: unresolvedFiles.length + unresolvedSymbols.length,
+      },
+      nextActions: patchNextActions(unresolvedFiles, unresolvedSymbols, validation, riskFlags, changedFiles),
+      confidence: patchImpactConfidence(changedFiles.length, unresolvedFiles.length + unresolvedSymbols.length, tests.length),
+      confidenceNotes: [
+        'Patch impact is simulated from the current indexed snapshot; uncommitted edits are included only when autoRefresh=true refreshes the snapshot first.',
+        'Dependency impact follows indexed file dependency edges; call impact follows indexed call edges and may include lower-confidence name-only matches.',
+      ],
+    };
+  }
+
+  private reviewPatch(snapshotId: string, args: Record<string, unknown>) {
+    const limit = clampInt(Number(args.limit ?? 50), 1, 200);
+    const focus = normalizeReviewFocus(String(args.focus ?? 'general'));
+    const outputMode = normalizeReviewOutputMode(String(args.outputMode ?? 'compact'));
+    const budget = reviewBudgetFor(outputMode, args, limit);
+    const diff = stringOrUndefined(args.diff) ?? '';
+    const allHunks = parsePatchHunks(diff);
+    const diffStats = patchDiffStats(allHunks, diff);
+    const impact = this.simulatePatchImpact(snapshotId, {
+      ...args,
+      limit,
+      callSeedLimit: 0,
+      skipLikelyTests: args.includeLikelyTests !== true,
+    }) as Record<string, unknown>;
+    const hunks = rankPatchHunks(allHunks).slice(0, Math.max(budget.maxLineFocus, budget.maxFindings));
+    const lineMapping = this.patchLineMappings(snapshotId, hunks);
+    const changedFiles = stringArray(impact.changedFiles);
+    const tests = arrayRecords(impact.testsLikelyRelevant);
+    const validation = isPlainObject(impact.validation) ? impact.validation : {};
+    const riskFlags = arrayRecords(impact.riskFlags);
+    const allFindings = reviewFindingsForPatch({
+      focus,
+      diff,
+      hunks,
+      changedFiles,
+      riskFlags,
+      testsCount: tests.length,
+      summary: isPlainObject(impact.summary) ? impact.summary : {},
+    });
+    const findings = allFindings
+      .slice(0, budget.maxFindings)
+      .map(finding => compactReviewFinding(finding, budget.maxEvidencePerFinding));
+    const lineFocus = hunks
+      .slice(0, budget.maxLineFocus)
+      .map(hunk => compactPatchHunk(hunk, lineMapping.get(hunk)))
+      .map(hunk => compactReviewObject(hunk, budget.maxEvidencePerFinding, 2) as Record<string, unknown>);
+    const priorityCounts = reviewPriorityCounts(findings);
+    const cappedRiskFlags = riskFlags
+      .slice(0, budget.maxRiskFlags)
+      .map(flag => compactReviewObject(flag, budget.maxEvidencePerFinding, 2) as Record<string, unknown>);
+    const cappedTests = tests
+      .slice(0, budget.maxTests)
+      .map(test => compactReviewObject(test, budget.maxEvidencePerFinding, 2) as Record<string, unknown>);
+
+    return {
+      outputMode,
+      focus,
+      reviewStatus: reviewStatusFor(findings, changedFiles),
+      impactSummary: impact.summary,
+      changedFiles,
+      diffStats,
+      reviewPlan: reviewPlanForPatch(diffStats, findings, impact),
+      reviewFindings: findings,
+      reviewFocus: reviewFocusForPatch(focus, impact, findings, budget.maxEvidencePerFinding),
+      lineFocus,
+      riskFlags: cappedRiskFlags,
+      testsLikelyRelevant: cappedTests,
+      validation: compactReviewObject(validation, budget.maxEvidencePerFinding, 2),
+      requiredToolCalls: reviewToolCalls(changedFiles, lineFocus, findings, budget.maxRequiredToolCalls),
+      reviewerQuestions: reviewQuestionsForPatch(findings, impact),
+      metrics: {
+        changedFileCount: changedFiles.length,
+        diffHunkCount: allHunks.length,
+        reportedLineFocusCount: lineFocus.length,
+        findingCount: findings.length,
+        totalFindingCount: allFindings.length,
+        priorityCounts,
+        likelyTestCount: tests.length,
+        omittedFindings: Math.max(0, allFindings.length - findings.length),
+        omittedHunks: Math.max(0, allHunks.length - lineFocus.length),
+        omittedRiskFlags: Math.max(0, riskFlags.length - cappedRiskFlags.length),
+        omittedTests: Math.max(0, tests.length - cappedTests.length),
+      },
+      confidence: reviewConfidence(changedFiles.length, hunks.length, findings, riskFlags),
+      confidenceNotes: [
+        'Review findings are deterministic risk hypotheses from the diff and graph impact, not proof of bugs.',
+        'Default output is capped for large diffs; use outputMode=full only when expanded evidence is needed.',
+        'Use requiredToolCalls for exact source slices before writing final review comments.',
+      ],
+    };
+  }
+
+  private patchLineMappings(snapshotId: string, hunks: PatchHunk[]): Map<PatchHunk, PatchLineMapping> {
+    const result = new Map<PatchHunk, PatchLineMapping>();
+    const root = this.workspaceRootForSnapshot(snapshotId);
+    if (!root) {
+      for (const hunk of hunks) {
+        result.set(hunk, {
+          confidence: 'low',
+          exactSliceSafe: false,
+          reason: 'workspace root is unavailable',
+        });
+      }
+      return result;
+    }
+
+    const cache = new Map<string, string[] | undefined>();
+    for (const hunk of hunks) {
+      if (!hunk.file) {
+        result.set(hunk, { confidence: 'low', exactSliceSafe: false, reason: 'diff hunk has no file path' });
+        continue;
+      }
+      const resolved = this.resolveFile(snapshotId, hunk.file) ?? hunk.file;
+      let sourceLines = cache.get(resolved);
+      if (!cache.has(resolved)) {
+        const absolutePath = safeResolve(root, resolved);
+        try {
+          sourceLines = absolutePath ? fs.readFileSync(absolutePath, 'utf-8').split(/\r?\n/) : undefined;
+        } catch {
+          sourceLines = undefined;
+        }
+        cache.set(resolved, sourceLines);
+      }
+      result.set(hunk, patchLineMappingFor(hunk, sourceLines));
+    }
+    return result;
   }
 
   private findTestsFor(snapshotId: string, args: Record<string, unknown>) {
@@ -2561,6 +2827,899 @@ function endpointRankExplanation(row: EndpointRow, requestedMethod: string, requ
     factors.push(`partial path reason: ${row.path_resolution_reason}`);
   }
   return factors;
+}
+
+function parsePatchFilePaths(diff: string): string[] {
+  if (!diff.trim()) return [];
+  const files: string[] = [];
+  for (const rawLine of diff.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const gitMatch = /^diff --git "?a\/(.+?)"? "?b\/(.+?)"?$/.exec(line);
+    if (gitMatch) {
+      files.push(normalizePatchPath(gitMatch[1] ?? ''));
+      files.push(normalizePatchPath(gitMatch[2] ?? ''));
+      continue;
+    }
+    const markerMatch = /^(?:---|\+\+\+)\s+(.+?)(?:\t.*)?$/.exec(line);
+    if (markerMatch) {
+      files.push(normalizePatchPath(markerMatch[1] ?? ''));
+      continue;
+    }
+    const renameMatch = /^(?:rename|copy) (?:from|to)\s+(.+)$/.exec(line);
+    if (renameMatch) files.push(normalizePatchPath(renameMatch[1] ?? ''));
+  }
+  return uniqueFilesInOrder(files.filter(Boolean));
+}
+
+function normalizePatchPath(value: string): string {
+  let normalized = value.trim().replace(/\\/g, '/');
+  if (!normalized || normalized === '/dev/null') return '';
+  normalized = normalized.replace(/^"|"$/g, '').replace(/^\.\/+/, '');
+  if (normalized === '/dev/null') return '';
+  if (normalized.startsWith('a/') || normalized.startsWith('b/')) normalized = normalized.slice(2);
+  return normalized;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values.map(item => item.trim()).filter(Boolean)) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+  }
+  return result;
+}
+
+function uniqueRecordsBy<T>(rows: T[], keyFor: (row: T) => string): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const row of rows) {
+    const key = keyFor(row);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(row);
+  }
+  return result;
+}
+
+function uniqueCallEdges(rows: CallEdgeRow[]): CallEdgeRow[] {
+  return uniqueRecordsBy(rows, row => `${row.caller}:${row.callee}:${row.file}:${row.line}`);
+}
+
+function patchRiskFlags(input: {
+  changedFiles: string[];
+  touchedSymbols: Array<{ kind?: string; symbol: string; file: string; frameworkRole?: string }>;
+  changedEndpoints: Array<{ method: string; path: string; file: string }>;
+  impactedEndpoints: Array<{ method: string; path: string; file: string }>;
+  directDependentCount: number;
+  callerCount: number;
+  testsCount: number;
+  unresolvedInputCount: number;
+}): Array<Record<string, unknown>> {
+  const flags: Array<Record<string, unknown>> = [];
+  const changedFileSet = new Set(input.changedFiles);
+  const dependentEndpoints = input.impactedEndpoints.filter(endpoint => !changedFileSet.has(endpoint.file));
+  if (input.changedEndpoints.length > 0) {
+    flags.push({
+      type: 'endpoint-change',
+      severity: 'high',
+      reason: 'Changed files expose indexed HTTP endpoints.',
+      evidence: input.changedEndpoints.slice(0, 5),
+    });
+  }
+  if (dependentEndpoints.length > 0) {
+    flags.push({
+      type: 'dependent-endpoint',
+      severity: 'medium',
+      reason: 'Dependent or caller files expose endpoints that may observe this change.',
+      evidence: dependentEndpoints.slice(0, 5),
+    });
+  }
+  const publicSymbols = input.touchedSymbols.filter(symbol => isPublicPatchSymbol(symbol));
+  if (publicSymbols.length > 0) {
+    flags.push({
+      type: 'public-api-symbol',
+      severity: input.changedEndpoints.length > 0 ? 'high' : 'medium',
+      reason: 'Changed files declare public API-like symbols.',
+      evidence: publicSymbols.slice(0, 8),
+    });
+  }
+  const configFiles = input.changedFiles.filter(isConfigPatchFile);
+  if (configFiles.length > 0) {
+    flags.push({
+      type: 'config-change',
+      severity: 'medium',
+      reason: 'Build, runtime, or deployment configuration appears in the patch.',
+      evidence: configFiles.slice(0, 8),
+    });
+  }
+  const fanout = input.directDependentCount + input.callerCount;
+  if (fanout >= 10) {
+    flags.push({
+      type: 'high-fanout',
+      severity: 'high',
+      reason: `Patch has ${input.directDependentCount} direct dependents and ${input.callerCount} call sites.`,
+    });
+  } else if (fanout >= 5) {
+    flags.push({
+      type: 'moderate-fanout',
+      severity: 'medium',
+      reason: `Patch has ${input.directDependentCount} direct dependents and ${input.callerCount} call sites.`,
+    });
+  }
+  if (input.changedFiles.length > 0 && input.changedFiles.every(isTestPatchFile)) {
+    flags.push({
+      type: 'test-only-change',
+      severity: 'low',
+      reason: 'All resolved changed files look like tests or fixtures.',
+    });
+  }
+  if (input.changedFiles.length > 0 && input.testsCount === 0 && !input.changedFiles.every(isTestPatchFile)) {
+    flags.push({
+      type: 'no-tests-found',
+      severity: 'medium',
+      reason: 'No likely tests were found from file names, symbol names, or call edges.',
+    });
+  }
+  if (input.unresolvedInputCount > 0) {
+    flags.push({
+      type: 'unresolved-inputs',
+      severity: 'medium',
+      reason: `${input.unresolvedInputCount} file or symbol inputs did not resolve in the current index.`,
+    });
+  }
+  return flags;
+}
+
+function patchBlastRadius(input: {
+  changedFiles: string[];
+  directDependentCount: number;
+  callerCount: number;
+  changedEndpointCount: number;
+  impactedEndpointCount: number;
+  testsCount: number;
+  riskFlags: Array<Record<string, unknown>>;
+}): 'unknown' | 'low' | 'medium' | 'high' {
+  if (input.changedFiles.length === 0) return 'unknown';
+  if (input.riskFlags.some(flag => flag.type === 'endpoint-change' || flag.type === 'high-fanout')) return 'high';
+  const score = input.changedFiles.length
+    + (input.directDependentCount * 2)
+    + input.callerCount
+    + (input.changedEndpointCount * 5)
+    + (input.impactedEndpointCount * 3)
+    + Math.min(input.testsCount, 5);
+  if (score >= 18) return 'high';
+  if (score >= 5) return 'medium';
+  return 'low';
+}
+
+function patchNextActions(
+  unresolvedFiles: string[],
+  unresolvedSymbols: string[],
+  validation: Record<string, unknown>,
+  riskFlags: Array<Record<string, unknown>>,
+  changedFiles: string[],
+): string[] {
+  const actions: string[] = [];
+  if (unresolvedFiles.length > 0 || unresolvedSymbols.length > 0) {
+    actions.push('Resolve unresolved file/symbol inputs or rerun with autoRefresh=true before trusting the impact slice.');
+  }
+  const firstFile = changedFiles[0];
+  if (firstFile) actions.push(`Call get_file_slice for "${firstFile}" before editing to keep context bounded.`);
+  if (riskFlags.some(flag => flag.type === 'endpoint-change' || flag.type === 'dependent-endpoint')) {
+    actions.push('Inspect changedEndpoints and impactedEndpoints before changing handler/service contracts.');
+  }
+  if (riskFlags.some(flag => flag.type === 'high-fanout' || flag.type === 'moderate-fanout')) {
+    actions.push('Inspect dependencyImpact.dependents and callImpact.callers before patching shared behavior.');
+  }
+  const suggestedCommands = Array.isArray(validation.suggestedCommands) ? validation.suggestedCommands as string[] : [];
+  if (suggestedCommands.length > 0) actions.push(`Run targeted validation first: ${suggestedCommands[0]}`);
+  else actions.push('No validation command was inferred; identify a local targeted test or typecheck command before broad validation.');
+  return actions;
+}
+
+function patchImpactConfidence(changedFileCount: number, unresolvedInputCount: number, testsCount: number): number {
+  let confidence = changedFileCount > 0 ? 0.72 : 0.3;
+  if (testsCount > 0) confidence += 0.06;
+  if (unresolvedInputCount > 0) confidence -= Math.min(0.3, unresolvedInputCount * 0.08);
+  return Math.round(Math.max(0.25, Math.min(0.9, confidence)) * 100) / 100;
+}
+
+function isPublicPatchSymbol(symbol: { kind?: string; symbol: string; frameworkRole?: string }): boolean {
+  const kind = String(symbol.kind ?? '');
+  const role = String(symbol.frameworkRole ?? '');
+  return role.length > 0 || kind === 'class' || kind === 'interface' || kind === 'enum' || kind === 'method' || kind === 'function';
+}
+
+function isConfigPatchFile(file: string): boolean {
+  return /(^|\/)(package\.json|pom\.xml|build\.gradle|settings\.gradle|gradle\.properties|Dockerfile|docker-compose\.ya?ml|application[-.\w]*\.(ya?ml|properties)|[^/]+\.(xml|ya?ml|toml|ini))$/i.test(file);
+}
+
+function isTestPatchFile(file: string): boolean {
+  return /(^|\/)(test|tests|spec|__tests__|fixtures?)(\/|$)|(\.test|\.spec)\.[^.]+$/i.test(file);
+}
+
+type ReviewFocus = 'general' | 'bug-risk' | 'api-contract' | 'tests' | 'security';
+type ReviewOutputMode = 'compact' | 'balanced' | 'full';
+
+interface PatchLineChange {
+  line: number;
+  text: string;
+}
+
+interface PatchContextLine {
+  oldLine: number;
+  newLine: number;
+  text: string;
+}
+
+interface PatchHunk {
+  file: string;
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  addedLines: PatchLineChange[];
+  removedLines: PatchLineChange[];
+  contextLines: PatchContextLine[];
+  changeKinds: string[];
+}
+
+interface ReviewFinding {
+  id: string;
+  priority: 'P0' | 'P1' | 'P2';
+  title: string;
+  why: string;
+  evidence?: unknown;
+  suggestedCheck: string;
+  confidence: number;
+}
+
+interface PatchLineMapping {
+  confidence: 'high' | 'medium' | 'low';
+  exactSliceSafe: boolean;
+  reason: string;
+  fileSliceLines?: string;
+}
+
+interface ReviewBudget {
+  outputMode: ReviewOutputMode;
+  maxFindings: number;
+  maxLineFocus: number;
+  maxRiskFlags: number;
+  maxTests: number;
+  maxEvidencePerFinding: number;
+  maxRequiredToolCalls: number;
+}
+
+function normalizeReviewFocus(value: string): ReviewFocus {
+  if (value === 'bug-risk' || value === 'api-contract' || value === 'tests' || value === 'security') return value;
+  return 'general';
+}
+
+function normalizeReviewOutputMode(value: string): ReviewOutputMode {
+  if (value === 'balanced' || value === 'full') return value;
+  return 'compact';
+}
+
+function reviewBudgetFor(outputMode: ReviewOutputMode, args: Record<string, unknown>, limit: number): ReviewBudget {
+  const defaults = outputMode === 'full'
+    ? { maxFindings: limit, maxLineFocus: limit, maxRiskFlags: limit, maxTests: Math.min(limit, 50), maxEvidencePerFinding: 12, maxRequiredToolCalls: 8 }
+    : outputMode === 'balanced'
+      ? { maxFindings: 10, maxLineFocus: 20, maxRiskFlags: 12, maxTests: 8, maxEvidencePerFinding: 5, maxRequiredToolCalls: 4 }
+      : { maxFindings: 6, maxLineFocus: 10, maxRiskFlags: 8, maxTests: 5, maxEvidencePerFinding: 3, maxRequiredToolCalls: 3 };
+  return {
+    outputMode,
+    maxFindings: clampInt(Number(args.maxFindings ?? defaults.maxFindings), 1, limit),
+    maxLineFocus: clampInt(Number(args.maxLineFocus ?? defaults.maxLineFocus), 1, limit),
+    maxRiskFlags: clampInt(defaults.maxRiskFlags, 1, limit),
+    maxTests: clampInt(defaults.maxTests, 0, limit),
+    maxEvidencePerFinding: clampInt(Number(args.maxEvidencePerFinding ?? defaults.maxEvidencePerFinding), 1, 20),
+    maxRequiredToolCalls: clampInt(Number(args.maxRequiredToolCalls ?? defaults.maxRequiredToolCalls), 1, 20),
+  };
+}
+
+function parsePatchHunks(diff: string): PatchHunk[] {
+  if (!diff.trim()) return [];
+  const hunks: PatchHunk[] = [];
+  let currentFile = '';
+  let current: (PatchHunk & { oldLine: number; newLine: number }) | undefined;
+
+  for (const rawLine of diff.split(/\r?\n/)) {
+    const line = rawLine.replace(/\r$/, '');
+    const gitMatch = /^diff --git "?a\/(.+?)"? "?b\/(.+?)"?$/.exec(line.trim());
+    if (gitMatch) {
+      currentFile = normalizePatchPath(gitMatch[2] ?? gitMatch[1] ?? '');
+      current = undefined;
+      continue;
+    }
+    const markerMatch = /^\+\+\+\s+(.+?)(?:\t.*)?$/.exec(line.trim());
+    if (markerMatch) {
+      const markerFile = normalizePatchPath(markerMatch[1] ?? '');
+      if (markerFile) currentFile = markerFile;
+      current = undefined;
+      continue;
+    }
+    const hunkMatch = /^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?/.exec(line);
+    if (hunkMatch) {
+      const oldStart = Number(hunkMatch[1]);
+      const newStart = Number(hunkMatch[3]);
+      current = {
+        file: currentFile,
+        oldStart,
+        oldLines: Number(hunkMatch[2] ?? 1),
+        newStart,
+        newLines: Number(hunkMatch[4] ?? 1),
+        addedLines: [],
+        removedLines: [],
+        contextLines: [],
+        changeKinds: [],
+        oldLine: oldStart,
+        newLine: newStart,
+      };
+      hunks.push(current);
+      continue;
+    }
+    if (!current || line.startsWith('\\')) continue;
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      current.addedLines.push({ line: current.newLine, text: truncateString(line.slice(1), 240) });
+      current.newLine++;
+      continue;
+    }
+    if (line.startsWith('-') && !line.startsWith('---')) {
+      current.removedLines.push({ line: current.oldLine, text: truncateString(line.slice(1), 240) });
+      current.oldLine++;
+      continue;
+    }
+    if (line.startsWith(' ')) {
+      current.contextLines.push({
+        oldLine: current.oldLine,
+        newLine: current.newLine,
+        text: truncateString(line.slice(1), 240),
+      });
+      current.oldLine++;
+      current.newLine++;
+    }
+  }
+
+  for (const hunk of hunks) {
+    hunk.changeKinds = patchChangeKinds(hunk);
+  }
+  return hunks;
+}
+
+function compactPatchHunk(hunk: PatchHunk, mapping?: PatchLineMapping): Record<string, unknown> {
+  const firstAdded = hunk.addedLines[0]?.line ?? hunk.newStart;
+  const lastAdded = hunk.addedLines[hunk.addedLines.length - 1]?.line ?? Math.max(hunk.newStart, hunk.newStart + hunk.newLines - 1);
+  const newLines = lineRangeString(firstAdded, lastAdded);
+  return {
+    file: hunk.file,
+    newLines,
+    fileSliceLines: mapping?.exactSliceSafe ? (mapping.fileSliceLines ?? newLines) : undefined,
+    lineMappingConfidence: mapping?.confidence ?? 'medium',
+    lineMappingReason: mapping?.reason ?? 'diff hunk line numbers are assumed to match the post-patch file',
+    oldLines: lineRangeString(hunk.oldStart, Math.max(hunk.oldStart, hunk.oldStart + hunk.oldLines - 1)),
+    addedLineCount: hunk.addedLines.length,
+    removedLineCount: hunk.removedLines.length,
+    changeKinds: hunk.changeKinds,
+    addedPreview: hunk.addedLines.slice(0, 2),
+    removedPreview: hunk.removedLines.slice(0, 2),
+  };
+}
+
+function patchChangeKinds(hunk: PatchHunk): string[] {
+  const file = hunk.file.toLowerCase();
+  const added = hunk.addedLines.map(line => line.text).join('\n');
+  const removed = hunk.removedLines.map(line => line.text).join('\n');
+  const both = `${added}\n${removed}`;
+  const kinds = new Set<string>();
+  if (isConfigPatchFile(hunk.file)) kinds.add('config');
+  if (isTestPatchFile(hunk.file) || /\b(assert|expect|verify|@Test|describe\(|it\()\b/.test(both)) kinds.add('test');
+  if (/@(GET|POST|PUT|PATCH|DELETE|Path|GetMapping|PostMapping|PutMapping|PatchMapping|DeleteMapping|RequestMapping)\b/.test(both)) kinds.add('endpoint');
+  if (/\b(public|export|interface|class|enum|record)\b/.test(added)) kinds.add('contract');
+  if (/\b(catch|throw|throws|Exception|Throwable|Error)\b/.test(both)) kinds.add('error-handling');
+  if (/\b(select|insert|update|delete|where)\b/i.test(both)) kinds.add('sql');
+  if (/\b(auth|permission|role|token|secret|password|credential|api[_-]?key)\b/i.test(both)) kinds.add('security');
+  if (/\b(console\.log|System\.out|printStackTrace|debugger)\b/.test(added)) kinds.add('debug-output');
+  if (file.includes('/test/') || file.includes('/tests/')) kinds.add('test');
+  return [...kinds];
+}
+
+function reviewFindingsForPatch(input: {
+  focus: ReviewFocus;
+  diff: string;
+  hunks: PatchHunk[];
+  changedFiles: string[];
+  riskFlags: Array<Record<string, unknown>>;
+  testsCount: number;
+  summary: Record<string, unknown>;
+}): ReviewFinding[] {
+  const findings: ReviewFinding[] = [];
+  const add = (finding: ReviewFinding) => {
+    if (findings.some(existing => existing.id === finding.id)) return;
+    findings.push(finding);
+  };
+
+  if (input.changedFiles.length === 0) {
+    add({
+      id: 'no-resolved-patch-input',
+      priority: 'P1',
+      title: 'Patch inputs did not resolve to indexed files',
+      why: 'The review packet cannot connect the patch to graph evidence until at least one file or symbol resolves.',
+      suggestedCheck: 'Refresh the index or pass explicit repo-relative files from the diff.',
+      confidence: 0.85,
+    });
+  }
+
+  for (const flag of input.riskFlags) {
+    const type = String(flag.type ?? '');
+    if (type === 'endpoint-change') {
+      add({
+        id: 'review-endpoint-contract',
+        priority: 'P1',
+        title: 'Endpoint contract changed or is directly touched',
+        why: 'Endpoint changes are user-facing and often require request/response, auth, compatibility, and integration-test checks.',
+        evidence: flag.evidence,
+        suggestedCheck: 'Verify route compatibility, status codes, auth behavior, and endpoint-level tests.',
+        confidence: 0.8,
+      });
+    } else if (type === 'dependent-endpoint') {
+      add({
+        id: 'review-dependent-endpoints',
+        priority: input.focus === 'api-contract' ? 'P1' : 'P2',
+        title: 'Dependent endpoint may observe the change',
+        why: 'The changed files feed code that is associated with indexed endpoints.',
+        evidence: flag.evidence,
+        suggestedCheck: 'Trace the endpoint path and inspect whether behavior changes for callers.',
+        confidence: 0.68,
+      });
+    } else if (type === 'high-fanout' || type === 'moderate-fanout') {
+      add({
+        id: 'review-fanout',
+        priority: type === 'high-fanout' ? 'P1' : 'P2',
+        title: 'Shared code has non-trivial fanout',
+        why: String(flag.reason ?? 'Patch has multiple dependents or callers.'),
+        suggestedCheck: 'Inspect callImpact.callers and dependencyImpact.dependents before approving behavior changes.',
+        confidence: 0.75,
+      });
+    } else if (type === 'no-tests-found') {
+      add({
+        id: 'review-missing-tests',
+        priority: 'P1',
+        title: 'No likely tests were found',
+        why: 'A production patch without nearby tests is higher risk, especially when graph impact is non-empty.',
+        suggestedCheck: 'Ask for a targeted test or identify the closest existing test command before approval.',
+        confidence: 0.72,
+      });
+    } else if (type === 'unresolved-inputs') {
+      add({
+        id: 'review-unresolved-inputs',
+        priority: 'P1',
+        title: 'Some review inputs did not resolve',
+        why: String(flag.reason ?? 'Unresolved file or symbol input can hide affected code.'),
+        suggestedCheck: 'Refresh the index and retry with exact repo-relative paths.',
+        confidence: 0.78,
+      });
+    } else if (type === 'config-change') {
+      add({
+        id: 'review-config-change',
+        priority: input.focus === 'security' ? 'P1' : 'P2',
+        title: 'Configuration changed',
+        why: 'Config changes can affect runtime behavior without direct call graph edges.',
+        evidence: flag.evidence,
+        suggestedCheck: 'Check environment defaults, deployment overrides, and rollback behavior.',
+        confidence: 0.7,
+      });
+    } else if (type === 'public-api-symbol') {
+      add({
+        id: 'review-public-api',
+        priority: input.focus === 'api-contract' ? 'P1' : 'P2',
+        title: 'Public API-like symbols are touched',
+        why: 'Public classes, methods, interfaces, or framework roles can affect consumers beyond local call sites.',
+        evidence: flag.evidence,
+        suggestedCheck: 'Check compatibility, overloads, serialization shape, and downstream callers.',
+        confidence: 0.66,
+      });
+    }
+  }
+
+  for (const hunk of input.hunks) {
+    const added = hunk.addedLines.map(line => line.text).join('\n');
+    const removed = hunk.removedLines.map(line => line.text).join('\n');
+    const lineEvidence = firstLineEvidence(hunk);
+    if (containsSecretLikeAssignment(added)) {
+      add({
+        id: `review-secret-${hunk.file}`,
+        priority: 'P0',
+        title: 'Secret-like value appears in added lines',
+        why: 'Hardcoded credentials or tokens should block approval until verified as non-secret test data.',
+        evidence: lineEvidence,
+        suggestedCheck: 'Remove the value, move it to secret management, or prove it is inert fixture data.',
+        confidence: 0.82,
+      });
+    }
+    if (/\b(Runtime\.getRuntime\(\)\.exec|new\s+ProcessBuilder|child_process\.exec|shell:\s*true)\b/.test(added)) {
+      add({
+        id: `review-command-exec-${hunk.file}`,
+        priority: input.focus === 'security' ? 'P0' : 'P1',
+        title: 'Command execution path added',
+        why: 'Command execution requires input validation, escaping, least privilege, and failure-mode review.',
+        evidence: lineEvidence,
+        suggestedCheck: 'Verify all command arguments are trusted or safely escaped and covered by tests.',
+        confidence: 0.76,
+      });
+    }
+    if (/\bcatch\s*\(\s*(Exception|Throwable|Error)\b/.test(added)) {
+      add({
+        id: `review-broad-catch-${hunk.file}`,
+        priority: 'P1',
+        title: 'Broad exception handling added',
+        why: 'Broad catches can hide failures or change retry/transaction semantics.',
+        evidence: lineEvidence,
+        suggestedCheck: 'Check whether the catch preserves error semantics, logging, and rollback behavior.',
+        confidence: 0.68,
+      });
+    }
+    if (hunk.changeKinds.includes('debug-output') || /\b(console\.log|System\.out\.print|printStackTrace|debugger)\b/.test(added)) {
+      add({
+        id: `review-debug-output-${hunk.file}`,
+        priority: 'P2',
+        title: 'Debug output appears in added lines',
+        why: 'Debug output in production paths can leak data or create noisy logs.',
+        evidence: lineEvidence,
+        suggestedCheck: 'Replace with structured logging at the right level or remove before approval.',
+        confidence: 0.78,
+      });
+    }
+    if (/\b(assert|expect|verify|shouldThrow|assertThrows)\b/.test(removed) && !/\b(assert|expect|verify|shouldThrow|assertThrows)\b/.test(added)) {
+      add({
+        id: `review-removed-assertion-${hunk.file}`,
+        priority: 'P1',
+        title: 'Test assertion appears to be removed',
+        why: 'Removing assertions can make tests pass while checking less behavior.',
+        evidence: firstRemovedLineEvidence(hunk),
+        suggestedCheck: 'Confirm an equivalent or stronger assertion was added elsewhere.',
+        confidence: 0.72,
+      });
+    }
+    if (looksLikeSqlStringConcatenation(added)) {
+      add({
+        id: `review-sql-concat-${hunk.file}`,
+        priority: input.focus === 'security' ? 'P0' : 'P1',
+        title: 'SQL string concatenation risk',
+        why: 'String-built SQL can introduce injection or query escaping bugs.',
+        evidence: lineEvidence,
+        suggestedCheck: 'Verify parameter binding or safe query builder usage.',
+        confidence: 0.7,
+      });
+    }
+  }
+
+  if ((input.focus === 'tests' || Number(input.summary.changedFileCount ?? 0) > 0) && input.testsCount === 0
+    && !input.changedFiles.every(isTestPatchFile)) {
+    add({
+      id: 'review-targeted-validation-required',
+      priority: 'P1',
+      title: 'Targeted validation is not identified',
+      why: 'The review packet could not map this patch to likely test files.',
+      suggestedCheck: 'Ask for the smallest command that exercises the changed behavior.',
+      confidence: 0.62,
+    });
+  }
+
+  return findings.sort((a, b) => reviewPriorityRank(a.priority) - reviewPriorityRank(b.priority) || b.confidence - a.confidence);
+}
+
+function reviewFocusForPatch(
+  focus: ReviewFocus,
+  impact: Record<string, unknown>,
+  findings: ReviewFinding[],
+  maxEvidence = 5,
+): Array<Record<string, unknown>> {
+  const summary = isPlainObject(impact.summary) ? impact.summary : {};
+  const impactedEndpoints = Array.isArray(impact.impactedEndpoints) ? impact.impactedEndpoints as unknown[] : [];
+  const tests = Array.isArray(impact.testsLikelyRelevant) ? impact.testsLikelyRelevant as unknown[] : [];
+  const focusItems: Array<Record<string, unknown>> = [];
+  if (focus !== 'tests') {
+    focusItems.push({
+      area: 'behavior-impact',
+      priority: findings.some(finding => finding.priority === 'P0' || finding.priority === 'P1') ? 'high' : 'normal',
+      check: 'Review changed behavior against callers, dependents, and impacted endpoints before reading unrelated files.',
+      evidence: compactReviewObject(summary, maxEvidence, 2),
+    });
+  }
+  if (impactedEndpoints.length > 0 || focus === 'api-contract') {
+    focusItems.push({
+      area: 'api-contract',
+      priority: impactedEndpoints.length > 0 ? 'high' : 'normal',
+      check: 'Check endpoint compatibility, request/response shape, status codes, and auth assumptions.',
+      evidence: compactReviewObject(impactedEndpoints, maxEvidence, 2),
+    });
+  }
+  focusItems.push({
+    area: 'tests',
+    priority: tests.length > 0 ? 'normal' : 'high',
+    check: tests.length > 0 ? 'Run or inspect likely targeted tests first.' : 'Find or request targeted tests before approval.',
+    evidence: compactReviewObject(tests, maxEvidence, 2),
+  });
+  if (focus === 'security' || findings.some(finding => finding.id.includes('secret') || finding.id.includes('sql') || finding.id.includes('command'))) {
+    focusItems.push({
+      area: 'security',
+      priority: 'high',
+      check: 'Inspect secret handling, command execution, query construction, and auth-sensitive lines.',
+    });
+  }
+  return focusItems;
+}
+
+function reviewToolCalls(
+  changedFiles: string[],
+  lineFocus: Array<Record<string, unknown>>,
+  findings: ReviewFinding[],
+  maxCalls = 6,
+): Array<Record<string, unknown>> {
+  const calls: Array<Record<string, unknown>> = [];
+  for (const hunk of lineFocus) {
+    if (calls.length >= maxCalls) break;
+    const file = stringOrUndefined(hunk.file);
+    const lines = stringOrUndefined(hunk.fileSliceLines);
+    if (file && lines) calls.push({ tool: 'get_file_slice', args: { file, lines, maxChars: 4000 } });
+  }
+  if (calls.length === 0 && changedFiles[0]) calls.push({ tool: 'get_file_summary', args: { file: changedFiles[0] } });
+  if (calls.length < maxCalls && findings.some(finding => finding.id === 'review-fanout') && changedFiles[0]) {
+    calls.push({ tool: 'trace_dependencies', args: { target: changedFiles[0], direction: 'dependents', depth: 2, limit: 100 } });
+  }
+  return calls.slice(0, maxCalls);
+}
+
+function rankPatchHunks(hunks: PatchHunk[]): PatchHunk[] {
+  return [...hunks].sort((a, b) => patchHunkRiskScore(b) - patchHunkRiskScore(a)
+    || b.addedLines.length + b.removedLines.length - (a.addedLines.length + a.removedLines.length)
+    || a.file.localeCompare(b.file)
+    || a.newStart - b.newStart);
+}
+
+function patchHunkRiskScore(hunk: PatchHunk): number {
+  let score = 0;
+  const weights: Record<string, number> = {
+    security: 100,
+    sql: 85,
+    endpoint: 75,
+    contract: 65,
+    'error-handling': 55,
+    config: 45,
+    'debug-output': 35,
+    test: 10,
+  };
+  for (const kind of hunk.changeKinds) score += weights[kind] ?? 20;
+  const added = hunk.addedLines.map(line => line.text).join('\n');
+  if (containsSecretLikeAssignment(added)) score += 120;
+  if (looksLikeSqlStringConcatenation(added)) score += 90;
+  if (/\b(Runtime\.getRuntime\(\)\.exec|new\s+ProcessBuilder|child_process\.exec|shell:\s*true)\b/.test(added)) score += 100;
+  score += Math.min(30, hunk.addedLines.length + hunk.removedLines.length);
+  return score;
+}
+
+function patchDiffStats(hunks: PatchHunk[], diff: string): Record<string, unknown> {
+  const files = new Set(hunks.map(hunk => hunk.file).filter(Boolean));
+  const addedLineCount = hunks.reduce((sum, hunk) => sum + hunk.addedLines.length, 0);
+  const removedLineCount = hunks.reduce((sum, hunk) => sum + hunk.removedLines.length, 0);
+  const changedLineCount = addedLineCount + removedLineCount;
+  return {
+    fileCount: files.size,
+    hunkCount: hunks.length,
+    addedLineCount,
+    removedLineCount,
+    changedLineCount,
+    diffChars: diff.length,
+    scale: changedLineCount >= 100_000 ? 'huge'
+      : changedLineCount >= 20_000 ? 'very-large'
+        : changedLineCount >= 2_000 ? 'large'
+          : changedLineCount >= 500 ? 'medium'
+            : 'small',
+  };
+}
+
+function compactReviewFinding(finding: ReviewFinding, maxEvidence: number): ReviewFinding {
+  return {
+    ...finding,
+    evidence: finding.evidence === undefined ? undefined : compactReviewObject(finding.evidence, maxEvidence, 3),
+    why: truncateString(finding.why, 420),
+    suggestedCheck: truncateString(finding.suggestedCheck, 320),
+  };
+}
+
+function compactReviewObject(value: unknown, maxArrayItems: number, depth: number): unknown {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return truncateString(value, 260);
+  if (typeof value !== 'object') return value;
+  if (depth <= 0) {
+    if (Array.isArray(value)) return { omittedCount: value.length };
+    return '[object omitted]';
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, maxArrayItems).map(item => compactReviewObject(item, maxArrayItems, depth - 1));
+  }
+  const output: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (Array.isArray(child)) {
+      output[key] = child.slice(0, maxArrayItems).map(item => compactReviewObject(item, maxArrayItems, depth - 1));
+      if (child.length > maxArrayItems) output[`${key}OmittedCount`] = child.length - maxArrayItems;
+    } else {
+      output[key] = compactReviewObject(child, maxArrayItems, depth - 1);
+    }
+  }
+  return output;
+}
+
+function reviewPlanForPatch(
+  diffStats: Record<string, unknown>,
+  findings: ReviewFinding[],
+  impact: Record<string, unknown>,
+): Array<Record<string, unknown>> {
+  const scale = String(diffStats.scale ?? 'small');
+  const summary = isPlainObject(impact.summary) ? impact.summary : {};
+  const plan: Array<Record<string, unknown>> = [];
+  plan.push({
+    step: 'triage',
+    action: 'Read reviewStatus, priorityCounts, changedFiles, and top P0/P1 findings before opening files.',
+  });
+  if (scale === 'large' || scale === 'very-large' || scale === 'huge') {
+    plan.push({
+      step: 'batch-by-risk',
+      action: 'Review only risky hunks first; defer low-risk formatting/mechanical changes unless tests fail.',
+      batchSize: scale === 'huge' ? '10-20 files per pass' : '20-50 files per pass',
+    });
+  }
+  if (findings.some(finding => finding.priority === 'P0' || finding.priority === 'P1')) {
+    plan.push({
+      step: 'confirm-findings',
+      action: 'For each top finding, call only the listed requiredToolCalls or exact file slices; do not scan the whole diff.',
+    });
+  }
+  if (Number(summary.impactedEndpointCount ?? 0) > 0) {
+    plan.push({
+      step: 'api-contract',
+      action: 'Check endpoint compatibility and representative request/response tests before implementation details.',
+    });
+  }
+  plan.push({
+    step: 'validation',
+    action: 'Report missing targeted tests as a review finding; broad test suites are secondary evidence.',
+  });
+  return plan;
+}
+
+function patchLineMappingFor(hunk: PatchHunk, sourceLines: string[] | undefined): PatchLineMapping {
+  if (!sourceLines) {
+    return { confidence: 'low', exactSliceSafe: false, reason: 'file content could not be loaded for line mapping validation' };
+  }
+  const context = hunk.contextLines
+    .filter(line => line.text.trim().length > 0)
+    .slice(0, 4);
+  if (context.length === 0) {
+    return { confidence: 'medium', exactSliceSafe: true, reason: 'diff has no non-empty context lines; using hunk new-line numbers' };
+  }
+  let newMatched = 0;
+  let oldMatched = 0;
+  for (const line of context) {
+    const expected = line.text.trim();
+    const actualNew = sourceLines[line.newLine - 1]?.trim();
+    const actualOld = sourceLines[line.oldLine - 1]?.trim();
+    if (actualNew && actualNew === expected) newMatched++;
+    if (actualOld && actualOld === expected) oldMatched++;
+  }
+  if (newMatched === context.length) {
+    return {
+      confidence: 'high',
+      exactSliceSafe: true,
+      reason: 'diff context matches current file at post-patch line numbers',
+    };
+  }
+  if (oldMatched === context.length) {
+    const start = Math.max(1, hunk.oldStart - 2);
+    const end = Math.max(start, hunk.oldStart + Math.max(hunk.oldLines, 1) + 2);
+    return {
+      confidence: 'high',
+      exactSliceSafe: true,
+      fileSliceLines: lineRangeString(start, end),
+      reason: 'diff context matches current file at pre-patch line numbers; slice shows surrounding existing code',
+    };
+  }
+  const matched = Math.max(newMatched, oldMatched);
+  if (matched > 0) {
+    const start = Math.max(1, hunk.oldStart - 2);
+    const end = Math.max(start, hunk.oldStart + Math.max(hunk.oldLines, 1) + 2);
+    return {
+      confidence: 'medium',
+      exactSliceSafe: true,
+      fileSliceLines: lineRangeString(start, end),
+      reason: `partial diff context match (${matched}/${context.length}); verify slice before final review`,
+    };
+  }
+  return {
+    confidence: 'low',
+    exactSliceSafe: false,
+    reason: 'diff context does not match current file at hunk line numbers; use file summary or symbol lookup before exact line comments',
+  };
+}
+
+function reviewQuestionsForPatch(findings: ReviewFinding[], impact: Record<string, unknown>): string[] {
+  const questions: string[] = [];
+  if (findings.some(finding => finding.id === 'review-endpoint-contract')) {
+    questions.push('Does the patch preserve endpoint compatibility and documented response/error behavior?');
+  }
+  if (findings.some(finding => finding.id === 'review-missing-tests' || finding.id === 'review-targeted-validation-required')) {
+    questions.push('What targeted test or command proves the changed behavior?');
+  }
+  if (findings.some(finding => finding.id.includes('secret') || finding.id.includes('sql') || finding.id.includes('command'))) {
+    questions.push('Can the security-sensitive change be constrained, parameterized, or covered by a negative test?');
+  }
+  const summary = isPlainObject(impact.summary) ? impact.summary : {};
+  if (Number(summary.directDependentCount ?? 0) > 0 || Number(summary.callerCount ?? 0) > 0) {
+    questions.push('Have direct dependents and callers been checked for changed assumptions?');
+  }
+  return questions.slice(0, 6);
+}
+
+function reviewStatusFor(findings: ReviewFinding[], changedFiles: string[]): string {
+  if (changedFiles.length === 0 || findings.some(finding => finding.priority === 'P0')) return 'blocked';
+  if (findings.some(finding => finding.priority === 'P1')) return 'needs-attention';
+  return 'ready-for-review';
+}
+
+function reviewPriorityCounts(findings: ReviewFinding[]): Record<string, number> {
+  return {
+    P0: findings.filter(finding => finding.priority === 'P0').length,
+    P1: findings.filter(finding => finding.priority === 'P1').length,
+    P2: findings.filter(finding => finding.priority === 'P2').length,
+  };
+}
+
+function reviewConfidence(
+  changedFileCount: number,
+  hunkCount: number,
+  findings: ReviewFinding[],
+  riskFlags: Array<Record<string, unknown>>,
+): number {
+  let confidence = changedFileCount > 0 ? 0.68 : 0.28;
+  if (hunkCount > 0) confidence += 0.08;
+  if (riskFlags.length > 0) confidence += 0.04;
+  if (findings.some(finding => finding.priority === 'P0')) confidence += 0.04;
+  return Math.round(Math.max(0.25, Math.min(0.9, confidence)) * 100) / 100;
+}
+
+function reviewPriorityRank(priority: ReviewFinding['priority']): number {
+  if (priority === 'P0') return 0;
+  if (priority === 'P1') return 1;
+  return 2;
+}
+
+function firstLineEvidence(hunk: PatchHunk): Record<string, unknown> | undefined {
+  const line = hunk.addedLines[0];
+  if (!line) return undefined;
+  return { file: hunk.file, line: line.line, text: line.text };
+}
+
+function firstRemovedLineEvidence(hunk: PatchHunk): Record<string, unknown> | undefined {
+  const line = hunk.removedLines[0];
+  if (!line) return undefined;
+  return { file: hunk.file, line: line.line, text: line.text };
+}
+
+function containsSecretLikeAssignment(value: string): boolean {
+  return /\b(password|passwd|secret|token|api[_-]?key|private[_-]?key|credential)\b\s*[:=]\s*["'][^"']{6,}["']/i.test(value);
+}
+
+function looksLikeSqlStringConcatenation(value: string): boolean {
+  return /["'`]\s*(select|insert|update|delete)\b[\s\S]{0,160}\+\s*/i.test(value)
+    || /\+\s*["'`][\s\S]{0,80}\b(where|and|or|from)\b/i.test(value);
+}
+
+function arrayRecords(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value.filter(isPlainObject);
 }
 
 interface SearchIntent {

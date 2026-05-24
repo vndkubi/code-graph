@@ -27,9 +27,11 @@ Java/Jakarta EE is the primary semantic target. TypeScript/JavaScript and Python
 | `get_index_stats` | Inspect current snapshot counts and file roles |
 | `get_research_pack` | Return a token-budgeted research pack with definitions, callers, callees, impacted endpoints, top files, and confidence notes |
 | `impact_of_symbol` | Return an impact slice for a symbol: definitions, callers, callees, affected endpoints, likely tests, and top files |
+| `review_patch` | Build a code review packet from files, symbols, or a unified diff: findings, line focus, impact, tests, validation, and reviewer questions |
 | `search_code` | Mixed retrieval across files, symbols, endpoints, references, and dependencies |
 | `search_files` | Find relevant files with top symbols/endpoints, facets, pagination, and rank evidence |
 | `search_symbol` | Search indexed symbols with intent-aware ranking, pagination, facets, and optional rank explanations |
+| `simulate_patch_impact` | Simulate impact from changed files, symbols, or a unified diff before editing; returns endpoints, dependents, callers, likely tests, validation, and risk flags |
 | `trace_dependencies` | Trace direct/transitive dependencies or dependents with seed files, graph edges, impacted endpoints, and cycle hints |
 
 Graph edges and research packs include confidence notes when resolution is fuzzy or incomplete.
@@ -51,6 +53,113 @@ Use prompts like these to make the agent reach for graph tools before opening ma
 - "Use `find_tests_for`: which tests are likely relevant for `NotebookController.createNotebook`?"
 - "Use `explain_endpoint` with snippets: explain `GET /notebooks` from controller to service/repository/DTO/tests."
 - "Use `impact_of_symbol`: who calls `RecallService`, what does it call, and which tests should I run?"
+- "Use `simulate_patch_impact` before editing `OrderService.java`: which endpoints, callers, dependents, and tests are likely affected?"
+- "Use `review_patch` on this diff with focus `api-contract`: what should block review, what lines need exact slices, and what tests should run?"
+
+### Patch Impact Simulator
+
+`simulate_patch_impact` is the pre-edit/PR-review tool. It accepts any mix of `files`, `symbols`, and a unified `diff`, resolves them against the current snapshot, then returns a compact impact packet:
+
+- changed files and symbols declared in those files
+- direct dependencies and dependents
+- callers and callees for touched symbols
+- endpoints changed directly or exposed by impacted files
+- likely tests and inferred validation commands
+- risk flags such as `endpoint-change`, `dependent-endpoint`, `high-fanout`, `config-change`, `no-tests-found`, and `unresolved-inputs`
+
+Example MCP arguments:
+
+```json
+{
+  "files": ["src/main/java/com/example/orders/OrderService.java"],
+  "symbols": ["OrderService.createOrder"],
+  "diff": "diff --git a/src/main/java/com/example/orders/OrderService.java b/src/main/java/com/example/orders/OrderService.java\n+++ b/src/main/java/com/example/orders/OrderService.java",
+  "limit": 50,
+  "autoRefresh": true
+}
+```
+
+Use this before loading large files. The intended agent flow is `simulate_patch_impact` -> `get_file_slice` for the top changed/impacted file -> targeted validation from the simulator response.
+
+### Code Review Packet
+
+`review_patch` builds on `simulate_patch_impact` and adds review-specific evidence:
+
+- `reviewFindings`: deterministic risk hypotheses with `P0`/`P1`/`P2`, not unsupported claims.
+- `lineFocus`: changed hunks, line ranges, added/removed previews, and change kinds such as `endpoint`, `contract`, `security`, `debug-output`, or `test`.
+- `reviewFocus`: what the reviewer should inspect first: behavior impact, API contract, tests, or security.
+- `requiredToolCalls`: exact follow-up graph/slice calls an agent should make before writing final review comments.
+- `reviewerQuestions`: concise questions to ask when evidence is incomplete.
+- `includeLikelyTests: true`: optional slower deep test lookup. The default review path stays fast and raises a validation gap when tests are not inferred.
+
+Example MCP arguments:
+
+```json
+{
+  "files": ["src/main/java/com/example/orders/OrderController.java"],
+  "symbols": ["OrderController.create"],
+  "diff": "diff --git a/src/main/java/com/example/orders/OrderController.java b/src/main/java/com/example/orders/OrderController.java\n--- a/src/main/java/com/example/orders/OrderController.java\n+++ b/src/main/java/com/example/orders/OrderController.java\n@@ -20,6 +20,7 @@\n+        System.out.println(\"debug create order\");",
+  "focus": "api-contract",
+  "includeLikelyTests": true,
+  "limit": 50,
+  "autoRefresh": true
+}
+```
+
+The intended review flow is `review_patch` -> run the listed `requiredToolCalls` -> write final review comments only for issues confirmed by exact slices or tests.
+
+### Large Diff Review Strategy
+
+For real PRs in the 2k-170k changed-line range, do not ask the AI to review the whole diff linearly. Use `review_patch` as a triage router first, then expand only the riskiest areas.
+
+Default `review_patch` output is now `outputMode: "compact"`:
+
+- `reviewStatus`: `blocked`, `needs-attention`, or `ready-for-review`.
+- `reviewPlan`: ordered review workflow for large diffs.
+- `diffStats`: file count, hunk count, added/removed/changed lines, and scale.
+- `reviewFindings`: capped top P0/P1/P2 hypotheses.
+- `lineFocus`: ranked risky hunks, not every hunk.
+- `lineMappingConfidence`: tells whether exact file line comments are safe.
+- `requiredToolCalls`: the next bounded graph/slice calls; no broad scan by default.
+- `metrics.omitted*`: how much evidence was intentionally capped.
+
+Use these modes:
+
+| Mode | Use when | Behavior |
+|------|----------|----------|
+| `compact` | Default for Copilot/Codex review, especially large PRs | Small verdict-first packet, top findings only |
+| `balanced` | Need a little more evidence after triage | More hunks/findings/evidence, still capped |
+| `full` | Local debugging or benchmark only | Expanded evidence; can be too large for agent context |
+
+Example for a huge PR:
+
+```json
+{
+  "diff": "<unified diff>",
+  "focus": "bug-risk",
+  "outputMode": "compact",
+  "maxFindings": 8,
+  "maxLineFocus": 15,
+  "maxEvidencePerFinding": 3,
+  "maxRequiredToolCalls": 3
+}
+```
+
+Review loop for large diffs:
+
+1. Run `review_patch` with `outputMode: "compact"`.
+2. Read only `reviewStatus`, `reviewPlan`, P0/P1 findings, and `requiredToolCalls`.
+3. Execute required tool calls. If `lineMappingConfidence` is `low`, use `get_file_summary` or symbol lookup before exact line comments.
+4. Write final review comments only for confirmed P0/P1 issues; report missing targeted tests as a separate finding.
+5. If the compact packet shows many omitted findings/hunks, rerun with `outputMode: "balanced"` for one subsystem or file group, not the whole PR.
+
+Local measurement after compacting `review_patch`, run on 2026-05-24 with the same synthetic review diffs:
+
+| Repo | Compact packet | Full packet | Compact reduction | Next tool behavior |
+|------|---------------:|------------:|------------------:|--------------------|
+| `doughnut` | 11.7KB | 21.4KB | 45.5% smaller | one bounded `get_file_slice` |
+| `hadoop` | 4.4KB | 4.4KB | n/a for tiny diff | `get_file_summary` because diff context did not match the real file |
+| `elasticsearch` | 4.2KB | 4.2KB | n/a for tiny diff | `get_file_summary` because diff context did not match the real file |
 
 ---
 
@@ -544,11 +653,162 @@ Real-project index benchmark, run on 2026-05-24 against local checkouts under `D
 | `elasticsearch` | Warm unchanged | 19.8s | 9.6s | 51.7% faster | 17.7s | 7.5s | 57.9% faster | skipped unchanged |
 | `elasticsearch` | Modify 1 file | 404.0s | 22.2s | 94.5% faster | 403.3s | 20.8s | 94.8% faster | incremental |
 
+Review-packet proof benchmark, run on 2026-05-24 against warmed indexes for the same local checkouts. It compares baseline raw file reads/search against one `review_patch` packet per task. Token counts use the documented `ceil(character_count / 4)` estimator, not actual model API usage.
+
+| Repo | Tasks | Baseline correct | Review packet correct | Input token change | Output token change | File-open change | `review_patch` p95 |
+|------|------:|-----------------:|----------------------:|-------------------:|--------------------:|-----------------:|-------------------:|
+| `doughnut` | 3 | 3/3 | 3/3 | 78.8% fewer | 51.2% fewer | 80.0% fewer | 688ms |
+| `hadoop` | 1 | 0/1 | 1/1 | 97.5% fewer | 50.2% fewer | 98.3% fewer | 5,364ms |
+| `elasticsearch` | 1 | 1/1 | 1/1 | 93.9% fewer | 68.0% fewer | 93.3% fewer | 9,285ms |
+
+The Hadoop baseline missed the expected file within its capped raw-file scan, while the review packet resolved it from the index. Large-repo review latency is still higher than ideal, but it stays bounded to one graph packet instead of dozens of raw file reads.
+
+Real GitHub Copilot CLI A/B review proof, run on 2026-05-24 with `gh copilot --output-format=json`. The same technical-review prompt and synthetic debug-print diff were used for both modes. Exact model input tokens were not exposed in the Copilot JSONL on this machine (`actualInputTokens: null`), so this table reports actual assistant `outputTokens`, wall time, and tool behavior from the captured JSONL.
+
+| Repo | Baseline time | CodeGraph time | Time change | Baseline output tokens | CodeGraph output tokens | Output token change | CodeGraph tools used | Raw-file mention change |
+|------|--------------:|---------------:|------------:|-----------------------:|------------------------:|--------------------:|----------------------|------------------------:|
+| `doughnut` | 29.3s | 52.8s | 80.4% slower | 880 | 1,592 | 80.9% more | `review_patch`, `get_file_slice` | 62 more |
+| `hadoop` | 33.3s | 65.0s | 95.2% slower | 1,043 | 2,679 | 156.9% more | `review_patch`, `get_file_slice` | 57 more |
+| `elasticsearch` | 34.9s | 42.2s | 20.9% slower | 1,106 | 1,251 | 13.1% more | `review_patch`, `get_file_slice` | 22 fewer |
+
+The Copilot CLI proof did not validate a token/time win yet. It validated that the MCP can connect and be called in real Copilot sessions, but the current `review_patch` output is too large/noisy for agent review. The main failure modes observed:
+
+- `review_patch` can return a large packet, especially for controller files with many endpoints; Copilot then spends extra turns reading the packet or its temp-file spill.
+- `requiredToolCalls` used diff hunk line numbers as if they were real file line numbers. For synthetic diffs against large real files, `get_file_slice` returned license/header lines instead of the changed code, so Copilot fell back to normal `view`.
+- Workspace identity must be stable. The Copilot runner needs the same `-WorkspaceKey` used during prewarm; otherwise MCP starts against an unindexed workspace and falls back to raw search.
+
+Workspace-key prewarm setup cost for the same proof run:
+
+| Repo | Files | Files parsed | Parse cache hits | Key-snapshot build time | Note |
+|------|------:|-------------:|-----------------:|------------------------:|------|
+| `doughnut` | existing | existing | existing | already warm | Keyed snapshot already existed |
+| `hadoop` | 13,356 | 0 | 13,356 | 79.7s | Snapshot rebuild from parse cache |
+| `elasticsearch` | 27,015 | 0 | 24,891 | 235.0s | Snapshot rebuild from parse cache, observed RSS around 2.6GB |
+
+Next review-quality optimization target: make `review_patch` return a compact verdict-first packet with real-file line mapping, capped endpoint evidence, and only one or two high-confidence required follow-up calls. Until that is fixed, the local benchmark `benchmark review` proves retrieval compression, while real Copilot CLI review does not yet prove lower token/time consumption.
+
 ---
 
 ## Docker
 
 Docker is optional. v2 normally runs best as a local stdio command from VS Code/Codex, but the image can be used when the workspace must be mounted into a container.
+
+### Docker setup runbook
+
+Use this checklist when setting up Docker for one or more real repositories.
+
+1. Build the image from the CodeGraph repo:
+
+```powershell
+cd D:\Personal\Projects\code-graph
+docker --context desktop-linux build -t mcp-code-graph:latest .
+```
+
+If your Docker context is already the Docker Desktop Linux engine, plain `docker build -t mcp-code-graph:latest .` is enough. On Windows, `docker --context desktop-linux ...` avoids accidentally targeting a stopped/default context.
+
+2. Create one persistent cache volume. Reuse this volume across runs so warm index data survives container exit:
+
+```powershell
+docker --context desktop-linux volume create codegraph-cache
+```
+
+3. Prewarm a project index before wiring the MCP into an editor:
+
+```powershell
+docker --context desktop-linux run --rm `
+  -v "D:/Personal/Projects/doughnut:/workspace:ro" `
+  -v "codegraph-cache:/codegraph-home" `
+  -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/doughnut" `
+  mcp-code-graph:latest `
+  index --root /workspace
+```
+
+Run the same command again to confirm warm behavior. A healthy warm run should report `skippedUnchanged: true` or `filesParsed: 0`, plus high `hashCacheHits`/`parseCacheHits`.
+
+4. Run the MCP stdio process manually as a smoke test:
+
+```powershell
+docker --context desktop-linux run --rm -i `
+  -v "D:/Personal/Projects/doughnut:/workspace:ro" `
+  -v "codegraph-cache:/codegraph-home" `
+  -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/doughnut" `
+  mcp-code-graph:latest `
+  mcp --root /workspace --auto-refresh
+```
+
+This command is expected to keep running because it is an MCP stdio server. Stop it with `Ctrl+C` after confirming the container starts without errors.
+
+5. Use a different `CODEGRAPH_WORKSPACE_KEY` for every host project, even though all containers mount the repo at `/workspace`:
+
+```powershell
+# Doughnut
+-v "D:/Personal/Projects/doughnut:/workspace:ro"
+-e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/doughnut"
+
+# Hadoop
+-v "D:/Personal/Projects/hadoop:/workspace:ro"
+-e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop"
+
+# Elasticsearch
+-v "D:/Personal/Projects/elasticsearch:/workspace:ro"
+-e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/elasticsearch"
+```
+
+Without a stable workspace key, multiple repos can collide because Docker presents each one as `/workspace`.
+
+6. Inspect the Docker cache if warm runs look wrong:
+
+```powershell
+docker --context desktop-linux run --rm `
+  -v "codegraph-cache:/codegraph-home" `
+  --entrypoint sh `
+  mcp-code-graph:latest `
+  -lc "ls -lh /codegraph-home && du -sh /codegraph-home"
+```
+
+7. Reset Docker cache only when you intentionally want a cold run:
+
+```powershell
+docker --context desktop-linux volume rm codegraph-cache
+docker --context desktop-linux volume create codegraph-cache
+```
+
+8. Benchmark Docker retrieval with a warmed index:
+
+```powershell
+docker --context desktop-linux run --rm `
+  -v "D:/Personal/Projects/doughnut:/workspace:ro" `
+  -v "codegraph-cache:/codegraph-home" `
+  -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/doughnut" `
+  mcp-code-graph:latest `
+  benchmark proof --root /workspace --tasks auto --task-count 3 --no-index
+```
+
+Use `--no-index` only after a successful prewarm. It measures retrieval/context routing without refreshing the snapshot first.
+
+For code-review effectiveness specifically, run:
+
+```powershell
+docker --context desktop-linux run --rm `
+  -v "D:/Personal/Projects/doughnut:/workspace:ro" `
+  -v "codegraph-cache:/codegraph-home" `
+  -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/doughnut" `
+  mcp-code-graph:latest `
+  benchmark review --root /workspace --tasks auto --task-count 3 --no-index
+```
+
+`benchmark review` compares baseline raw file reads against one `review_patch` packet per task and reports input/output token savings, file-open reduction, correctness, and `reviewPatchP95Ms`.
+
+### Docker troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `Cannot connect to the Docker daemon` | Docker Desktop engine/context is not running | Start Docker Desktop, then try `docker --context desktop-linux ps` |
+| Every repo appears as the same workspace | Missing or reused `CODEGRAPH_WORKSPACE_KEY` | Set a unique host path or stable key per repo |
+| Warm run still parses everything | Cache volume changed or workspace key changed | Reuse the same volume and exact workspace key |
+| Very slow cold index on Windows | Docker Desktop bind mount overhead | Prefer local Node/stdio or WSL/ext4 for large repos; keep Docker cache volume persistent |
+| Corporate `npm ci` fails during build | Missing trusted root CA | Use `.\docker-build.ps1 -CaCert C:\path\corp-root-ca.crt` |
+| MCP starts but agent does not use it | Editor config points to wrong command/args | Check CodeGraph logs or ask the agent to call `get_index_stats` explicitly |
 
 Windows PowerShell:
 
@@ -705,17 +965,17 @@ codegraph daemon start|stop|status     Manage local daemon
 codegraph daemon run                   Run daemon in the foreground
 codegraph index --root <workspace>     Prewarm persistent index
 codegraph doctor                       Inspect local configuration
-codegraph benchmark generate|index|eval|proof
-                                      Generate synthetic repos, measure indexing, run golden evals, or prove context routing savings
+codegraph benchmark generate|index|eval|proof|review
+                                      Generate synthetic repos, measure indexing, run evals, or prove context/review savings
 
 Options:
   --root <path>                        Workspace root
   --home <path>                        Override CODEGRAPH_HOME
   --port <number>                      Daemon port for daemon run
   --tasks <path>                       Golden eval task JSON file
-  --tasks auto                         Derive context-proof tasks from indexed-looking source files
-  --task-count <number>                Number of auto-derived context-proof tasks
-  --no-index                           Reuse the current context-proof snapshot instead of refreshing first
+  --tasks auto                         Derive proof/review tasks from indexed-looking source files
+  --task-count <number>                Number of auto-derived proof/review tasks
+  --no-index                           Reuse the current proof/review snapshot instead of refreshing first
   --parse-workers <number>             Worker threads for cold/cache-miss parsing during index
   --no-incremental                     Force changed-file index runs through full snapshot rebuild
   --incremental-file-limit <number>    Max changed/deleted files for incremental index path
@@ -740,6 +1000,9 @@ node dist/cli.js benchmark eval --root /path/to/project --tasks examples/golden-
 
 # Compare baseline file reads with get_context_packet + get_file_slice
 node dist/cli.js benchmark proof --root /path/to/project --tasks examples/context-proof-tasks.example.json --home /tmp/codegraph-proof-home
+
+# Compare baseline raw review context with review_patch packets
+node dist/cli.js benchmark review --root /path/to/project --tasks examples/review-proof-tasks.example.json --home /tmp/codegraph-proof-home
 ```
 
 ---
@@ -968,6 +1231,42 @@ Each proof task can include:
 
 The proof report includes `baselineCorrect`, `mcpCorrect`, `qualityMaintained`, `tokenSavingPct`, `fileOpenReductionPct`, `contextPacketP95Ms`, and `mcpWorkflowP95Ms`. Treat it as a retrieval proof; full coding proof still needs running the same edit tasks with an agent and validating patches/tests.
 
+To prove code-review workflow specifically, use `benchmark review`. It compares a baseline reviewer that opens matched files against CodeGraph calling `review_patch` once per task:
+
+```bash
+node dist/cli.js benchmark review --root /path/to/project --tasks examples/review-proof-tasks.example.json --home /tmp/codegraph-proof-home
+```
+
+Each review task can include:
+
+- `title`: review request.
+- `files`, `symbols`, and `diff`: the proposed patch inputs for `review_patch`.
+- `focus`: `general`, `bug-risk`, `api-contract`, `tests`, or `security`.
+- `baselineSearchTerms`: terms the baseline scanner uses.
+- `expectedContains` and `expectedFiles`: lightweight correctness checks for the review packet.
+
+The review proof report includes `baselineCorrect`, `mcpCorrect`, `qualityMaintained`, `inputTokenSavingPct`, `outputTokenSavingPct`, `fileOpenReductionPct`, and `reviewPatchP95Ms`.
+
+To prove the same workflow with the real GitHub Copilot CLI, use the A/B runner after `gh auth login` and after `gh copilot -- --help` works:
+
+```powershell
+npm.cmd run build
+powershell -ExecutionPolicy Bypass -File .\examples\copilot-review-proof.ps1 `
+  -RepoRoot D:\Personal\Projects\doughnut `
+  -CodeGraphRoot D:\Personal\Projects\code-graph `
+  -CodeGraphHome D:\Personal\Projects\code-graph\.tmp-debug-home\proof-home-doughnut `
+  -WorkspaceKey D:\Personal\Projects\doughnut
+```
+
+Use `-WorkspaceKey` whenever the index was prewarmed with `--workspace-key` or `CODEGRAPH_WORKSPACE_KEY`; the MCP run must use the same key or it will register a new unindexed workspace. Use `-SkipIndex` only after the keyed snapshot already exists. Use `-DiffFile <path>` to review a fixed patch file instead of the current working-tree diff.
+
+The script runs the same technical-review prompt twice:
+
+- baseline: `gh copilot -p ... --disable-mcp-server=codegraph`
+- CodeGraph: `gh copilot -p ... --additional-mcp-config=@<temp codegraph mcp config>`
+
+It writes `summary.json`, captured JSONL output, logs, prompt, diff, and MCP config under `.tmp-debug-home/copilot-review-proof-runs/<timestamp>`. The summary reports assistant `outputTokens` when Copilot JSONL exposes `assistant.message.data.outputTokens`. Exact input tokens are often not present; in that case `actualInputTokens` is `null`, and `estimatedTokens` is only a consistent captured-log size estimate (`ceil(captured_chars / 4)`), not true model input usage.
+
 Metrics to report:
 
 | Metric | Target |
@@ -981,6 +1280,8 @@ Metrics to report:
 | Impact top-5 recall | >90% |
 | Agent context token reduction | 40-70% |
 | Agent file-open reduction | 50%+ |
+| `review_patch` p95 | <2s small/medium repos; <10s very large repos |
+| Review input token reduction | 40-70% with correctness maintained |
 
 ### Proof Runbook
 
