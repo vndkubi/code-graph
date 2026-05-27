@@ -515,6 +515,7 @@ There are two common variants:
 |-------------|---------|-----|
 | `registry.npmjs.org` | npm cannot verify the registry TLS issuer | Build with `-CaCert` or `--ca-cert`. |
 | `unofficial-builds.nodejs.org/...node-headers...` | a native addon such as `better-sqlite3` fell back to `node-gyp` and tried to download Alpine/musl Node headers | Use the current Dockerfile. It sets both `NPM_CONFIG_*` and `npm_config_*` values plus `npm ci --build-from-source --nodedir=/usr/local`, so native addons use the local Node headers already in the image. |
+| Native addons compile again in the runtime stage | Runtime ran `npm ci --omit=dev` after the builder already compiled native modules | Use the current Dockerfile. It builds once in the builder, runs `npm prune --omit=dev`, and copies pruned `node_modules` into runtime. |
 
 Fix it by exporting the corporate root certificate as PEM/CRT and building with
 the CA secret:
