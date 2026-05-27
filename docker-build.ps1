@@ -37,6 +37,19 @@ function Assert-LastExitCode {
   }
 }
 
+function Write-CertificateBuildHelp {
+  Write-Host ""
+  Write-Host "Docker build failed with UNABLE_TO_GET_ISSUER_CERT_LOCALLY." -ForegroundColor Yellow
+  Write-Host "The container does not trust the HTTPS issuer used for npm downloads."
+  Write-Host ""
+  Write-Host "Fix:"
+  Write-Host "  1. Export your corporate/root CA as PEM or CRT."
+  Write-Host "  2. Rebuild with:"
+  Write-Host "     .\docker-build.ps1 -CaCert C:\temp\corp-root-ca.crt"
+  Write-Host ""
+  Write-Host "Do not use npm strict-ssl=false; pass the issuer CA into the image instead."
+}
+
 function Compress-GzipFile {
   param(
     [string]$Source,
@@ -78,8 +91,22 @@ if ($CaCert) {
 $buildArgs += "."
 
 Write-Host "Building Docker image: $Image"
-& docker @buildArgs
-Assert-LastExitCode "Docker build failed."
+$buildLog = Join-Path ([System.IO.Path]::GetTempPath()) ("codegraph-docker-build-" + [System.Guid]::NewGuid().ToString("N") + ".log")
+try {
+  & docker @buildArgs 2>&1 | Tee-Object -FilePath $buildLog
+  $dockerExitCode = $LASTEXITCODE
+  if ($dockerExitCode -ne 0) {
+    $logText = if (Test-Path -LiteralPath $buildLog) { Get-Content -Raw -LiteralPath $buildLog } else { "" }
+    if ($logText -match "UNABLE_TO_GET_ISSUER_CERT_LOCALLY") {
+      Write-CertificateBuildHelp
+    }
+    throw "Docker build failed."
+  }
+} finally {
+  if (Test-Path -LiteralPath $buildLog) {
+    Remove-Item -LiteralPath $buildLog -Force
+  }
+}
 Write-Host "Image built: $Image"
 
 if ($Export) {

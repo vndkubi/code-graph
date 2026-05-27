@@ -79,8 +79,30 @@ if [[ -n "$CA_CERT" ]]; then
   BUILD_ARGS+=(--secret "id=codegraph_ca,src=$CA_CERT")
 fi
 
+print_certificate_build_help() {
+  cat >&2 <<'EOF'
+
+Docker build failed with UNABLE_TO_GET_ISSUER_CERT_LOCALLY.
+The container does not trust the HTTPS issuer used for npm downloads.
+
+Fix:
+  1. Export your corporate/root CA as PEM or CRT.
+  2. Rebuild with:
+     ./docker-build.sh --ca-cert /path/to/corp-root-ca.crt
+
+Do not use npm strict-ssl=false; pass the issuer CA into the image instead.
+EOF
+}
+
 echo "Building Docker image: $IMAGE"
-docker build "${BUILD_ARGS[@]}" -t "$IMAGE" .
+BUILD_LOG="$(mktemp "${TMPDIR:-/tmp}/codegraph-docker-build.XXXXXX")"
+trap 'rm -f "$BUILD_LOG"' EXIT
+if ! docker build "${BUILD_ARGS[@]}" -t "$IMAGE" . 2>&1 | tee "$BUILD_LOG"; then
+  if grep -q "UNABLE_TO_GET_ISSUER_CERT_LOCALLY" "$BUILD_LOG"; then
+    print_certificate_build_help
+  fi
+  exit 1
+fi
 echo "Image built: $IMAGE"
 
 if $EXPORT_MODE; then

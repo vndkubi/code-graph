@@ -12,12 +12,14 @@ RUN --mount=type=secret,id=codegraph_ca,target=/tmp/codegraph-ca.crt,required=fa
     if [ -s /tmp/codegraph-ca.crt ]; then \
       cp /tmp/codegraph-ca.crt /usr/local/share/ca-certificates/codegraph-extra-ca.crt; \
       update-ca-certificates; \
+      cat /tmp/codegraph-ca.crt >> /etc/ssl/certs/ca-certificates.crt; \
     fi
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 ENV NPM_CONFIG_CAFILE=/etc/ssl/certs/ca-certificates.crt
 
 COPY package*.json ./
-RUN npm ci
+RUN npm config set cafile /etc/ssl/certs/ca-certificates.crt \
+    && npm ci
 
 COPY tsconfig.json ./
 COPY src/ ./src/
@@ -36,12 +38,14 @@ RUN --mount=type=secret,id=codegraph_ca,target=/tmp/codegraph-ca.crt,required=fa
     if [ -s /tmp/codegraph-ca.crt ]; then \
       cp /tmp/codegraph-ca.crt /usr/local/share/ca-certificates/codegraph-extra-ca.crt; \
       update-ca-certificates; \
+      cat /tmp/codegraph-ca.crt >> /etc/ssl/certs/ca-certificates.crt; \
     fi
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 ENV NPM_CONFIG_CAFILE=/etc/ssl/certs/ca-certificates.crt
 
 COPY package*.json ./
-RUN npm ci --omit=dev \
+RUN npm config set cafile /etc/ssl/certs/ca-certificates.crt \
+    && npm ci --omit=dev \
     && apk del python3 make g++
 
 COPY --from=builder /app/dist ./dist

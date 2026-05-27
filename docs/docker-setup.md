@@ -516,6 +516,10 @@ the CA secret:
 .\docker-build.ps1 -CaCert C:\temp\corp-root-ca.crt
 ```
 
+The `-CaCert`/`--ca-cert` file may contain either one root CA certificate or a
+PEM bundle/chain. During build, CodeGraph registers it with the OS trust store
+and appends it to the CA bundle used by npm.
+
 Or with raw Docker:
 
 ```powershell
