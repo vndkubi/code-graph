@@ -7,7 +7,10 @@ const FreshnessOptions = {
 
 const SnippetOptions = {
   includeSnippets: z.boolean().optional(),
-  snippetLines: z.number().min(3).max(80).optional(),
+  // LLM clients sometimes over-ask for source context. Query services clamp this
+  // value per tool, so keep the MCP schema permissive enough to avoid a hard
+  // parse failure before the service can apply its own budget.
+  snippetLines: z.number().min(1).max(240).optional(),
   snippetTokenBudget: z.number().min(100).max(12000).optional(),
 };
 
@@ -146,10 +149,17 @@ export const V2ToolSchemas = {
     limit: z.number().min(1).max(200).default(50),
     ...FreshnessOptions,
   }),
+  get_flow_pack: z.object({
+    target: z.string(),
+    taskType: z.string().default('architecture'),
+    tokenBudget: z.number().min(1000).max(12000).default(8000),
+    ...SnippetOptions,
+    ...FreshnessOptions,
+  }),
   get_research_pack: z.object({
     target: z.string(),
     taskType: z.string().default('research'),
-    tokenBudget: z.number().min(1000).max(12000).default(4000),
+    tokenBudget: z.number().min(1000).max(12000).default(8000),
     ...SnippetOptions,
     ...FreshnessOptions,
   }),
@@ -200,10 +210,12 @@ export function parseToolArgs(name: string, args: unknown): Record<string, unkno
 
 function descriptionFor(name: V2ToolName): string {
   switch (name) {
+    case 'get_flow_pack':
+      return 'PRIMARY/FALLBACK-STOP TOOL for architecture and "how does X work" questions. Returns an answer-ready flow pack in one call: ordered steps, ranked symbols/files, call/dependency evidence, and capped source slices with line numbers. Answer directly from this pack; use granular search/slice tools only if missingFacts says evidence is insufficient.';
     case 'get_research_pack':
-      return 'Return a token-budgeted research pack for an agent: definitions, callers, callees, impacted endpoints, top files, and confidence notes.';
+      return 'PRIMARY TOOL for research/architecture questions. Returns an answer-ready pack with flow steps, ranked definitions, related edges, top files, and capped source evidence in ONE call. Usually enough to answer without search_code/search_symbol/get_file_slice; call those only when missingFacts lists a specific gap.';
     case 'get_context_packet':
-      return 'Route a natural-language task to a compact agent context packet with domain guess, candidate files/symbols, small snippets, likely tests, validation hints, confidence, omissions, and a next action.';
+      return 'Route an implementation/debugging task to a compact context packet with domain guess, candidate files/symbols, small snippets, likely tests, validation hints, confidence, omissions, and a next action. For architecture/how-does-X-work questions prefer get_research_pack/get_flow_pack first.';
     case 'search_symbol':
       return 'Search indexed symbols with intent-aware ranking, pagination, facets, and optional rank explanations. Hides Lombok synthetic symbols, tests, generated files, and fixtures by default unless requested or implied by the query.';
     case 'search_files':
@@ -213,7 +225,7 @@ function descriptionFor(name: V2ToolName): string {
     case 'get_file_summary':
       return 'Summarize a file using persistent symbols, imports, dependencies, and dependents.';
     case 'get_file_slice':
-      return 'Return one bounded source slice by file and line range, or by indexed symbol, with exact line numbers and truncation metadata. Use this before editing instead of reading whole files.';
+      return 'Return one bounded source slice by file and line range, or by indexed symbol, with exact line numbers and truncation metadata. Use for editing or for one explicit missing range; do not loop this after get_research_pack/get_flow_pack when evidenceSlices already contain the needed source.';
     case 'get_dependencies':
       return 'Return direct dependency edges for a file or module.';
     case 'get_dependents':
@@ -239,7 +251,7 @@ function descriptionFor(name: V2ToolName): string {
     case 'find_tests_for':
       return 'Find tests likely relevant to a symbol using test file names, test symbols, and indexed call edges.';
     case 'search_code':
-      return 'Mixed retrieval search that returns file, symbol, endpoint, reference, and dependency sections for an agent to choose the next tool or file to inspect.';
+      return 'Fallback mixed retrieval search for when get_research_pack/get_flow_pack reports low confidence or missing facts. Returns file, symbol, endpoint, reference, and dependency sections; avoid using it as a first step for architecture questions.';
     case 'get_index_stats':
       return 'Return persistent index and graph statistics plus health diagnostics such as parse failures, stale files, unresolved calls/imports, and framework warnings.';
   }

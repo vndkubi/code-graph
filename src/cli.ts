@@ -30,6 +30,7 @@ async function main(): Promise<void> {
         prewarm: parsed.flags.get('no-prewarm') !== true,
         workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
         autoRefresh: parsed.flags.get('auto-refresh') === true || envFlag('CODEGRAPH_AUTO_REFRESH'),
+        toolAllowlist: getFlag(parsed, 'mcp-tools') ?? process.env.CODEGRAPH_MCP_TOOLS,
       });
       return;
     case 'daemon':
@@ -253,6 +254,7 @@ Options:
   --incremental-file-limit <number>      Max changed/deleted files for incremental index path
   --workspace-key <key>                  Stable workspace identity key, useful when Docker always mounts roots at /workspace
   --auto-refresh                         Refresh stale snapshots automatically before MCP tool calls
+  --mcp-tools <a,b,c>                    Comma-separated MCP tool allowlist; also CODEGRAPH_MCP_TOOLS
 `);
 }
 

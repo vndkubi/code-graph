@@ -74,6 +74,8 @@ export class V2QueryService {
         return withFreshness(this.reviewPatch(snapshotId, envelope.args));
       case 'find_tests_for':
         return withFreshness(this.findTestsFor(snapshotId, envelope.args));
+      case 'get_flow_pack':
+        return withFreshness(this.getResearchPack(snapshotId, { ...envelope.args, taskType: envelope.args.taskType ?? 'architecture' }));
       case 'get_research_pack':
         return withFreshness(this.getResearchPack(snapshotId, envelope.args));
       case 'get_context_packet':
@@ -1249,32 +1251,455 @@ export class V2QueryService {
   }
 
   private getResearchPack(snapshotId: string, args: Record<string, unknown>) {
-    const target = String(args.target ?? '');
-    const tokenBudget = Math.max(1000, Math.min(Number(args.tokenBudget ?? 4000), 12000));
-    const definitions = (this.searchSymbol(snapshotId, { ...args, query: target, limit: 10 }) as { symbols: unknown[] }).symbols;
-    const callers = (this.getCallers(snapshotId, { symbol: target, limit: 30 }) as { callers: CallEdgeRow[] }).callers;
-    const callees = (this.getCallees(snapshotId, { symbol: target, limit: 30 }) as { callees: CallEdgeRow[] }).callees;
-    const impact = this.getImpactRadius(snapshotId, { target }) as Record<string, unknown>;
-    const endpoints = this.findEndpoints(snapshotId, { ...args, path: target }) as { endpoints: unknown[] };
+    const target = String(args.target ?? '').trim();
+    const tokenBudget = clampInt(Number(args.tokenBudget ?? 8000), 1000, 12000);
+    const preferredFileRole = String(args.fileRole ?? 'main_source');
+    const preferredLanguage = args.language ? String(args.language) : this.dominantResearchLanguage(snapshotId);
+    const seedTerms = researchSeedTerms(target);
+    const symbolRows: Array<Record<string, unknown>> = [];
+    for (const query of researchSymbolQueries(target, seedTerms)) {
+      const result = this.searchSymbol(snapshotId, {
+        ...args,
+        query,
+        fileRole: preferredFileRole,
+        language: preferredLanguage,
+        limit: query === target ? 10 : 6,
+        includeTests: false,
+        includeGenerated: false,
+        includeFixtures: false,
+        includeSynthetic: false,
+        includeSnippets: false,
+        explainRank: query === target,
+      }) as { symbols: Array<Record<string, unknown>> };
+      symbolRows.push(...result.symbols);
+    }
+    const explicitSymbols = this.explicitResearchSymbols(
+      snapshotId,
+      target,
+      preferredFileRole,
+      preferredLanguage,
+      8,
+    );
+    const explicitFiles = this.explicitResearchFiles(
+      snapshotId,
+      target,
+      preferredFileRole,
+      preferredLanguage,
+      5,
+    );
+
+    const symbolCandidates = uniqueSymbolCandidates([
+      ...explicitSymbols,
+      ...symbolRows.map(row => compactSymbolCandidate(row)),
+    ]);
+    const explicitFileSet = new Set(explicitFiles.map(file => file.file));
+    const scopedSymbolCandidates = explicitFiles.length > 0
+      ? symbolCandidates.filter(symbol => explicitFileSet.has(symbol.file))
+      : symbolCandidates;
+    const relevantSymbols = (scopedSymbolCandidates.length > 0 ? scopedSymbolCandidates : symbolCandidates).slice(0, 6);
+    const fileResults = this.searchFiles(snapshotId, {
+      ...args,
+      query: target,
+      fileRole: preferredFileRole,
+      language: preferredLanguage,
+      limit: 8,
+      includeTests: false,
+      includeGenerated: false,
+      includeFixtures: false,
+      includeSnippets: true,
+      snippetLines: clampInt(Number(args.snippetLines ?? 14), 6, 40),
+      snippetTokenBudget: Math.min(5000, Math.max(1200, Math.floor(tokenBudget * 0.45))),
+      explainRank: true,
+    }) as { files: Array<Record<string, unknown>>; totalFound?: number };
+    const candidateFiles = uniqueFileCandidates([
+      ...explicitFiles,
+      ...(explicitFiles.length >= 3 ? [] : fileResults.files.map(row => compactFileCandidate(row))),
+      ...relevantSymbols.map(symbol => ({
+        file: symbol.file,
+        lines: symbol.lines,
+        whyRelevant: symbol.whyRelevant,
+        confidence: symbol.confidence,
+        matchedTokens: symbol.matchedTokens,
+        topSymbols: [symbol],
+        endpoints: [],
+      })),
+    ]).slice(0, 6);
+
+    const edgeSeeds = relevantSymbols.slice(0, 4);
+    const candidateFileSet = new Set(candidateFiles.map(file => file.file));
+    const callersRaw = this.researchCallEdges(snapshotId, edgeSeeds, 'callers', 8);
+    const calleesRaw = this.researchCallEdges(snapshotId, edgeSeeds, 'callees', 8);
+    const callers = explicitFiles.length > 0
+      ? callersRaw.filter(edge => candidateFileSet.has(edge.file)).slice(0, 8)
+      : callersRaw;
+    const callees = explicitFiles.length > 0
+      ? calleesRaw.filter(edge => candidateFileSet.has(edge.file)).slice(0, 8)
+      : calleesRaw;
+    const endpointNeedle = endpointNeedleForResearch(target);
+    const endpointSearch = endpointNeedle
+      ? this.findEndpoints(snapshotId, {
+        ...args,
+        path: endpointNeedle,
+        method: args.method ?? 'all',
+        limit: 8,
+        includeSnippets: false,
+      }) as { endpoints: Array<Record<string, unknown>>; totalCount?: number }
+      : { endpoints: [], totalCount: 0 };
+    const impactedEndpoints = compactEndpointCandidates(endpointSearch.endpoints).slice(0, 6);
+    const topFiles = uniqueFilesInOrder([
+      ...candidateFiles.map(file => file.file),
+      ...relevantSymbols.map(symbol => symbol.file),
+      ...callers.map(edge => edge.file),
+      ...callees.map(edge => edge.file),
+      ...impactedEndpoints.map(endpoint => endpoint.file),
+    ]).slice(0, 8);
+    const evidenceSlices = this.researchEvidenceSlices(
+      snapshotId,
+      relevantSymbols,
+      candidateFiles,
+      seedTerms,
+      Math.max(1400, Math.min(4500, Math.floor(tokenBudget * 4 * 0.22))),
+    );
+    const flowSteps = researchFlowSteps({
+      symbols: relevantSymbols,
+      callers,
+      callees,
+      endpoints: impactedEndpoints,
+      files: candidateFiles,
+    });
+    const missingFacts = researchMissingFacts({
+      target,
+      relevantSymbols,
+      evidenceSlices,
+      flowSteps,
+    });
+    const sufficientForAnswer = missingFacts.length === 0;
+    const returnedFlowSteps = flowSteps.slice(0, 8);
+    const returnedDefinitions = relevantSymbols.slice(0, 4);
+    const returnedCallers = callers.slice(0, 4).map(compactCallEdge);
+    const returnedCallees = callees.slice(0, 4).map(compactCallEdge);
+    const returnedEndpoints = impactedEndpoints.slice(0, 4);
+    const returnedTopFiles = topFiles.slice(0, 6);
+    const returnedSeedTerms = seedTerms.slice(0, 10);
 
     return {
       target,
       taskType: args.taskType ?? 'research',
       tokenBudget,
-      definitionCandidates: definitions,
-      callers: callers.slice(0, 20),
-      callees: callees.slice(0, 20),
-      impactedEndpoints: (impact.impactedEndpoints as unknown[]) ?? endpoints.endpoints.slice(0, 20),
-      topFiles: rankFiles([
-        ...callers.map(c => c.file),
-        ...callees.map(c => c.file),
-        ...(((impact.direct as Array<Record<string, unknown>>) ?? []).map(d => String(d.file ?? d.modulePath ?? ''))),
-      ]).slice(0, 20),
+      routing: {
+        intendedUse: 'answer-ready architecture/research context',
+        expectedToolCalls: sufficientForAnswer ? 1 : 2,
+        answerDirectly: sufficientForAnswer,
+        followUpRule: 'Use search_code/search_symbol/get_file_slice only for a specific item listed in missingFacts.',
+      },
+      seedTerms: returnedSeedTerms,
+      flowSteps: returnedFlowSteps,
+      definitionCandidates: returnedDefinitions,
+      callers: returnedCallers,
+      callees: returnedCallees,
+      impactedEndpoints: returnedEndpoints,
+      topFiles: returnedTopFiles,
+      evidenceSlices,
+      completeness: {
+        sufficientForAnswer,
+        evidenceSliceCount: evidenceSlices.length,
+        symbolCandidateCount: relevantSymbols.length,
+        fileCandidateCount: candidateFiles.length,
+        omittedFileMatches: Math.max(0, Number(fileResults.totalFound ?? candidateFiles.length) - candidateFiles.length),
+      },
+      missingFacts,
+      answerGuidance: sufficientForAnswer
+        ? [
+          'Answer directly from this pack.',
+          'Treat evidenceSlices as already-read source; cite file and line ranges from them.',
+          'Do not call search_code, search_symbol, get_file_slice, grep, or Read unless the user asks for more detail.',
+        ]
+        : [
+          'This pack is incomplete; perform only the targeted follow-up named in missingFacts.',
+          'Prefer one get_file_slice for a listed missing file/range over broad grep/read loops.',
+        ],
+      nextAction: sufficientForAnswer
+        ? 'Answer the user directly from flowSteps and evidenceSlices.'
+        : `Resolve missing fact: ${missingFacts[0]}`,
+      confidence: sufficientForAnswer ? 0.82 : relevantSymbols.length > 0 ? 0.62 : 0.35,
       confidenceNotes: [
-        'Definitions and graph edges are ranked by semantic confidence and file role.',
-        'Fuzzy/name-only call edges are included with lower confidence until Java receiver resolution is exact.',
+        'The pack intentionally includes capped source evidence so architecture answers do not need many follow-up slice calls.',
+        'Flow steps are ranked from indexed symbols, call edges, endpoints, and file evidence; ambiguous Java call edges remain confidence-scored.',
+        'Use granular tools only for explicit missing facts, not for broad rediscovery.',
       ],
+      budget: {
+        preferredFileRole,
+        preferredLanguage,
+        estimatedResponseTokens: estimateTokens(JSON.stringify({
+          flowSteps: returnedFlowSteps,
+          definitionCandidates: returnedDefinitions,
+          callers: returnedCallers,
+          callees: returnedCallees,
+          impactedEndpoints: returnedEndpoints,
+          topFiles: returnedTopFiles,
+          evidenceSlices,
+        })),
+      },
     };
+  }
+
+  private explicitResearchFiles(
+    snapshotId: string,
+    target: string,
+    preferredFileRole: string,
+    preferredLanguage: string | undefined,
+    limit: number,
+  ): Array<ReturnType<typeof compactFileCandidate>> {
+    const rootBasename = compactSearchText(path.basename(this.workspaceRootForSnapshot(snapshotId) ?? ''));
+    const needles = explicitFileNeedles(target)
+      .filter(needle => path.posix.extname(needle))
+      .filter(needle => isPreferredLanguageFileNeedle(needle, preferredLanguage))
+      .filter((needle) => {
+        const basename = path.posix.basename(needle, path.posix.extname(needle));
+        return compactSearchText(basename) !== rootBasename;
+      });
+    if (needles.length === 0) return [];
+    const files: string[] = [];
+    const root = this.workspaceRootForSnapshot(snapshotId);
+    for (const needle of needles.slice(0, 12)) {
+      const normalized = needle.replace(/\\/g, '/');
+      const basename = path.posix.basename(normalized);
+      const params: unknown[] = [snapshotId, `%/${escapeLike(normalized)}`, `%/${escapeLike(basename)}`];
+      const filters = ['snapshot_id = ?', "(path LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')"];
+      if (preferredFileRole) {
+        filters.push('file_role = ?');
+        params.push(preferredFileRole);
+      }
+      if (preferredLanguage) {
+        filters.push('language = ?');
+        params.push(preferredLanguage);
+      }
+      const rows = this.db.prepare(`
+        SELECT path
+        FROM files
+        WHERE ${filters.join(' AND ')}
+        ORDER BY LENGTH(path), path
+        LIMIT 50
+      `).all(...params) as Array<{ path: string }>;
+      rows.sort((a, b) => {
+        const aHasExplicitRange = bestExplicitSourceRange(root, a.path, target, true) ? 0 : 1;
+        const bHasExplicitRange = bestExplicitSourceRange(root, b.path, target, true) ? 0 : 1;
+        return aHasExplicitRange - bHasExplicitRange || a.path.length - b.path.length || a.path.localeCompare(b.path);
+      });
+      files.push(...rows.slice(0, 1).map(row => row.path));
+      if (files.length >= limit * 2) break;
+    }
+    const orderedFiles = uniqueFilesInOrder(files).slice(0, limit * 2);
+    const order = new Map(orderedFiles.map((file, index) => [file, index]));
+    return this.fileCandidatesForPaths(snapshotId, orderedFiles, target)
+      .sort((a, b) => (order.get(a.file) ?? 9999) - (order.get(b.file) ?? 9999))
+      .slice(0, limit)
+      .map(candidate => ({
+        ...candidate,
+        lines: bestExplicitSourceRange(root, candidate.file, target) ?? candidate.lines,
+        whyRelevant: candidate.whyRelevant.startsWith('explicit')
+          ? candidate.whyRelevant
+          : `explicit file/class mention: ${candidate.file}`,
+        confidence: Math.max(candidate.confidence, 0.9),
+      }));
+  }
+
+  private explicitResearchSymbols(
+    snapshotId: string,
+    target: string,
+    preferredFileRole: string,
+    preferredLanguage: string | undefined,
+    limit: number,
+  ): ResearchSymbolCandidate[] {
+    const refs = explicitSymbolRefs(target);
+    if (refs.length === 0) return [];
+
+    const rows: SymbolRow[] = [];
+    const baseFilters = ['snapshot_id = ?'];
+    const baseParams: unknown[] = [snapshotId];
+    if (preferredFileRole) {
+      baseFilters.push('file_role = ?');
+      baseParams.push(preferredFileRole);
+    }
+    if (preferredLanguage) {
+      baseFilters.push(`file IN (SELECT path FROM files WHERE snapshot_id = ? AND language = ?)`);
+      baseParams.push(snapshotId, preferredLanguage);
+    }
+    const baseWhere = baseFilters.join(' AND ');
+    const select = `
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+             package_name, return_type, parameter_types_json, annotations_json,
+             framework_role, framework_meta_json, file_role
+      FROM symbols
+    `;
+    const classesWithMemberRefs = new Set(refs
+      .filter(ref => Boolean(ref.member))
+      .map(ref => ref.className));
+
+    for (const ref of refs.slice(0, 12)) {
+      if (ref.member) {
+        const fileLike = `%/${escapeLike(ref.className)}.%`;
+        const fqLike = `%${escapeLike(ref.className)}.${escapeLike(ref.member)}%`;
+        rows.push(...this.db.prepare(`
+          ${select}
+          WHERE ${baseWhere}
+            AND simple_name = ?
+            AND (
+              parent = ?
+              OR fq_name LIKE ? ESCAPE '\\'
+              OR file LIKE ? ESCAPE '\\'
+            )
+          ORDER BY
+            CASE
+              WHEN parent = ? THEN 0
+              WHEN file LIKE ? ESCAPE '\\' THEN 1
+              ELSE 2
+            END,
+            line
+          LIMIT 6
+        `).all(
+          ...baseParams,
+          ref.member,
+          ref.className,
+          fqLike,
+          fileLike,
+          ref.className,
+          fileLike,
+        ) as SymbolRow[]);
+        continue;
+      }
+      if (classesWithMemberRefs.has(ref.className)) continue;
+
+      rows.push(...this.db.prepare(`
+        ${select}
+        WHERE ${baseWhere}
+          AND simple_name = ?
+          AND kind IN ('class', 'interface', 'enum', 'record')
+        ORDER BY line
+        LIMIT 3
+      `).all(...baseParams, ref.className) as SymbolRow[]);
+    }
+
+    return uniqueSymbolCandidates(rows.map(row => compactSymbolCandidate(
+      symbolDto(row),
+      'explicit class/method mention in target',
+    ))).slice(0, limit);
+  }
+
+  private dominantResearchLanguage(snapshotId: string): string | undefined {
+    const rows = this.db.prepare(`
+      SELECT language, COUNT(*) AS count
+      FROM files
+      WHERE snapshot_id = ?
+        AND file_role = 'main_source'
+        AND language IN ('java', 'typescript', 'javascript', 'python')
+      GROUP BY language
+      ORDER BY count DESC
+      LIMIT 2
+    `).all(snapshotId) as Array<{ language: string; count: number }>;
+    const first = rows[0];
+    if (!first || first.count < 20) return undefined;
+    const second = rows[1];
+    if (!second || first.count >= second.count * 1.25) return first.language;
+    return undefined;
+  }
+
+  private researchCallEdges(
+    snapshotId: string,
+    symbols: ResearchSymbolCandidate[],
+    direction: 'callers' | 'callees',
+    limit: number,
+  ): CallEdgeRow[] {
+    const column = direction === 'callers' ? 'callee' : 'caller';
+    const needles = researchEdgeNeedles(symbols).slice(0, 8);
+    if (needles.length === 0) return [];
+    const clauses = needles.map(() => `${column} LIKE ? ESCAPE '\\'`).join(' OR ');
+    const params = [snapshotId, ...needles.map(needle => `%${escapeLike(needle)}%`), limit];
+    const rows = this.db.prepare(`
+      SELECT caller, callee, file, line, confidence, resolution_kind
+      FROM call_edges
+      WHERE snapshot_id = ?
+        AND file_role != 'test_source'
+        AND (${clauses})
+      ORDER BY confidence DESC, file, line
+      LIMIT ?
+    `).all(...params) as CallEdgeRow[];
+    return uniqueCallEdges(rows);
+  }
+
+  private researchEvidenceSlices(
+    snapshotId: string,
+    symbols: ResearchSymbolCandidate[],
+    files: ResearchFileCandidate[],
+    seedTerms: string[],
+    budgetChars: number,
+  ): Array<Record<string, unknown>> {
+    const seeds: Array<{ file: string; lines?: string; symbol?: string; why: string }> = [];
+    const root = this.workspaceRootForSnapshot(snapshotId);
+    for (const file of files) {
+      const lines = file.lines || bestSourceRange(root, file.file, seedTerms);
+      if (lines) {
+        seeds.push({
+          file: file.file,
+          lines,
+          why: file.whyRelevant,
+        });
+      }
+    }
+    for (const file of files) {
+      for (const symbol of file.topSymbols.slice(0, 3)) {
+        const compact = compactSymbolCandidate(symbol);
+        if (compact.file && compact.lines) {
+          seeds.push({
+            file: compact.file,
+            lines: compact.lines,
+            symbol: compact.symbol,
+            why: `top symbol in ranked file: ${compact.name}`,
+          });
+        }
+      }
+    }
+    for (const symbol of symbols) {
+      if (!symbol.file || !symbol.lines) continue;
+      seeds.push({
+        file: symbol.file,
+        lines: symbol.lines,
+        symbol: symbol.symbol,
+        why: `definition/source evidence for ${symbol.name}`,
+      });
+    }
+
+    const slices: Array<Record<string, unknown>> = [];
+    const seen = new Set<string>();
+    let usedChars = 0;
+    for (const seed of seeds) {
+      if (usedChars >= budgetChars) break;
+      const key = `${seed.file}:${seed.lines ?? ''}:${seed.symbol ?? ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const remaining = budgetChars - usedChars;
+      if (remaining < 500) break;
+      const slice = this.getFileSlice(snapshotId, {
+        file: seed.file,
+        lines: seed.lines,
+        symbol: seed.symbol,
+        maxChars: Math.min(900, remaining),
+      }) as Record<string, unknown>;
+      const text = typeof slice.text === 'string' ? slice.text : '';
+      if (!text) continue;
+      usedChars += text.length;
+      slices.push({
+        file: String(slice.file ?? seed.file),
+        lines: String(slice.lines ?? seed.lines ?? ''),
+        symbol: seed.symbol,
+        why: seed.why,
+        text,
+        truncated: Boolean(slice.truncated),
+        confidence: slice.confidence,
+      });
+      if (slices.length >= 5) break;
+    }
+    return slices;
   }
 
   private getContextPacket(snapshotId: string, args: Record<string, unknown>) {
@@ -2307,6 +2732,29 @@ interface FileEvidence {
   importCount: number;
 }
 
+interface ResearchSymbolCandidate {
+  symbol: string;
+  name: string;
+  kind?: string;
+  file: string;
+  lines?: string;
+  signature?: string;
+  frameworkRole?: string;
+  whyRelevant: string;
+  confidence: number;
+  matchedTokens: string[];
+}
+
+interface ResearchFileCandidate {
+  file: string;
+  lines?: string;
+  whyRelevant: string;
+  confidence: number;
+  matchedTokens: string[];
+  topSymbols: Array<Record<string, unknown>>;
+  endpoints: Array<Record<string, unknown>>;
+}
+
 interface FileSearchScore {
   score: number;
   matchedTokens: string[];
@@ -2505,6 +2953,96 @@ function safeResolve(root: string, file: string): string | undefined {
   return absolutePath;
 }
 
+function bestSourceRange(root: string | undefined, file: string, terms: string[]): string | undefined {
+  if (!root || !file) return undefined;
+  const absolutePath = safeResolve(root, file);
+  if (!absolutePath) return undefined;
+  let source: string;
+  try {
+    source = fs.readFileSync(absolutePath, 'utf-8');
+  } catch {
+    return undefined;
+  }
+  const needles = uniqueStrings(terms
+    .flatMap(term => [term, ...tokenizeSearchQuery(term)])
+    .map(term => term.trim().toLowerCase())
+    .filter(term => term.length >= 4 && !RESEARCH_STOP_WORDS.has(term)))
+    .slice(0, 16);
+  if (needles.length === 0) return undefined;
+  const lines = source.split(/\r?\n/);
+  let bestLine = 0;
+  let bestScore = 0;
+  for (let index = 0; index < lines.length; index++) {
+    const lower = lines[index]?.toLowerCase() ?? '';
+    let score = 0;
+    for (const needle of needles) {
+      if (lower.includes(needle)) score += needle.length >= 8 ? 3 : 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestLine = index + 1;
+    }
+  }
+  if (bestScore === 0) return undefined;
+  return lineRangeString(Math.max(1, bestLine - 24), Math.min(lines.length, bestLine + 44));
+}
+
+function bestExplicitSourceRange(
+  root: string | undefined,
+  file: string,
+  target: string,
+  requireMemberMatch = false,
+): string | undefined {
+  if (!root || !file) return undefined;
+  const refs = explicitSymbolRefs(target);
+  if (refs.length === 0) return undefined;
+  const basename = path.posix.basename(file.replace(/\\/g, '/'), path.posix.extname(file));
+  const matchingRefs = refs.filter(ref => ref.className === basename || file.includes(`${ref.className}.`));
+  if (matchingRefs.length === 0) return undefined;
+  const absolutePath = safeResolve(root, file);
+  if (!absolutePath) return undefined;
+
+  let source: string;
+  try {
+    source = fs.readFileSync(absolutePath, 'utf-8');
+  } catch {
+    return undefined;
+  }
+  const lines = source.split(/\r?\n/);
+  const memberNames = uniqueStrings(matchingRefs
+    .map(ref => ref.member)
+    .filter((member): member is string => Boolean(member)));
+  for (const member of memberNames) {
+    const memberPattern = new RegExp(`\\b${escapeRegExp(member)}\\s*\\(`);
+    const line = firstSourceLineMatching(lines, memberPattern);
+    if (line > 0) return sourceWindow(lines.length, line, 10, 60);
+  }
+  if (requireMemberMatch && memberNames.length > 0) return undefined;
+  for (const ref of matchingRefs) {
+    const classPattern = new RegExp(`\\b(class|interface|enum|record)\\s+${escapeRegExp(ref.className)}\\b`);
+    const line = firstSourceLineMatching(lines, classPattern);
+    if (line > 0) return sourceWindow(lines.length, line, 6, 48);
+  }
+  return undefined;
+}
+
+function firstSourceLineMatching(lines: string[], pattern: RegExp): number {
+  for (let index = 0; index < lines.length; index++) {
+    const trimmed = (lines[index] ?? '').trim();
+    if (!trimmed || trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) continue;
+    if (pattern.test(trimmed)) return index + 1;
+  }
+  return 0;
+}
+
+function sourceWindow(lineCount: number, line: number, before: number, after: number): string {
+  return lineRangeString(Math.max(1, line - before), Math.min(lineCount, line + after));
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function parseLineRange(value: string): { start: number; end: number } | undefined {
   const match = value.trim().match(/^(\d+)(?:\s*[-:]\s*(\d+))?$/);
   if (!match) return undefined;
@@ -2654,12 +3192,43 @@ function endpointNeedleForTask(task: string, domain?: string): string {
   return '';
 }
 
+function explicitSymbolRefs(task: string, domain?: string): Array<{ className: string; member?: string }> {
+  const text = [task, domain ?? ''].join(' ');
+  const refs: Array<{ className: string; member?: string }> = [];
+  for (const match of text.matchAll(/\b([A-Z][A-Za-z0-9_$]{2,})\.([A-Za-z_$][A-Za-z0-9_$]{2,})\b/g)) {
+    const className = match[1] ?? '';
+    const member = match[2] ?? '';
+    if (!className || !member || EXPLICIT_FILENAME_STOP_WORDS.has(className)) continue;
+    refs.push({ className, member });
+  }
+  for (const match of text.matchAll(/\b[A-Z][A-Za-z0-9_$]{3,}\b/g)) {
+    const className = match[0];
+    if (EXPLICIT_FILENAME_STOP_WORDS.has(className)) continue;
+    refs.push({ className });
+  }
+
+  const seen = new Set<string>();
+  const result: Array<{ className: string; member?: string }> = [];
+  for (const ref of refs) {
+    const key = `${ref.className}\0${ref.member ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(ref);
+  }
+  return result;
+}
+
 function explicitFileNeedles(task: string, domain?: string): string[] {
   const text = [task, domain ?? ''].join(' ');
   const needles = new Set<string>();
   for (const match of text.matchAll(/[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+/g)) {
     const value = match[0]?.replace(/\\/g, '/').replace(/[),.;:]+$/g, '');
     if (value && value.includes('/')) needles.add(value);
+  }
+  for (const ref of explicitSymbolRefs(task, domain)) {
+    needles.add(`${ref.className}.java`);
+    needles.add(`${ref.className}.ts`);
+    needles.add(`${ref.className}.py`);
   }
   for (const match of text.matchAll(/\b[A-Z][A-Za-z0-9_$]{3,}\b/g)) {
     const name = match[0];
@@ -2670,6 +3239,21 @@ function explicitFileNeedles(task: string, domain?: string): string[] {
     }
   }
   return [...needles].filter(needle => needle.length >= 4);
+}
+
+function isPreferredLanguageFileNeedle(needle: string, preferredLanguage: string | undefined): boolean {
+  if (!preferredLanguage) return true;
+  const ext = path.posix.extname(needle).toLowerCase();
+  const allowed = preferredLanguage === 'java'
+    ? new Set(['.java'])
+    : preferredLanguage === 'typescript'
+      ? new Set(['.ts', '.tsx'])
+      : preferredLanguage === 'javascript'
+        ? new Set(['.js', '.jsx'])
+        : preferredLanguage === 'python'
+          ? new Set(['.py'])
+          : undefined;
+  return !allowed || allowed.has(ext);
 }
 
 function isCompatibleExplicitFileCandidate(file: string, explicitFiles: string[]): boolean {
@@ -2885,6 +3469,128 @@ function uniqueRecordsBy<T>(rows: T[], keyFor: (row: T) => string): T[] {
 
 function uniqueCallEdges(rows: CallEdgeRow[]): CallEdgeRow[] {
   return uniqueRecordsBy(rows, row => `${row.caller}:${row.callee}:${row.file}:${row.line}`);
+}
+
+function researchSeedTerms(target: string): string[] {
+  const identifierTerms = target.match(/\b[A-Za-z_$][\w$]*(?:(?:::|\.)[A-Za-z_$][\w$]*)+\b/g) ?? [];
+  const symbolTerms = target.match(/\b(?:[A-Z][A-Za-z0-9_$]{2,}|[a-z]+[A-Z][A-Za-z0-9_$]*)\b/g) ?? [];
+  const tokenTerms = tokenizeSearchQuery(target)
+    .filter(token => token.length >= 3 && !RESEARCH_STOP_WORDS.has(token))
+    .slice(0, 12);
+  return uniqueStrings([...identifierTerms, ...symbolTerms, ...tokenTerms]).slice(0, 18);
+}
+
+function researchSymbolQueries(target: string, seedTerms: string[]): string[] {
+  const identifiers = seedTerms.filter(term => /[A-Z_.:$]/.test(term));
+  const queryGroups = [
+    target,
+    identifiers.slice(0, 4).join(' '),
+    seedTerms.slice(0, 6).join(' '),
+  ];
+  return uniqueStrings(queryGroups.filter(query => query.trim().length >= 3)).slice(0, 3);
+}
+
+function endpointNeedleForResearch(target: string): string {
+  const explicitPath = target.match(/\/[A-Za-z0-9_{}:$.-][A-Za-z0-9_{}:$/.-]*/);
+  if (explicitPath) return explicitPath[0];
+  return '';
+}
+
+function compactCallEdge(edge: CallEdgeRow): Record<string, unknown> {
+  return {
+    caller: edge.caller,
+    callee: edge.callee,
+    file: edge.file,
+    line: edge.line,
+    confidence: edge.confidence,
+    resolutionKind: edge.resolution_kind,
+  };
+}
+
+function researchEdgeNeedles(symbols: ResearchSymbolCandidate[]): string[] {
+  const values: string[] = [];
+  for (const symbol of symbols) {
+    values.push(symbol.name, symbol.symbol);
+    const parts = symbol.symbol.split(/[.#]/g).filter(Boolean);
+    if (parts.length >= 2) values.push(`${parts[parts.length - 2]}.${parts[parts.length - 1]}`);
+    if (parts.length > 0) values.push(parts[parts.length - 1] ?? '');
+  }
+  return uniqueStrings(values
+    .map(value => value.replace(/\([^)]*\)$/, '').trim())
+    .filter(value => value.length >= 4 && !RESEARCH_STOP_WORDS.has(value.toLowerCase())));
+}
+
+function researchFlowSteps(input: {
+  symbols: ResearchSymbolCandidate[];
+  callers: CallEdgeRow[];
+  callees: CallEdgeRow[];
+  endpoints: Array<{ method: string; path: string; handlerSymbol: string; file: string; line: number; confidence: number }>;
+  files: ResearchFileCandidate[];
+}): Array<Record<string, unknown>> {
+  const steps: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  const add = (step: Record<string, unknown>) => {
+    const key = `${step.kind}:${step.summary}:${step.file}:${step.line}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    steps.push({ order: steps.length + 1, ...step });
+  };
+
+  for (const endpoint of input.endpoints.slice(0, 4)) {
+    add({
+      kind: 'endpoint',
+      summary: `${endpoint.method} ${endpoint.path} enters ${endpoint.handlerSymbol}`,
+      file: endpoint.file,
+      line: endpoint.line,
+      confidence: endpoint.confidence,
+    });
+  }
+  for (const symbol of input.symbols.slice(0, 6)) {
+    add({
+      kind: 'definition',
+      summary: `${symbol.name} (${symbol.kind ?? 'symbol'}) is a ranked entry point`,
+      symbol: symbol.symbol,
+      file: symbol.file,
+      lines: symbol.lines,
+      confidence: symbol.confidence,
+    });
+  }
+  for (const file of input.files.slice(0, 5)) {
+    add({
+      kind: 'file',
+      summary: file.whyRelevant,
+      file: file.file,
+      lines: file.lines,
+      confidence: file.confidence,
+    });
+  }
+  for (const edge of [...input.callees, ...input.callers]
+    .sort((a, b) => b.confidence - a.confidence || a.file.localeCompare(b.file))
+    .slice(0, 8)) {
+    add({
+      kind: 'call',
+      summary: `${edge.caller} -> ${edge.callee}`,
+      file: edge.file,
+      line: edge.line,
+      confidence: edge.confidence,
+      resolutionKind: edge.resolution_kind,
+    });
+  }
+  return steps.slice(0, 10);
+}
+
+function researchMissingFacts(input: {
+  target: string;
+  relevantSymbols: ResearchSymbolCandidate[];
+  evidenceSlices: Array<Record<string, unknown>>;
+  flowSteps: Array<Record<string, unknown>>;
+}): string[] {
+  const missing: string[] = [];
+  if (!input.target.trim()) missing.push('Target was empty; rerun with the subsystem, class, or request flow to research.');
+  if (input.relevantSymbols.length === 0) missing.push('No ranked symbols resolved; call search_code with the exact subsystem/class names.');
+  if (input.evidenceSlices.length === 0) missing.push('No source evidence slices were produced; call get_file_slice for the top ranked file or symbol.');
+  if (input.flowSteps.length === 0 && input.evidenceSlices.length === 0) missing.push('No flow steps or source evidence were available from the index.');
+  return missing;
 }
 
 function patchRiskFlags(input: {
@@ -3873,6 +4579,16 @@ function searchFiltersFor(args: Record<string, unknown>, query: string): {
   if (!includeFixtures) sql.push("file_role != 'mock_source'");
   if (!includeSynthetic) sql.push("COALESCE(framework_meta_json, '') NOT LIKE '%\"synthetic\":\"true\"%'");
 
+  const fileRole = args.fileRole ? String(args.fileRole) : '';
+  if (fileRole) {
+    sql.push('file_role = ?');
+    params.push(fileRole);
+  }
+  const language = args.language ? String(args.language) : '';
+  if (language) {
+    const extensionFilter = symbolFileLanguageFilter(language);
+    if (extensionFilter) sql.push(extensionFilter);
+  }
   const frameworkRole = args.frameworkRole ? String(args.frameworkRole) : '';
   if (frameworkRole) {
     sql.push("COALESCE(framework_role, '') = ?");
@@ -3892,6 +4608,8 @@ function searchFiltersFor(args: Record<string, unknown>, query: string): {
       includeTests,
       includeGenerated,
       includeFixtures,
+      fileRole: fileRole || undefined,
+      language: language || undefined,
       frameworkRole: frameworkRole || undefined,
       annotation: annotation || undefined,
     },
@@ -3935,6 +4653,21 @@ function fileFiltersFor(args: Record<string, unknown>, query: string): {
       language: language || undefined,
     },
   };
+}
+
+function symbolFileLanguageFilter(language: string): string | undefined {
+  switch (language) {
+    case 'java':
+      return "file LIKE '%.java'";
+    case 'typescript':
+      return "(file LIKE '%.ts' OR file LIKE '%.tsx')";
+    case 'javascript':
+      return "(file LIKE '%.js' OR file LIKE '%.jsx' OR file LIKE '%.mjs' OR file LIKE '%.cjs')";
+    case 'python':
+      return "file LIKE '%.py'";
+    default:
+      return undefined;
+  }
 }
 
 function referenceFiltersFor(args: Record<string, unknown>, query: string): {
@@ -4289,6 +5022,26 @@ const SEARCH_STOP_WORDS = new Set([
   'the',
   'to',
   'with',
+]);
+
+const RESEARCH_STOP_WORDS = new Set([
+  ...SEARCH_STOP_WORDS,
+  'about',
+  'does',
+  'execute',
+  'explain',
+  'flow',
+  'handle',
+  'happen',
+  'how',
+  'overview',
+  'request',
+  'through',
+  'what',
+  'when',
+  'where',
+  'work',
+  'works',
 ]);
 
 function escapeLike(value: string): string {

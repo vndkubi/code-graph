@@ -460,6 +460,79 @@ public class PaymentServiceTest {
     expect(slice.resolvedSymbol?.symbol).toContain('PaymentService.refund');
   });
 
+  it('builds answer-ready research and flow packs with source evidence', () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-research-pack-');
+    writeFile(repo, 'src/main/java/com/example/payment/PaymentGateway.java', `package com.example.payment;
+
+public interface PaymentGateway {
+    void processRefund(String transactionId);
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/payment/PaymentService.java', `package com.example.payment;
+
+public class PaymentService {
+    private final PaymentGateway gateway;
+
+    public PaymentService(PaymentGateway gateway) {
+        this.gateway = gateway;
+    }
+
+    public void refund(String transactionId) {
+        gateway.processRefund(transactionId);
+    }
+}
+`);
+
+    const { db } = openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const researchPack = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_research_pack',
+      args: {
+        target: 'How does PaymentService refund call PaymentGateway processRefund?',
+        taskType: 'architecture',
+        tokenBudget: 5000,
+      },
+    }) as {
+      evidenceSlices: Array<{ file: string; text: string; lines: string }>;
+      completeness: { sufficientForAnswer: boolean; evidenceSliceCount: number };
+      answerGuidance: string[];
+      nextAction: string;
+      definitionCandidates: Array<{ symbol: string; file: string }>;
+      flowSteps: unknown[];
+    };
+
+    expect(researchPack.completeness.sufficientForAnswer).toBe(true);
+    expect(researchPack.completeness.evidenceSliceCount).toBeGreaterThan(0);
+    expect(researchPack.definitionCandidates.some(symbol => symbol.symbol.includes('PaymentService'))).toBe(true);
+    expect(researchPack.evidenceSlices.some(slice => slice.file.endsWith('PaymentService.java'))).toBe(true);
+    expect(researchPack.evidenceSlices.some(slice => slice.text.includes('processRefund'))).toBe(true);
+    expect(researchPack.answerGuidance.join(' ')).toContain('Answer directly');
+    expect(researchPack.nextAction).toContain('Answer');
+    expect(researchPack.flowSteps.length).toBeGreaterThan(0);
+
+    const flowPack = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_flow_pack',
+      args: {
+        target: 'PaymentService refund flow',
+        tokenBudget: 5000,
+      },
+    }) as {
+      taskType: string;
+      routing: { answerDirectly: boolean };
+      evidenceSlices: Array<{ text: string }>;
+    };
+
+    expect(flowPack.taskType).toBe('architecture');
+    expect(flowPack.routing.answerDirectly).toBe(true);
+    expect(flowPack.evidenceSlices.some(slice => slice.text.includes('processRefund'))).toBe(true);
+  });
+
   it('simulates patch impact from changed files, symbols, and diffs', () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-patch-impact-');
