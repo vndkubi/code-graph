@@ -16,15 +16,18 @@ RUN --mount=type=secret,id=codegraph_ca,target=/tmp/codegraph-ca.crt,required=fa
     fi
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 ENV NPM_CONFIG_CAFILE=/etc/ssl/certs/ca-certificates.crt
+ENV npm_config_cafile=/etc/ssl/certs/ca-certificates.crt
 ENV NPM_CONFIG_NODEDIR=/usr/local
+ENV npm_config_nodedir=/usr/local
 ENV NPM_CONFIG_BUILD_FROM_SOURCE=true
+ENV npm_config_build_from_source=true
 RUN test -f /usr/local/include/node/node.h
 
 COPY package*.json ./
 RUN npm config set cafile /etc/ssl/certs/ca-certificates.crt \
     && npm config set nodedir /usr/local \
     && npm config set build-from-source true \
-    && npm ci
+    && npm ci --build-from-source --nodedir=/usr/local
 
 COPY tsconfig.json ./
 COPY src/ ./src/
@@ -47,15 +50,18 @@ RUN --mount=type=secret,id=codegraph_ca,target=/tmp/codegraph-ca.crt,required=fa
     fi
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 ENV NPM_CONFIG_CAFILE=/etc/ssl/certs/ca-certificates.crt
+ENV npm_config_cafile=/etc/ssl/certs/ca-certificates.crt
 ENV NPM_CONFIG_NODEDIR=/usr/local
+ENV npm_config_nodedir=/usr/local
 ENV NPM_CONFIG_BUILD_FROM_SOURCE=true
+ENV npm_config_build_from_source=true
 RUN test -f /usr/local/include/node/node.h
 
 COPY package*.json ./
 RUN npm config set cafile /etc/ssl/certs/ca-certificates.crt \
     && npm config set nodedir /usr/local \
     && npm config set build-from-source true \
-    && npm ci --omit=dev \
+    && npm ci --omit=dev --build-from-source --nodedir=/usr/local \
     && apk del python3 make g++
 
 COPY --from=builder /app/dist ./dist

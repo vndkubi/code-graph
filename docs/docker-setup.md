@@ -514,7 +514,7 @@ There are two common variants:
 | Failing URL | Meaning | Fix |
 |-------------|---------|-----|
 | `registry.npmjs.org` | npm cannot verify the registry TLS issuer | Build with `-CaCert` or `--ca-cert`. |
-| `unofficial-builds.nodejs.org/...node-headers...` | a native addon such as `better-sqlite3` fell back to `node-gyp` and tried to download Alpine/musl Node headers | Use the current Dockerfile. It sets `NPM_CONFIG_NODEDIR=/usr/local` and `NPM_CONFIG_BUILD_FROM_SOURCE=true` so native addons use the local Node headers already in the image. |
+| `unofficial-builds.nodejs.org/...node-headers...` | a native addon such as `better-sqlite3` fell back to `node-gyp` and tried to download Alpine/musl Node headers | Use the current Dockerfile. It sets both `NPM_CONFIG_*` and `npm_config_*` values plus `npm ci --build-from-source --nodedir=/usr/local`, so native addons use the local Node headers already in the image. |
 
 Fix it by exporting the corporate root certificate as PEM/CRT and building with
 the CA secret:
