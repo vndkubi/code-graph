@@ -84,6 +84,21 @@ interface PreparedParseBatch {
   parseWorkers: number;
 }
 
+type SqlValue = string | number | null | undefined;
+
+interface BatchInsertOptions {
+  ignoreConflicts?: boolean;
+  suffix?: string;
+}
+
+interface ParseResultForFile {
+  file: ManifestFile;
+  result: ParseResult;
+}
+
+const MAX_BATCH_PARAMS = 10_000;
+const WRITE_FILE_BATCH_SIZE = 250;
+
 const HTTP_METHOD_ANNOTATIONS = new Map([
   ['GET', 'GET'],
   ['POST', 'POST'],
@@ -316,35 +331,42 @@ export class V2Indexer {
         manifest.files.length,
       );
 
-      let filesWritten = 0;
-      let lastWriteProgressAt = 0;
+      const parseStatusByPath = new Map<string, string>();
       for (const file of manifest.files) {
         const previous = previousByPath.get(file.relPath);
         if (previous && previous.blobHash === file.blobHash) {
-          await this.insertFile(snapshotId, file, previous.parseStatus ?? 'ok');
-          filesWritten++;
-          lastWriteProgressAt = reportProgressEvery(options.progress, lastWriteProgressAt, {
-            phase: 'write',
-            status: filesWritten === manifest.files.length ? 'complete' : 'progress',
-            message: `writing ${file.relPath}`,
-            current: filesWritten,
-            total: manifest.files.length,
-            elapsedMs: Date.now() - start,
-          });
+          parseStatusByPath.set(file.relPath, previous.parseStatus ?? 'ok');
           continue;
         }
 
         const plan = parsePlanByPath.get(file.relPath);
-        await this.insertFile(snapshotId, file, plan?.parseStatus ?? 'skipped');
-        if (plan?.result) {
-          if (plan.cacheInsert) await this.insertParseCache(file, plan.result, now);
-          await this.materializeParseResult(snapshotId, file, plan.result);
+        parseStatusByPath.set(file.relPath, plan?.parseStatus ?? 'skipped');
+      }
+      await this.insertFiles(snapshotId, manifest.files, parseStatusByPath);
+
+      let filesWritten = 0;
+      let lastWriteProgressAt = 0;
+      for (const fileBatch of chunkArray(manifest.files, WRITE_FILE_BATCH_SIZE)) {
+        const parseCacheItems: ParseResultForFile[] = [];
+        const materializeItems: ParseResultForFile[] = [];
+        for (const file of fileBatch) {
+          const previous = previousByPath.get(file.relPath);
+          if (previous && previous.blobHash === file.blobHash) continue;
+
+          const plan = parsePlanByPath.get(file.relPath);
+          if (!plan?.result) continue;
+          materializeItems.push({ file, result: plan.result });
+          if (plan.cacheInsert) parseCacheItems.push({ file, result: plan.result });
         }
-        filesWritten++;
+        await this.insertParseCaches(parseCacheItems, now);
+        await this.materializeParseResults(snapshotId, materializeItems);
+
+        filesWritten += fileBatch.length;
+        const currentFile = fileBatch[fileBatch.length - 1]!;
         lastWriteProgressAt = reportProgressEvery(options.progress, lastWriteProgressAt, {
           phase: 'write',
           status: filesWritten === manifest.files.length ? 'complete' : 'progress',
-          message: `writing ${file.relPath}`,
+          message: `writing ${currentFile.relPath}`,
           current: filesWritten,
           total: manifest.files.length,
           elapsedMs: Date.now() - start,
@@ -574,19 +596,21 @@ export class V2Indexer {
     };
   }
 
-  private async insertParseCache(file: ManifestFile, parseResult: ParseResult, now: string): Promise<void> {
-    if (!file.language) return;
-    await this.db.prepare(`
-      INSERT OR IGNORE INTO parse_cache (
-        blob_hash, language, parse_json, has_parse_errors, parse_confidence, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      file.blobHash,
-      file.language,
-      JSON.stringify(parseResult),
-      parseResult.hasParseErrors ? 1 : 0,
-      parseResult.parseConfidence,
-      now,
+  private async insertParseCaches(items: ParseResultForFile[], now: string): Promise<void> {
+    await this.insertRows(
+      'parse_cache',
+      ['blob_hash', 'language', 'parse_json', 'has_parse_errors', 'parse_confidence', 'created_at'],
+      items
+        .filter(item => item.file.language)
+        .map(item => [
+          item.file.blobHash,
+          item.file.language,
+          JSON.stringify(item.result),
+          item.result.hasParseErrors ? 1 : 0,
+          item.result.parseConfidence,
+          now,
+        ]),
+      { ignoreConflicts: true },
     );
   }
 
@@ -650,20 +674,34 @@ export class V2Indexer {
       await this.deleteIndexedRowsForFiles(args.snapshotId, affectedPaths);
       await this.deleteDependencyEdgesForSources(args.snapshotId, dependencySources);
 
+      const parseStatusByPath = new Map(
+        args.changes.changedFiles.map(file => [
+          file.relPath,
+          parsePlanByPath.get(file.relPath)?.parseStatus ?? 'skipped',
+        ]),
+      );
+      await this.insertFiles(args.snapshotId, args.changes.changedFiles, parseStatusByPath);
+
       let filesWritten = 0;
       let lastWriteProgressAt = 0;
-      for (const file of args.changes.changedFiles) {
-        const plan = parsePlanByPath.get(file.relPath);
-        await this.insertFile(args.snapshotId, file, plan?.parseStatus ?? 'skipped');
-        if (plan?.result) {
-          if (plan.cacheInsert) await this.insertParseCache(file, plan.result, now);
-          await this.materializeParseResult(args.snapshotId, file, plan.result);
+      for (const fileBatch of chunkArray(args.changes.changedFiles, WRITE_FILE_BATCH_SIZE)) {
+        const parseCacheItems: ParseResultForFile[] = [];
+        const materializeItems: ParseResultForFile[] = [];
+        for (const file of fileBatch) {
+          const plan = parsePlanByPath.get(file.relPath);
+          if (!plan?.result) continue;
+          materializeItems.push({ file, result: plan.result });
+          if (plan.cacheInsert) parseCacheItems.push({ file, result: plan.result });
         }
-        filesWritten++;
+        await this.insertParseCaches(parseCacheItems, now);
+        await this.materializeParseResults(args.snapshotId, materializeItems);
+
+        filesWritten += fileBatch.length;
+        const currentFile = fileBatch[fileBatch.length - 1]!;
         lastWriteProgressAt = reportProgressEvery(args.progress, lastWriteProgressAt, {
           phase: 'write',
           status: filesWritten === args.changes.changedFiles.length ? 'complete' : 'progress',
-          message: `writing ${file.relPath}`,
+          message: `writing ${currentFile.relPath}`,
           current: filesWritten,
           total: args.changes.changedFiles.length,
           elapsedMs: Date.now() - args.start,
@@ -770,29 +808,32 @@ export class V2Indexer {
     `).run(snapshotId, ...values);
   }
 
-  private async insertFile(snapshotId: string, file: ManifestFile, parseStatus: string): Promise<void> {
-    await this.db.prepare(`
-      INSERT INTO files (
-        snapshot_id, path, blob_hash, mtime_ms, size, language, file_role, parse_status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT (snapshot_id, path) DO UPDATE SET
-        blob_hash = excluded.blob_hash,
-        mtime_ms = excluded.mtime_ms,
-        size = excluded.size,
-        language = excluded.language,
-        file_role = excluded.file_role,
-        parse_status = excluded.parse_status
-    `).run(snapshotId, file.relPath, file.blobHash, file.mtimeMs, file.size, file.language, file.role, parseStatus);
-  }
-
-  private async copyUnchangedFile(fromSnapshotId: string, toSnapshotId: string, file: ManifestFile): Promise<boolean> {
-    const oldFile = await this.db.prepare(`
-      SELECT blob_hash, parse_status FROM files WHERE snapshot_id = ? AND path = ?
-    `).get(fromSnapshotId, file.relPath) as { blob_hash: string; parse_status: string } | undefined;
-    if (!oldFile || oldFile.blob_hash !== file.blobHash) return false;
-
-    await this.insertFile(toSnapshotId, file, oldFile.parse_status);
-    return true;
+  private async insertFiles(snapshotId: string, files: ManifestFile[], parseStatusByPath: Map<string, string>): Promise<void> {
+    await this.insertRows(
+      'files',
+      ['snapshot_id', 'path', 'blob_hash', 'mtime_ms', 'size', 'language', 'file_role', 'parse_status'],
+      files.map(file => [
+        snapshotId,
+        file.relPath,
+        file.blobHash,
+        file.mtimeMs,
+        file.size,
+        file.language,
+        file.role,
+        parseStatusByPath.get(file.relPath) ?? 'skipped',
+      ]),
+      {
+        suffix: `
+          ON CONFLICT (snapshot_id, path) DO UPDATE SET
+            blob_hash = excluded.blob_hash,
+            mtime_ms = excluded.mtime_ms,
+            size = excluded.size,
+            language = excluded.language,
+            file_role = excluded.file_role,
+            parse_status = excluded.parse_status
+        `,
+      },
+    );
   }
 
   private async copyUnchangedRows(fromSnapshotId: string, toSnapshotId: string): Promise<void> {
@@ -821,229 +862,94 @@ export class V2Indexer {
     `).run(toSnapshotId, fromSnapshotId, toSnapshotId, fromSnapshotId);
   }
 
-  private async materializeParseResult(snapshotId: string, file: ManifestFile, result: ParseResult): Promise<void> {
-    const classesByName = new Map<string, SymbolInfo>();
-    for (const sym of result.symbols) {
-      if ((sym.kind === 'class' || sym.kind === 'interface') && sym.name) {
-        classesByName.set(sym.name, sym);
-      }
-    }
+  private async materializeParseResults(snapshotId: string, items: ParseResultForFile[]): Promise<void> {
+    const symbolRows: SqlValue[][] = [];
+    const annotationRows: SqlValue[][] = [];
+    const inheritanceRows: SqlValue[][] = [];
+    const beanRows: SqlValue[][] = [];
+    const endpointRows: SqlValue[][] = [];
+    const importRows: SqlValue[][] = [];
+    const typeRefRows: SqlValue[][] = [];
+    const callRows: SqlValue[][] = [];
 
-    for (const sym of result.symbols) {
-      const fqName = symbolFqName(sym);
-      await this.db.prepare(`
-        INSERT OR IGNORE INTO symbols (
-          snapshot_id, fq_name, simple_name, kind, file, line, column, end_line, signature,
-          visibility, parent, package_name, return_type, parameter_types_json, annotations_json,
-          framework_role, framework_meta_json, file_role
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        snapshotId,
-        fqName,
-        sym.name,
-        sym.kind,
-        file.relPath,
-        sym.line,
-        sym.column,
-        sym.endLine,
-        sym.signature,
-        sym.visibility,
-        sym.parent,
-        sym.packageName,
-        sym.returnType,
-        JSON.stringify(sym.parameterTypes ?? []),
-        JSON.stringify(sym.annotations ?? []),
-        sym.frameworkRole,
-        JSON.stringify(sym.frameworkMeta ?? {}),
-        file.role,
-      );
-
-      for (const annotation of sym.annotations ?? []) {
-        await this.db.prepare(`
-          INSERT INTO annotations (snapshot_id, symbol_fq_name, annotation, file, line)
-          VALUES (?, ?, ?, ?, ?)
-        `).run(snapshotId, fqName, annotation, file.relPath, sym.line);
+    for (const { file, result } of items) {
+      const classesByName = new Map<string, SymbolInfo>();
+      for (const sym of result.symbols) {
+        if ((sym.kind === 'class' || sym.kind === 'interface') && sym.name) {
+          classesByName.set(sym.name, sym);
+        }
       }
 
-      await this.materializeInheritance(snapshotId, file, sym);
-      await this.materializeBean(snapshotId, file, sym, fqName);
-      await this.materializeEndpoint(snapshotId, file, sym, fqName, classesByName);
-    }
-
-    for (const imp of result.imports) {
-      await this.db.prepare(`
-        INSERT INTO imports (
-          snapshot_id, file, source, imported_symbols_json, line, is_external, file_role
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(snapshotId, file.relPath, imp.source, JSON.stringify(imp.symbols), imp.line, imp.isExternal ? 1 : 0, file.role);
-    }
-
-    for (const ref of result.typeReferences ?? []) {
-      await this.db.prepare(`
-        INSERT INTO type_refs (snapshot_id, file, referenced_type, context, line, file_role)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(snapshotId, file.relPath, ref.referencedType, ref.context, ref.line, file.role);
-    }
-
-    for (const call of result.calls) {
-      await this.db.prepare(`
-        INSERT INTO call_edges (
-          snapshot_id, caller, callee, file, line, confidence, resolution_kind, file_role
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(snapshotId, call.caller, call.callee, file.relPath, call.line, 0.4, 'name-only', file.role);
-    }
-  }
-
-  private async materializeInheritance(snapshotId: string, file: ManifestFile, sym: SymbolInfo): Promise<void> {
-    const child = symbolFqName(sym).replace(/\([^)]*\)$/, '');
-    if (sym.extends) {
-      await this.db.prepare(`
-        INSERT INTO inheritance (snapshot_id, child_type, parent_type, kind, file, line, confidence)
-        VALUES (?, ?, ?, 'extends', ?, ?, 0.8)
-      `).run(snapshotId, child, sym.extends, file.relPath, sym.line);
-    }
-    for (const parent of sym.implements ?? []) {
-      await this.db.prepare(`
-        INSERT INTO inheritance (snapshot_id, child_type, parent_type, kind, file, line, confidence)
-        VALUES (?, ?, ?, 'implements', ?, ?, 0.8)
-      `).run(snapshotId, child, parent, file.relPath, sym.line);
-    }
-  }
-
-  private async materializeBean(snapshotId: string, file: ManifestFile, sym: SymbolInfo, fqName: string): Promise<void> {
-    if (sym.kind !== 'class' && sym.kind !== 'interface') return;
-    const annotations = sym.annotations ?? [];
-    const beanAnnotation = annotations.find(a => BEAN_ANNOTATIONS.has(a));
-    if (!beanAnnotation) return;
-
-    await this.db.prepare(`
-      INSERT INTO beans (
-        snapshot_id, bean_type, implementation, scope, qualifiers_json, source, file, line, confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      snapshotId,
-      sym.name,
-      fqName,
-      beanAnnotation,
-      JSON.stringify(annotations.filter(a => a.endsWith('Qualifier'))),
-      'annotation',
-      file.relPath,
-      sym.line,
-      0.8,
-    );
-  }
-
-  private async materializeEndpoint(
-    snapshotId: string,
-    file: ManifestFile,
-    sym: SymbolInfo,
-    fqName: string,
-    classesByName: Map<string, SymbolInfo>,
-  ): Promise<void> {
-    const annotations = sym.annotations ?? [];
-
-    if (sym.kind === 'class' || sym.kind === 'interface') {
-      if (annotations.includes('ServerEndpoint')) {
-        const endpointPath = resolveClassEndpointPath(sym);
-        await this.db.prepare(`
-          INSERT INTO endpoints (
-            snapshot_id, method, path, path_resolution, path_resolution_reason,
-            handler_symbol, controller, file, line, framework, confidence, file_role
-          ) VALUES (?, 'WEBSOCKET', ?, ?, ?, ?, ?, ?, ?, 'websocket', ?, ?)
-        `).run(
+      for (const sym of result.symbols) {
+        const fqName = symbolFqName(sym);
+        symbolRows.push([
           snapshotId,
-          endpointPath.path,
-          endpointPath.resolution,
-          endpointPath.reason,
           fqName,
           sym.name,
+          sym.kind,
           file.relPath,
           sym.line,
-          endpointPath.resolution === 'exact' ? 0.8 : 0.5,
+          sym.column,
+          sym.endLine,
+          sym.signature,
+          sym.visibility,
+          sym.parent,
+          sym.packageName,
+          sym.returnType,
+          JSON.stringify(sym.parameterTypes ?? []),
+          JSON.stringify(sym.annotations ?? []),
+          sym.frameworkRole,
+          JSON.stringify(sym.frameworkMeta ?? {}),
           file.role,
-        );
-        return;
+        ]);
+
+        for (const annotation of sym.annotations ?? []) {
+          annotationRows.push([snapshotId, fqName, annotation, file.relPath, sym.line]);
+        }
+
+        const child = fqName.replace(/\([^)]*\)$/, '');
+        if (sym.extends) {
+          inheritanceRows.push([snapshotId, child, sym.extends, 'extends', file.relPath, sym.line, 0.8]);
+        }
+        for (const parent of sym.implements ?? []) {
+          inheritanceRows.push([snapshotId, child, parent, 'implements', file.relPath, sym.line, 0.8]);
+        }
+
+        const beanRow = beanRowForSymbol(snapshotId, file, sym, fqName);
+        if (beanRow) beanRows.push(beanRow);
+        const endpointRow = endpointRowForSymbol(snapshotId, file, sym, fqName, classesByName);
+        if (endpointRow) endpointRows.push(endpointRow);
       }
 
-      if (annotations.includes('WebServlet')) {
-        const endpointPath = resolveClassEndpointPath(sym);
-        await this.db.prepare(`
-          INSERT INTO endpoints (
-            snapshot_id, method, path, path_resolution, path_resolution_reason,
-            handler_symbol, controller, file, line, framework, confidence, file_role
-          ) VALUES (?, 'SERVLET', ?, ?, ?, ?, ?, ?, ?, 'servlet', ?, ?)
-        `).run(
+      for (const imp of result.imports) {
+        importRows.push([
           snapshotId,
-          endpointPath.path,
-          endpointPath.resolution,
-          endpointPath.reason,
-          fqName,
-          sym.name,
           file.relPath,
-          sym.line,
-          endpointPath.resolution === 'exact' ? 0.75 : 0.5,
+          imp.source,
+          JSON.stringify(imp.symbols),
+          imp.line,
+          imp.isExternal ? 1 : 0,
           file.role,
-        );
-        return;
+        ]);
+      }
+
+      for (const ref of result.typeReferences ?? []) {
+        typeRefRows.push([snapshotId, file.relPath, ref.referencedType, ref.context, ref.line, file.role]);
+      }
+
+      for (const call of result.calls) {
+        callRows.push([snapshotId, call.caller, call.callee, file.relPath, call.line, 0.4, 'name-only', file.role]);
       }
     }
 
-    if (sym.kind !== 'method') return;
-
-    if (
-      sym.frameworkRole === 'openapi:endpoint'
-      || sym.frameworkRole === 'postman:request'
-      || sym.frameworkRole === 'elastic-rest:endpoint'
-    ) {
-      const method = String(sym.frameworkMeta?.httpMethod ?? 'GET').toUpperCase();
-      const endpointPath = String(sym.frameworkMeta?.path ?? '/');
-      const framework = sym.frameworkRole === 'elastic-rest:endpoint'
-        ? 'elastic-rest'
-        : sym.frameworkRole.startsWith('openapi') ? 'openapi' : 'postman';
-      await this.db.prepare(`
-        INSERT INTO endpoints (
-          snapshot_id, method, path, path_resolution, path_resolution_reason,
-          handler_symbol, controller, file, line, framework, confidence, file_role
-        ) VALUES (?, ?, ?, 'exact', NULL, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        snapshotId,
-        method,
-        endpointPath,
-        fqName,
-        sym.parent,
-        file.relPath,
-        sym.line,
-        framework,
-        0.75,
-        file.role,
-      );
-      return;
-    }
-
-    const methodAnnotation = annotations.find(a => HTTP_METHOD_ANNOTATIONS.has(a));
-    if (!methodAnnotation) return;
-
-    const httpMethod = sym.frameworkMeta?.httpMethod ?? HTTP_METHOD_ANNOTATIONS.get(methodAnnotation) ?? 'REQUEST';
-    const endpointPath = resolveEndpointPath(sym, classesByName.get(sym.parent ?? ''));
-    await this.db.prepare(`
-      INSERT INTO endpoints (
-        snapshot_id, method, path, path_resolution, path_resolution_reason,
-        handler_symbol, controller, file, line, framework, confidence, file_role
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      snapshotId,
-      httpMethod,
-      endpointPath.path,
-      endpointPath.resolution,
-      endpointPath.reason,
-      fqName,
-      sym.parent,
-      file.relPath,
-      sym.line,
-      methodAnnotation.includes('Mapping') ? 'spring' : 'jakarta',
-      endpointPath.resolution === 'exact' ? 0.85 : 0.55,
-      file.role,
-    );
+    await this.insertRows('symbols', copyableColumnsFor('symbols'), symbolRows, { ignoreConflicts: true });
+    await this.insertRows('annotations', copyableColumnsFor('annotations'), annotationRows);
+    await this.insertRows('inheritance', copyableColumnsFor('inheritance'), inheritanceRows);
+    await this.insertRows('beans', copyableColumnsFor('beans'), beanRows);
+    await this.insertRows('endpoints', copyableColumnsFor('endpoints'), endpointRows);
+    await this.insertRows('imports', copyableColumnsFor('imports'), importRows);
+    await this.insertRows('type_refs', copyableColumnsFor('type_refs'), typeRefRows);
+    await this.insertRows('call_edges', copyableColumnsFor('call_edges'), callRows);
   }
 
   private async rebuildDependencyEdges(snapshotId: string, sourceFiles?: Set<string>): Promise<void> {
@@ -1076,27 +982,23 @@ export class V2Indexer {
       if (!classToFile.has(sym.fq_name)) classToFile.set(sym.fq_name, sym.file);
     }
 
-    const insert = await this.db.prepare(`
-      INSERT INTO dependency_edges (
-        snapshot_id, from_file, to_file, kind, confidence, resolution_kind
-      ) VALUES (?, ?, ?, ?, ?, ?)
-    `);
+    const edgeRows: SqlValue[][] = [];
     const seen = new Set<string>();
-    const addEdge = async (from: string, to: string | undefined, kind: string, confidence: number, resolutionKind: string) => {
+    const addEdge = (from: string, to: string | undefined, kind: string, confidence: number, resolutionKind: string) => {
       if (!to || to === from) return;
       if (sourceFiles && !sourceFiles.has(from)) return;
       const key = `${from}\0${to}\0${kind}`;
       if (seen.has(key)) return;
       seen.add(key);
-      await insert.run(snapshotId, from, to, kind, confidence, resolutionKind);
+      edgeRows.push([snapshotId, from, to, kind, confidence, resolutionKind]);
     };
 
     for (const imp of imports) {
       const simple = imp.source.split('.').pop() ?? imp.source;
-      await addEdge(imp.file, classToFile.get(imp.source) ?? classToFile.get(simple), 'compile', 0.8, 'import');
+      addEdge(imp.file, classToFile.get(imp.source) ?? classToFile.get(simple), 'compile', 0.8, 'import');
     }
     for (const ref of typeRefs) {
-      await addEdge(ref.file, classToFile.get(ref.referenced_type), 'compile', 0.6, 'type-ref');
+      addEdge(ref.file, classToFile.get(ref.referenced_type), 'compile', 0.6, 'type-ref');
     }
 
     const javaTypesByFqName = new Map<string, string[]>();
@@ -1123,10 +1025,12 @@ export class V2Indexer {
       const meta = parseJsonObject(mapper.framework_meta_json);
       const namespace = typeof meta.namespace === 'string' && meta.namespace ? meta.namespace : mapper.fq_name;
       for (const javaFile of javaTypesByFqName.get(namespace) ?? []) {
-        await addEdge(mapper.file, javaFile, 'config', 0.95, 'mybatis-namespace');
-        await addEdge(javaFile, mapper.file, 'config', 0.95, 'mybatis-namespace');
+        addEdge(mapper.file, javaFile, 'config', 0.95, 'mybatis-namespace');
+        addEdge(javaFile, mapper.file, 'config', 0.95, 'mybatis-namespace');
       }
     }
+
+    await this.insertRows('dependency_edges', copyableColumnsFor('dependency_edges'), edgeRows);
   }
 
   private async resolveCallEdges(snapshotId: string, files?: Set<string>): Promise<void> {
@@ -1186,22 +1090,14 @@ export class V2Indexer {
         .map(row => `${row.parent}.${row.simple_name}`),
     );
 
-    const update = await this.db.prepare(`
-      UPDATE call_edges
-      SET callee = ?, confidence = ?, resolution_kind = ?
-      WHERE rowid = ?
-    `);
-    const insert = await this.db.prepare(`
-      INSERT INTO call_edges (
-        snapshot_id, caller, callee, file, line, confidence, resolution_kind, file_role
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    const edgeUpdates: SqlValue[][] = [];
+    const implementationEdgeRows: SqlValue[][] = [];
     const insertedImplementationEdges = new Set<string>();
-    const insertImplementationEdges = async (
+    const queueImplementationEdges = (
       row: typeof rows[number],
       receiverType: string,
       method: string,
-    ): Promise<void> => {
+    ): void => {
       const implementations = implementationsByInterface.get(simpleTypeName(receiverType)) ?? [];
       for (const implementation of implementations) {
         if (!methodOwners.has(`${implementation}.${method}`)) continue;
@@ -1209,7 +1105,16 @@ export class V2Indexer {
         const key = `${row.caller}\0${callee}\0${row.file}\0${row.line}`;
         if (insertedImplementationEdges.has(key)) continue;
         insertedImplementationEdges.add(key);
-        await insert.run(snapshotId, row.caller, callee, row.file, row.line, 0.65, 'interface-implementation', row.file_role);
+        implementationEdgeRows.push([
+          snapshotId,
+          row.caller,
+          callee,
+          row.file,
+          row.line,
+          0.65,
+          'interface-implementation',
+          row.file_role,
+        ]);
       }
     };
 
@@ -1221,14 +1126,68 @@ export class V2Indexer {
       const method = row.callee.substring(dot + 1);
       const fieldType = fieldsByFile.get(row.file)?.get(normalizedReceiver);
       if (fieldType) {
-        await update.run(`${fieldType}.${method}`, 0.8, 'receiver-field', row.row_id);
-        await insertImplementationEdges(row, fieldType, method);
+        edgeUpdates.push([row.row_id, `${fieldType}.${method}`, 0.8, 'receiver-field']);
+        queueImplementationEdges(row, fieldType, method);
         continue;
       }
       if (/^[A-Z]/.test(receiver)) {
-        await update.run(row.callee, 0.8, 'static-or-type-receiver', row.row_id);
-        await insertImplementationEdges(row, receiver, method);
+        edgeUpdates.push([row.row_id, row.callee, 0.8, 'static-or-type-receiver']);
+        queueImplementationEdges(row, receiver, method);
       }
+    }
+
+    await this.updateCallEdges(edgeUpdates);
+    await this.insertRows('call_edges', copyableColumnsFor('call_edges'), implementationEdgeRows);
+  }
+
+  private async updateCallEdges(rows: SqlValue[][]): Promise<void> {
+    if (rows.length === 0) return;
+    const columns = ['row_id', 'callee', 'confidence', 'resolution_kind'];
+    const maxRows = Math.max(1, Math.floor(MAX_BATCH_PARAMS / columns.length));
+    for (const batch of chunkArray(rows, maxRows)) {
+      const params: SqlValue[] = [];
+      const placeholders = batch.map(row => {
+        if (row.length !== columns.length) {
+          throw new Error(`Expected ${columns.length} values for call_edges update, received ${row.length}.`);
+        }
+        params.push(...row.map(value => value === undefined ? null : value));
+        return `(${columns.map(() => '?').join(', ')})`;
+      }).join(', ');
+      await this.db.prepare(`
+        UPDATE call_edges AS target
+        SET callee = updates.callee::text,
+            confidence = updates.confidence::double precision,
+            resolution_kind = updates.resolution_kind::text
+        FROM (VALUES ${placeholders}) AS updates(row_id, callee, confidence, resolution_kind)
+        WHERE target.id = updates.row_id::bigint
+      `).run(...params);
+    }
+  }
+
+  private async insertRows(
+    table: string,
+    columns: string[],
+    rows: SqlValue[][],
+    options: BatchInsertOptions = {},
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    const maxRows = Math.max(1, Math.floor(MAX_BATCH_PARAMS / columns.length));
+    const insertKeyword = options.ignoreConflicts ? 'INSERT OR IGNORE INTO' : 'INSERT INTO';
+    const columnList = columns.map(sqlColumnName).join(', ');
+    for (const batch of chunkArray(rows, maxRows)) {
+      const params: SqlValue[] = [];
+      const placeholders = batch.map(row => {
+        if (row.length !== columns.length) {
+          throw new Error(`Expected ${columns.length} values for ${table}, received ${row.length}.`);
+        }
+        params.push(...row.map(value => value === undefined ? null : value));
+        return `(${columns.map(() => '?').join(', ')})`;
+      }).join(', ');
+      await this.db.prepare(`
+        ${insertKeyword} ${table} (${columnList})
+        VALUES ${placeholders}
+        ${options.suffix ?? ''}
+      `).run(...params);
     }
   }
 }
@@ -1241,6 +1200,120 @@ interface EndpointPathResolution {
   path: string;
   resolution: 'exact' | 'partial';
   reason?: string;
+}
+
+function beanRowForSymbol(snapshotId: string, file: ManifestFile, sym: SymbolInfo, fqName: string): SqlValue[] | undefined {
+  if (sym.kind !== 'class' && sym.kind !== 'interface') return undefined;
+  const annotations = sym.annotations ?? [];
+  const beanAnnotation = annotations.find(a => BEAN_ANNOTATIONS.has(a));
+  if (!beanAnnotation) return undefined;
+  return [
+    snapshotId,
+    sym.name,
+    fqName,
+    beanAnnotation,
+    JSON.stringify(annotations.filter(a => a.endsWith('Qualifier'))),
+    'annotation',
+    file.relPath,
+    sym.line,
+    0.8,
+  ];
+}
+
+function endpointRowForSymbol(
+  snapshotId: string,
+  file: ManifestFile,
+  sym: SymbolInfo,
+  fqName: string,
+  classesByName: Map<string, SymbolInfo>,
+): SqlValue[] | undefined {
+  const annotations = sym.annotations ?? [];
+
+  if (sym.kind === 'class' || sym.kind === 'interface') {
+    if (annotations.includes('ServerEndpoint')) {
+      const endpointPath = resolveClassEndpointPath(sym);
+      return [
+        snapshotId,
+        'WEBSOCKET',
+        endpointPath.path,
+        endpointPath.resolution,
+        endpointPath.reason,
+        fqName,
+        sym.name,
+        file.relPath,
+        sym.line,
+        'websocket',
+        endpointPath.resolution === 'exact' ? 0.8 : 0.5,
+        file.role,
+      ];
+    }
+
+    if (annotations.includes('WebServlet')) {
+      const endpointPath = resolveClassEndpointPath(sym);
+      return [
+        snapshotId,
+        'SERVLET',
+        endpointPath.path,
+        endpointPath.resolution,
+        endpointPath.reason,
+        fqName,
+        sym.name,
+        file.relPath,
+        sym.line,
+        'servlet',
+        endpointPath.resolution === 'exact' ? 0.75 : 0.5,
+        file.role,
+      ];
+    }
+  }
+
+  if (sym.kind !== 'method') return undefined;
+
+  if (
+    sym.frameworkRole === 'openapi:endpoint'
+    || sym.frameworkRole === 'postman:request'
+    || sym.frameworkRole === 'elastic-rest:endpoint'
+  ) {
+    const method = String(sym.frameworkMeta?.httpMethod ?? 'GET').toUpperCase();
+    const endpointPath = String(sym.frameworkMeta?.path ?? '/');
+    const framework = sym.frameworkRole === 'elastic-rest:endpoint'
+      ? 'elastic-rest'
+      : sym.frameworkRole.startsWith('openapi') ? 'openapi' : 'postman';
+    return [
+      snapshotId,
+      method,
+      endpointPath,
+      'exact',
+      null,
+      fqName,
+      sym.parent,
+      file.relPath,
+      sym.line,
+      framework,
+      0.75,
+      file.role,
+    ];
+  }
+
+  const methodAnnotation = annotations.find(a => HTTP_METHOD_ANNOTATIONS.has(a));
+  if (!methodAnnotation) return undefined;
+
+  const httpMethod = sym.frameworkMeta?.httpMethod ?? HTTP_METHOD_ANNOTATIONS.get(methodAnnotation) ?? 'REQUEST';
+  const endpointPath = resolveEndpointPath(sym, classesByName.get(sym.parent ?? ''));
+  return [
+    snapshotId,
+    httpMethod,
+    endpointPath.path,
+    endpointPath.resolution,
+    endpointPath.reason,
+    fqName,
+    sym.parent,
+    file.relPath,
+    sym.line,
+    methodAnnotation.includes('Mapping') ? 'spring' : 'jakarta',
+    endpointPath.resolution === 'exact' ? 0.85 : 0.55,
+    file.role,
+  ];
 }
 
 function resolveEndpointPath(methodSym: SymbolInfo, classSym: SymbolInfo | undefined): EndpointPathResolution {
@@ -1332,6 +1405,8 @@ function copyableColumnsFor(table: string): string[] {
       return ['snapshot_id', 'file', 'referenced_type', 'context', 'line', 'file_role'];
     case 'call_edges':
       return ['snapshot_id', 'caller', 'callee', 'file', 'line', 'confidence', 'resolution_kind', 'file_role'];
+    case 'dependency_edges':
+      return ['snapshot_id', 'from_file', 'to_file', 'kind', 'confidence', 'resolution_kind'];
     case 'annotations':
       return ['snapshot_id', 'symbol_fq_name', 'annotation', 'file', 'line'];
     case 'endpoints':
@@ -1346,6 +1421,18 @@ function copyableColumnsFor(table: string): string[] {
     default:
       throw new Error(`Unsupported copy table: ${table}`);
   }
+}
+
+function sqlColumnName(column: string): string {
+  return column;
+}
+
+function chunkArray<T>(items: T[], chunkSize: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize));
+  }
+  return chunks;
 }
 
 function normalizeWorkspaceKey(value: string | undefined): string | undefined {
