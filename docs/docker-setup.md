@@ -42,6 +42,9 @@ identity.
 - Git available inside the source repository on the host.
 - On Windows, use forward slashes in Docker bind mounts, for example
   `D:/Personal/Projects/hadoop:/workspace:ro`.
+- On Windows Docker Desktop, make sure the drive that contains the repository is
+  shared with Docker. Open Docker Desktop -> Settings -> Resources -> File
+  Sharing, add `D:\`, click Apply & Restart, then re-run the index command.
 - For large Windows repositories, WSL/ext4 bind mounts are usually faster than
   Docker Desktop bind mounts from `D:\...`.
 
@@ -495,6 +498,7 @@ docker --context desktop-linux run --rm `
 | Symptom | Likely Cause | Fix |
 |---------|--------------|-----|
 | `Cannot connect to the Docker daemon` | Docker Desktop or Docker context is not running | Start Docker Desktop and run `docker --context desktop-linux ps`. |
+| Docker cannot mount `D:/...`, `/workspace` is empty, or the index sees no project files | The Windows drive is not shared with Docker Desktop | Docker Desktop -> Settings -> Resources -> File Sharing -> Add `D:\` -> Apply & Restart, then re-run the index command. |
 | Every repo looks like the same workspace | Missing or reused `CODEGRAPH_WORKSPACE_KEY` | Use a unique host path or stable key per repo/worktree. |
 | Warm run parses everything again | Different cache volume, different workspace key, or changed branch/files | Reuse the same volume/key and inspect index output fields. |
 | First MCP question after checkout is slow | `--auto-refresh` is refreshing a stale snapshot | Prewarm manually after checkout before asking the agent. |

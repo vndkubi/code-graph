@@ -806,6 +806,7 @@ docker --context desktop-linux run --rm `
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `Cannot connect to the Docker daemon` | Docker Desktop engine/context is not running | Start Docker Desktop, then try `docker --context desktop-linux ps` |
+| Docker cannot mount `D:/...`, `/workspace` is empty, or index finds no project files | Windows drive is not shared with Docker Desktop | Docker Desktop -> Settings -> Resources -> File Sharing -> Add `D:\` -> Apply & Restart, then re-run the index command |
 | Every repo appears as the same workspace | Missing or reused `CODEGRAPH_WORKSPACE_KEY` | Set a unique host path or stable key per repo |
 | Warm run still parses everything | Cache volume changed or workspace key changed | Reuse the same volume and exact workspace key |
 | Very slow cold index on Windows | Docker Desktop bind mount overhead | Prefer local Node/stdio or WSL/ext4 for large repos; keep Docker cache volume persistent |
