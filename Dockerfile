@@ -10,11 +10,11 @@ WORKDIR /app
 RUN apk add --no-cache ca-certificates python3 make g++
 RUN --mount=type=secret,id=codegraph_ca,target=/tmp/codegraph-ca.crt,required=false \
     if [ -s /tmp/codegraph-ca.crt ]; then \
-      cat /tmp/codegraph-ca.crt >> /etc/ssl/certs/ca-certificates.crt; \
       cp /tmp/codegraph-ca.crt /usr/local/share/ca-certificates/codegraph-extra-ca.crt; \
-      update-ca-certificates || true; \
+      update-ca-certificates; \
     fi
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+ENV NPM_CONFIG_CAFILE=/etc/ssl/certs/ca-certificates.crt
 
 COPY package*.json ./
 RUN npm ci
@@ -34,11 +34,11 @@ RUN apk add --no-cache ca-certificates git python3 make g++
 RUN git config --system --add safe.directory '*'
 RUN --mount=type=secret,id=codegraph_ca,target=/tmp/codegraph-ca.crt,required=false \
     if [ -s /tmp/codegraph-ca.crt ]; then \
-      cat /tmp/codegraph-ca.crt >> /etc/ssl/certs/ca-certificates.crt; \
       cp /tmp/codegraph-ca.crt /usr/local/share/ca-certificates/codegraph-extra-ca.crt; \
-      update-ca-certificates || true; \
+      update-ca-certificates; \
     fi
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+ENV NPM_CONFIG_CAFILE=/etc/ssl/certs/ca-certificates.crt
 
 COPY package*.json ./
 RUN npm ci --omit=dev \

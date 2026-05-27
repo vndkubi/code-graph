@@ -809,7 +809,7 @@ docker --context desktop-linux run --rm `
 | Every repo appears as the same workspace | Missing or reused `CODEGRAPH_WORKSPACE_KEY` | Set a unique host path or stable key per repo |
 | Warm run still parses everything | Cache volume changed or workspace key changed | Reuse the same volume and exact workspace key |
 | Very slow cold index on Windows | Docker Desktop bind mount overhead | Prefer local Node/stdio or WSL/ext4 for large repos; keep Docker cache volume persistent |
-| Corporate `npm ci` fails during build | Missing trusted root CA | Use `.\docker-build.ps1 -CaCert C:\path\corp-root-ca.crt` |
+| Corporate `npm ci` fails during build with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` | Missing trusted root CA inside the Docker build container | Use `.\docker-build.ps1 -CaCert C:\path\corp-root-ca.crt`; see [`docs/docker-setup.md`](docs/docker-setup.md#unable_to_get_issuer_cert_locally-during-docker-build) |
 | MCP starts but agent does not use it | Editor config points to wrong command/args | Check CodeGraph logs or ask the agent to call `get_index_stats` explicitly |
 
 Windows PowerShell:

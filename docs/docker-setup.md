@@ -86,6 +86,15 @@ pass a PEM/CRT certificate at build time:
 ./docker-build.sh --ca-cert /path/to/corp-root-ca.crt
 ```
 
+Direct Docker build with a CA secret:
+
+```powershell
+$env:DOCKER_BUILDKIT = "1"
+docker --context desktop-linux build `
+  --secret "id=codegraph_ca,src=C:\temp\corp-root-ca.crt" `
+  -t mcp-code-graph:latest .
+```
+
 Rebuild the image whenever you change CodeGraph source code, `package-lock.json`,
 or `Dockerfile`.
 
@@ -493,3 +502,37 @@ docker --context desktop-linux run --rm `
 | Docker index is much slower than local Node | Docker Desktop bind mount overhead | Prefer WSL/ext4 or local Node for very large repos. |
 | Build fails at `npm ci` behind corporate TLS | Missing corporate root CA | Build with `-CaCert` or `--ca-cert`. |
 | Unsupported SQLite schema version | Old cache volume with incompatible DB schema | Use a new volume or reset `codegraph-cache`. |
+
+### `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` during Docker build
+
+This is an npm/Node TLS trust failure inside the Docker build container. It
+usually means your network uses a corporate HTTPS inspection proxy and the
+container does not trust the corporate root CA.
+
+Fix it by exporting the corporate root certificate as PEM/CRT and building with
+the CA secret:
+
+```powershell
+.\docker-build.ps1 -CaCert C:\temp\corp-root-ca.crt
+```
+
+Or with raw Docker:
+
+```powershell
+$env:DOCKER_BUILDKIT = "1"
+docker --context desktop-linux build `
+  --secret "id=codegraph_ca,src=C:\temp\corp-root-ca.crt" `
+  -t mcp-code-graph:latest .
+```
+
+If you have the certificate in Windows Certificate Manager, export the trusted
+root CA and PEM-encode it:
+
+```powershell
+$cert = Get-ChildItem Cert:\CurrentUser\Root | Where-Object Thumbprint -eq "<THUMBPRINT>"
+Export-Certificate -Cert $cert -FilePath C:\temp\corp-root-ca.cer | Out-Null
+certutil -encode C:\temp\corp-root-ca.cer C:\temp\corp-root-ca.crt
+```
+
+Do not fix this by setting `strict-ssl=false`; that disables TLS verification
+instead of teaching the container to trust the correct issuer.
