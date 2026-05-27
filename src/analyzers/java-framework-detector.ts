@@ -1,4 +1,4 @@
-import type { SymbolInfo } from './base-analyzer.js';
+import type { ImportInfo, SymbolInfo } from './base-analyzer.js';
 
 // ─── Role mapping tables ─────────────────────────────────────────────────────
 
@@ -272,6 +272,233 @@ const ANNOTATION_ROLE: Record<string, string> = {
   Accessors: 'lombok:accessors',
 };
 
+function roleEntries(names: string[], role: string): Record<string, string> {
+  return Object.fromEntries(names.map(name => [name, role]));
+}
+
+const JAKARTA_EE_8_PLUS_ROLE: Record<string, string> = {
+  // Jakarta Annotations / common resources
+  ...roleEntries([
+    'Generated', 'ManagedBean', 'Resources', 'Nullable', 'Nonnull',
+  ], 'jakarta:annotation'),
+  ...roleEntries([
+    'DataSourceDefinition', 'DataSourceDefinitions',
+  ], 'jakarta:datasource'),
+  ...roleEntries([
+    'Resource', 'Resources',
+  ], 'jakarta:resource'),
+
+  // Jakarta Batch
+  ...roleEntries(['BatchProperty'], 'jakarta:batch'),
+
+  // Jakarta Concurrency
+  ...roleEntries([
+    'Asynchronous', 'ContextServiceDefinition', 'ManagedExecutorDefinition',
+    'ManagedScheduledExecutorDefinition', 'ManagedThreadFactoryDefinition',
+  ], 'jakarta:concurrency'),
+
+  // Jakarta Data (Jakarta EE 11+)
+  ...roleEntries([
+    'By', 'EntityDefining', 'Find', 'Insert', 'Param', 'Query',
+    'Repository', 'Save', 'Update',
+  ], 'jakarta:data'),
+
+  // CDI / Dependency Injection / contexts
+  ...roleEntries([
+    'ActivateRequestContext', 'Any', 'BeforeDestroyed', 'Decorated', 'Default',
+    'Destroyed', 'Initialized', 'Intercepted', 'Model', 'New', 'Nonbinding',
+    'NormalScope', 'TransientReference', 'Typed', 'WithAnnotations',
+  ], 'jakarta:cdi'),
+  ...roleEntries([
+    'TransactionScoped',
+  ], 'jakarta:cdi-bean'),
+  ...roleEntries([
+    'Discovery', 'Enhancement', 'Registration', 'SkipIfPortableExtensionPresent',
+    'Synthesis', 'Validation',
+  ], 'jakarta:cdi-extension'),
+
+  // EJB / Enterprise Beans
+  ...roleEntries([
+    'AfterBegin', 'AfterCompletion', 'ApplicationException', 'BeforeCompletion',
+    'DependsOn', 'EJBs', 'Init', 'Local', 'LocalHome', 'PostActivate',
+    'PrePassivate', 'Remote', 'RemoteHome', 'Schedules', 'StatefulTimeout',
+    'Timeout',
+  ], 'jakarta:ejb'),
+
+  // Faces / JSF
+  ...roleEntries([
+    'ApplicationMap', 'ClientWindowScoped', 'CustomScoped', 'DataModelClasses',
+    'FaceletsResourceResolver', 'FacesBehavior', 'FacesBehaviorRenderer',
+    'FacesComponent', 'FacesConfig', 'FacesConverter', 'FacesDataModel',
+    'FacesRenderer', 'FacesValidator', 'FlowBuilderParameter', 'FlowDefinition',
+    'FlowMap', 'FlowScoped', 'HeaderMap', 'HeaderValuesMap', 'InitParameterMap',
+    'ListenerFor', 'ListenersFor', 'ManagedProperty', 'NamedEvent', 'NoneScoped',
+    'Push', 'ReferencedBean', 'RequestCookieMap', 'RequestMap',
+    'RequestParameterMap', 'RequestParameterValuesMap', 'ResourceDependencies',
+    'ResourceDependency', 'SessionMap', 'ViewMap', 'ViewScoped',
+  ], 'jakarta:faces'),
+
+  // Interceptors
+  ...roleEntries([
+    'ExcludeClassInterceptors', 'ExcludeDefaultInterceptors',
+    'ExcludeDefaultListeners', 'ExcludeSuperclassListeners', 'InterceptorBinding',
+  ], 'jakarta:interceptor'),
+
+  // Jakarta Messaging / Mail / Connectors
+  ...roleEntries([
+    'JMSConnectionFactory', 'JMSConnectionFactoryDefinition',
+    'JMSConnectionFactoryDefinitions', 'JMSDestinationDefinition',
+    'JMSDestinationDefinitions', 'JMSPasswordCredential', 'JMSSessionMode',
+  ], 'jakarta:jms'),
+  ...roleEntries([
+    'MailSessionDefinition', 'MailSessionDefinitions',
+  ], 'jakarta:mail'),
+  ...roleEntries([
+    'Activation', 'AdministeredObject', 'AdministeredObjectDefinition',
+    'AdministeredObjectDefinitions', 'AuthenticationMechanism', 'ConfigProperty',
+    'ConnectionDefinition', 'ConnectionDefinitions', 'ConnectionFactoryDefinition',
+    'ConnectionFactoryDefinitions', 'Connector', 'SecurityPermission',
+  ], 'jakarta:connector'),
+
+  // Jakarta Persistence extras across EE 8-11
+  ...roleEntries([
+    'Access', 'AssociationOverrides', 'CheckConstraint', 'ColumnResult',
+    'ConstructorResult', 'Convert', 'Converter', 'Converts',
+    'DiscriminatorColumn', 'DiscriminatorValue', 'EntityResult',
+    'EnumeratedValue', 'FieldResult', 'ForeignKey', 'Index', 'JoinColumns',
+    'MapKey', 'MapKeyClass', 'MapKeyColumn', 'MapKeyEnumerated',
+    'MapKeyJoinColumn', 'MapKeyJoinColumns', 'MapKeyTemporal', 'MapsId',
+    'NamedAttributeNode', 'NamedEntityGraph', 'NamedEntityGraphs',
+    'NamedNativeQueries', 'NamedStoredProcedureQueries',
+    'NamedStoredProcedureQuery', 'NamedSubgraph', 'PersistenceContexts',
+    'PersistenceProperty', 'PersistenceUnits', 'PrimaryKeyJoinColumn',
+    'PrimaryKeyJoinColumns', 'QueryHint', 'SecondaryTables',
+    'SequenceGenerator', 'SequenceGenerators', 'SqlResultSetMapping',
+    'SqlResultSetMappings', 'StaticMetamodel', 'StoredProcedureParameter',
+    'TableGenerator', 'TableGenerators', 'UniqueConstraint',
+  ], 'jakarta:persistence'),
+
+  // Jakarta REST extras
+  ...roleEntries([
+    'ConstrainedTo', 'DefaultValue', 'Encoded', 'HttpMethod', 'NameBinding',
+    'PreMatching', 'Suspended',
+  ], 'jaxrs:annotation'),
+
+  // Servlet
+  ...roleEntries([
+    'HandlesTypes', 'HttpConstraint', 'HttpMethodConstraint',
+  ], 'jakarta:servlet'),
+
+  // Jakarta Security
+  ...roleEntries([
+    'AutoApplySession', 'BasicAuthenticationMechanismDefinition',
+    'ClaimsDefinition', 'CustomFormAuthenticationMechanismDefinition',
+    'DatabaseIdentityStoreDefinition', 'FormAuthenticationMechanismDefinition',
+    'InMemoryIdentityStoreDefinition', 'LdapIdentityStoreDefinition',
+    'LoginToContinue', 'LogoutDefinition', 'OpenIdAuthenticationMechanismDefinition',
+    'OpenIdProviderMetadata', 'RememberMe',
+  ], 'jakarta:security'),
+
+  // Validation extras
+  ...roleEntries([
+    'ConvertGroup', 'ExtractedValue', 'GroupSequence', 'Null',
+    'OverridesAttribute', 'ReportAsSingleViolation', 'SupportedValidationTarget',
+    'UnwrapByDefault', 'ValidateOnExecution',
+  ], 'jakarta:validation'),
+
+  // WebSocket
+  ClientEndpoint: 'websocket:client-endpoint',
+  ServerEndpoint: 'websocket:endpoint',
+  ...roleEntries([
+    'OnClose', 'OnError', 'OnMessage', 'OnOpen',
+  ], 'websocket:handler'),
+
+  // JSON-B
+  ...roleEntries([
+    'JsonbAnnotation', 'JsonbCreator', 'JsonbDateFormat', 'JsonbNillable',
+    'JsonbNumberFormat', 'JsonbProperty', 'JsonbPropertyOrder', 'JsonbSubtype',
+    'JsonbTransient', 'JsonbTypeAdapter', 'JsonbTypeDeserializer',
+    'JsonbTypeInfo', 'JsonbTypeSerializer', 'JsonbVisibility',
+  ], 'jakarta:jsonb'),
+
+  // XML Binding
+  ...roleEntries([
+    'XmlAccessorOrder', 'XmlAccessorType', 'XmlAnyAttribute', 'XmlAnyElement',
+    'XmlAttachmentRef', 'XmlAttribute', 'XmlElement', 'XmlElementDecl',
+    'XmlElementRef', 'XmlElementRefs', 'XmlElements', 'XmlElementWrapper',
+    'XmlEnum', 'XmlEnumValue', 'XmlID', 'XmlIDREF', 'XmlInlineBinaryData',
+    'XmlJavaTypeAdapter', 'XmlJavaTypeAdapters', 'XmlList', 'XmlMimeType',
+    'XmlMixed', 'XmlNs', 'XmlRegistry', 'XmlRootElement', 'XmlSchema',
+    'XmlSchemaType', 'XmlSchemaTypes', 'XmlSeeAlso', 'XmlTransient',
+    'XmlType', 'XmlValue',
+  ], 'jakarta:xml-binding'),
+
+  // JAX-WS / Web Services Metadata
+  ...roleEntries([
+    'Action', 'Addressing', 'BindingType', 'FaultAction', 'HandlerChain',
+    'InitParam', 'MTOM', 'Oneway', 'RequestWrapper', 'RespectBinding',
+    'ResponseWrapper', 'ServiceMode', 'SOAPBinding', 'SOAPMessageHandler',
+    'SOAPMessageHandlers', 'WebEndpoint', 'WebFault', 'WebMethod', 'WebParam',
+    'WebResult', 'WebService', 'WebServiceClient', 'WebServiceFeatureAnnotation',
+    'WebServiceProvider', 'WebServiceRefs',
+  ], 'jakarta:web-service'),
+};
+
+function annotationImportMap(imports: ImportInfo[]): Map<string, string> {
+  const byName = new Map<string, string>();
+  for (const imp of imports) {
+    for (const symbol of imp.symbols) {
+      if (symbol) byName.set(symbol, imp.source);
+    }
+    const last = imp.source.split('.').pop();
+    if (last && /^[A-Z]/.test(last) && !byName.has(last)) {
+      byName.set(last, imp.source);
+    }
+  }
+  return byName;
+}
+
+function roleForAnnotation(
+  annotation: string,
+  sym: SymbolInfo,
+  annotationImports: Map<string, string>,
+): string | undefined {
+  const importedFrom = annotationImports.get(annotation) ?? '';
+
+  if (annotation === 'Transactional') {
+    if (isJakartaOrJavax(importedFrom, 'transaction')) return 'jakarta:transactional';
+    return ANNOTATION_ROLE[annotation];
+  }
+
+  if (annotation === 'Query') {
+    if (isJakartaOrJavax(importedFrom, 'data')) return 'jakarta:data-query';
+    return ANNOTATION_ROLE[annotation];
+  }
+
+  if (annotation === 'Repository') {
+    if (isJakartaOrJavax(importedFrom, 'data')) return 'jakarta:data';
+    return ANNOTATION_ROLE[annotation];
+  }
+
+  if (annotation === 'Asynchronous') {
+    if (isJakartaOrJavax(importedFrom, 'enterprise.concurrent')) return 'jakarta:concurrency';
+    return ANNOTATION_ROLE[annotation] ?? JAKARTA_EE_8_PLUS_ROLE[annotation];
+  }
+
+  if (annotation === 'Value') {
+    return sym.kind === 'class' ? 'lombok:value' : 'spring:config-value';
+  }
+
+  return ANNOTATION_ROLE[annotation] ?? JAKARTA_EE_8_PLUS_ROLE[annotation];
+}
+
+function isJakartaOrJavax(importedFrom: string, packagePart: string): boolean {
+  return importedFrom.startsWith(`jakarta.${packagePart}.`)
+    || importedFrom === `jakarta.${packagePart}`
+    || importedFrom.startsWith(`javax.${packagePart}.`)
+    || importedFrom === `javax.${packagePart}`;
+}
+
 /** HTTP method implied by annotation (Spring MVC + JAX-RS) */
 const HTTP_METHOD: Record<string, string> = {
   // Spring MVC
@@ -312,7 +539,9 @@ const LOMBOK_CONSTRUCTORS: Record<string, string> = {
  * Mutates symbols in-place: sets frameworkRole and frameworkMeta
  * based on the annotations already extracted from the AST.
  */
-export function detectFrameworkRoles(symbols: SymbolInfo[]): void {
+export function detectFrameworkRoles(symbols: SymbolInfo[], imports: ImportInfo[] = []): void {
+  const annotationImports = annotationImportMap(imports);
+
   for (const sym of symbols) {
     if (!sym.annotations?.length) continue;
 
@@ -336,7 +565,7 @@ export function detectFrameworkRoles(symbols: SymbolInfo[]): void {
         continue;
       }
 
-      const role = ANNOTATION_ROLE[ann];
+      const role = roleForAnnotation(ann, sym, annotationImports);
       if (role && !roles.includes(role)) roles.push(role);
 
       // HTTP method metadata
@@ -348,9 +577,12 @@ export function detectFrameworkRoles(symbols: SymbolInfo[]): void {
       // Primary role = first detected; but prefer mvc:controller / spring:rest-controller
       // over generic cdi-bean / endpoint so the most actionable role surfaces first
       const prioritized = [
+        'websocket:endpoint', 'jakarta:web-servlet',
         'mvc:controller', 'spring:rest-controller', 'spring:controller',
         'jakarta:stateless', 'jakarta:singleton', 'jakarta:stateful',
+        'jakarta:data-query', 'jakarta:data', 'jakarta:datasource',
         'spring:service', 'spring:repository', 'spring:component',
+        'jakarta:cdi-bean',
       ];
       const primary = prioritized.find(r => roles.includes(r)) ?? roles[0];
       sym.frameworkRole = primary;

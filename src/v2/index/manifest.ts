@@ -34,6 +34,17 @@ export interface ManifestPreviousFile {
 export interface ManifestScanOptions {
   maxFileSizeBytes?: number;
   previousFiles?: ManifestPreviousFile[];
+  progress?: (event: ManifestScanProgressEvent) => void;
+}
+
+export interface ManifestScanProgressEvent {
+  phase: 'manifest';
+  status: 'start' | 'progress' | 'complete';
+  currentPath?: string;
+  filesFound: number;
+  filesHashed: number;
+  hashCacheHits: number;
+  elapsedMs: number;
 }
 
 const DEFAULT_SKIP_DIRS = new Set([
@@ -56,9 +67,27 @@ export function scanManifest(root: string, options: ManifestScanOptions = {}): M
   const maxFileSizeBytes = options.maxFileSizeBytes ?? 5 * 1024 * 1024;
   const files: ManifestFile[] = [];
   const previousByPath = new Map((options.previousFiles ?? []).map(file => [file.path, file]));
-  const stats = { filesHashed: 0, hashCacheHits: 0 };
+  const stats = { filesHashed: 0, hashCacheHits: 0, lastProgressAt: start };
 
-  walk(rootDir, rootDir, files, maxFileSizeBytes, previousByPath, stats);
+  options.progress?.({
+    phase: 'manifest',
+    status: 'start',
+    filesFound: 0,
+    filesHashed: 0,
+    hashCacheHits: 0,
+    elapsedMs: 0,
+  });
+
+  walk(rootDir, rootDir, files, maxFileSizeBytes, previousByPath, stats, start, options.progress);
+
+  options.progress?.({
+    phase: 'manifest',
+    status: 'complete',
+    filesFound: files.length,
+    filesHashed: stats.filesHashed,
+    hashCacheHits: stats.hashCacheHits,
+    elapsedMs: Date.now() - start,
+  });
 
   return {
     root: rootDir,
@@ -76,7 +105,9 @@ function walk(
   files: ManifestFile[],
   maxFileSizeBytes: number,
   previousByPath: Map<string, ManifestPreviousFile>,
-  stats: { filesHashed: number; hashCacheHits: number },
+  stats: { filesHashed: number; hashCacheHits: number; lastProgressAt: number },
+  start: number,
+  progress?: (event: ManifestScanProgressEvent) => void,
 ): void {
   let entries: fs.Dirent[];
   try {
@@ -91,7 +122,7 @@ function walk(
 
     if (entry.isDirectory()) {
       if (DEFAULT_SKIP_DIRS.has(entry.name)) continue;
-      walk(root, absPath, files, maxFileSizeBytes, previousByPath, stats);
+      walk(root, absPath, files, maxFileSizeBytes, previousByPath, stats, start, progress);
       continue;
     }
 
@@ -128,5 +159,19 @@ function walk(
       role: classification.role,
       parseable: classification.parseable,
     });
+
+    const now = Date.now();
+    if (progress && (files.length % 500 === 0 || now - stats.lastProgressAt >= 5_000)) {
+      stats.lastProgressAt = now;
+      progress({
+        phase: 'manifest',
+        status: 'progress',
+        currentPath: relPath,
+        filesFound: files.length,
+        filesHashed: stats.filesHashed,
+        hashCacheHits: stats.hashCacheHits,
+        elapsedMs: now - start,
+      });
+    }
   }
 }

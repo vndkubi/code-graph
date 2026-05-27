@@ -4,7 +4,6 @@ import path from 'node:path';
 
 export interface CodeGraphPaths {
   homeDir: string;
-  dbPath: string;
   daemonInfoPath: string;
   logDir: string;
   daemonLogPath: string;
@@ -14,7 +13,6 @@ export function getCodeGraphPaths(homeOverride?: string): CodeGraphPaths {
   const homeDir = path.resolve(homeOverride ?? process.env.CODEGRAPH_HOME ?? defaultHomeDir());
   return {
     homeDir,
-    dbPath: path.join(homeDir, 'codegraph.sqlite'),
     daemonInfoPath: path.join(homeDir, 'daemon.json'),
     logDir: path.join(homeDir, 'logs'),
     daemonLogPath: path.join(homeDir, 'logs', 'daemon.jsonl'),

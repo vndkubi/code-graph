@@ -2,7 +2,7 @@
 
 CodeGraph v2 MCP proxy and persistent semantic indexer for GitHub Copilot/Codex agents.
 
-The runtime is v2-only: `node dist/cli.js mcp --root <workspace>` starts an MCP stdio proxy, auto-starts a local daemon, and uses a global SQLite cache for incremental indexing across repos, worktrees, and clones.
+The runtime is v2-only: `node dist/cli.js mcp --root <workspace>` starts an MCP stdio proxy, auto-starts a local daemon, and uses a local Postgres database for incremental indexing across repos, worktrees, and clones.
 
 Java/Jakarta EE is the primary semantic target. TypeScript/JavaScript and Python parsing remain available through the shared tree-sitter analyzer.
 
@@ -195,7 +195,7 @@ Run the MCP stdio proxy:
 node dist/cli.js mcp --root /path/to/your/project
 ```
 
-This starts an MCP stdio proxy, auto-starts the local daemon, and registers the `--root` workspace in the persistent SQLite index.
+This starts an MCP stdio proxy, auto-starts the local daemon, and registers the `--root` workspace in the persistent Postgres index.
 
 Inspect local daemon/cache health:
 
@@ -266,6 +266,8 @@ Expected log line:
 ```
 
 If the UI only shows shell commands, file reads, or text search and the CodeGraph log has no `query` event, the agent did not use CodeGraph for that step.
+
+For GitHub Copilot CLI user-level setup in `~/.copilot/mcp-config.json`, see [`docs/copilot-mcp-config.md`](docs/copilot-mcp-config.md).
 
 ---
 
@@ -348,7 +350,7 @@ Avoid pointing VS Code at an old clone or stale compiled entrypoint. The support
 
 ## Multi-window and multi-branch usage
 
-v2 uses one local daemon with a global SQLite cache, while each MCP stdio proxy is scoped to the `--root` passed by the editor window. You do not need one daemon per repo or branch. You only need to make sure each editor/agent window starts CodeGraph with the correct workspace root.
+v2 uses one local daemon with a local Postgres database, while each MCP stdio proxy is scoped to the `--root` passed by the editor window. You do not need one daemon per repo or branch. You only need to make sure each editor/agent window starts CodeGraph with the correct workspace root.
 
 Keep these paths mentally separate:
 
@@ -356,7 +358,7 @@ Keep these paths mentally separate:
 |------|---------|---------|
 | CodeGraph install | This tool's repo | `C:/path/to/code-graph` |
 | Workspace root | The project or branch the agent should inspect | `C:/path/to/project-a` |
-| CodeGraph cache | Shared SQLite/cache/daemon state | Managed by CodeGraph, shown by `doctor` |
+| CodeGraph cache | Shared Postgres/cache/daemon state | Managed by CodeGraph, shown by `doctor` |
 
 | Scenario | Recommended v2 setup |
 |----------|----------------------|
@@ -622,8 +624,8 @@ Each editor window normally starts its own stdio proxy, so you usually do not ru
 
 ## Performance model
 
-- SQLite is the source of truth; the daemon does not load the full graph object model into memory.
-- Cold indexing scans the manifest, classifies `file_role`, hashes files, parses cache misses, and materializes symbols/imports/calls/endpoints into SQLite.
+- Postgres is the source of truth; the daemon does not load the full graph object model into memory.
+- Cold indexing scans the manifest, classifies `file_role`, hashes files, parses cache misses, and materializes symbols/imports/calls/endpoints into Postgres.
 - Warm indexing reuses previous `blob_hash` values when `mtime_ms` and `size` match, reuses `parse_cache` entries keyed by `blob_hash`, and skips rebuilding a new snapshot when the manifest, HEAD, and dirty state are unchanged.
 - Cold or cache-miss parsing can fan out across worker threads after build; small updates use an in-place incremental path that reparses changed files, removes deleted file rows, and rebuilds dependency/call graph rows for affected files instead of copying and resolving the whole snapshot.
 - Multiple windows/repositories share the same daemon and global cache, but each `--root` has its own workspace snapshot.
@@ -708,9 +710,10 @@ docker --context desktop-linux build -t mcp-code-graph:latest .
 
 If your Docker context is already the Docker Desktop Linux engine, plain `docker build -t mcp-code-graph:latest .` is enough. On Windows, `docker --context desktop-linux ...` avoids accidentally targeting a stopped/default context.
 
-2. Create one persistent cache volume. Reuse this volume across runs so warm index data survives container exit:
+2. Start the local Postgres service and create one persistent CodeGraph home volume:
 
 ```powershell
+docker compose -f compose.postgres.yml up -d
 docker --context desktop-linux volume create codegraph-cache
 ```
 
@@ -721,6 +724,8 @@ docker --context desktop-linux run --rm `
   -v "D:/Personal/Projects/doughnut:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/doughnut" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   index --root /workspace
 ```
@@ -736,6 +741,8 @@ docker --context desktop-linux run --rm -i `
   -v "D:/Personal/Projects/doughnut:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/doughnut" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   mcp --root /workspace --auto-refresh
 ```
@@ -784,6 +791,8 @@ docker --context desktop-linux run --rm `
   -v "D:/Personal/Projects/doughnut:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/doughnut" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   benchmark proof --root /workspace --tasks auto --task-count 3 --no-index
 ```
@@ -797,6 +806,8 @@ docker --context desktop-linux run --rm `
   -v "D:/Personal/Projects/doughnut:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/doughnut" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   benchmark review --root /workspace --tasks auto --task-count 3 --no-index
 ```
@@ -809,12 +820,12 @@ docker --context desktop-linux run --rm `
 |---------|--------------|-----|
 | `Cannot connect to the Docker daemon` | Docker Desktop engine/context is not running | Start Docker Desktop, then try `docker --context desktop-linux ps` |
 | Docker cannot mount `D:/...`, `/workspace` is empty, or index finds no project files | Windows drive is not shared with Docker Desktop | Docker Desktop -> Settings -> Resources -> File Sharing -> Add `D:\` -> Apply & Restart, then re-run the index command |
-| `get_flow_pack` returns empty results after `filesTotal: 0` | The SQLite snapshot has no files, symbols, or graph rows because the bind mount was empty | Fix Docker Desktop File Sharing for `D:\`, then re-run `docker run ... index --root /workspace` with the same workspace key |
+| `get_flow_pack` returns empty results after `filesTotal: 0` | The Postgres snapshot has no files, symbols, or graph rows because the bind mount was empty | Fix Docker Desktop File Sharing for `D:\`, then re-run `docker run ... index --root /workspace` with the same workspace key |
 | Every repo appears as the same workspace | Missing or reused `CODEGRAPH_WORKSPACE_KEY` | Set a unique host path or stable key per repo |
 | Warm run still parses everything | Cache volume changed or workspace key changed | Reuse the same volume and exact workspace key |
 | Very slow cold index on Windows | Docker Desktop bind mount overhead | Prefer local Node/stdio or WSL/ext4 for large repos; keep Docker cache volume persistent |
 | Corporate `npm ci` fails during build with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` | Missing trusted root CA inside the Docker build container | Use `.\docker-build.ps1 -CaCert C:\path\corp-root-ca.crt`; see [`docs/docker-setup.md`](docs/docker-setup.md#unable_to_get_issuer_cert_locally-during-docker-build) |
-| `better-sqlite3`/`node-gyp` tries to download headers from `unofficial-builds.nodejs.org` | Alpine native addon build is trying to fetch Node headers over corporate TLS | Use the latest Dockerfile, which sets npm/node-gyp `nodedir=/usr/local` and builds native addons from source against local headers |
+| `connect ECONNREFUSED 127.0.0.1:54329` or `host.docker.internal:54329` | Local Postgres is not running or the container cannot reach the host port | Run `docker compose -f compose.postgres.yml up -d`; use `127.0.0.1` for local Node and `host.docker.internal` from Docker MCP containers |
 | Runtime stage recompiles native addons | Runtime ran `npm ci --omit=dev` after builder already compiled dependencies | Use the latest Dockerfile, which prunes dev deps in builder and copies production `node_modules` into runtime |
 | `autoRefresh=true` on an empty/first-time large index does not populate results | Auto-refresh skips snapshots with zero indexed files; it is intended for incremental refreshes of existing snapshots | Run explicit `docker run ... index --root /workspace` after fixing the bind mount |
 | Daemon crashes on Docker bind mounts with Chokidar/inotify errors | WSL2/Windows NTFS bind mounts can reject watcher setup or emit watcher errors | Use the latest build; watcher errors are swallowed and setup failures are logged without failing workspace registration |
@@ -900,6 +911,8 @@ VS Code MCP config using Docker:
           "codegraph-cache:/codegraph-home",
           "-e",
           "CODEGRAPH_WORKSPACE_KEY=${workspaceFolder}",
+          "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+          "CODEGRAPH_PG_POOL_MAX=10",
           "mcp-code-graph:latest",
           "mcp",
           "--root",
@@ -928,6 +941,8 @@ args = [
   "codegraph-cache:/codegraph-home",
   "-e",
   "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/mall",
+          "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+          "CODEGRAPH_PG_POOL_MAX=10",
   "mcp-code-graph:latest",
   "mcp",
   "--root",
@@ -936,7 +951,7 @@ args = [
 ]
 ```
 
-For multiple projects, keep one MCP server entry per project or use the VS Code `${workspaceFolder}` config above. The container should keep the source mount read-only and store CodeGraph's SQLite cache in `codegraph-cache`.
+For multiple projects, keep one MCP server entry per project or use the VS Code `${workspaceFolder}` config above. The container should keep the source mount read-only and connect CodeGraph to the local Postgres database and keep `/codegraph-home` for daemon metadata/logs.
 
 Multi-project examples:
 
@@ -1032,12 +1047,12 @@ npm run lint                              # Type-check only
 
 ## Enterprise Indexer
 
-CodeGraph uses a local daemon, global SQLite cache, per-workspace snapshots, file-content parse-cache reuse, and a stdio proxy command intended for Copilot/Codex multi-window usage.
+CodeGraph uses a local daemon, local Postgres database, per-workspace snapshots, file-content parse-cache reuse, and a stdio proxy command intended for Copilot/Codex multi-window usage.
 
 ```bash
 npm run build
 
-# Prewarm a workspace into the persistent SQLite index
+# Prewarm a workspace into the persistent Postgres index
 node dist/cli.js index --root /path/to/java-enterprise-repo
 
 # Use as the MCP command from VS Code/Codex
@@ -1099,9 +1114,9 @@ flowchart LR
   W --> S2["Snapshot: feature worktree"]
 
   D --> I["Incremental indexer"]
-  D --> Q["SQLite-backed query service"]
+  D --> Q["Postgres-backed query service"]
 
-  I --> DB[("Global SQLite cache")]
+  I --> DB[("Global Postgres cache")]
   Q --> DB
 
   DB --> PC["Parse cache by blob_hash"]
@@ -1125,7 +1140,7 @@ flowchart TD
   E -->|no| G["Parse with tree-sitter workers"]
   G --> H["Store parse_cache"]
 
-  F --> I["Materialize SQLite rows"]
+  F --> I["Materialize Postgres rows"]
   H --> I
 
   I --> J["Resolve Java imports / types / methods"]
@@ -1144,7 +1159,7 @@ sequenceDiagram
   participant Agent as Codex/Copilot
   participant MCP as MCP proxy
   participant Daemon as CodeGraph daemon
-  participant DB as SQLite
+  participant DB as Postgres
   participant Pack as Research pack builder
 
   Agent->>MCP: get_research_pack("PaymentService.charge", tokenBudget=4000)
@@ -1514,7 +1529,7 @@ node demo-ecommerce.mjs    # Jakarta EE Servlet + JPA
 | `spring:service` | `@Service` |
 | `spring:transactional` | `@Transactional` |
 | `mvc:controller` | `@Controller` + `@Path` (Jakarta MVC) |
-| `jaxrs:endpoint` | `@GET`, `@POST`, `@PUT`, `@DELETE`, `@PATCH` |
+| `jaxrs:endpoint` | `@GET`, `@POST`, `@PUT`, `@DELETE`, `@PATCH`, `@HEAD`, `@OPTIONS` |
 | `jaxrs:provider` | `@Provider` (ExceptionMapper, ParamConverter) |
 | `jakarta:entity` | `@Entity` |
 | `jakarta:stateless` | `@Stateless` |
@@ -1523,6 +1538,13 @@ node demo-ecommerce.mjs    # Jakarta EE Servlet + JPA
 | `jakarta:web-filter` | `@WebFilter` |
 | `jakarta:lifecycle` | `@PrePersist`, `@PostConstruct`, etc. |
 | `jakarta:validation` | `@NotNull`, `@Size`, `@Email`, etc. |
+| `jakarta:datasource` | `@DataSourceDefinition`, `@DataSourceDefinitions` |
+| `jakarta:data` | `@Repository`, `@Find`, `@Insert`, `@Save`, `@Update` (Jakarta Data) |
+| `jakarta:jsonb` | `@JsonbProperty`, `@JsonbCreator`, `@JsonbTypeInfo`, etc. |
+| `jakarta:xml-binding` | `@XmlRootElement`, `@XmlElement`, `@XmlType`, etc. |
+| `jakarta:web-service` | `@WebService`, `@WebMethod`, `@WebServiceProvider`, etc. |
+| `jakarta:faces` | `@FacesComponent`, `@ViewScoped`, `@FacesConverter`, etc. |
+| `websocket:endpoint` | `@ServerEndpoint` |
 | `test:test` | `@Test` (JUnit 5/4) |
 | `test:mock` | `@Mock`, `@MockBean` (Mockito) |
 | `lombok:data` | `@Data` |
@@ -1561,8 +1583,8 @@ src/
 │   ├── daemon/                # Local daemon, auth token, workspace registration
 │   ├── index/                 # Manifest scan, parse cache, materialization, watcher
 │   ├── mcp/                   # MCP stdio proxy and tool definitions
-│   ├── query/                 # SQLite-backed queries and research pack builder
-│   └── storage/               # SQLite schema and migrations
+│   ├── query/                 # Postgres-backed queries and research pack builder
+│   └── storage/               # Postgres schema and migrations
 └── utils/
     └── path-guard.ts          # Directory traversal prevention
 ```

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Database as DatabaseType } from 'better-sqlite3';
+import type { CodeGraphDb } from '../storage/database.js';
 import { V2Indexer } from '../index/indexer.js';
 import { scanManifest } from '../index/manifest.js';
 import { V2QueryService } from '../query/service.js';
@@ -59,12 +59,20 @@ export function loadGoldenEvalTasks(tasksFile?: string): GoldenEvalTask[] {
 }
 
 export function runGoldenEval(
-  db: DatabaseType,
+  db: CodeGraphDb,
   root: string,
   tasks: GoldenEvalTask[],
-): GoldenEvalResult {
+): Promise<GoldenEvalResult> {
+  return runGoldenEvalAsync(db, root, tasks);
+}
+
+async function runGoldenEvalAsync(
+  db: CodeGraphDb,
+  root: string,
+  tasks: GoldenEvalTask[],
+): Promise<GoldenEvalResult> {
   const indexer = new V2Indexer(db);
-  const index = indexer.indexWorkspace({ root });
+  const index = await indexer.indexWorkspace({ root });
   const queryService = new V2QueryService(db);
   const normalizedRoot = path.resolve(root);
   const results: GoldenEvalResult['tasks'] = [];
@@ -72,7 +80,7 @@ export function runGoldenEval(
   for (const task of tasks) {
     const baseline = runBaselineRetrieval(normalizedRoot, task);
     const start = Date.now();
-    const response = queryService.query({
+    const response = await queryService.query({
       workspaceId: index.workspaceId,
       toolName: task.codegraphTool,
       args: task.codegraphArgs,

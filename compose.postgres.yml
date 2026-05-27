@@ -1,0 +1,47 @@
+services:
+  codegraph-postgres:
+    image: postgres:16-alpine
+    container_name: codegraph-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: codegraph
+      POSTGRES_USER: codegraph
+      POSTGRES_PASSWORD: codegraph_local
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${CODEGRAPH_PG_PORT:-54329}:5432"
+    volumes:
+      - codegraph-postgres-data:/var/lib/postgresql/data
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=40"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "effective_cache_size=2GB"
+      - "-c"
+      - "work_mem=32MB"
+      - "-c"
+      - "maintenance_work_mem=512MB"
+      - "-c"
+      - "wal_compression=on"
+      - "-c"
+      - "checkpoint_timeout=15min"
+      - "-c"
+      - "max_wal_size=4GB"
+      - "-c"
+      - "synchronous_commit=off"
+      - "-c"
+      - "random_page_cost=1.1"
+      - "-c"
+      - "effective_io_concurrency=200"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codegraph -d codegraph"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  codegraph-postgres-data:

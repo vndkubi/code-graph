@@ -11,11 +11,96 @@ import { watchWorkspace, type WorkspaceWatchHandle } from '../index/watcher.js';
 export async function runDaemon(options: DaemonStartOptions = {}): Promise<void> {
   const paths = getCodeGraphPaths(options.homeDir);
   ensureCodeGraphDirs(paths);
-  const { db } = openCodeGraphDb(options.homeDir);
+  const { db, connectionString } = await openCodeGraphDb(options.homeDir);
   const indexer = new V2Indexer(db);
   const queries = new V2QueryService(db);
   const token = crypto.randomBytes(24).toString('hex');
   const watchers = new Map<string, WorkspaceWatchHandle>();
+  const workspaceKeysByRoot = new Map<string, Set<string>>();
+  const refreshJobs = new Map<string, {
+    root: string;
+    workspaceKey?: string;
+    running: boolean;
+    pending: boolean;
+    reason: string;
+    timer?: NodeJS.Timeout;
+  }>();
+  const refreshDelayMs = refreshDebounceMs();
+
+  const scheduleWorkspaceRefresh = (root: string, workspaceKey: string | undefined, reason: string) => {
+    const key = refreshJobKey(root, workspaceKey);
+    let job = refreshJobs.get(key);
+    if (!job) {
+      job = {
+        root,
+        workspaceKey,
+        running: false,
+        pending: false,
+        reason,
+      };
+      refreshJobs.set(key, job);
+    }
+    job.pending = true;
+    job.reason = reason;
+    if (job.running) return;
+    if (job.timer) clearTimeout(job.timer);
+    job.timer = setTimeout(() => {
+      job!.timer = undefined;
+      void runScheduledRefresh(job!);
+    }, refreshDelayMs);
+  };
+
+  const runScheduledRefresh = async (job: {
+    root: string;
+    workspaceKey?: string;
+    running: boolean;
+    pending: boolean;
+    reason: string;
+    timer?: NodeJS.Timeout;
+  }) => {
+    if (job.running || !job.pending) return;
+    job.running = true;
+    job.pending = false;
+    const reason = job.reason;
+    const startedAt = Date.now();
+    try {
+      const result = await indexer.indexWorkspace({ root: job.root, workspaceKey: job.workspaceKey });
+      logEvent(paths.daemonLogPath, {
+        event: 'workspace.refresh',
+        mode: 'background',
+        reason,
+        root: job.root,
+        workspaceKey: job.workspaceKey,
+        workspaceId: result.workspaceId,
+        snapshotId: result.snapshotId,
+        filesTotal: result.filesTotal,
+        filesParsed: result.filesParsed,
+        parseCacheHits: result.parseCacheHits,
+        indexTimeMs: result.indexTimeMs,
+        durationMs: Date.now() - startedAt,
+      });
+    } catch (error) {
+      process.stderr.write(`[codegraph] background refresh failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      logEvent(paths.daemonLogPath, {
+        event: 'workspace.refresh.failed',
+        mode: 'background',
+        reason,
+        root: job.root,
+        workspaceKey: job.workspaceKey,
+        durationMs: Date.now() - startedAt,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      job.running = false;
+      if (job.pending) {
+        if (job.timer) clearTimeout(job.timer);
+        job.timer = setTimeout(() => {
+          job.timer = undefined;
+          void runScheduledRefresh(job);
+        }, refreshDelayMs);
+      }
+    }
+  };
 
   const server = createServer(async (req, res) => {
     try {
@@ -29,7 +114,8 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         sendJson(res, 200, {
           ok: true,
           pid: process.pid,
-          dbPath: paths.dbPath,
+          backend: 'postgres',
+          databaseUrl: redactDatabaseUrl(connectionString),
           logPath: paths.daemonLogPath,
           uptimeSeconds: Math.round(process.uptime()),
         });
@@ -41,14 +127,16 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         const body = await readJson(req);
         const root = requireString(body.root, 'root');
         const workspaceKey = optionalString(body.workspaceKey);
-        const workspace = indexer.registerWorkspace(root, workspaceKey);
+        const workspace = await indexer.registerWorkspace(root, workspaceKey);
+        const rootKeys = workspaceKeysByRoot.get(workspace.root) ?? new Set<string>();
+        rootKeys.add(workspaceKeyValue(workspaceKey));
+        workspaceKeysByRoot.set(workspace.root, rootKeys);
         if (!watchers.has(workspace.root)) {
           try {
             watchers.set(workspace.root, watchWorkspace(workspace.root, () => {
-              try {
-                indexer.indexWorkspace({ root: workspace.root, workspaceKey });
-              } catch (error) {
-                process.stderr.write(`[codegraph] watcher refresh failed: ${error instanceof Error ? error.message : String(error)}\n`);
+              const keys = workspaceKeysByRoot.get(workspace.root) ?? new Set([workspaceKeyValue(workspaceKey)]);
+              for (const key of keys) {
+                scheduleWorkspaceRefresh(workspace.root, workspaceKeyFromValue(key), 'watch');
               }
             }));
           } catch (error) {
@@ -79,7 +167,12 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         const body = await readJson(req);
         const root = requireString(body.root, 'root');
         const workspaceKey = optionalString(body.workspaceKey);
-        const result = indexer.indexWorkspace({ root, workspaceKey });
+        if (body.background === true) {
+          scheduleWorkspaceRefresh(root, workspaceKey, 'startup');
+          sendJson(res, 202, { queued: true, root, workspaceKey });
+          return;
+        }
+        const result = await indexer.indexWorkspace({ root, workspaceKey });
         logEvent(paths.daemonLogPath, {
           event: 'workspace.refresh',
           root,
@@ -102,7 +195,7 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         const workspaceId = requireString(body.workspaceId, 'workspaceId');
         const toolName = requireString(body.toolName, 'toolName');
         const args = isRecord(body.args) ? body.args : {};
-        const result = queries.query({
+        const result = await queries.query({
           workspaceId,
           toolName,
           args,
@@ -150,7 +243,7 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
 
   const close = async () => {
     await Promise.all([...watchers.values()].map(watcher => watcher.close().catch(() => undefined)));
-    db.close();
+    await db.close();
   };
   process.once('SIGINT', () => { void close().finally(() => process.exit(0)); });
   process.once('SIGTERM', () => { void close().finally(() => process.exit(0)); });
@@ -186,6 +279,24 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+function refreshJobKey(root: string, workspaceKey: string | undefined): string {
+  return `${root}\0${workspaceKey ?? ''}`;
+}
+
+function workspaceKeyValue(workspaceKey: string | undefined): string {
+  return workspaceKey ?? '';
+}
+
+function workspaceKeyFromValue(value: string): string | undefined {
+  return value.length > 0 ? value : undefined;
+}
+
+function refreshDebounceMs(): number {
+  const raw = Number(process.env.CODEGRAPH_REFRESH_DEBOUNCE_MS ?? 750);
+  if (!Number.isFinite(raw) || raw < 0) return 750;
+  return Math.min(Math.floor(raw), 60_000);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -207,4 +318,14 @@ function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
     }
   }
   return summary;
+}
+
+function redactDatabaseUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    if (url.password) url.password = '***';
+    return url.toString();
+  } catch {
+    return value.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:***@');
+  }
 }

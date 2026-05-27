@@ -547,6 +547,8 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       'Path', 'ApplicationPath',
       // Servlet
       'WebServlet', 'WebFilter',
+      // WebSocket
+      'ServerEndpoint',
     ]);
 
     const meta: Record<string, string> = {};

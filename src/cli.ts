@@ -2,7 +2,7 @@
 
 import fs from 'node:fs';
 import { openCodeGraphDb } from './v2/storage/database.js';
-import { V2Indexer } from './v2/index/indexer.js';
+import { V2Indexer, type IndexProgressEvent } from './v2/index/indexer.js';
 import { runDaemon } from './v2/daemon/server.js';
 import { DaemonClient, stopDaemon } from './v2/daemon/client.js';
 import { runMcpProxy } from './v2/mcp/proxy.js';
@@ -28,6 +28,7 @@ async function main(): Promise<void> {
         root: getFlag(parsed, 'root') ?? process.cwd(),
         homeDir: getFlag(parsed, 'home'),
         prewarm: parsed.flags.get('no-prewarm') !== true,
+        refreshOnStart: parsed.flags.get('refresh-on-start') === true || envFlag('CODEGRAPH_REFRESH_ON_START'),
         workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
         autoRefresh: parsed.flags.get('auto-refresh') === true || envFlag('CODEGRAPH_AUTO_REFRESH'),
         toolAllowlist: getFlag(parsed, 'mcp-tools') ?? process.env.CODEGRAPH_MCP_TOOLS,
@@ -68,47 +69,47 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     }
     case 'index': {
       const root = getFlag(parsed, 'root') ?? process.cwd();
-      console.log(JSON.stringify(runIndexBenchmark(root, getFlag(parsed, 'home')), null, 2));
+      console.log(JSON.stringify(await runIndexBenchmark(root, getFlag(parsed, 'home')), null, 2));
       return;
     }
     case 'eval': {
       const root = getFlag(parsed, 'root') ?? process.cwd();
-      const { db } = openCodeGraphDb(getFlag(parsed, 'home'));
+      const { db } = await openCodeGraphDb(getFlag(parsed, 'home'));
       try {
         const tasks = loadGoldenEvalTasks(getFlag(parsed, 'tasks'));
-        console.log(JSON.stringify(runGoldenEval(db, root, tasks), null, 2));
+        console.log(JSON.stringify(await runGoldenEval(db, root, tasks), null, 2));
       } finally {
-        db.close();
+        await db.close();
       }
       return;
     }
     case 'proof': {
       const root = getFlag(parsed, 'root') ?? process.cwd();
-      const { db } = openCodeGraphDb(getFlag(parsed, 'home'));
+      const { db } = await openCodeGraphDb(getFlag(parsed, 'home'));
       try {
         const tasks = shouldUseAutoTasks(parsed)
           ? deriveContextProofTasks(root, { limit: getNumberFlag(parsed, 'task-count') })
           : loadContextProofTasks(getFlag(parsed, 'tasks'));
-        console.log(JSON.stringify(runContextProofEval(db, root, tasks, {
+        console.log(JSON.stringify(await runContextProofEval(db, root, tasks, {
           skipIndex: parsed.flags.get('no-index') === true,
         }), null, 2));
       } finally {
-        db.close();
+        await db.close();
       }
       return;
     }
     case 'review': {
       const root = getFlag(parsed, 'root') ?? process.cwd();
-      const { db } = openCodeGraphDb(getFlag(parsed, 'home'));
+      const { db } = await openCodeGraphDb(getFlag(parsed, 'home'));
       try {
         const tasks = shouldUseAutoTasks(parsed)
           ? deriveReviewProofTasks(root, { limit: getNumberFlag(parsed, 'task-count') })
           : loadReviewProofTasks(getFlag(parsed, 'tasks'));
-        console.log(JSON.stringify(runReviewProofEval(db, root, tasks, {
+        console.log(JSON.stringify(await runReviewProofEval(db, root, tasks, {
           skipIndex: parsed.flags.get('no-index') === true,
         }), null, 2));
       } finally {
-        db.close();
+        await db.close();
       }
       return;
     }
@@ -144,27 +145,37 @@ async function runDaemonCommand(subcommand: string | undefined, parsed: ParsedAr
 
 async function runIndexCommand(parsed: ParsedArgs): Promise<void> {
   const root = getFlag(parsed, 'root') ?? process.cwd();
-  const { db, paths } = openCodeGraphDb(getFlag(parsed, 'home'));
+  const { db, connectionString } = await openCodeGraphDb(getFlag(parsed, 'home'));
   const indexer = new V2Indexer(db);
-  const result = indexer.indexWorkspace({
-    root,
-    workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
-    parseWorkers: getNumberFlag(parsed, 'parse-workers'),
-    incremental: parsed.flags.get('no-incremental') === true ? false : undefined,
-    incrementalFileLimit: getNumberFlag(parsed, 'incremental-file-limit'),
-  });
-  console.log(JSON.stringify({ ...result, dbPath: paths.dbPath }, null, 2));
+  const progress = parsed.flags.get('quiet') === true
+    ? undefined
+    : createIndexProgressReporter(connectionString);
+  try {
+    const result = await indexer.indexWorkspace({
+      root,
+      workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
+      parseWorkers: getNumberFlag(parsed, 'parse-workers'),
+      incremental: parsed.flags.get('no-incremental') === true ? false : undefined,
+      incrementalFileLimit: getNumberFlag(parsed, 'incremental-file-limit'),
+      progress,
+    });
+    console.log(JSON.stringify({ ...result, backend: 'postgres', databaseUrl: redactDatabaseUrl(connectionString) }, null, 2));
+  } finally {
+    await db.close();
+  }
 }
 
 async function runDoctorCommand(parsed: ParsedArgs): Promise<void> {
   const paths = getCodeGraphPaths(getFlag(parsed, 'home'));
+  const databaseUrl = process.env.CODEGRAPH_DATABASE_URL ?? defaultPostgresUrl();
   const daemon = DaemonClient.readInfo(getFlag(parsed, 'home'));
   const client = daemon ? new DaemonClient(daemon) : undefined;
   const daemonAlive = client ? await client.isAlive() : false;
   const daemonStatus = daemonAlive && client ? await client.status().catch(() => undefined) : undefined;
   console.log(JSON.stringify({
     homeDir: paths.homeDir,
-    dbPath: paths.dbPath,
+    backend: 'postgres',
+    databaseUrl: redactDatabaseUrl(databaseUrl),
     daemonInfoPath: paths.daemonInfoPath,
     daemonLogPath: paths.daemonLogPath,
     daemonKnown: Boolean(daemon),
@@ -253,9 +264,78 @@ Options:
   --no-incremental                       Force changed-file index runs through full snapshot rebuild
   --incremental-file-limit <number>      Max changed/deleted files for incremental index path
   --workspace-key <key>                  Stable workspace identity key, useful when Docker always mounts roots at /workspace
+  --quiet                                Suppress index progress logs on stderr
   --auto-refresh                         Refresh stale snapshots automatically before MCP tool calls
+  --refresh-on-start                     Queue a workspace refresh when MCP starts, without blocking startup
   --mcp-tools <a,b,c>                    Comma-separated MCP tool allowlist; also CODEGRAPH_MCP_TOOLS
 `);
+}
+
+function createIndexProgressReporter(connectionString: string): (event: IndexProgressEvent) => void {
+  const startedAt = Date.now();
+  let lastLineAt = 0;
+  let lastPhase = '';
+  const redactedDb = redactDatabaseUrl(connectionString);
+
+  return (event: IndexProgressEvent) => {
+    const now = Date.now();
+    const force = event.phase !== lastPhase
+      || event.status === 'start'
+      || event.status === 'complete'
+      || event.status === 'skipped'
+      || event.status === 'fallback';
+    if (!force && now - lastLineAt < 5_000) return;
+
+    lastLineAt = now;
+    lastPhase = event.phase;
+
+    const elapsed = formatDuration(event.elapsedMs ?? now - startedAt);
+    const count = formatProgressCount(event.current, event.total);
+    const message = event.message ? ` ${shorten(event.message, 140)}` : '';
+    const details = formatProgressDetails(event.details);
+    const db = event.phase === 'start' ? ` db=${redactedDb}` : '';
+    process.stderr.write(`[codegraph:index] ${elapsed} ${event.phase}:${event.status}${count}${message}${details}${db}\n`);
+  };
+}
+
+function formatProgressCount(current: number | undefined, total: number | undefined): string {
+  if (current === undefined) return '';
+  if (total === undefined || total <= 0) return ` ${current.toLocaleString()}`;
+  const percent = Math.floor((current / total) * 100);
+  return ` ${current.toLocaleString()}/${total.toLocaleString()} ${percent}%`;
+}
+
+function formatProgressDetails(details: IndexProgressEvent['details']): string {
+  if (!details) return '';
+  const pairs = Object.entries(details)
+    .filter((entry): entry is [string, string | number | boolean] => entry[1] !== undefined)
+    .map(([key, value]) => `${key}=${String(value)}`);
+  return pairs.length > 0 ? ` ${pairs.join(' ')}` : '';
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m${seconds.toString().padStart(2, '0')}s` : `${seconds}s`;
+}
+
+function shorten(value: string, maxLength: number): string {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
+}
+
+function redactDatabaseUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    if (url.password) url.password = '***';
+    return url.toString();
+  } catch {
+    return value.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:***@');
+  }
+}
+
+function defaultPostgresUrl(): string {
+  return 'postgres://codegraph:codegraph_local@127.0.0.1:54329/codegraph';
 }
 
 main().catch((error) => {

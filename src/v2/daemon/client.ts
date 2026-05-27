@@ -52,8 +52,12 @@ export class DaemonClient {
     }>;
   }
 
-  async refreshWorkspace(root: string, workspaceKey?: string): Promise<unknown> {
-    return this.request('/workspaces/refresh', 'POST', { root, workspaceKey });
+  async refreshWorkspace(root: string, workspaceKey?: string, options: { background?: boolean } = {}): Promise<unknown> {
+    return this.request('/workspaces/refresh', 'POST', {
+      root,
+      workspaceKey,
+      background: options.background === true,
+    });
   }
 
   async query(workspaceId: string, toolName: string, args: Record<string, unknown>): Promise<unknown> {

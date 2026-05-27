@@ -1,5 +1,5 @@
 import path from 'node:path';
-import type { Database as DatabaseType } from 'better-sqlite3';
+import type { CodeGraphDb } from '../storage/database.js';
 import type { ParseResult, SymbolInfo } from '../../analyzers/base-analyzer.js';
 import { getGitInfo, type GitInfo } from '../git.js';
 import { sha256Json, stableId } from '../hash.js';
@@ -16,6 +16,7 @@ export interface IndexWorkspaceOptions {
   incremental?: boolean;
   incrementalFileLimit?: number;
   incrementalFileRatio?: number;
+  progress?: (event: IndexProgressEvent) => void;
 }
 
 export interface IndexWorkspaceResult {
@@ -33,6 +34,16 @@ export interface IndexWorkspaceResult {
   parseWorkers: number;
   manifestScanMs: number;
   indexTimeMs: number;
+}
+
+export interface IndexProgressEvent {
+  phase: 'start' | 'workspace' | 'manifest' | 'diff' | 'parse-cache' | 'parse' | 'write' | 'edges' | 'complete';
+  status: 'start' | 'progress' | 'complete' | 'skipped' | 'fallback';
+  message?: string;
+  current?: number;
+  total?: number;
+  elapsedMs?: number;
+  details?: Record<string, string | number | boolean | undefined>;
 }
 
 interface WorkspaceRow {
@@ -79,6 +90,8 @@ const HTTP_METHOD_ANNOTATIONS = new Map([
   ['PUT', 'PUT'],
   ['DELETE', 'DELETE'],
   ['PATCH', 'PATCH'],
+  ['HEAD', 'HEAD'],
+  ['OPTIONS', 'OPTIONS'],
   ['GetMapping', 'GET'],
   ['PostMapping', 'POST'],
   ['PutMapping', 'PUT'],
@@ -94,7 +107,18 @@ const BEAN_ANNOTATIONS = new Set([
   'ApplicationScoped',
   'RequestScoped',
   'SessionScoped',
+  'ConversationScoped',
   'Dependent',
+  'Named',
+  'ManagedBean',
+  'Model',
+  'MessageDriven',
+  'TransactionScoped',
+  'ViewScoped',
+  'FlowScoped',
+  'ClientWindowScoped',
+  'NoneScoped',
+  'CustomScoped',
   'Service',
   'Component',
   'Repository',
@@ -103,21 +127,21 @@ const BEAN_ANNOTATIONS = new Set([
 ]);
 
 export class V2Indexer {
-  constructor(private readonly db: DatabaseType) {}
+  constructor(private readonly db: CodeGraphDb) {}
 
-  registerWorkspace(root: string, workspaceKey?: string): { workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string } {
+  async registerWorkspace(root: string, workspaceKey?: string): Promise<{ workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string }> {
     const realRoot = path.resolve(root);
     const git = getGitInfo(realRoot);
     return this.registerWorkspaceWithGit(realRoot, workspaceKey, git);
   }
 
-  private registerWorkspaceWithGit(root: string, workspaceKey: string | undefined, git: GitInfo): { workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string } {
+  private async registerWorkspaceWithGit(root: string, workspaceKey: string | undefined, git: GitInfo): Promise<{ workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string }> {
     const realRoot = path.resolve(root);
     const resolvedWorkspaceKey = normalizeWorkspaceKey(workspaceKey ?? process.env.CODEGRAPH_WORKSPACE_KEY);
     const workspaceId = stableId(workspaceIdentityParts(realRoot, git, resolvedWorkspaceKey));
     const now = new Date().toISOString();
 
-    this.db.prepare(`
+    await this.db.prepare(`
       INSERT INTO workspaces (id, root, workspace_key, git_remote, git_common_dir, created_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
@@ -128,24 +152,53 @@ export class V2Indexer {
         last_seen_at = excluded.last_seen_at
     `).run(workspaceId, realRoot, resolvedWorkspaceKey, git.remoteUrl, git.gitCommonDir, now, now);
 
-    const row = this.db.prepare('SELECT current_snapshot_id FROM workspaces WHERE id = ?')
+    const row = await this.db.prepare('SELECT current_snapshot_id FROM workspaces WHERE id = ?')
       .get(workspaceId) as { current_snapshot_id?: string } | undefined;
 
     return { workspaceId, root: realRoot, workspaceKey: resolvedWorkspaceKey, currentSnapshotId: row?.current_snapshot_id };
   }
 
-  indexWorkspace(options: IndexWorkspaceOptions): IndexWorkspaceResult {
+  async indexWorkspace(options: IndexWorkspaceOptions): Promise<IndexWorkspaceResult> {
     const start = Date.now();
     const realRoot = path.resolve(options.root);
+    options.progress?.({
+      phase: 'start',
+      status: 'start',
+      message: `indexing ${realRoot}`,
+      elapsedMs: 0,
+      details: { root: realRoot, workspaceKey: options.workspaceKey ?? process.env.CODEGRAPH_WORKSPACE_KEY },
+    });
     const git = getGitInfo(realRoot);
-    const workspace = this.registerWorkspaceWithGit(realRoot, options.workspaceKey, git);
-    const latestSnapshotId = this.getWorkspace(workspace.workspaceId)?.current_snapshot_id;
-    const previousFiles = latestSnapshotId && !options.force ? this.previousFilesForSnapshot(latestSnapshotId) : undefined;
+    const workspace = await this.registerWorkspaceWithGit(realRoot, options.workspaceKey, git);
+    options.progress?.({
+      phase: 'workspace',
+      status: 'complete',
+      message: 'workspace registered',
+      elapsedMs: Date.now() - start,
+      details: {
+        workspaceId: workspace.workspaceId,
+        branch: git.branch,
+        headCommit: git.headCommit,
+      },
+    });
+    const latestSnapshotId = (await this.getWorkspace(workspace.workspaceId))?.current_snapshot_id;
+    const previousFiles = latestSnapshotId && !options.force ? await this.previousFilesForSnapshot(latestSnapshotId) : undefined;
     const manifest = scanManifest(workspace.root, {
       maxFileSizeBytes: options.maxFileSizeBytes,
       previousFiles,
+      progress: event => options.progress?.({
+        phase: 'manifest',
+        status: event.status,
+        message: event.currentPath ? `scanning ${event.currentPath}` : undefined,
+        current: event.filesFound,
+        elapsedMs: event.elapsedMs,
+        details: {
+          filesHashed: event.filesHashed,
+          hashCacheHits: event.hashCacheHits,
+        },
+      }),
     });
-    const latestSnapshot = latestSnapshotId ? this.snapshotSummary(latestSnapshotId) : undefined;
+    const latestSnapshot = latestSnapshotId ? await this.snapshotSummary(latestSnapshotId) : undefined;
     if (!options.force
       && latestSnapshotId
       && latestSnapshot
@@ -153,11 +206,20 @@ export class V2Indexer {
       && latestSnapshot.dirty_hash === git.dirtyHash
       && previousFiles
       && manifestMatchesPreviousFiles(manifest.files, previousFiles)) {
-      this.db.prepare(`
+      await this.db.prepare(`
         UPDATE workspaces
         SET last_seen_at = ?
         WHERE id = ?
       `).run(new Date().toISOString(), workspace.workspaceId);
+
+      options.progress?.({
+        phase: 'complete',
+        status: 'skipped',
+        message: 'index is already current',
+        current: manifest.files.length,
+        total: manifest.files.length,
+        elapsedMs: Date.now() - start,
+      });
 
       return {
         workspaceId: workspace.workspaceId,
@@ -178,8 +240,21 @@ export class V2Indexer {
     }
 
     const changes = diffManifestFiles(manifest.files, previousFiles ?? []);
+    options.progress?.({
+      phase: 'diff',
+      status: 'complete',
+      message: 'manifest diff complete',
+      current: changes.changedFiles.length,
+      total: manifest.files.length,
+      elapsedMs: Date.now() - start,
+      details: {
+        changedFiles: changes.changedFiles.length,
+        deletedFiles: changes.deletedPaths.length,
+        unchangedFiles: changes.unchangedFiles.length,
+      },
+    });
     if (latestSnapshotId && shouldUseIncrementalUpdate(changes, manifest.files.length, options)) {
-      const prepared = this.prepareParseBatch(workspace.root, changes.changedFiles, options.parseWorkers);
+      const prepared = await this.prepareParseBatch(workspace.root, changes.changedFiles, options.parseWorkers, options.progress);
       return this.updateSnapshotIncrementally({
         start,
         workspaceId: workspace.workspaceId,
@@ -192,6 +267,7 @@ export class V2Indexer {
         hashCacheHits: manifest.hashCacheHits,
         changes,
         prepared,
+        progress: options.progress,
       });
     }
 
@@ -208,13 +284,21 @@ export class V2Indexer {
     let filesParsed = 0;
     let parseCacheHits = 0;
     const previousByPath = new Map((previousFiles ?? []).map(file => [file.path, file]));
-    const prepared = this.prepareParseBatch(workspace.root, changes.changedFiles, options.parseWorkers);
+    const prepared = await this.prepareParseBatch(workspace.root, changes.changedFiles, options.parseWorkers, options.progress);
     const parsePlanByPath = new Map(prepared.plans.map(plan => [plan.file.relPath, plan]));
     filesParsed = prepared.filesParsed;
     parseCacheHits = changes.unchangedFiles.length + prepared.parseCacheHits;
 
-    const tx = this.db.transaction(() => {
-      this.db.prepare(`
+    const tx = this.db.transaction(async () => {
+      options.progress?.({
+        phase: 'write',
+        status: 'start',
+        message: 'writing snapshot rows',
+        current: 0,
+        total: manifest.files.length,
+        elapsedMs: Date.now() - start,
+      });
+      await this.db.prepare(`
         INSERT INTO snapshots (
           id, workspace_id, branch, head_commit, tree_hash, dirty_hash, created_at, status,
           manifest_scan_ms, files_total
@@ -232,26 +316,65 @@ export class V2Indexer {
         manifest.files.length,
       );
 
+      let filesWritten = 0;
+      let lastWriteProgressAt = 0;
       for (const file of manifest.files) {
         const previous = previousByPath.get(file.relPath);
         if (previous && previous.blobHash === file.blobHash) {
-          this.insertFile(snapshotId, file, previous.parseStatus ?? 'ok');
+          await this.insertFile(snapshotId, file, previous.parseStatus ?? 'ok');
+          filesWritten++;
+          lastWriteProgressAt = reportProgressEvery(options.progress, lastWriteProgressAt, {
+            phase: 'write',
+            status: filesWritten === manifest.files.length ? 'complete' : 'progress',
+            message: `writing ${file.relPath}`,
+            current: filesWritten,
+            total: manifest.files.length,
+            elapsedMs: Date.now() - start,
+          });
           continue;
         }
 
         const plan = parsePlanByPath.get(file.relPath);
-        this.insertFile(snapshotId, file, plan?.parseStatus ?? 'skipped');
-        if (!plan?.result) continue;
-        if (plan.cacheInsert) this.insertParseCache(file, plan.result, now);
-        this.materializeParseResult(snapshotId, file, plan.result);
+        await this.insertFile(snapshotId, file, plan?.parseStatus ?? 'skipped');
+        if (plan?.result) {
+          if (plan.cacheInsert) await this.insertParseCache(file, plan.result, now);
+          await this.materializeParseResult(snapshotId, file, plan.result);
+        }
+        filesWritten++;
+        lastWriteProgressAt = reportProgressEvery(options.progress, lastWriteProgressAt, {
+          phase: 'write',
+          status: filesWritten === manifest.files.length ? 'complete' : 'progress',
+          message: `writing ${file.relPath}`,
+          current: filesWritten,
+          total: manifest.files.length,
+          elapsedMs: Date.now() - start,
+        });
       }
 
       if (latestSnapshotId) {
-        this.copyUnchangedRows(latestSnapshotId, snapshotId);
+        options.progress?.({
+          phase: 'edges',
+          status: 'start',
+          message: 'copying unchanged graph rows',
+          elapsedMs: Date.now() - start,
+        });
+        await this.copyUnchangedRows(latestSnapshotId, snapshotId);
       }
-      this.resolveCallEdges(snapshotId);
-      this.rebuildDependencyEdges(snapshotId);
-      this.db.prepare(`
+      options.progress?.({
+        phase: 'edges',
+        status: 'start',
+        message: 'resolving call edges',
+        elapsedMs: Date.now() - start,
+      });
+      await this.resolveCallEdges(snapshotId);
+      options.progress?.({
+        phase: 'edges',
+        status: 'start',
+        message: 'rebuilding dependency edges',
+        elapsedMs: Date.now() - start,
+      });
+      await this.rebuildDependencyEdges(snapshotId);
+      await this.db.prepare(`
         UPDATE snapshots
         SET status = 'ready',
             index_time_ms = ?,
@@ -259,14 +382,23 @@ export class V2Indexer {
             parse_cache_hits = ?
         WHERE id = ?
       `).run(Date.now() - start, filesParsed, parseCacheHits, snapshotId);
-      this.db.prepare(`
+      await this.db.prepare(`
         UPDATE workspaces
         SET current_snapshot_id = ?, last_indexed_head = ?, last_seen_at = ?
         WHERE id = ?
       `).run(snapshotId, git.headCommit, now, workspace.workspaceId);
     });
 
-    tx();
+    await tx();
+
+    options.progress?.({
+      phase: 'complete',
+      status: 'complete',
+      message: 'index complete',
+      current: manifest.files.length,
+      total: manifest.files.length,
+      elapsedMs: Date.now() - start,
+    });
 
     return {
       workspaceId: workspace.workspaceId,
@@ -286,17 +418,17 @@ export class V2Indexer {
     };
   }
 
-  private getWorkspace(workspaceId: string): WorkspaceRow | undefined {
-    return this.db.prepare('SELECT * FROM workspaces WHERE id = ?').get(workspaceId) as WorkspaceRow | undefined;
+  private async getWorkspace(workspaceId: string): Promise<WorkspaceRow | undefined> {
+    return await this.db.prepare('SELECT * FROM workspaces WHERE id = ?').get(workspaceId) as WorkspaceRow | undefined;
   }
 
-  private snapshotSummary(snapshotId: string): SnapshotSummaryRow | undefined {
-    return this.db.prepare('SELECT head_commit, dirty_hash FROM snapshots WHERE id = ?')
+  private async snapshotSummary(snapshotId: string): Promise<SnapshotSummaryRow | undefined> {
+    return await this.db.prepare('SELECT head_commit, dirty_hash FROM snapshots WHERE id = ?')
       .get(snapshotId) as SnapshotSummaryRow | undefined;
   }
 
-  private previousFilesForSnapshot(snapshotId: string): ManifestPreviousFile[] {
-    const rows = this.db.prepare(`
+  private async previousFilesForSnapshot(snapshotId: string): Promise<ManifestPreviousFile[]> {
+    const rows = await this.db.prepare(`
       SELECT path, blob_hash, mtime_ms, size, parse_status
       FROM files
       WHERE snapshot_id = ?
@@ -310,10 +442,27 @@ export class V2Indexer {
     }));
   }
 
-  private prepareParseBatch(root: string, files: ManifestFile[], requestedWorkers: number | undefined): PreparedParseBatch {
+  private async prepareParseBatch(
+    root: string,
+    files: ManifestFile[],
+    requestedWorkers: number | undefined,
+    progress?: (event: IndexProgressEvent) => void,
+  ): Promise<PreparedParseBatch> {
+    const start = Date.now();
     const plans: ParsePlan[] = [];
     const workItems: Array<{ key: string; absPath: string; rootDir: string }> = [];
     let parseCacheHits = 0;
+    let checkedFiles = 0;
+    let lastCacheProgressAt = 0;
+
+    progress?.({
+      phase: 'parse-cache',
+      status: 'start',
+      message: 'checking parse cache',
+      current: 0,
+      total: files.length,
+      elapsedMs: 0,
+    });
 
     for (const file of files) {
       if (!file.parseable || !file.language) {
@@ -323,10 +472,20 @@ export class V2Indexer {
           cacheInsert: false,
           parseStatus: 'skipped',
         });
+        checkedFiles++;
+        lastCacheProgressAt = reportProgressEvery(progress, lastCacheProgressAt, {
+          phase: 'parse-cache',
+          status: 'progress',
+          message: `checking ${file.relPath}`,
+          current: checkedFiles,
+          total: files.length,
+          elapsedMs: Date.now() - start,
+          details: { parseCacheHits, queuedForParse: workItems.length },
+        });
         continue;
       }
 
-      const cached = this.db.prepare('SELECT parse_json FROM parse_cache WHERE blob_hash = ?')
+      const cached = await this.db.prepare('SELECT parse_json FROM parse_cache WHERE blob_hash = ?')
         .get(file.blobHash) as ParseCacheRow | undefined;
       if (cached) {
         const result = JSON.parse(cached.parse_json) as ParseResult;
@@ -338,6 +497,16 @@ export class V2Indexer {
           cacheInsert: false,
           parseStatus: result.hasParseErrors ? 'error' : 'ok',
         });
+        checkedFiles++;
+        lastCacheProgressAt = reportProgressEvery(progress, lastCacheProgressAt, {
+          phase: 'parse-cache',
+          status: 'progress',
+          message: `checking ${file.relPath}`,
+          current: checkedFiles,
+          total: files.length,
+          elapsedMs: Date.now() - start,
+          details: { parseCacheHits, queuedForParse: workItems.length },
+        });
         continue;
       }
 
@@ -346,9 +515,39 @@ export class V2Indexer {
         absPath: file.absPath,
         rootDir: root,
       });
+      checkedFiles++;
+      lastCacheProgressAt = reportProgressEvery(progress, lastCacheProgressAt, {
+        phase: 'parse-cache',
+        status: 'progress',
+        message: `checking ${file.relPath}`,
+        current: checkedFiles,
+        total: files.length,
+        elapsedMs: Date.now() - start,
+        details: { parseCacheHits, queuedForParse: workItems.length },
+      });
     }
 
-    const parsed = parseFilesBatch(workItems, { workers: requestedWorkers });
+    progress?.({
+      phase: 'parse-cache',
+      status: 'complete',
+      message: 'parse cache check complete',
+      current: files.length,
+      total: files.length,
+      elapsedMs: Date.now() - start,
+      details: { parseCacheHits, queuedForParse: workItems.length },
+    });
+
+    const parsed = parseFilesBatch(workItems, {
+      workers: requestedWorkers,
+      progress: event => progress?.({
+        phase: 'parse',
+        status: event.status,
+        current: event.completed,
+        total: event.total,
+        elapsedMs: event.elapsedMs,
+        details: { workers: event.workers },
+      }),
+    });
     const parsedByPath = new Map(parsed.map(item => [item.key, item.result]));
     for (const file of files) {
       if (!file.parseable || !file.language) continue;
@@ -375,9 +574,9 @@ export class V2Indexer {
     };
   }
 
-  private insertParseCache(file: ManifestFile, parseResult: ParseResult, now: string): void {
+  private async insertParseCache(file: ManifestFile, parseResult: ParseResult, now: string): Promise<void> {
     if (!file.language) return;
-    this.db.prepare(`
+    await this.db.prepare(`
       INSERT OR IGNORE INTO parse_cache (
         blob_hash, language, parse_json, has_parse_errors, parse_confidence, created_at
       ) VALUES (?, ?, ?, ?, ?, ?)
@@ -391,7 +590,7 @@ export class V2Indexer {
     );
   }
 
-  private updateSnapshotIncrementally(args: {
+  private async updateSnapshotIncrementally(args: {
     start: number;
     workspaceId: string;
     snapshotId: string;
@@ -403,17 +602,32 @@ export class V2Indexer {
     hashCacheHits: number;
     changes: ManifestChangeSet;
     prepared: PreparedParseBatch;
-  }): IndexWorkspaceResult {
+    progress?: (event: IndexProgressEvent) => void;
+  }): Promise<IndexWorkspaceResult> {
     const now = new Date().toISOString();
     const changedPaths = new Set(args.changes.changedFiles.map(file => file.relPath));
     const deletedPaths = new Set(args.changes.deletedPaths);
     const affectedPaths = new Set([...changedPaths, ...deletedPaths]);
-    const dependencySources = this.affectedDependencySources(args.snapshotId, affectedPaths);
+    args.progress?.({
+      phase: 'edges',
+      status: 'start',
+      message: 'detecting affected dependency sources',
+      elapsedMs: Date.now() - args.start,
+    });
+    const dependencySources = await this.affectedDependencySources(args.snapshotId, affectedPaths);
     for (const file of changedPaths) dependencySources.add(file);
     const parsePlanByPath = new Map(args.prepared.plans.map(plan => [plan.file.relPath, plan]));
 
-    const tx = this.db.transaction(() => {
-      this.db.prepare(`
+    const tx = this.db.transaction(async () => {
+      args.progress?.({
+        phase: 'write',
+        status: 'start',
+        message: 'updating snapshot rows',
+        current: 0,
+        total: args.changes.changedFiles.length,
+        elapsedMs: Date.now() - args.start,
+      });
+      await this.db.prepare(`
         UPDATE snapshots
         SET status = 'indexing',
             branch = ?,
@@ -433,21 +647,45 @@ export class V2Indexer {
         args.snapshotId,
       );
 
-      this.deleteIndexedRowsForFiles(args.snapshotId, affectedPaths);
-      this.deleteDependencyEdgesForSources(args.snapshotId, dependencySources);
+      await this.deleteIndexedRowsForFiles(args.snapshotId, affectedPaths);
+      await this.deleteDependencyEdgesForSources(args.snapshotId, dependencySources);
 
+      let filesWritten = 0;
+      let lastWriteProgressAt = 0;
       for (const file of args.changes.changedFiles) {
         const plan = parsePlanByPath.get(file.relPath);
-        this.insertFile(args.snapshotId, file, plan?.parseStatus ?? 'skipped');
-        if (!plan?.result) continue;
-        if (plan.cacheInsert) this.insertParseCache(file, plan.result, now);
-        this.materializeParseResult(args.snapshotId, file, plan.result);
+        await this.insertFile(args.snapshotId, file, plan?.parseStatus ?? 'skipped');
+        if (plan?.result) {
+          if (plan.cacheInsert) await this.insertParseCache(file, plan.result, now);
+          await this.materializeParseResult(args.snapshotId, file, plan.result);
+        }
+        filesWritten++;
+        lastWriteProgressAt = reportProgressEvery(args.progress, lastWriteProgressAt, {
+          phase: 'write',
+          status: filesWritten === args.changes.changedFiles.length ? 'complete' : 'progress',
+          message: `writing ${file.relPath}`,
+          current: filesWritten,
+          total: args.changes.changedFiles.length,
+          elapsedMs: Date.now() - args.start,
+        });
       }
 
-      this.resolveCallEdges(args.snapshotId, changedPaths);
-      this.rebuildDependencyEdges(args.snapshotId, dependencySources);
+      args.progress?.({
+        phase: 'edges',
+        status: 'start',
+        message: 'resolving call edges',
+        elapsedMs: Date.now() - args.start,
+      });
+      await this.resolveCallEdges(args.snapshotId, changedPaths);
+      args.progress?.({
+        phase: 'edges',
+        status: 'start',
+        message: 'rebuilding dependency edges',
+        elapsedMs: Date.now() - args.start,
+      });
+      await this.rebuildDependencyEdges(args.snapshotId, dependencySources);
 
-      this.db.prepare(`
+      await this.db.prepare(`
         UPDATE snapshots
         SET status = 'ready',
             index_time_ms = ?,
@@ -455,14 +693,23 @@ export class V2Indexer {
             parse_cache_hits = ?
         WHERE id = ?
       `).run(Date.now() - args.start, args.prepared.filesParsed, args.prepared.parseCacheHits, args.snapshotId);
-      this.db.prepare(`
+      await this.db.prepare(`
         UPDATE workspaces
         SET current_snapshot_id = ?, last_indexed_head = ?, last_seen_at = ?
         WHERE id = ?
       `).run(args.snapshotId, args.git.headCommit, now, args.workspaceId);
     });
 
-    tx();
+    await tx();
+
+    args.progress?.({
+      phase: 'complete',
+      status: 'complete',
+      message: 'incremental index complete',
+      current: args.changes.changedFiles.length,
+      total: args.changes.changedFiles.length,
+      elapsedMs: Date.now() - args.start,
+    });
 
     return {
       workspaceId: args.workspaceId,
@@ -482,28 +729,28 @@ export class V2Indexer {
     };
   }
 
-  private deleteIndexedRowsForFiles(snapshotId: string, files: Set<string>): void {
+  private async deleteIndexedRowsForFiles(snapshotId: string, files: Set<string>): Promise<void> {
     if (files.size === 0) return;
     const values = [...files];
     const placeholders = values.map(() => '?').join(', ');
     for (const table of ['symbols', 'imports', 'type_refs', 'call_edges', 'annotations', 'endpoints', 'beans', 'inheritance']) {
-      this.db.prepare(`
+      await this.db.prepare(`
         DELETE FROM ${table}
         WHERE snapshot_id = ? AND file IN (${placeholders})
       `).run(snapshotId, ...values);
     }
-    this.db.prepare(`
+    await this.db.prepare(`
       DELETE FROM files
       WHERE snapshot_id = ? AND path IN (${placeholders})
     `).run(snapshotId, ...values);
   }
 
-  private affectedDependencySources(snapshotId: string, changedOrDeletedFiles: Set<string>): Set<string> {
+  private async affectedDependencySources(snapshotId: string, changedOrDeletedFiles: Set<string>): Promise<Set<string>> {
     const affected = new Set<string>();
     if (changedOrDeletedFiles.size === 0) return affected;
     const values = [...changedOrDeletedFiles];
     const placeholders = values.map(() => '?').join(', ');
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT DISTINCT from_file
       FROM dependency_edges
       WHERE snapshot_id = ?
@@ -513,46 +760,53 @@ export class V2Indexer {
     return affected;
   }
 
-  private deleteDependencyEdgesForSources(snapshotId: string, sourceFiles: Set<string>): void {
+  private async deleteDependencyEdgesForSources(snapshotId: string, sourceFiles: Set<string>): Promise<void> {
     if (sourceFiles.size === 0) return;
     const values = [...sourceFiles];
     const placeholders = values.map(() => '?').join(', ');
-    this.db.prepare(`
+    await this.db.prepare(`
       DELETE FROM dependency_edges
       WHERE snapshot_id = ? AND from_file IN (${placeholders})
     `).run(snapshotId, ...values);
   }
 
-  private insertFile(snapshotId: string, file: ManifestFile, parseStatus: string): void {
-    this.db.prepare(`
-      INSERT OR REPLACE INTO files (
+  private async insertFile(snapshotId: string, file: ManifestFile, parseStatus: string): Promise<void> {
+    await this.db.prepare(`
+      INSERT INTO files (
         snapshot_id, path, blob_hash, mtime_ms, size, language, file_role, parse_status
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (snapshot_id, path) DO UPDATE SET
+        blob_hash = excluded.blob_hash,
+        mtime_ms = excluded.mtime_ms,
+        size = excluded.size,
+        language = excluded.language,
+        file_role = excluded.file_role,
+        parse_status = excluded.parse_status
     `).run(snapshotId, file.relPath, file.blobHash, file.mtimeMs, file.size, file.language, file.role, parseStatus);
   }
 
-  private copyUnchangedFile(fromSnapshotId: string, toSnapshotId: string, file: ManifestFile): boolean {
-    const oldFile = this.db.prepare(`
+  private async copyUnchangedFile(fromSnapshotId: string, toSnapshotId: string, file: ManifestFile): Promise<boolean> {
+    const oldFile = await this.db.prepare(`
       SELECT blob_hash, parse_status FROM files WHERE snapshot_id = ? AND path = ?
     `).get(fromSnapshotId, file.relPath) as { blob_hash: string; parse_status: string } | undefined;
     if (!oldFile || oldFile.blob_hash !== file.blobHash) return false;
 
-    this.insertFile(toSnapshotId, file, oldFile.parse_status);
+    await this.insertFile(toSnapshotId, file, oldFile.parse_status);
     return true;
   }
 
-  private copyUnchangedRows(fromSnapshotId: string, toSnapshotId: string): void {
+  private async copyUnchangedRows(fromSnapshotId: string, toSnapshotId: string): Promise<void> {
     for (const table of ['symbols', 'imports', 'type_refs', 'call_edges', 'annotations', 'endpoints', 'beans', 'inheritance']) {
-      this.copyRowsForUnchangedFiles(table, fromSnapshotId, toSnapshotId);
+      await this.copyRowsForUnchangedFiles(table, fromSnapshotId, toSnapshotId);
     }
   }
 
-  private copyRowsForUnchangedFiles(table: string, fromSnapshotId: string, toSnapshotId: string): void {
+  private async copyRowsForUnchangedFiles(table: string, fromSnapshotId: string, toSnapshotId: string): Promise<void> {
     const fileColumn = 'file';
-    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-    const selectCols = cols.map(col => col.name === 'snapshot_id' ? '? AS snapshot_id' : `src.${col.name}`).join(', ');
-    const insertCols = cols.map(col => col.name).join(', ');
-    this.db.prepare(`
+    const cols = copyableColumnsFor(table);
+    const selectCols = cols.map(col => col === 'snapshot_id' ? '? AS snapshot_id' : `src.${col}`).join(', ');
+    const insertCols = cols.join(', ');
+    await this.db.prepare(`
       INSERT INTO ${table} (${insertCols})
       SELECT ${selectCols}
       FROM ${table} src
@@ -567,7 +821,7 @@ export class V2Indexer {
     `).run(toSnapshotId, fromSnapshotId, toSnapshotId, fromSnapshotId);
   }
 
-  private materializeParseResult(snapshotId: string, file: ManifestFile, result: ParseResult): void {
+  private async materializeParseResult(snapshotId: string, file: ManifestFile, result: ParseResult): Promise<void> {
     const classesByName = new Map<string, SymbolInfo>();
     for (const sym of result.symbols) {
       if ((sym.kind === 'class' || sym.kind === 'interface') && sym.name) {
@@ -577,7 +831,7 @@ export class V2Indexer {
 
     for (const sym of result.symbols) {
       const fqName = symbolFqName(sym);
-      this.db.prepare(`
+      await this.db.prepare(`
         INSERT OR IGNORE INTO symbols (
           snapshot_id, fq_name, simple_name, kind, file, line, column, end_line, signature,
           visibility, parent, package_name, return_type, parameter_types_json, annotations_json,
@@ -605,19 +859,19 @@ export class V2Indexer {
       );
 
       for (const annotation of sym.annotations ?? []) {
-        this.db.prepare(`
+        await this.db.prepare(`
           INSERT INTO annotations (snapshot_id, symbol_fq_name, annotation, file, line)
           VALUES (?, ?, ?, ?, ?)
         `).run(snapshotId, fqName, annotation, file.relPath, sym.line);
       }
 
-      this.materializeInheritance(snapshotId, file, sym);
-      this.materializeBean(snapshotId, file, sym, fqName);
-      this.materializeEndpoint(snapshotId, file, sym, fqName, classesByName);
+      await this.materializeInheritance(snapshotId, file, sym);
+      await this.materializeBean(snapshotId, file, sym, fqName);
+      await this.materializeEndpoint(snapshotId, file, sym, fqName, classesByName);
     }
 
     for (const imp of result.imports) {
-      this.db.prepare(`
+      await this.db.prepare(`
         INSERT INTO imports (
           snapshot_id, file, source, imported_symbols_json, line, is_external, file_role
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -625,14 +879,14 @@ export class V2Indexer {
     }
 
     for (const ref of result.typeReferences ?? []) {
-      this.db.prepare(`
+      await this.db.prepare(`
         INSERT INTO type_refs (snapshot_id, file, referenced_type, context, line, file_role)
         VALUES (?, ?, ?, ?, ?, ?)
       `).run(snapshotId, file.relPath, ref.referencedType, ref.context, ref.line, file.role);
     }
 
     for (const call of result.calls) {
-      this.db.prepare(`
+      await this.db.prepare(`
         INSERT INTO call_edges (
           snapshot_id, caller, callee, file, line, confidence, resolution_kind, file_role
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -640,29 +894,29 @@ export class V2Indexer {
     }
   }
 
-  private materializeInheritance(snapshotId: string, file: ManifestFile, sym: SymbolInfo): void {
+  private async materializeInheritance(snapshotId: string, file: ManifestFile, sym: SymbolInfo): Promise<void> {
     const child = symbolFqName(sym).replace(/\([^)]*\)$/, '');
     if (sym.extends) {
-      this.db.prepare(`
+      await this.db.prepare(`
         INSERT INTO inheritance (snapshot_id, child_type, parent_type, kind, file, line, confidence)
         VALUES (?, ?, ?, 'extends', ?, ?, 0.8)
       `).run(snapshotId, child, sym.extends, file.relPath, sym.line);
     }
     for (const parent of sym.implements ?? []) {
-      this.db.prepare(`
+      await this.db.prepare(`
         INSERT INTO inheritance (snapshot_id, child_type, parent_type, kind, file, line, confidence)
         VALUES (?, ?, ?, 'implements', ?, ?, 0.8)
       `).run(snapshotId, child, parent, file.relPath, sym.line);
     }
   }
 
-  private materializeBean(snapshotId: string, file: ManifestFile, sym: SymbolInfo, fqName: string): void {
+  private async materializeBean(snapshotId: string, file: ManifestFile, sym: SymbolInfo, fqName: string): Promise<void> {
     if (sym.kind !== 'class' && sym.kind !== 'interface') return;
     const annotations = sym.annotations ?? [];
     const beanAnnotation = annotations.find(a => BEAN_ANNOTATIONS.has(a));
     if (!beanAnnotation) return;
 
-    this.db.prepare(`
+    await this.db.prepare(`
       INSERT INTO beans (
         snapshot_id, bean_type, implementation, scope, qualifiers_json, source, file, line, confidence
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -679,13 +933,61 @@ export class V2Indexer {
     );
   }
 
-  private materializeEndpoint(
+  private async materializeEndpoint(
     snapshotId: string,
     file: ManifestFile,
     sym: SymbolInfo,
     fqName: string,
     classesByName: Map<string, SymbolInfo>,
-  ): void {
+  ): Promise<void> {
+    const annotations = sym.annotations ?? [];
+
+    if (sym.kind === 'class' || sym.kind === 'interface') {
+      if (annotations.includes('ServerEndpoint')) {
+        const endpointPath = resolveClassEndpointPath(sym);
+        await this.db.prepare(`
+          INSERT INTO endpoints (
+            snapshot_id, method, path, path_resolution, path_resolution_reason,
+            handler_symbol, controller, file, line, framework, confidence, file_role
+          ) VALUES (?, 'WEBSOCKET', ?, ?, ?, ?, ?, ?, ?, 'websocket', ?, ?)
+        `).run(
+          snapshotId,
+          endpointPath.path,
+          endpointPath.resolution,
+          endpointPath.reason,
+          fqName,
+          sym.name,
+          file.relPath,
+          sym.line,
+          endpointPath.resolution === 'exact' ? 0.8 : 0.5,
+          file.role,
+        );
+        return;
+      }
+
+      if (annotations.includes('WebServlet')) {
+        const endpointPath = resolveClassEndpointPath(sym);
+        await this.db.prepare(`
+          INSERT INTO endpoints (
+            snapshot_id, method, path, path_resolution, path_resolution_reason,
+            handler_symbol, controller, file, line, framework, confidence, file_role
+          ) VALUES (?, 'SERVLET', ?, ?, ?, ?, ?, ?, ?, 'servlet', ?, ?)
+        `).run(
+          snapshotId,
+          endpointPath.path,
+          endpointPath.resolution,
+          endpointPath.reason,
+          fqName,
+          sym.name,
+          file.relPath,
+          sym.line,
+          endpointPath.resolution === 'exact' ? 0.75 : 0.5,
+          file.role,
+        );
+        return;
+      }
+    }
+
     if (sym.kind !== 'method') return;
 
     if (
@@ -698,7 +1000,7 @@ export class V2Indexer {
       const framework = sym.frameworkRole === 'elastic-rest:endpoint'
         ? 'elastic-rest'
         : sym.frameworkRole.startsWith('openapi') ? 'openapi' : 'postman';
-      this.db.prepare(`
+      await this.db.prepare(`
         INSERT INTO endpoints (
           snapshot_id, method, path, path_resolution, path_resolution_reason,
           handler_symbol, controller, file, line, framework, confidence, file_role
@@ -718,13 +1020,12 @@ export class V2Indexer {
       return;
     }
 
-    const annotations = sym.annotations ?? [];
     const methodAnnotation = annotations.find(a => HTTP_METHOD_ANNOTATIONS.has(a));
     if (!methodAnnotation) return;
 
     const httpMethod = sym.frameworkMeta?.httpMethod ?? HTTP_METHOD_ANNOTATIONS.get(methodAnnotation) ?? 'REQUEST';
     const endpointPath = resolveEndpointPath(sym, classesByName.get(sym.parent ?? ''));
-    this.db.prepare(`
+    await this.db.prepare(`
       INSERT INTO endpoints (
         snapshot_id, method, path, path_resolution, path_resolution_reason,
         handler_symbol, controller, file, line, framework, confidence, file_role
@@ -745,28 +1046,28 @@ export class V2Indexer {
     );
   }
 
-  private rebuildDependencyEdges(snapshotId: string, sourceFiles?: Set<string>): void {
+  private async rebuildDependencyEdges(snapshotId: string, sourceFiles?: Set<string>): Promise<void> {
     if (!sourceFiles) {
-      this.db.prepare('DELETE FROM dependency_edges WHERE snapshot_id = ?').run(snapshotId);
+      await this.db.prepare('DELETE FROM dependency_edges WHERE snapshot_id = ?').run(snapshotId);
     } else if (sourceFiles.size === 0) {
       return;
     }
 
     const sourceFilter = sourceFiles ? [...sourceFiles] : undefined;
     const sourcePlaceholders = sourceFilter?.map(() => '?').join(', ');
-    const imports = this.db.prepare(`
+    const imports = await this.db.prepare(`
       SELECT file, source FROM imports
       WHERE snapshot_id = ? AND is_external = 0
       ${sourceFilter ? `AND file IN (${sourcePlaceholders})` : ''}
     `).all(...(sourceFilter ? [snapshotId, ...sourceFilter] : [snapshotId])) as Array<{ file: string; source: string }>;
-    const typeRefs = this.db.prepare(`
+    const typeRefs = await this.db.prepare(`
       SELECT file, referenced_type FROM type_refs
       WHERE snapshot_id = ?
       ${sourceFilter ? `AND file IN (${sourcePlaceholders})` : ''}
     `).all(...(sourceFilter ? [snapshotId, ...sourceFilter] : [snapshotId])) as Array<{ file: string; referenced_type: string }>;
 
     const classToFile = new Map<string, string>();
-    const symbols = this.db.prepare(`
+    const symbols = await this.db.prepare(`
       SELECT simple_name, fq_name, file FROM symbols
       WHERE snapshot_id = ? AND kind IN ('class', 'interface', 'enum', 'type')
     `).all(snapshotId) as Array<{ simple_name: string; fq_name: string; file: string }>;
@@ -775,31 +1076,31 @@ export class V2Indexer {
       if (!classToFile.has(sym.fq_name)) classToFile.set(sym.fq_name, sym.file);
     }
 
-    const insert = this.db.prepare(`
+    const insert = await this.db.prepare(`
       INSERT INTO dependency_edges (
         snapshot_id, from_file, to_file, kind, confidence, resolution_kind
       ) VALUES (?, ?, ?, ?, ?, ?)
     `);
     const seen = new Set<string>();
-    const addEdge = (from: string, to: string | undefined, kind: string, confidence: number, resolutionKind: string) => {
+    const addEdge = async (from: string, to: string | undefined, kind: string, confidence: number, resolutionKind: string) => {
       if (!to || to === from) return;
       if (sourceFiles && !sourceFiles.has(from)) return;
       const key = `${from}\0${to}\0${kind}`;
       if (seen.has(key)) return;
       seen.add(key);
-      insert.run(snapshotId, from, to, kind, confidence, resolutionKind);
+      await insert.run(snapshotId, from, to, kind, confidence, resolutionKind);
     };
 
     for (const imp of imports) {
       const simple = imp.source.split('.').pop() ?? imp.source;
-      addEdge(imp.file, classToFile.get(imp.source) ?? classToFile.get(simple), 'compile', 0.8, 'import');
+      await addEdge(imp.file, classToFile.get(imp.source) ?? classToFile.get(simple), 'compile', 0.8, 'import');
     }
     for (const ref of typeRefs) {
-      addEdge(ref.file, classToFile.get(ref.referenced_type), 'compile', 0.6, 'type-ref');
+      await addEdge(ref.file, classToFile.get(ref.referenced_type), 'compile', 0.6, 'type-ref');
     }
 
     const javaTypesByFqName = new Map<string, string[]>();
-    const javaTypes = this.db.prepare(`
+    const javaTypes = await this.db.prepare(`
       SELECT fq_name, file
       FROM symbols
       WHERE snapshot_id = ?
@@ -812,7 +1113,7 @@ export class V2Indexer {
       javaTypesByFqName.set(row.fq_name, files);
     }
 
-    const mybatisXmlMappers = this.db.prepare(`
+    const mybatisXmlMappers = await this.db.prepare(`
       SELECT fq_name, file, framework_meta_json
       FROM symbols
       WHERE snapshot_id = ?
@@ -822,17 +1123,17 @@ export class V2Indexer {
       const meta = parseJsonObject(mapper.framework_meta_json);
       const namespace = typeof meta.namespace === 'string' && meta.namespace ? meta.namespace : mapper.fq_name;
       for (const javaFile of javaTypesByFqName.get(namespace) ?? []) {
-        addEdge(mapper.file, javaFile, 'config', 0.95, 'mybatis-namespace');
-        addEdge(javaFile, mapper.file, 'config', 0.95, 'mybatis-namespace');
+        await addEdge(mapper.file, javaFile, 'config', 0.95, 'mybatis-namespace');
+        await addEdge(javaFile, mapper.file, 'config', 0.95, 'mybatis-namespace');
       }
     }
   }
 
-  private resolveCallEdges(snapshotId: string, files?: Set<string>): void {
+  private async resolveCallEdges(snapshotId: string, files?: Set<string>): Promise<void> {
     if (files && files.size === 0) return;
     const fileFilter = files ? [...files] : undefined;
     const filePlaceholders = fileFilter?.map(() => '?').join(', ');
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT rowid AS row_id, caller, callee, file, line, file_role
       FROM call_edges
       WHERE snapshot_id = ? AND resolution_kind = 'name-only' AND callee LIKE '%.%'
@@ -847,7 +1148,7 @@ export class V2Indexer {
     }>;
 
     const fieldsByFile = new Map<string, Map<string, string>>();
-    const fields = this.db.prepare(`
+    const fields = await this.db.prepare(`
       SELECT file, simple_name, return_type
       FROM symbols
       WHERE snapshot_id = ? AND kind = 'field' AND return_type IS NOT NULL
@@ -863,7 +1164,7 @@ export class V2Indexer {
     }
 
     const implementationsByInterface = new Map<string, string[]>();
-    const implementations = this.db.prepare(`
+    const implementations = await this.db.prepare(`
       SELECT parent_type, child_type
       FROM inheritance
       WHERE snapshot_id = ? AND kind = 'implements'
@@ -877,7 +1178,7 @@ export class V2Indexer {
     }
 
     const methodOwners = new Set(
-      (this.db.prepare(`
+      (await this.db.prepare(`
         SELECT parent, simple_name
         FROM symbols
         WHERE snapshot_id = ? AND kind = 'method' AND parent IS NOT NULL
@@ -885,22 +1186,22 @@ export class V2Indexer {
         .map(row => `${row.parent}.${row.simple_name}`),
     );
 
-    const update = this.db.prepare(`
+    const update = await this.db.prepare(`
       UPDATE call_edges
       SET callee = ?, confidence = ?, resolution_kind = ?
       WHERE rowid = ?
     `);
-    const insert = this.db.prepare(`
+    const insert = await this.db.prepare(`
       INSERT INTO call_edges (
         snapshot_id, caller, callee, file, line, confidence, resolution_kind, file_role
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertedImplementationEdges = new Set<string>();
-    const insertImplementationEdges = (
+    const insertImplementationEdges = async (
       row: typeof rows[number],
       receiverType: string,
       method: string,
-    ): void => {
+    ): Promise<void> => {
       const implementations = implementationsByInterface.get(simpleTypeName(receiverType)) ?? [];
       for (const implementation of implementations) {
         if (!methodOwners.has(`${implementation}.${method}`)) continue;
@@ -908,7 +1209,7 @@ export class V2Indexer {
         const key = `${row.caller}\0${callee}\0${row.file}\0${row.line}`;
         if (insertedImplementationEdges.has(key)) continue;
         insertedImplementationEdges.add(key);
-        insert.run(snapshotId, row.caller, callee, row.file, row.line, 0.65, 'interface-implementation', row.file_role);
+        await insert.run(snapshotId, row.caller, callee, row.file, row.line, 0.65, 'interface-implementation', row.file_role);
       }
     };
 
@@ -920,13 +1221,13 @@ export class V2Indexer {
       const method = row.callee.substring(dot + 1);
       const fieldType = fieldsByFile.get(row.file)?.get(normalizedReceiver);
       if (fieldType) {
-        update.run(`${fieldType}.${method}`, 0.8, 'receiver-field', row.row_id);
-        insertImplementationEdges(row, fieldType, method);
+        await update.run(`${fieldType}.${method}`, 0.8, 'receiver-field', row.row_id);
+        await insertImplementationEdges(row, fieldType, method);
         continue;
       }
       if (/^[A-Z]/.test(receiver)) {
-        update.run(row.callee, 0.8, 'static-or-type-receiver', row.row_id);
-        insertImplementationEdges(row, receiver, method);
+        await update.run(row.callee, 0.8, 'static-or-type-receiver', row.row_id);
+        await insertImplementationEdges(row, receiver, method);
       }
     }
   }
@@ -966,6 +1267,26 @@ function resolveEndpointPath(methodSym: SymbolInfo, classSym: SymbolInfo | undef
   return { path, resolution: 'exact' };
 }
 
+function resolveClassEndpointPath(sym: SymbolInfo): EndpointPathResolution {
+  const meta = sym.frameworkMeta ?? {};
+  const path = composeEndpointPath(meta.path, undefined);
+  if (meta.pathResolution === 'partial') {
+    return {
+      path,
+      resolution: 'partial',
+      reason: meta.pathResolutionReason,
+    };
+  }
+  if (meta.path === undefined) {
+    return {
+      path,
+      resolution: 'partial',
+      reason: 'No class-level path literal/constant was found; using root fallback.',
+    };
+  }
+  return { path, resolution: 'exact' };
+}
+
 function composeEndpointPath(classPath: string | undefined, methodPath: string | undefined): string {
   const parts = [classPath, methodPath]
     .filter((part): part is string => part !== undefined)
@@ -994,6 +1315,36 @@ function parseJsonObject(value: string | undefined): Record<string, unknown> {
       : {};
   } catch {
     return {};
+  }
+}
+
+function copyableColumnsFor(table: string): string[] {
+  switch (table) {
+    case 'symbols':
+      return [
+        'snapshot_id', 'fq_name', 'simple_name', 'kind', 'file', 'line', 'column', 'end_line',
+        'signature', 'visibility', 'parent', 'package_name', 'return_type', 'parameter_types_json',
+        'annotations_json', 'framework_role', 'framework_meta_json', 'file_role',
+      ];
+    case 'imports':
+      return ['snapshot_id', 'file', 'source', 'imported_symbols_json', 'line', 'is_external', 'file_role'];
+    case 'type_refs':
+      return ['snapshot_id', 'file', 'referenced_type', 'context', 'line', 'file_role'];
+    case 'call_edges':
+      return ['snapshot_id', 'caller', 'callee', 'file', 'line', 'confidence', 'resolution_kind', 'file_role'];
+    case 'annotations':
+      return ['snapshot_id', 'symbol_fq_name', 'annotation', 'file', 'line'];
+    case 'endpoints':
+      return [
+        'snapshot_id', 'method', 'path', 'path_resolution', 'path_resolution_reason',
+        'handler_symbol', 'controller', 'file', 'line', 'framework', 'confidence', 'file_role',
+      ];
+    case 'beans':
+      return ['snapshot_id', 'bean_type', 'implementation', 'scope', 'qualifiers_json', 'source', 'file', 'line', 'confidence'];
+    case 'inheritance':
+      return ['snapshot_id', 'child_type', 'parent_type', 'kind', 'file', 'line', 'confidence'];
+    default:
+      throw new Error(`Unsupported copy table: ${table}`);
   }
 }
 
@@ -1037,6 +1388,21 @@ function shouldUseIncrementalUpdate(changes: ManifestChangeSet, filesTotal: numb
   const fileLimit = options.incrementalFileLimit ?? 500;
   const ratioLimit = Math.ceil(filesTotal * (options.incrementalFileRatio ?? 0.2));
   return changedCount <= Math.max(1, Math.min(fileLimit, ratioLimit));
+}
+
+function reportProgressEvery(
+  progress: ((event: IndexProgressEvent) => void) | undefined,
+  lastProgressAt: number,
+  event: IndexProgressEvent,
+): number {
+  if (!progress) return lastProgressAt;
+  const now = Date.now();
+  const shouldReport = event.status === 'complete'
+    || (event.current !== undefined && event.current % 500 === 0)
+    || now - lastProgressAt >= 5_000;
+  if (!shouldReport) return lastProgressAt;
+  progress(event);
+  return now;
 }
 
 function parseFilesBatchWorkerCount(itemCount: number, requested: number | undefined): number {

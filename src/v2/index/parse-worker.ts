@@ -10,10 +10,16 @@ const data = workerData as {
 };
 
 try {
-  const results: ParseWorkResult[] = data.tasks.map(task => ({
-    key: task.key,
-    result: parseFile(task.absPath, task.rootDir),
-  }));
+  const counter = new Int32Array(data.shared);
+  const results: ParseWorkResult[] = [];
+  for (const task of data.tasks) {
+    results.push({
+      key: task.key,
+      result: parseFile(task.absPath, task.rootDir),
+    });
+    Atomics.add(counter, 1, 1);
+    Atomics.notify(counter, 1);
+  }
   fs.writeFileSync(data.outputPath, JSON.stringify({ results }));
 } catch (error) {
   fs.writeFileSync(data.outputPath, JSON.stringify({
@@ -23,4 +29,5 @@ try {
   const counter = new Int32Array(data.shared);
   Atomics.sub(counter, 0, 1);
   Atomics.notify(counter, 0);
+  Atomics.notify(counter, 1);
 }

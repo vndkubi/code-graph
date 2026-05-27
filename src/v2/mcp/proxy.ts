@@ -8,6 +8,7 @@ export interface RunMcpProxyOptions {
   root: string;
   homeDir?: string;
   prewarm?: boolean;
+  refreshOnStart?: boolean;
   workspaceKey?: string;
   autoRefresh?: boolean;
   toolAllowlist?: string;
@@ -19,6 +20,8 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
   if (options.prewarm !== false && !workspace.currentSnapshotId) {
     await daemon.refreshWorkspace(workspace.root, options.workspaceKey);
     workspace = await daemon.registerWorkspace(workspace.root, options.workspaceKey);
+  } else if (options.refreshOnStart) {
+    await daemon.refreshWorkspace(workspace.root, options.workspaceKey, { background: true });
   }
 
   const allowedTools = parseToolAllowlist(options.toolAllowlist ?? process.env.CODEGRAPH_MCP_TOOLS);

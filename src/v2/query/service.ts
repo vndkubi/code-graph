@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Database as DatabaseType } from 'better-sqlite3';
+import type { CodeGraphDb } from '../storage/database.js';
 import { V2Indexer } from '../index/indexer.js';
 import { roleRank, type FileRole } from '../index/file-role.js';
 import { scanManifest } from '../index/manifest.js';
@@ -15,24 +15,47 @@ export interface QueryEnvelope {
 export class V2QueryService {
   private readonly indexer: V2Indexer;
 
-  constructor(private readonly db: DatabaseType) {
+  constructor(private readonly db: CodeGraphDb) {
     this.indexer = new V2Indexer(db);
   }
 
-  query(envelope: QueryEnvelope): unknown {
-    let snapshotId = this.requireSnapshot(envelope.workspaceId);
+  async query(envelope: QueryEnvelope): Promise<unknown> {
+    let snapshotId = await this.requireSnapshot(envelope.workspaceId);
+    let autoRefreshSkipped: Record<string, unknown> | undefined;
+    let freshnessBeforeRefresh: Record<string, unknown> | undefined;
+    let snapshotRefreshed = false;
     if (envelope.args.autoRefresh === true) {
-      const freshnessBeforeRefresh = this.indexFreshness(snapshotId);
-      const workspace = this.workspaceInfo(envelope.workspaceId);
-      const indexedFileCount = this.indexedFileCount(snapshotId);
-      if (freshnessBeforeRefresh?.isStale && workspace?.root && indexedFileCount > 0) {
-        snapshotId = this.indexer.indexWorkspace({
+      freshnessBeforeRefresh = await this.indexFreshness(snapshotId);
+      const workspace = await this.workspaceInfo(envelope.workspaceId);
+      const indexedFileCount = await this.indexedFileCount(snapshotId);
+      const refreshLimit = autoRefreshFileLimit();
+      if (freshnessBeforeRefresh?.isStale && workspace?.root && indexedFileCount > 0 && indexedFileCount <= refreshLimit) {
+        snapshotId = (await this.indexer.indexWorkspace({
           root: workspace.root,
           workspaceKey: workspace.workspaceKey,
-        }).snapshotId;
+        })).snapshotId;
+        snapshotRefreshed = true;
+      } else if (freshnessBeforeRefresh?.isStale && workspace?.root && indexedFileCount > refreshLimit) {
+        autoRefreshSkipped = {
+          reason: 'indexed-file-count-exceeds-auto-refresh-limit',
+          indexedFileCount,
+          autoRefreshFileLimit: refreshLimit,
+          suggestion: 'Run codegraph index manually for this large workspace, or raise CODEGRAPH_AUTO_REFRESH_FILE_LIMIT.',
+        };
       }
     }
-    const freshness = envelope.args.warnStale === false ? undefined : this.indexFreshness(snapshotId);
+    let freshness = envelope.args.warnStale === false
+      ? undefined
+      : !snapshotRefreshed && freshnessBeforeRefresh
+        ? freshnessBeforeRefresh
+        : await this.indexFreshness(snapshotId);
+    if (freshness && autoRefreshSkipped) {
+      freshness = {
+        ...freshness,
+        autoRefreshSkipped,
+        warning: `${String(freshness.warning ?? 'Index may be stale.')} Auto-refresh was skipped because this workspace is too large for inline refresh.`,
+      };
+    }
     const withFreshness = (result: unknown): unknown => {
       if (!freshness || !freshness.isStale || !isPlainObject(result)) return result;
       return {
@@ -42,64 +65,64 @@ export class V2QueryService {
     };
     switch (envelope.toolName) {
       case 'search_symbol':
-        return withFreshness(this.searchSymbol(snapshotId, envelope.args));
+        return withFreshness(await this.searchSymbol(snapshotId, envelope.args));
       case 'search_files':
-        return withFreshness(this.searchFiles(snapshotId, envelope.args));
+        return withFreshness(await this.searchFiles(snapshotId, envelope.args));
       case 'find_references':
-        return withFreshness(this.findReferences(snapshotId, envelope.args));
+        return withFreshness(await this.findReferences(snapshotId, envelope.args));
       case 'get_file_summary':
-        return withFreshness(this.getFileSummary(snapshotId, envelope.args));
+        return withFreshness(await this.getFileSummary(snapshotId, envelope.args));
       case 'get_file_slice':
-        return withFreshness(this.getFileSlice(snapshotId, envelope.args));
+        return withFreshness(await this.getFileSlice(snapshotId, envelope.args));
       case 'get_dependencies':
-        return withFreshness(this.getDependencies(snapshotId, envelope.args));
+        return withFreshness(await this.getDependencies(snapshotId, envelope.args));
       case 'get_dependents':
-        return withFreshness(this.getDependents(snapshotId, envelope.args));
+        return withFreshness(await this.getDependents(snapshotId, envelope.args));
       case 'get_callers':
-        return withFreshness(this.getCallers(snapshotId, envelope.args));
+        return withFreshness(await this.getCallers(snapshotId, envelope.args));
       case 'get_callees':
-        return withFreshness(this.getCallees(snapshotId, envelope.args));
+        return withFreshness(await this.getCallees(snapshotId, envelope.args));
       case 'find_endpoints':
-        return withFreshness(this.findEndpoints(snapshotId, envelope.args));
+        return withFreshness(await this.findEndpoints(snapshotId, envelope.args));
       case 'get_impact_radius':
-        return withFreshness(this.getImpactRadius(snapshotId, envelope.args));
+        return withFreshness(await this.getImpactRadius(snapshotId, envelope.args));
       case 'trace_dependencies':
-        return withFreshness(this.traceDependencies(snapshotId, envelope.args));
+        return withFreshness(await this.traceDependencies(snapshotId, envelope.args));
       case 'explain_endpoint':
-        return withFreshness(this.explainEndpoint(snapshotId, envelope.args));
+        return withFreshness(await this.explainEndpoint(snapshotId, envelope.args));
       case 'impact_of_symbol':
-        return withFreshness(this.impactOfSymbol(snapshotId, envelope.args));
+        return withFreshness(await this.impactOfSymbol(snapshotId, envelope.args));
       case 'simulate_patch_impact':
-        return withFreshness(this.simulatePatchImpact(snapshotId, envelope.args));
+        return withFreshness(await this.simulatePatchImpact(snapshotId, envelope.args));
       case 'review_patch':
-        return withFreshness(this.reviewPatch(snapshotId, envelope.args));
+        return withFreshness(await this.reviewPatch(snapshotId, envelope.args));
       case 'find_tests_for':
-        return withFreshness(this.findTestsFor(snapshotId, envelope.args));
+        return withFreshness(await this.findTestsFor(snapshotId, envelope.args));
       case 'get_flow_pack':
-        return withFreshness(this.getResearchPack(snapshotId, { ...envelope.args, taskType: envelope.args.taskType ?? 'architecture' }));
+        return withFreshness(await this.getResearchPack(snapshotId, { ...envelope.args, taskType: envelope.args.taskType ?? 'architecture' }));
       case 'get_research_pack':
-        return withFreshness(this.getResearchPack(snapshotId, envelope.args));
+        return withFreshness(await this.getResearchPack(snapshotId, envelope.args));
       case 'get_context_packet':
-        return withFreshness(this.getContextPacket(snapshotId, envelope.args));
+        return withFreshness(await this.getContextPacket(snapshotId, envelope.args));
       case 'search_code':
-        return withFreshness(this.searchCode(snapshotId, envelope.args));
+        return withFreshness(await this.searchCode(snapshotId, envelope.args));
       case 'get_index_stats':
-        return withFreshness(this.getIndexStats(snapshotId));
+        return withFreshness(await this.getIndexStats(snapshotId));
       default:
         throw new Error(`Unknown v2 tool: ${envelope.toolName}`);
     }
   }
 
-  ensureIndexed(root: string): ReturnType<V2Indexer['indexWorkspace']> {
+  async ensureIndexed(root: string): ReturnType<V2Indexer['indexWorkspace']> {
     return this.indexer.indexWorkspace({ root });
   }
 
-  private indexedFileCount(snapshotId: string): number {
-    return scalar(this.db, 'SELECT COUNT(*) FROM files WHERE snapshot_id = ?', snapshotId);
+  private async indexedFileCount(snapshotId: string): Promise<number> {
+    return await scalar(this.db, 'SELECT COUNT(*) FROM files WHERE snapshot_id = ?', snapshotId);
   }
 
-  private requireSnapshot(workspaceId: string): string {
-    const row = this.db.prepare('SELECT current_snapshot_id FROM workspaces WHERE id = ?')
+  private async requireSnapshot(workspaceId: string): Promise<string> {
+    const row = await this.db.prepare('SELECT current_snapshot_id FROM workspaces WHERE id = ?')
       .get(workspaceId) as { current_snapshot_id?: string } | undefined;
     if (!row?.current_snapshot_id) {
       throw new Error(`Workspace ${workspaceId} is not indexed yet`);
@@ -107,19 +130,19 @@ export class V2QueryService {
     return row.current_snapshot_id;
   }
 
-  private workspaceRoot(workspaceId: string): string | undefined {
-    return this.workspaceInfo(workspaceId)?.root;
+  private async workspaceRoot(workspaceId: string): Promise<string | undefined> {
+    return (await this.workspaceInfo(workspaceId))?.root;
   }
 
-  private workspaceInfo(workspaceId: string): { root?: string; workspaceKey?: string } | undefined {
-    const row = this.db.prepare('SELECT root, workspace_key FROM workspaces WHERE id = ?')
+  private async workspaceInfo(workspaceId: string): Promise<{ root?: string; workspaceKey?: string } | undefined> {
+    const row = await this.db.prepare('SELECT root, workspace_key FROM workspaces WHERE id = ?')
       .get(workspaceId) as { root?: string; workspace_key?: string } | undefined;
     if (!row) return undefined;
     return { root: row.root, workspaceKey: row.workspace_key };
   }
 
-  private workspaceRootForSnapshot(snapshotId: string): string | undefined {
-    const row = this.db.prepare(`
+  private async workspaceRootForSnapshot(snapshotId: string): Promise<string | undefined> {
+    const row = await this.db.prepare(`
       SELECT w.root
       FROM snapshots s
       JOIN workspaces w ON w.id = s.workspace_id
@@ -128,8 +151,8 @@ export class V2QueryService {
     return row?.root;
   }
 
-  private indexFreshness(snapshotId: string): Record<string, unknown> | undefined {
-    const row = this.db.prepare(`
+  private async indexFreshness(snapshotId: string): Promise<Record<string, unknown> | undefined> {
+    const row = await this.db.prepare(`
       SELECT s.created_at, s.head_commit, s.dirty_hash, w.root
       FROM snapshots s
       JOIN workspaces w ON w.id = s.workspace_id
@@ -146,7 +169,7 @@ export class V2QueryService {
     const gitDirty = git.available
       ? git.headCommit !== row.head_commit || git.dirtyHash !== row.dirty_hash
       : false;
-    const dirtyFiles = !git.available ? this.computeDirtyFiles(snapshotId) : undefined;
+    const dirtyFiles = !git.available ? await this.computeDirtyFiles(snapshotId) : undefined;
     const dirtyCounts = (dirtyFiles ?? {}) as {
       addedCount?: number;
       modifiedCount?: number;
@@ -171,9 +194,9 @@ export class V2QueryService {
     };
   }
 
-  private snippetOptions(snapshotId: string, args: Record<string, unknown>): SnippetOptions | undefined {
+  private async snippetOptions(snapshotId: string, args: Record<string, unknown>): Promise<SnippetOptions | undefined> {
     if (args.includeSnippets !== true) return undefined;
-    const root = this.workspaceRootForSnapshot(snapshotId);
+    const root = await this.workspaceRootForSnapshot(snapshotId);
     if (!root) return undefined;
     const lines = clampInt(Number(args.snippetLines ?? 12), 3, 80);
     const tokenBudget = clampInt(Number(args.snippetTokenBudget ?? 1200), 100, 12000);
@@ -182,10 +205,11 @@ export class V2QueryService {
       lines,
       budgetChars: tokenBudget * 4,
       usedChars: 0,
+      fileCache: new Map(),
     };
   }
 
-  private searchSymbol(snapshotId: string, args: Record<string, unknown>) {
+  private async searchSymbol(snapshotId: string, args: Record<string, unknown>) {
     const query = String(args.query ?? '*').trim();
     const kind = String(args.kind ?? 'all');
     const limit = Math.min(Number(args.limit ?? 20), 200);
@@ -197,7 +221,7 @@ export class V2QueryService {
     const kindFilter = kindFilterFor(kind);
     const intent = detectSearchIntent(query);
     const filters = searchFiltersFor(args, query);
-    const snippets = this.snippetOptions(snapshotId, args);
+    const snippets = await this.snippetOptions(snapshotId, args);
     const baseClauses = [
       'snapshot_id = ?',
       kindFilter.sql,
@@ -207,8 +231,8 @@ export class V2QueryService {
     const baseWhere = baseClauses.map(clause => `(${clause})`).join(' AND ');
 
     if (query === '*' || tokens.length === 0) {
-      const totalFound = scalar(this.db, `SELECT COUNT(*) FROM symbols WHERE ${baseWhere}`, ...baseParams);
-      const rows = this.db.prepare(`
+      const totalFound = await scalar(this.db, `SELECT COUNT(*) FROM symbols WHERE ${baseWhere}`, ...baseParams);
+      const rows = await this.db.prepare(`
         SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
                package_name, return_type, parameter_types_json, annotations_json,
                framework_role, framework_meta_json, file_role
@@ -243,7 +267,7 @@ export class V2QueryService {
           'No query tokens were supplied, so no per-result ranking score was computed.',
         ]) } : {}),
         confidence: 0.8,
-        confidenceNotes: ['SQLite-backed symbol lookup; exact Java semantic confidence is shown on graph edges.'],
+        confidenceNotes: ['Postgres-backed symbol lookup; exact Java semantic confidence is shown on graph edges.'],
       };
     }
 
@@ -278,7 +302,7 @@ export class V2QueryService {
     }
     const candidateLimit = Math.min(Math.max((cursorOffset + limit) * 50, 500), 5000);
 
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
              package_name, return_type, parameter_types_json, annotations_json,
              framework_role, framework_meta_json, file_role
@@ -328,21 +352,21 @@ export class V2QueryService {
     };
   }
 
-  private searchFiles(snapshotId: string, args: Record<string, unknown>) {
+  private async searchFiles(snapshotId: string, args: Record<string, unknown>) {
     const query = String(args.query ?? '*').trim();
     const limit = Math.min(Number(args.limit ?? 20), 200);
     const cursorOffset = parseCursor(args.cursor);
     const explainRank = Boolean(args.explainRank ?? false);
     const tokens = tokenizeSearchQuery(query);
     const filters = fileFiltersFor(args, query);
-    const snippets = this.snippetOptions(snapshotId, args);
+    const snippets = await this.snippetOptions(snapshotId, args);
     const baseClauses = ['f.snapshot_id = ?', ...filters.sql.map(sql => sql.replace(/\bfile_role\b/g, 'f.file_role'))];
     const baseParams: unknown[] = [snapshotId, ...filters.params];
     const baseWhere = baseClauses.map(clause => `(${clause})`).join(' AND ');
 
     if (query === '*' || tokens.length === 0) {
-      const totalFound = scalar(this.db, `SELECT COUNT(*) FROM files f WHERE ${baseWhere}`, ...baseParams);
-      const rows = this.db.prepare(`
+      const totalFound = await scalar(this.db, `SELECT COUNT(*) FROM files f WHERE ${baseWhere}`, ...baseParams);
+      const rows = await this.db.prepare(`
         SELECT f.path, f.language, f.file_role, f.parse_status, f.size
         FROM files f
         WHERE ${baseWhere}
@@ -360,7 +384,7 @@ export class V2QueryService {
         LIMIT ?
         OFFSET ?
       `).all(...baseParams, limit, cursorOffset) as FileRow[];
-      const evidence = this.fileEvidence(snapshotId, rows.map(row => row.path));
+      const evidence = await this.fileEvidence(snapshotId, rows.map(row => row.path));
       return {
         files: rows.map(row => fileDto(row, evidence.get(row.path), undefined, explainRank, snippets)),
         totalFound,
@@ -465,14 +489,14 @@ export class V2QueryService {
     const candidateLimit = broadConfigSearch
       ? Math.min(Math.max((cursorOffset + limit) * 100, 1000), 5000)
       : Math.min(Math.max((cursorOffset + limit) * 40, 500), 2000);
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT f.path, f.language, f.file_role, f.parse_status, f.size
       FROM files f
       WHERE ${baseWhere}
         AND (${matchClauses.map(clause => `(${clause})`).join(' OR ')})
       LIMIT ?
     `).all(...baseParams, ...matchParams, candidateLimit) as FileRow[];
-    const evidence = this.fileEvidence(snapshotId, rows.map(row => row.path));
+    const evidence = await this.fileEvidence(snapshotId, rows.map(row => row.path));
     const ranked = rows
       .map(row => ({ row, score: scoreFileSearch(row, evidence.get(row.path), query, tokens) }))
       .filter(candidate => candidate.score.matchedTokens.length > 0 || candidate.score.score > roleRank(candidate.row.file_role) / 10)
@@ -505,7 +529,7 @@ export class V2QueryService {
     };
   }
 
-  private findReferences(snapshotId: string, args: Record<string, unknown>) {
+  private async findReferences(snapshotId: string, args: Record<string, unknown>) {
     const symbol = String(args.symbol ?? '');
     const kind = String(args.kind ?? 'all');
     const limit = Math.min(Number(args.limit ?? 100), 500);
@@ -525,8 +549,8 @@ export class V2QueryService {
       ].join(' AND ');
       branches.push(`
         SELECT file, line, column, 'definition' AS kind, simple_name AS symbol_name,
-               fq_name AS source, NULL AS caller, NULL AS callee, NULL AS confidence,
-               NULL AS resolution_kind, file_role
+               fq_name AS source, NULL::text AS caller, NULL::text AS callee, NULL::double precision AS confidence,
+               NULL::text AS resolution_kind, file_role
         FROM symbols
         WHERE ${where}
       `);
@@ -542,8 +566,8 @@ export class V2QueryService {
       ].join(' AND ');
       branches.push(`
         SELECT file, line, 1 AS column, 'import' AS kind, source AS symbol_name,
-               source, NULL AS caller, NULL AS callee, NULL AS confidence,
-               NULL AS resolution_kind, file_role
+               source, NULL::text AS caller, NULL::text AS callee, NULL::double precision AS confidence,
+               NULL::text AS resolution_kind, file_role
         FROM imports
         WHERE ${where}
       `);
@@ -578,7 +602,7 @@ export class V2QueryService {
       };
     }
 
-    const referenceRows = this.db.prepare(`
+    const referenceRows = await this.db.prepare(`
       SELECT * FROM (
         ${branches.join('\nUNION ALL\n')}
       )
@@ -587,7 +611,10 @@ export class V2QueryService {
       OFFSET ?
     `).all(...params, limit, cursorOffset) as Array<Record<string, unknown>>;
     const references = referenceRows.map(referenceDto);
-    const totalCount = countQueries.reduce((sum, query) => sum + scalar(this.db, query.sql, ...query.params), 0);
+    let totalCount = 0;
+    for (const query of countQueries) {
+      totalCount += await scalar(this.db, query.sql, ...query.params);
+    }
 
     return {
       symbol,
@@ -602,21 +629,21 @@ export class V2QueryService {
     };
   }
 
-  private getFileSummary(snapshotId: string, args: Record<string, unknown>) {
+  private async getFileSummary(snapshotId: string, args: Record<string, unknown>) {
     const file = String(args.file ?? '');
-    const resolved = this.resolveFile(snapshotId, file);
+    const resolved = await this.resolveFile(snapshotId, file);
     if (!resolved) return { error: `File "${file}" not found in index.` };
-    const snippets = this.snippetOptions(snapshotId, args);
+    const snippets = await this.snippetOptions(snapshotId, args);
 
-    const symbols = this.db.prepare(`
+    const symbols = await this.db.prepare(`
       SELECT * FROM symbols WHERE snapshot_id = ? AND file = ? ORDER BY line
     `).all(snapshotId, resolved) as SymbolRow[];
-    const imports = this.db.prepare(`
+    const imports = await this.db.prepare(`
       SELECT source, imported_symbols_json, line, is_external FROM imports
       WHERE snapshot_id = ? AND file = ? ORDER BY line
     `).all(snapshotId, resolved) as Array<{ source: string; imported_symbols_json: string; line: number; is_external: number }>;
-    const deps = this.dependencyRows(snapshotId, resolved, 'from_file');
-    const dependents = this.dependencyRows(snapshotId, resolved, 'to_file');
+    const deps = await this.dependencyRows(snapshotId, resolved, 'from_file');
+    const dependents = await this.dependencyRows(snapshotId, resolved, 'to_file');
 
     return {
       file: resolved,
@@ -640,12 +667,12 @@ export class V2QueryService {
     };
   }
 
-  private getFileSlice(snapshotId: string, args: Record<string, unknown>) {
+  private async getFileSlice(snapshotId: string, args: Record<string, unknown>) {
     const requestedFile = args.file ? String(args.file) : '';
     const requestedSymbol = args.symbol ? String(args.symbol) : '';
     const maxChars = clampInt(Number(args.maxChars ?? 8000), 200, 30000);
-    let resolved = requestedFile ? this.resolveFile(snapshotId, requestedFile) : undefined;
-    const symbol = requestedSymbol ? this.lookupBestSymbol(snapshotId, requestedSymbol, resolved) : undefined;
+    let resolved = requestedFile ? await this.resolveFile(snapshotId, requestedFile) : undefined;
+    const symbol = requestedSymbol ? await this.lookupBestSymbol(snapshotId, requestedSymbol, resolved) : undefined;
     if (symbol) resolved = symbol.file;
     if (!resolved) {
       return {
@@ -665,7 +692,7 @@ export class V2QueryService {
       };
     }
 
-    const root = this.workspaceRootForSnapshot(snapshotId);
+    const root = await this.workspaceRootForSnapshot(snapshotId);
     const absolutePath = root ? safeResolve(root, resolved) : undefined;
     if (!absolutePath) return { file: resolved, error: 'Could not safely resolve file under workspace root.' };
 
@@ -723,23 +750,23 @@ export class V2QueryService {
     };
   }
 
-  private getDependencies(snapshotId: string, args: Record<string, unknown>) {
-    const file = this.resolveFile(snapshotId, String(args.module ?? args.file ?? ''));
+  private async getDependencies(snapshotId: string, args: Record<string, unknown>) {
+    const file = await this.resolveFile(snapshotId, String(args.module ?? args.file ?? ''));
     if (!file) return { module: args.module, dependencies: [], totalCount: 0 };
-    const dependencies = this.dependencyRows(snapshotId, file, 'from_file');
+    const dependencies = await this.dependencyRows(snapshotId, file, 'from_file');
     return { module: file, dependencies, totalCount: dependencies.length };
   }
 
-  private getDependents(snapshotId: string, args: Record<string, unknown>) {
-    const file = this.resolveFile(snapshotId, String(args.module ?? args.file ?? ''));
+  private async getDependents(snapshotId: string, args: Record<string, unknown>) {
+    const file = await this.resolveFile(snapshotId, String(args.module ?? args.file ?? ''));
     if (!file) return { module: args.module, direct: [], directCount: 0 };
-    const direct = this.dependencyRows(snapshotId, file, 'to_file');
+    const direct = await this.dependencyRows(snapshotId, file, 'to_file');
     return { module: file, direct, directCount: direct.length };
   }
 
-  private getCallers(snapshotId: string, args: Record<string, unknown>) {
+  private async getCallers(snapshotId: string, args: Record<string, unknown>) {
     const symbol = String(args.symbol ?? args.target ?? '');
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT caller, callee, file, line, confidence, resolution_kind
       FROM call_edges
       WHERE snapshot_id = ? AND callee LIKE ? ESCAPE '\\'
@@ -749,9 +776,9 @@ export class V2QueryService {
     return { symbol, callers: rows, totalCount: rows.length };
   }
 
-  private getCallees(snapshotId: string, args: Record<string, unknown>) {
+  private async getCallees(snapshotId: string, args: Record<string, unknown>) {
     const symbol = String(args.symbol ?? args.source ?? '');
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT caller, callee, file, line, confidence, resolution_kind
       FROM call_edges
       WHERE snapshot_id = ? AND caller LIKE ? ESCAPE '\\'
@@ -761,14 +788,14 @@ export class V2QueryService {
     return { symbol, callees: rows, totalCount: rows.length };
   }
 
-  private findEndpoints(snapshotId: string, args: Record<string, unknown>) {
+  private async findEndpoints(snapshotId: string, args: Record<string, unknown>) {
     const method = String(args.method ?? 'all').toUpperCase();
     const pathPattern = args.path ? `%${escapeLike(String(args.path))}%` : '%';
     const limit = Math.min(Number(args.limit ?? 200), 500);
     const cursorOffset = parseCursor(args.cursor);
     const explainRank = Boolean(args.explainRank ?? false);
-    const snippets = this.snippetOptions(snapshotId, args);
-    const rows = this.db.prepare(`
+    const snippets = await this.snippetOptions(snapshotId, args);
+    const rows = await this.db.prepare(`
       SELECT method, path, path_resolution, path_resolution_reason,
              handler_symbol, controller, file, line, framework, confidence, file_role
       FROM endpoints
@@ -783,7 +810,7 @@ export class V2QueryService {
       LIMIT ?
       OFFSET ?
     `).all(snapshotId, method, method, pathPattern, limit, cursorOffset) as EndpointRow[];
-    const totalCount = scalar(this.db, `
+    const totalCount = await scalar(this.db, `
       SELECT COUNT(*) FROM endpoints
       WHERE snapshot_id = ?
         AND (? = 'ALL' OR method = ?)
@@ -806,19 +833,19 @@ export class V2QueryService {
     };
   }
 
-  private getImpactRadius(snapshotId: string, args: Record<string, unknown>) {
+  private async getImpactRadius(snapshotId: string, args: Record<string, unknown>) {
     const target = String(args.target ?? args.module ?? '');
-    const file = this.resolveFile(snapshotId, target);
+    const file = await this.resolveFile(snapshotId, target);
     const symbolLike = `%${escapeLike(target)}%`;
-    const direct = file ? this.dependencyRows(snapshotId, file, 'to_file') : [];
-    const callers = this.db.prepare(`
+    const direct = file ? await this.dependencyRows(snapshotId, file, 'to_file') : [];
+    const callers = await this.db.prepare(`
       SELECT caller, callee, file, line, confidence, resolution_kind
       FROM call_edges
       WHERE snapshot_id = ? AND callee LIKE ? ESCAPE '\\'
       ORDER BY confidence DESC
       LIMIT 100
     `).all(snapshotId, symbolLike) as CallEdgeRow[];
-    const endpoints = this.impactedEndpoints(snapshotId, direct.map(row => String(row.modulePath ?? row.file ?? '')));
+    const endpoints = await this.impactedEndpoints(snapshotId, direct.map(row => String(row.modulePath ?? row.file ?? '')));
     const score = direct.length + callers.length + endpoints.length;
     return {
       target,
@@ -831,14 +858,15 @@ export class V2QueryService {
     };
   }
 
-  private traceDependencies(snapshotId: string, args: Record<string, unknown>) {
+  private async traceDependencies(snapshotId: string, args: Record<string, unknown>) {
     const target = String(args.target ?? args.module ?? args.file ?? '');
     const direction = normalizeDependencyDirection(String(args.direction ?? 'both'));
     const maxDepth = Math.max(1, Math.min(Number(args.depth ?? 2), 5));
     const limit = Math.min(Number(args.limit ?? 200), 1000);
     const filters = fileFiltersFor(args, target);
-    const fileRoles = this.fileRoleMap(snapshotId);
-    const seedFiles = this.seedFilesForDependencyTrace(snapshotId, target, filters).filter(file => fileAllowedByRole(file, fileRoles, filters));
+    const fileRoles = await this.fileRoleMap(snapshotId);
+    const seedFiles = (await this.seedFilesForDependencyTrace(snapshotId, target, filters))
+      .filter(file => fileAllowedByRole(file, fileRoles, filters));
     const edges: DependencyTraceEdge[] = [];
     const cycleHints: DependencyTraceEdge[] = [];
     const visited = new Set(seedFiles);
@@ -848,7 +876,7 @@ export class V2QueryService {
     while (queue.length > 0 && edges.length < limit) {
       const current = queue.shift()!;
       if (current.depth >= maxDepth) continue;
-      const nextEdges = this.dependencyTraceRows(snapshotId, current.file, direction);
+      const nextEdges = await this.dependencyTraceRows(snapshotId, current.file, direction);
       for (const edge of nextEdges) {
         if (edges.length >= limit) break;
         const neighbor = edge.fromFile === current.file ? edge.toFile : edge.fromFile;
@@ -873,7 +901,7 @@ export class V2QueryService {
 
     return {
       target,
-      resolvedAs: seedFiles.length === 1 && this.resolveFile(snapshotId, target) ? 'file' : seedFiles.length > 0 ? 'file-pattern' : 'none',
+      resolvedAs: seedFiles.length === 1 && await this.resolveFile(snapshotId, target) ? 'file' : seedFiles.length > 0 ? 'file-pattern' : 'none',
       direction,
       depth: maxDepth,
       seedFiles,
@@ -885,7 +913,7 @@ export class V2QueryService {
         ...edges.map(edge => edge.fromFile),
         ...edges.map(edge => edge.toFile),
       ]).slice(0, 50),
-      impactedEndpoints: this.impactedEndpoints(snapshotId, [...seedFiles, ...transitiveFiles]),
+      impactedEndpoints: await this.impactedEndpoints(snapshotId, [...seedFiles, ...transitiveFiles]),
       cycleHints,
       truncated: edges.length >= limit,
       filters: filters.effective,
@@ -897,11 +925,11 @@ export class V2QueryService {
     };
   }
 
-  private explainEndpoint(snapshotId: string, args: Record<string, unknown>) {
+  private async explainEndpoint(snapshotId: string, args: Record<string, unknown>) {
     const path = String(args.path ?? '');
     const method = String(args.method ?? 'all').toUpperCase();
-    const snippets = this.snippetOptions(snapshotId, args);
-    const endpointRows = this.db.prepare(`
+    const snippets = await this.snippetOptions(snapshotId, args);
+    const endpointRows = await this.db.prepare(`
       SELECT method, path, path_resolution, path_resolution_reason,
              handler_symbol, controller, file, line, framework, confidence, file_role
       FROM endpoints
@@ -917,14 +945,14 @@ export class V2QueryService {
         path,
         method,
         error: 'No indexed endpoint matched the requested method/path.',
-        suggestions: (this.findEndpoints(snapshotId, { path, limit: 10 }) as { endpoints: unknown[] }).endpoints,
+        suggestions: ((await this.findEndpoints(snapshotId, { path, limit: 10 })) as { endpoints: unknown[] }).endpoints,
       };
     }
 
-    const callChain = this.traceCallees(snapshotId, endpoint.handler_symbol, Number(args.depth ?? 3));
+    const callChain = await this.traceCallees(snapshotId, endpoint.handler_symbol, Number(args.depth ?? 3));
     const graphFiles = rankFiles([endpoint.file, ...callChain.map(edge => edge.file)]).slice(0, 30);
-    const relatedSymbols = this.symbolsForFiles(snapshotId, graphFiles, snippets);
-    const tests = this.findRelevantTests(snapshotId, endpoint.handler_symbol, 20);
+    const relatedSymbols = await this.symbolsForFiles(snapshotId, graphFiles, snippets);
+    const tests = await this.findRelevantTests(snapshotId, endpoint.handler_symbol, 20);
 
     return {
       endpoint: endpointDto(endpoint, snippets),
@@ -948,18 +976,18 @@ export class V2QueryService {
     };
   }
 
-  private impactOfSymbol(snapshotId: string, args: Record<string, unknown>) {
+  private async impactOfSymbol(snapshotId: string, args: Record<string, unknown>) {
     const target = String(args.symbol ?? args.target ?? '');
-    const definitions = (this.searchSymbol(snapshotId, {
+    const definitions = ((await this.searchSymbol(snapshotId, {
       ...args,
       query: target,
       limit: Number(args.limit ?? 10),
       includeTests: false,
       explainRank: true,
-    }) as { symbols: unknown[] }).symbols;
-    const callers = (this.getCallers(snapshotId, { symbol: target, limit: 100 }) as { callers: CallEdgeRow[] }).callers;
-    const callees = (this.getCallees(snapshotId, { symbol: target, limit: 100 }) as { callees: CallEdgeRow[] }).callees;
-    const impact = this.getImpactRadius(snapshotId, { target }) as Record<string, unknown>;
+    })) as { symbols: unknown[] }).symbols;
+    const callers = ((await this.getCallers(snapshotId, { symbol: target, limit: 100 })) as { callers: CallEdgeRow[] }).callers;
+    const callees = ((await this.getCallees(snapshotId, { symbol: target, limit: 100 })) as { callees: CallEdgeRow[] }).callees;
+    const impact = await this.getImpactRadius(snapshotId, { target }) as Record<string, unknown>;
 
     return {
       target,
@@ -967,7 +995,7 @@ export class V2QueryService {
       callers,
       callees,
       endpointsAffected: impact.impactedEndpoints ?? [],
-      testsLikelyRelevant: this.findRelevantTests(snapshotId, target, 30),
+      testsLikelyRelevant: await this.findRelevantTests(snapshotId, target, 30),
       topFiles: rankFiles([
         ...callers.map(call => call.file),
         ...callees.map(call => call.file),
@@ -978,7 +1006,7 @@ export class V2QueryService {
     };
   }
 
-  private simulatePatchImpact(snapshotId: string, args: Record<string, unknown>) {
+  private async simulatePatchImpact(snapshotId: string, args: Record<string, unknown>) {
     const limit = clampInt(Number(args.limit ?? 50), 1, 200);
     const requestedFiles = stringArray(args.files).map(normalizePatchPath).filter(Boolean);
     const diffFiles = parsePatchFilePaths(stringOrUndefined(args.diff) ?? '');
@@ -986,7 +1014,7 @@ export class V2QueryService {
     const resolvedFileInputs: Array<{ input: string; file: string }> = [];
     const unresolvedFiles: string[] = [];
     for (const input of fileInputs) {
-      const resolved = this.resolveFile(snapshotId, input);
+      const resolved = await this.resolveFile(snapshotId, input);
       if (resolved) resolvedFileInputs.push({ input, file: resolved });
       else unresolvedFiles.push(input);
     }
@@ -996,7 +1024,7 @@ export class V2QueryService {
     const symbolRows: SymbolRow[] = [];
     const unresolvedSymbols: string[] = [];
     for (const symbol of requestedSymbols) {
-      const row = this.lookupBestSymbol(snapshotId, symbol);
+      const row = await this.lookupBestSymbol(snapshotId, symbol);
       if (!row) {
         unresolvedSymbols.push(symbol);
         continue;
@@ -1010,17 +1038,17 @@ export class V2QueryService {
       ...symbolRows.map(row => row.file),
     ]).slice(0, limit);
     const touchedSymbols = uniqueSymbolCandidates(
-      this.symbolsForFiles(snapshotId, changedFiles)
+      (await this.symbolsForFiles(snapshotId, changedFiles))
         .map(symbol => compactSymbolCandidate(symbol, 'symbol declared in a changed file')),
     ).slice(0, limit);
-    const changedEndpoints = compactEndpointCandidates(this.impactedEndpoints(snapshotId, changedFiles));
+    const changedEndpoints = compactEndpointCandidates(await this.impactedEndpoints(snapshotId, changedFiles));
 
     const dependencyRows = uniqueRecordsBy(
-      changedFiles.flatMap(file => this.dependencyRows(snapshotId, file, 'from_file')),
+      (await Promise.all(changedFiles.map(file => this.dependencyRows(snapshotId, file, 'from_file')))).flat(),
       row => `${row.file}:${row.type}:${row.resolutionKind}`,
     );
     const dependentRows = uniqueRecordsBy(
-      changedFiles.flatMap(file => this.dependencyRows(snapshotId, file, 'to_file')),
+      (await Promise.all(changedFiles.map(file => this.dependencyRows(snapshotId, file, 'to_file')))).flat(),
       row => `${row.file}:${row.type}:${row.resolutionKind}`,
     );
 
@@ -1031,10 +1059,10 @@ export class V2QueryService {
       ...touchedSymbols.flatMap(symbol => [symbol.symbol, symbol.name]),
     ]).slice(0, callSeedLimit);
     const callers = uniqueCallEdges(
-      callSeeds.flatMap(symbol => (this.getCallers(snapshotId, { symbol, limit: 25 }) as { callers: CallEdgeRow[] }).callers),
+      (await Promise.all(callSeeds.map(async symbol => ((await this.getCallers(snapshotId, { symbol, limit: 25 })) as { callers: CallEdgeRow[] }).callers))).flat(),
     ).slice(0, limit * 2);
     const callees = uniqueCallEdges(
-      callSeeds.flatMap(symbol => (this.getCallees(snapshotId, { symbol, limit: 25 }) as { callees: CallEdgeRow[] }).callees),
+      (await Promise.all(callSeeds.map(async symbol => ((await this.getCallees(snapshotId, { symbol, limit: 25 })) as { callees: CallEdgeRow[] }).callees))).flat(),
     ).slice(0, limit * 2);
 
     const impactedFiles = rankFiles([
@@ -1044,14 +1072,14 @@ export class V2QueryService {
       ...callers.map(call => call.file),
       ...callees.map(call => call.file),
     ]).slice(0, limit);
-    const impactedEndpoints = compactEndpointCandidates(this.impactedEndpoints(snapshotId, impactedFiles)).slice(0, limit);
+    const impactedEndpoints = compactEndpointCandidates(await this.impactedEndpoints(snapshotId, impactedFiles)).slice(0, limit);
     const testSeeds = uniqueStrings([
       ...requestedSymbols,
       ...changedFiles.map(file => path.posix.basename(file, path.posix.extname(file))),
       ...touchedSymbols.flatMap(symbol => [symbol.symbol, symbol.name]),
     ]).slice(0, 32);
-    const tests = args.skipLikelyTests === true ? [] : this.findRelevantTestsForSeeds(snapshotId, testSeeds, limit);
-    const validation = this.validationHints(snapshotId, tests, impactedFiles.length > 0 ? impactedFiles : changedFiles);
+    const tests = args.skipLikelyTests === true ? [] : await this.findRelevantTestsForSeeds(snapshotId, testSeeds, limit);
+    const validation = await this.validationHints(snapshotId, tests, impactedFiles.length > 0 ? impactedFiles : changedFiles);
     const riskFlags = patchRiskFlags({
       changedFiles,
       touchedSymbols,
@@ -1122,7 +1150,7 @@ export class V2QueryService {
     };
   }
 
-  private reviewPatch(snapshotId: string, args: Record<string, unknown>) {
+  private async reviewPatch(snapshotId: string, args: Record<string, unknown>) {
     const limit = clampInt(Number(args.limit ?? 50), 1, 200);
     const focus = normalizeReviewFocus(String(args.focus ?? 'general'));
     const outputMode = normalizeReviewOutputMode(String(args.outputMode ?? 'compact'));
@@ -1130,14 +1158,14 @@ export class V2QueryService {
     const diff = stringOrUndefined(args.diff) ?? '';
     const allHunks = parsePatchHunks(diff);
     const diffStats = patchDiffStats(allHunks, diff);
-    const impact = this.simulatePatchImpact(snapshotId, {
+    const impact = await this.simulatePatchImpact(snapshotId, {
       ...args,
       limit,
       callSeedLimit: 0,
       skipLikelyTests: args.includeLikelyTests !== true,
     }) as Record<string, unknown>;
     const hunks = rankPatchHunks(allHunks).slice(0, Math.max(budget.maxLineFocus, budget.maxFindings));
-    const lineMapping = this.patchLineMappings(snapshotId, hunks);
+    const lineMapping = await this.patchLineMappings(snapshotId, hunks);
     const changedFiles = stringArray(impact.changedFiles);
     const tests = arrayRecords(impact.testsLikelyRelevant);
     const validation = isPlainObject(impact.validation) ? impact.validation : {};
@@ -1204,9 +1232,9 @@ export class V2QueryService {
     };
   }
 
-  private patchLineMappings(snapshotId: string, hunks: PatchHunk[]): Map<PatchHunk, PatchLineMapping> {
+  private async patchLineMappings(snapshotId: string, hunks: PatchHunk[]): Promise<Map<PatchHunk, PatchLineMapping>> {
     const result = new Map<PatchHunk, PatchLineMapping>();
-    const root = this.workspaceRootForSnapshot(snapshotId);
+    const root = await this.workspaceRootForSnapshot(snapshotId);
     if (!root) {
       for (const hunk of hunks) {
         result.set(hunk, {
@@ -1224,7 +1252,7 @@ export class V2QueryService {
         result.set(hunk, { confidence: 'low', exactSliceSafe: false, reason: 'diff hunk has no file path' });
         continue;
       }
-      const resolved = this.resolveFile(snapshotId, hunk.file) ?? hunk.file;
+      const resolved = await this.resolveFile(snapshotId, hunk.file) ?? hunk.file;
       let sourceLines = cache.get(resolved);
       if (!cache.has(resolved)) {
         const absolutePath = safeResolve(root, resolved);
@@ -1240,10 +1268,10 @@ export class V2QueryService {
     return result;
   }
 
-  private findTestsFor(snapshotId: string, args: Record<string, unknown>) {
+  private async findTestsFor(snapshotId: string, args: Record<string, unknown>) {
     const target = String(args.symbol ?? args.target ?? '');
     const limit = Math.min(Number(args.limit ?? 50), 200);
-    const tests = this.findRelevantTests(snapshotId, target, limit);
+    const tests = await this.findRelevantTests(snapshotId, target, limit);
     return {
       target,
       tests,
@@ -1255,20 +1283,20 @@ export class V2QueryService {
     };
   }
 
-  private getResearchPack(snapshotId: string, args: Record<string, unknown>) {
+  private async getResearchPack(snapshotId: string, args: Record<string, unknown>) {
     const target = String(args.target ?? '').trim();
     const tokenBudget = clampInt(Number(args.tokenBudget ?? 8000), 1000, 12000);
     const preferredFileRole = String(args.fileRole ?? 'main_source');
-    const preferredLanguage = args.language ? String(args.language) : this.dominantResearchLanguage(snapshotId);
+    const preferredLanguage = args.language ? String(args.language) : await this.dominantResearchLanguage(snapshotId);
     const seedTerms = researchSeedTerms(target);
-    const explicitSymbols = this.explicitResearchSymbols(
+    const explicitSymbols = await this.explicitResearchSymbols(
       snapshotId,
       target,
       preferredFileRole,
       preferredLanguage,
       8,
     );
-    const explicitFiles = this.explicitResearchFiles(
+    const explicitFiles = await this.explicitResearchFiles(
       snapshotId,
       target,
       preferredFileRole,
@@ -1279,7 +1307,7 @@ export class V2QueryService {
     const symbolRows: Array<Record<string, unknown>> = [];
     if (!explicitFastPath) {
       for (const query of researchSymbolQueries(target, seedTerms)) {
-        const result = this.searchSymbol(snapshotId, {
+        const result = await this.searchSymbol(snapshotId, {
           ...args,
           query,
           fileRole: preferredFileRole,
@@ -1307,7 +1335,7 @@ export class V2QueryService {
     const relevantSymbols = (scopedSymbolCandidates.length > 0 ? scopedSymbolCandidates : symbolCandidates).slice(0, 6);
     const fileResults = explicitFastPath
       ? { files: [] as Array<Record<string, unknown>>, totalFound: explicitFiles.length }
-      : this.searchFiles(snapshotId, {
+      : await this.searchFiles(snapshotId, {
         ...args,
         query: target,
         fileRole: preferredFileRole,
@@ -1337,8 +1365,8 @@ export class V2QueryService {
 
     const edgeSeeds = explicitFastPath ? [] : relevantSymbols.slice(0, 4);
     const candidateFileSet = new Set(candidateFiles.map(file => file.file));
-    const callersRaw = edgeSeeds.length > 0 ? this.researchCallEdges(snapshotId, edgeSeeds, 'callers', 8) : [];
-    const calleesRaw = edgeSeeds.length > 0 ? this.researchCallEdges(snapshotId, edgeSeeds, 'callees', 8) : [];
+    const callersRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callers', 8) : [];
+    const calleesRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callees', 8) : [];
     const callers = explicitFiles.length > 0
       ? callersRaw.filter(edge => candidateFileSet.has(edge.file)).slice(0, 8)
       : callersRaw;
@@ -1347,7 +1375,7 @@ export class V2QueryService {
       : calleesRaw;
     const endpointNeedle = endpointNeedleForResearch(target);
     const endpointSearch = endpointNeedle
-      ? this.findEndpoints(snapshotId, {
+      ? await this.findEndpoints(snapshotId, {
         ...args,
         path: endpointNeedle,
         method: args.method ?? 'all',
@@ -1363,7 +1391,7 @@ export class V2QueryService {
       ...callees.map(edge => edge.file),
       ...impactedEndpoints.map(endpoint => endpoint.file),
     ]).slice(0, 8);
-    const evidenceSlices = this.researchEvidenceSlices(
+    const evidenceSlices = await this.researchEvidenceSlices(
       snapshotId,
       relevantSymbols,
       candidateFiles,
@@ -1454,14 +1482,14 @@ export class V2QueryService {
     };
   }
 
-  private explicitResearchFiles(
+  private async explicitResearchFiles(
     snapshotId: string,
     target: string,
     preferredFileRole: string,
     preferredLanguage: string | undefined,
     limit: number,
-  ): Array<ReturnType<typeof compactFileCandidate>> {
-    const rootBasename = compactSearchText(path.basename(this.workspaceRootForSnapshot(snapshotId) ?? ''));
+  ): Promise<Array<ReturnType<typeof compactFileCandidate>>> {
+    const rootBasename = compactSearchText(path.basename(await this.workspaceRootForSnapshot(snapshotId) ?? ''));
     const needles = explicitFileNeedles(target)
       .filter(needle => path.posix.extname(needle))
       .filter(needle => isPreferredLanguageFileNeedle(needle, preferredLanguage))
@@ -1471,7 +1499,15 @@ export class V2QueryService {
       });
     if (needles.length === 0) return [];
     const files: string[] = [];
-    const root = this.workspaceRootForSnapshot(snapshotId);
+    const root = await this.workspaceRootForSnapshot(snapshotId);
+    const explicitRangeCache = new Map<string, string | undefined>();
+    const explicitRangeFor = (file: string, requireMemberMatch = false): string | undefined => {
+      const key = `${file}\0${requireMemberMatch ? 'member' : 'any'}`;
+      if (!explicitRangeCache.has(key)) {
+        explicitRangeCache.set(key, bestExplicitSourceRange(root, file, target, requireMemberMatch));
+      }
+      return explicitRangeCache.get(key);
+    };
     for (const needle of needles.slice(0, 12)) {
       const normalized = needle.replace(/\\/g, '/');
       const basename = path.posix.basename(normalized);
@@ -1485,7 +1521,7 @@ export class V2QueryService {
         filters.push('language = ?');
         params.push(preferredLanguage);
       }
-      const rows = this.db.prepare(`
+      const rows = await this.db.prepare(`
         SELECT path
         FROM files
         WHERE ${filters.join(' AND ')}
@@ -1493,8 +1529,8 @@ export class V2QueryService {
         LIMIT 50
       `).all(...params) as Array<{ path: string }>;
       rows.sort((a, b) => {
-        const aHasExplicitRange = bestExplicitSourceRange(root, a.path, target, true) ? 0 : 1;
-        const bHasExplicitRange = bestExplicitSourceRange(root, b.path, target, true) ? 0 : 1;
+        const aHasExplicitRange = explicitRangeFor(a.path, true) ? 0 : 1;
+        const bHasExplicitRange = explicitRangeFor(b.path, true) ? 0 : 1;
         return aHasExplicitRange - bHasExplicitRange || a.path.length - b.path.length || a.path.localeCompare(b.path);
       });
       files.push(...rows.slice(0, 1).map(row => row.path));
@@ -1503,7 +1539,7 @@ export class V2QueryService {
     const orderedFiles = uniqueFilesInOrder(files).slice(0, limit * 2);
     if (orderedFiles.length === 0) return [];
     const placeholders = orderedFiles.map(() => '?').join(', ');
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT path, language, file_role
       FROM files
       WHERE snapshot_id = ? AND path IN (${placeholders})
@@ -1518,7 +1554,7 @@ export class V2QueryService {
           file,
           language: row?.language,
           fileRole: row?.file_role,
-          lines: bestExplicitSourceRange(root, file, target) ?? '1-80',
+          lines: explicitRangeFor(file) ?? '1-80',
           whyRelevant: `explicit file/class mention: ${file}`,
           confidence: 0.95,
           matchedTokens: [basename],
@@ -1528,13 +1564,13 @@ export class V2QueryService {
       });
   }
 
-  private explicitResearchSymbols(
+  private async explicitResearchSymbols(
     snapshotId: string,
     target: string,
     preferredFileRole: string,
     preferredLanguage: string | undefined,
     limit: number,
-  ): ResearchSymbolCandidate[] {
+  ): Promise<ResearchSymbolCandidate[]> {
     const refs = explicitSymbolRefs(target);
     if (refs.length === 0) return [];
 
@@ -1564,7 +1600,7 @@ export class V2QueryService {
       if (ref.member) {
         const fileLike = `%/${escapeLike(ref.className)}.%`;
         const fqLike = `%${escapeLike(ref.className)}.${escapeLike(ref.member)}%`;
-        rows.push(...this.db.prepare(`
+        rows.push(...await this.db.prepare(`
           ${select}
           WHERE ${baseWhere}
             AND simple_name = ?
@@ -1594,7 +1630,7 @@ export class V2QueryService {
       }
       if (classesWithMemberRefs.has(ref.className)) continue;
 
-      rows.push(...this.db.prepare(`
+      rows.push(...await this.db.prepare(`
         ${select}
         WHERE ${baseWhere}
           AND simple_name = ?
@@ -1610,8 +1646,8 @@ export class V2QueryService {
     ))).slice(0, limit);
   }
 
-  private dominantResearchLanguage(snapshotId: string): string | undefined {
-    const rows = this.db.prepare(`
+  private async dominantResearchLanguage(snapshotId: string): Promise<string | undefined> {
+    const rows = await this.db.prepare(`
       SELECT language, COUNT(*) AS count
       FROM files
       WHERE snapshot_id = ?
@@ -1628,18 +1664,18 @@ export class V2QueryService {
     return undefined;
   }
 
-  private researchCallEdges(
+  private async researchCallEdges(
     snapshotId: string,
     symbols: ResearchSymbolCandidate[],
     direction: 'callers' | 'callees',
     limit: number,
-  ): CallEdgeRow[] {
+  ): Promise<CallEdgeRow[]> {
     const column = direction === 'callers' ? 'callee' : 'caller';
     const needles = researchEdgeNeedles(symbols).slice(0, 8);
     if (needles.length === 0) return [];
     const clauses = needles.map(() => `${column} LIKE ? ESCAPE '\\'`).join(' OR ');
     const params = [snapshotId, ...needles.map(needle => `%${escapeLike(needle)}%`), limit];
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT caller, callee, file, line, confidence, resolution_kind
       FROM call_edges
       WHERE snapshot_id = ?
@@ -1651,15 +1687,15 @@ export class V2QueryService {
     return uniqueCallEdges(rows);
   }
 
-  private researchEvidenceSlices(
+  private async researchEvidenceSlices(
     snapshotId: string,
     symbols: ResearchSymbolCandidate[],
     files: ResearchFileCandidate[],
     seedTerms: string[],
     budgetChars: number,
-  ): Array<Record<string, unknown>> {
+  ): Promise<Array<Record<string, unknown>>> {
     const seeds: Array<{ file: string; lines?: string; symbol?: string; why: string }> = [];
-    const root = this.workspaceRootForSnapshot(snapshotId);
+    const root = await this.workspaceRootForSnapshot(snapshotId);
     for (const file of files) {
       const lines = file.lines || bestSourceRange(root, file.file, seedTerms);
       if (lines) {
@@ -1703,7 +1739,7 @@ export class V2QueryService {
       seen.add(key);
       const remaining = budgetChars - usedChars;
       if (remaining < 500) break;
-      const slice = this.getFileSlice(snapshotId, {
+      const slice = await this.getFileSlice(snapshotId, {
         file: seed.file,
         lines: seed.lines,
         symbol: seed.symbol,
@@ -1726,7 +1762,7 @@ export class V2QueryService {
     return slices;
   }
 
-  private getContextPacket(snapshotId: string, args: Record<string, unknown>) {
+  private async getContextPacket(snapshotId: string, args: Record<string, unknown>) {
     const task = String(args.task ?? '').trim();
     if (!task) return { error: 'get_context_packet requires a non-empty task.' };
 
@@ -1743,9 +1779,9 @@ export class V2QueryService {
       12000,
     );
     const query = [domain, task].filter(Boolean).join(' ');
-    const explicitContext = this.explicitContextMatches(snapshotId, task, domain, maxFiles);
+    const explicitContext = await this.explicitContextMatches(snapshotId, task, domain, maxFiles);
 
-    const files = this.searchFiles(snapshotId, {
+    const files = await this.searchFiles(snapshotId, {
       ...args,
       query,
       limit: maxFiles,
@@ -1757,7 +1793,7 @@ export class V2QueryService {
       snippetLines,
       snippetTokenBudget,
     }) as { files: Array<Record<string, unknown>>; totalFound?: number };
-    const symbols = this.searchSymbol(snapshotId, {
+    const symbols = await this.searchSymbol(snapshotId, {
       ...args,
       query,
       limit: maxSymbols,
@@ -1770,7 +1806,7 @@ export class V2QueryService {
     }) as { symbols: Array<Record<string, unknown>>; totalFound?: number };
     const endpointNeedle = endpointNeedleForTask(task, domain);
     const endpointSearch = endpointNeedle
-      ? this.findEndpoints(snapshotId, {
+      ? await this.findEndpoints(snapshotId, {
         ...args,
         path: endpointNeedle,
         method: 'all',
@@ -1780,7 +1816,7 @@ export class V2QueryService {
       }) as { endpoints: Array<Record<string, unknown>>; totalCount?: number }
       : { endpoints: [], totalCount: 0 };
     const myBatisContext = isMyBatisIntent(query)
-      ? this.myBatisContext(snapshotId, query, maxFiles, maxSymbols)
+      ? await this.myBatisContext(snapshotId, query, maxFiles, maxSymbols)
       : { candidateFiles: [], relevantSymbols: [], topFiles: [] };
     const directEndpointCandidates = compactEndpointCandidates(endpointSearch.endpoints);
     const endpointFileCandidates = directEndpointCandidates.map(endpoint => ({
@@ -1829,9 +1865,9 @@ export class V2QueryService {
       ...topFiles.slice(0, 5).map(file => path.basename(file, path.extname(file))),
     ].filter(seed => seed.length > 0);
     const testsLikelyRelevant = includeTests
-      ? this.findRelevantTestsForSeeds(snapshotId, testSeeds, Math.max(10, maxFiles * 2))
+      ? await this.findRelevantTestsForSeeds(snapshotId, testSeeds, Math.max(10, maxFiles * 2))
       : [];
-    const validation = this.validationHints(snapshotId, testsLikelyRelevant, topFiles);
+    const validation = await this.validationHints(snapshotId, testsLikelyRelevant, topFiles);
     const inferredDomain = domain ?? inferDomain(task, topFiles);
 
     const result = {
@@ -1886,17 +1922,17 @@ export class V2QueryService {
     };
   }
 
-  private myBatisContext(
+  private async myBatisContext(
     snapshotId: string,
     query: string,
     maxFiles: number,
     maxSymbols: number,
-  ): {
+  ): Promise<{
     candidateFiles: Array<ReturnType<typeof compactFileCandidate>>;
     relevantSymbols: Array<ReturnType<typeof compactSymbolCandidate>>;
     topFiles: string[];
-  } {
-    const xmlFiles = this.searchFiles(snapshotId, {
+  }> {
+    const xmlFiles = await this.searchFiles(snapshotId, {
       query,
       limit: Math.max(maxFiles, 8),
       fileRole: 'resource_config',
@@ -1916,7 +1952,7 @@ export class V2QueryService {
     ];
     const myBatisSymbols: Array<Record<string, unknown>> = [];
     for (const role of roles) {
-      const result = this.searchSymbol(snapshotId, {
+      const result = await this.searchSymbol(snapshotId, {
         query,
         frameworkRole: role,
         limit: Math.max(maxSymbols, 8),
@@ -1937,10 +1973,10 @@ export class V2QueryService {
       .slice(0, 1)
       .map(file => String(file.path ?? ''))
       .filter(Boolean);
-    const primaryRelatedFiles = this.relatedMyBatisFiles(snapshotId, primaryXmlFiles, Math.max(maxFiles * 2, 8));
-    const relatedFiles = this.relatedMyBatisFiles(snapshotId, seedFiles, Math.max(maxFiles * 3, 12));
-    const primaryRelatedCandidates = this.fileCandidatesForPaths(snapshotId, primaryRelatedFiles, query);
-    const relatedCandidates = this.fileCandidatesForPaths(snapshotId, relatedFiles, query);
+    const primaryRelatedFiles = await this.relatedMyBatisFiles(snapshotId, primaryXmlFiles, Math.max(maxFiles * 2, 8));
+    const relatedFiles = await this.relatedMyBatisFiles(snapshotId, seedFiles, Math.max(maxFiles * 3, 12));
+    const primaryRelatedCandidates = await this.fileCandidatesForPaths(snapshotId, primaryRelatedFiles, query);
+    const relatedCandidates = await this.fileCandidatesForPaths(snapshotId, relatedFiles, query);
     const xmlCandidates = xmlFiles.files.map(row => compactFileCandidate(row));
 
     const candidateFiles = uniqueFileCandidates([
@@ -1965,11 +2001,11 @@ export class V2QueryService {
     };
   }
 
-  private relatedMyBatisFiles(snapshotId: string, files: string[], limit: number): string[] {
+  private async relatedMyBatisFiles(snapshotId: string, files: string[], limit: number): Promise<string[]> {
     const unique = [...new Set(files.filter(Boolean))].slice(0, 50);
     if (unique.length === 0) return [];
     const placeholders = unique.map(() => '?').join(', ');
-    const namespaceEdges = this.db.prepare(`
+    const namespaceEdges = await this.db.prepare(`
       SELECT from_file, to_file, resolution_kind
       FROM dependency_edges
       WHERE snapshot_id = ?
@@ -1989,7 +2025,7 @@ export class V2QueryService {
     const targetFiles = [...new Set([...unique, ...javaMapperFiles])].slice(0, limit * 2);
     if (targetFiles.length === 0) return neighbors.slice(0, limit);
     const javaPlaceholders = targetFiles.map(() => '?').join(', ');
-    const dependents = this.db.prepare(`
+    const dependents = await this.db.prepare(`
       SELECT from_file, to_file, resolution_kind
       FROM dependency_edges
       WHERE snapshot_id = ?
@@ -2009,20 +2045,20 @@ export class V2QueryService {
     ]).slice(0, limit);
   }
 
-  private fileCandidatesForPaths(
+  private async fileCandidatesForPaths(
     snapshotId: string,
     files: string[],
     query: string,
-  ): Array<ReturnType<typeof compactFileCandidate>> {
+  ): Promise<Array<ReturnType<typeof compactFileCandidate>>> {
     const unique = [...new Set(files.filter(Boolean))].slice(0, 100);
     if (unique.length === 0) return [];
     const placeholders = unique.map(() => '?').join(', ');
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT path, language, file_role, parse_status, size
       FROM files
       WHERE snapshot_id = ? AND path IN (${placeholders})
     `).all(snapshotId, ...unique) as FileRow[];
-    const evidence = this.fileEvidence(snapshotId, rows.map(row => row.path));
+    const evidence = await this.fileEvidence(snapshotId, rows.map(row => row.path));
     const tokens = tokenizeSearchQuery(query);
     return rows
       .map((row) => {
@@ -2036,24 +2072,24 @@ export class V2QueryService {
       .map(item => item.candidate);
   }
 
-  private searchCode(snapshotId: string, args: Record<string, unknown>) {
+  private async searchCode(snapshotId: string, args: Record<string, unknown>) {
     const query = String(args.query ?? '').trim();
     const limit = Math.min(Number(args.limit ?? 10), 50);
     const includeReferences = Boolean(args.includeReferences ?? true);
     const includeDependencies = Boolean(args.includeDependencies ?? true);
-    const symbolResults = this.searchSymbol(snapshotId, {
+    const symbolResults = await this.searchSymbol(snapshotId, {
       ...args,
       query,
       limit,
       explainRank: Boolean(args.explainRank ?? false),
     }) as Record<string, unknown>;
-    const fileResults = this.searchFiles(snapshotId, {
+    const fileResults = await this.searchFiles(snapshotId, {
       ...args,
       query,
       limit,
       explainRank: Boolean(args.explainRank ?? false),
     }) as Record<string, unknown>;
-    const endpointResults = this.findEndpoints(snapshotId, {
+    const endpointResults = await this.findEndpoints(snapshotId, {
       ...args,
       path: query,
       method: args.method ?? 'all',
@@ -2061,7 +2097,7 @@ export class V2QueryService {
       explainRank: Boolean(args.explainRank ?? false),
     }) as Record<string, unknown>;
     const references = includeReferences && query
-      ? this.findReferences(snapshotId, {
+      ? await this.findReferences(snapshotId, {
         ...args,
         symbol: query,
         limit,
@@ -2069,7 +2105,7 @@ export class V2QueryService {
       }) as Record<string, unknown>
       : undefined;
     const dependencies = includeDependencies && query
-      ? this.traceDependencies(snapshotId, {
+      ? await this.traceDependencies(snapshotId, {
         ...args,
         target: query,
         depth: args.depth ?? 1,
@@ -2103,32 +2139,32 @@ export class V2QueryService {
     };
   }
 
-  private getIndexStats(snapshotId: string) {
-    const snapshot = this.db.prepare(`
+  private async getIndexStats(snapshotId: string) {
+    const snapshot = await this.db.prepare(`
       SELECT s.*, w.root AS workspace_root
       FROM snapshots s
       JOIN workspaces w ON w.id = s.workspace_id
       WHERE s.id = ?
     `).get(snapshotId);
     const counts = {
-      files: scalar(this.db, 'SELECT COUNT(*) FROM files WHERE snapshot_id = ?', snapshotId),
-      symbols: scalar(this.db, 'SELECT COUNT(*) FROM symbols WHERE snapshot_id = ?', snapshotId),
-      imports: scalar(this.db, 'SELECT COUNT(*) FROM imports WHERE snapshot_id = ?', snapshotId),
-      callEdges: scalar(this.db, 'SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ?', snapshotId),
-      dependencyEdges: scalar(this.db, 'SELECT COUNT(*) FROM dependency_edges WHERE snapshot_id = ?', snapshotId),
-      endpoints: scalar(this.db, 'SELECT COUNT(*) FROM endpoints WHERE snapshot_id = ?', snapshotId),
-      beans: scalar(this.db, 'SELECT COUNT(*) FROM beans WHERE snapshot_id = ?', snapshotId),
+      files: await scalar(this.db, 'SELECT COUNT(*) FROM files WHERE snapshot_id = ?', snapshotId),
+      symbols: await scalar(this.db, 'SELECT COUNT(*) FROM symbols WHERE snapshot_id = ?', snapshotId),
+      imports: await scalar(this.db, 'SELECT COUNT(*) FROM imports WHERE snapshot_id = ?', snapshotId),
+      callEdges: await scalar(this.db, 'SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ?', snapshotId),
+      dependencyEdges: await scalar(this.db, 'SELECT COUNT(*) FROM dependency_edges WHERE snapshot_id = ?', snapshotId),
+      endpoints: await scalar(this.db, 'SELECT COUNT(*) FROM endpoints WHERE snapshot_id = ?', snapshotId),
+      beans: await scalar(this.db, 'SELECT COUNT(*) FROM beans WHERE snapshot_id = ?', snapshotId),
     };
-    const fileRoles = this.db.prepare(`
+    const fileRoles = await this.db.prepare(`
       SELECT file_role, COUNT(*) AS count FROM files WHERE snapshot_id = ? GROUP BY file_role
     `).all(snapshotId);
-    const parseFailures = this.db.prepare(`
+    const parseFailures = await this.db.prepare(`
       SELECT path, language, parse_status FROM files
       WHERE snapshot_id = ? AND parse_status = 'error'
       ORDER BY path
       LIMIT 50
     `).all(snapshotId);
-    const endpointWarnings = this.db.prepare(`
+    const endpointWarnings = await this.db.prepare(`
       SELECT method, path, path_resolution, path_resolution_reason, handler_symbol, file, line
       FROM endpoints
       WHERE snapshot_id = ? AND path_resolution != 'exact'
@@ -2142,9 +2178,9 @@ export class V2QueryService {
       fileRoles,
       diagnostics: {
         parseFailures,
-        staleFiles: this.computeDirtyFiles(snapshotId),
-        topUnresolvedImports: this.topUnresolvedImports(snapshotId),
-        topUnresolvedCalls: this.db.prepare(`
+        staleFiles: await this.computeDirtyFiles(snapshotId),
+        topUnresolvedImports: await this.topUnresolvedImports(snapshotId),
+        topUnresolvedCalls: await this.db.prepare(`
           SELECT callee, COUNT(*) AS count, MAX(confidence) AS maxConfidence
           FROM call_edges
           WHERE snapshot_id = ? AND resolution_kind = 'name-only'
@@ -2154,7 +2190,7 @@ export class V2QueryService {
         `).all(snapshotId),
         frameworkWarnings: {
           endpointPathUnresolved: endpointWarnings,
-          endpointPathUnresolvedCount: scalar(this.db, `
+          endpointPathUnresolvedCount: await scalar(this.db, `
             SELECT COUNT(*) FROM endpoints WHERE snapshot_id = ? AND path_resolution != 'exact'
           `, snapshotId),
         },
@@ -2162,9 +2198,9 @@ export class V2QueryService {
     };
   }
 
-  private dependencyRows(snapshotId: string, file: string, direction: 'from_file' | 'to_file') {
+  private async dependencyRows(snapshotId: string, file: string, direction: 'from_file' | 'to_file') {
     const selectTarget = direction === 'from_file' ? 'to_file' : 'from_file';
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT ${selectTarget} AS file, kind, confidence, resolution_kind
       FROM dependency_edges
       WHERE snapshot_id = ? AND ${direction} = ?
@@ -2181,12 +2217,12 @@ export class V2QueryService {
     }));
   }
 
-  private seedFilesForDependencyTrace(
+  private async seedFilesForDependencyTrace(
     snapshotId: string,
     target: string,
     filters: ReturnType<typeof fileFiltersFor>,
-  ): string[] {
-    const resolved = this.resolveFile(snapshotId, target);
+  ): Promise<string[]> {
+    const resolved = await this.resolveFile(snapshotId, target);
     if (resolved) return [resolved];
     if (!target) return [];
     const normalized = target.replace(/\\/g, '/');
@@ -2194,7 +2230,7 @@ export class V2QueryService {
     const filterSql = filters.sql.length > 0
       ? `AND ${filters.sql.map(sql => `(${sql.replace(/\bfile_role\b/g, 'f.file_role')})`).join(' AND ')}`
       : '';
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT f.path
       FROM files f
       WHERE f.snapshot_id = ?
@@ -2209,11 +2245,11 @@ export class V2QueryService {
     return rows.map(row => row.path);
   }
 
-  private dependencyTraceRows(
+  private async dependencyTraceRows(
     snapshotId: string,
     file: string,
     direction: 'dependencies' | 'dependents' | 'both',
-  ): DependencyTraceEdge[] {
+  ): Promise<DependencyTraceEdge[]> {
     const clauses: string[] = [];
     const params: unknown[] = [snapshotId];
     if (direction === 'dependencies' || direction === 'both') {
@@ -2225,7 +2261,7 @@ export class V2QueryService {
       params.push(file);
     }
     if (clauses.length === 0) return [];
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT from_file, to_file, kind, confidence, resolution_kind
       FROM dependency_edges
       WHERE snapshot_id = ? AND (${clauses.join(' OR ')})
@@ -2248,21 +2284,21 @@ export class V2QueryService {
     }));
   }
 
-  private fileRoleMap(snapshotId: string): Map<string, string> {
-    const rows = this.db.prepare(`
+  private async fileRoleMap(snapshotId: string): Promise<Map<string, string>> {
+    const rows = await this.db.prepare(`
       SELECT path, file_role FROM files WHERE snapshot_id = ?
     `).all(snapshotId) as Array<{ path: string; file_role: string }>;
     return new Map(rows.map(row => [row.path, row.file_role]));
   }
 
-  private resolveFile(snapshotId: string, query: string): string | undefined {
+  private async resolveFile(snapshotId: string, query: string): Promise<string | undefined> {
     if (!query) return undefined;
     const normalized = query.replace(/\\/g, '/');
-    const exact = this.db.prepare('SELECT path FROM files WHERE snapshot_id = ? AND path = ?')
+    const exact = await this.db.prepare('SELECT path FROM files WHERE snapshot_id = ? AND path = ?')
       .get(snapshotId, normalized) as { path: string } | undefined;
     if (exact) return exact.path;
     const basename = normalized.includes('/') ? normalized.substring(normalized.lastIndexOf('/') + 1) : normalized;
-    const row = this.db.prepare(`
+    const row = await this.db.prepare(`
       SELECT path FROM files
       WHERE snapshot_id = ?
         AND (path LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')
@@ -2272,7 +2308,7 @@ export class V2QueryService {
     return row?.path;
   }
 
-  private traceCallees(snapshotId: string, handlerSymbol: string, depth: number): CallEdgeRow[] {
+  private async traceCallees(snapshotId: string, handlerSymbol: string, depth: number): Promise<CallEdgeRow[]> {
     const maxDepth = Math.max(1, Math.min(depth, 5));
     const start = callGraphName(handlerSymbol);
     const queue: Array<{ caller: string; depth: number }> = [{ caller: start, depth: 0 }];
@@ -2283,7 +2319,7 @@ export class V2QueryService {
       const current = queue.shift()!;
       if (current.depth >= maxDepth || seenCallers.has(current.caller)) continue;
       seenCallers.add(current.caller);
-      const rows = this.db.prepare(`
+      const rows = await this.db.prepare(`
         SELECT caller, callee, file, line, confidence, resolution_kind
         FROM call_edges
         WHERE snapshot_id = ? AND caller LIKE ? ESCAPE '\\'
@@ -2299,11 +2335,11 @@ export class V2QueryService {
     return edges;
   }
 
-  private symbolsForFiles(snapshotId: string, files: string[], snippets?: SnippetOptions): Array<Record<string, unknown>> {
+  private async symbolsForFiles(snapshotId: string, files: string[], snippets?: SnippetOptions): Promise<Array<Record<string, unknown>>> {
     const unique = [...new Set(files.filter(Boolean))].slice(0, 200);
     if (unique.length === 0) return [];
     const placeholders = unique.map(() => '?').join(', ');
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
              package_name, return_type, parameter_types_json, annotations_json,
              framework_role, framework_meta_json, file_role
@@ -2315,7 +2351,7 @@ export class V2QueryService {
     return rows.map(row => symbolDto(row, snippets));
   }
 
-  private fileEvidence(snapshotId: string, files: string[]): Map<string, FileEvidence> {
+  private async fileEvidence(snapshotId: string, files: string[]): Promise<Map<string, FileEvidence>> {
     const unique = [...new Set(files.filter(Boolean))].slice(0, 2000);
     const evidence = new Map<string, FileEvidence>();
     for (const file of unique) {
@@ -2329,7 +2365,7 @@ export class V2QueryService {
     if (unique.length === 0) return evidence;
     const placeholders = unique.map(() => '?').join(', ');
 
-    const symbols = this.db.prepare(`
+    const symbols = await this.db.prepare(`
       SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
              package_name, return_type, parameter_types_json, annotations_json,
              framework_role, framework_meta_json, file_role
@@ -2344,7 +2380,7 @@ export class V2QueryService {
       current.symbols.push(symbolDto(row));
     }
 
-    const endpoints = this.db.prepare(`
+    const endpoints = await this.db.prepare(`
       SELECT method, path, path_resolution, path_resolution_reason,
              handler_symbol, controller, file, line, framework, confidence, file_role
       FROM endpoints
@@ -2358,7 +2394,7 @@ export class V2QueryService {
       current.endpoints.push(endpointDto(row));
     }
 
-    const outgoing = this.db.prepare(`
+    const outgoing = await this.db.prepare(`
       SELECT from_file AS file, COUNT(*) AS count
       FROM dependency_edges
       WHERE snapshot_id = ? AND from_file IN (${placeholders})
@@ -2369,7 +2405,7 @@ export class V2QueryService {
       if (current) current.dependencyCounts.outgoing = row.count;
     }
 
-    const incoming = this.db.prepare(`
+    const incoming = await this.db.prepare(`
       SELECT to_file AS file, COUNT(*) AS count
       FROM dependency_edges
       WHERE snapshot_id = ? AND to_file IN (${placeholders})
@@ -2380,7 +2416,7 @@ export class V2QueryService {
       if (current) current.dependencyCounts.incoming = row.count;
     }
 
-    const imports = this.db.prepare(`
+    const imports = await this.db.prepare(`
       SELECT file, COUNT(*) AS count
       FROM imports
       WHERE snapshot_id = ? AND file IN (${placeholders})
@@ -2394,7 +2430,7 @@ export class V2QueryService {
     return evidence;
   }
 
-  private findRelevantTests(snapshotId: string, target: string, limit: number): Array<Record<string, unknown>> {
+  private async findRelevantTests(snapshotId: string, target: string, limit: number): Promise<Array<Record<string, unknown>>> {
     const terms = searchTermsForTarget(target);
     if (terms.length === 0) return [];
     const candidates = new Map<string, { file: string; score: number; reasons: Set<string> }>();
@@ -2408,7 +2444,7 @@ export class V2QueryService {
 
     for (const term of terms) {
       const pattern = `%${escapeLike(term)}%`;
-      const files = this.db.prepare(`
+      const files = await this.db.prepare(`
         SELECT path AS file
         FROM files
         WHERE snapshot_id = ?
@@ -2418,7 +2454,7 @@ export class V2QueryService {
       `).all(snapshotId, pattern) as Array<{ file: string }>;
       for (const row of files) add(row.file, 4, `test file path matches "${term}"`);
 
-      const symbols = this.db.prepare(`
+      const symbols = await this.db.prepare(`
         SELECT DISTINCT file
         FROM symbols
         WHERE snapshot_id = ?
@@ -2428,7 +2464,7 @@ export class V2QueryService {
       `).all(snapshotId, pattern, pattern) as Array<{ file: string }>;
       for (const row of symbols) add(row.file, 3, `test symbol matches "${term}"`);
 
-      const calls = this.db.prepare(`
+      const calls = await this.db.prepare(`
         SELECT DISTINCT file
         FROM call_edges
         WHERE snapshot_id = ?
@@ -2449,34 +2485,35 @@ export class V2QueryService {
       }));
   }
 
-  private explicitContextMatches(
+  private async explicitContextMatches(
     snapshotId: string,
     task: string,
     domain: string | undefined,
     limit: number,
-  ): {
+  ): Promise<{
     candidateFiles: Array<ReturnType<typeof compactFileCandidate>>;
     relevantSymbols: Array<ReturnType<typeof compactSymbolCandidate>>;
     topFiles: string[];
-  } {
-    const resolvedFiles = uniqueFilesInOrder(
-      explicitFileNeedles(task, domain)
-        .map(needle => this.resolveFile(snapshotId, needle))
-        .filter((file): file is string => Boolean(file)),
-    ).slice(0, limit);
+  }> {
+    const resolvedNeedles: string[] = [];
+    for (const needle of explicitFileNeedles(task, domain)) {
+      const resolved = await this.resolveFile(snapshotId, needle);
+      if (resolved) resolvedNeedles.push(resolved);
+    }
+    const resolvedFiles = uniqueFilesInOrder(resolvedNeedles).slice(0, limit);
     if (resolvedFiles.length === 0) {
       return { candidateFiles: [], relevantSymbols: [], topFiles: [] };
     }
 
     const placeholders = resolvedFiles.map(() => '?').join(', ');
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT path, language, file_role, parse_status, size
       FROM files
       WHERE snapshot_id = ? AND path IN (${placeholders})
     `).all(snapshotId, ...resolvedFiles) as FileRow[];
     const rowsByPath = new Map(rows.map(row => [row.path, row]));
     const symbolsByFile = new Map<string, Array<Record<string, unknown>>>();
-    for (const symbol of this.symbolsForFiles(snapshotId, resolvedFiles)) {
+    for (const symbol of await this.symbolsForFiles(snapshotId, resolvedFiles)) {
       const file = String(symbol.file ?? '');
       const current = symbolsByFile.get(file) ?? [];
       current.push(symbol);
@@ -2516,10 +2553,10 @@ export class V2QueryService {
     };
   }
 
-  private findRelevantTestsForSeeds(snapshotId: string, seeds: string[], limit: number): Array<Record<string, unknown>> {
+  private async findRelevantTestsForSeeds(snapshotId: string, seeds: string[], limit: number): Promise<Array<Record<string, unknown>>> {
     const merged = new Map<string, { file: string; score: number; reasons: Set<string> }>();
     for (const seed of [...new Set(seeds.map(item => item.trim()).filter(Boolean))].slice(0, 16)) {
-      for (const test of this.findRelevantTests(snapshotId, seed, limit)) {
+      for (const test of await this.findRelevantTests(snapshotId, seed, limit)) {
         const file = String(test.file ?? '');
         if (!file) continue;
         const existing = merged.get(file) ?? { file, score: 0, reasons: new Set<string>() };
@@ -2538,12 +2575,12 @@ export class V2QueryService {
       }));
   }
 
-  private validationHints(
+  private async validationHints(
     snapshotId: string,
     tests: Array<Record<string, unknown>>,
     topFiles: string[],
-  ): Record<string, unknown> {
-    const root = this.workspaceRootForSnapshot(snapshotId);
+  ): Promise<Record<string, unknown>> {
+    const root = await this.workspaceRootForSnapshot(snapshotId);
     const testFiles = tests.map(test => String(test.file ?? '')).filter(Boolean).slice(0, 8);
     const commands: string[] = [];
     if (root) {
@@ -2570,7 +2607,7 @@ export class V2QueryService {
     };
   }
 
-  private lookupBestSymbol(snapshotId: string, symbol: string, file?: string): SymbolRow | undefined {
+  private async lookupBestSymbol(snapshotId: string, symbol: string, file?: string): Promise<SymbolRow | undefined> {
     const query = symbol.trim();
     if (!query) return undefined;
     const pattern = `%${escapeLike(query)}%`;
@@ -2578,7 +2615,7 @@ export class V2QueryService {
     const params: unknown[] = [snapshotId];
     if (file) params.push(file);
     params.push(query, query, pattern, pattern);
-    return this.db.prepare(`
+    return await this.db.prepare(`
       SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
              package_name, return_type, parameter_types_json, annotations_json,
              framework_role, framework_meta_json, file_role
@@ -2612,8 +2649,8 @@ export class V2QueryService {
     `).get(...params, query, query, pattern) as SymbolRow | undefined;
   }
 
-  private computeDirtyFiles(snapshotId: string): Record<string, unknown> {
-    const snapshot = this.db.prepare(`
+  private async computeDirtyFiles(snapshotId: string): Promise<Record<string, unknown>> {
+    const snapshot = await this.db.prepare(`
       SELECT w.root AS root
       FROM snapshots s
       JOIN workspaces w ON w.id = s.workspace_id
@@ -2624,7 +2661,7 @@ export class V2QueryService {
     try {
       const manifest = scanManifest(snapshot.root);
       const current = new Map(manifest.files.map(file => [file.relPath, file.blobHash]));
-      const indexedRows = this.db.prepare(`
+      const indexedRows = await this.db.prepare(`
         SELECT path, blob_hash FROM files WHERE snapshot_id = ?
       `).all(snapshotId) as Array<{ path: string; blob_hash: string }>;
       const indexed = new Map(indexedRows.map(row => [row.path, row.blob_hash]));
@@ -2655,8 +2692,8 @@ export class V2QueryService {
     }
   }
 
-  private topUnresolvedImports(snapshotId: string): Array<Record<string, unknown>> {
-    const symbols = this.db.prepare(`
+  private async topUnresolvedImports(snapshotId: string): Promise<Array<Record<string, unknown>>> {
+    const symbols = await this.db.prepare(`
       SELECT fq_name, simple_name FROM symbols WHERE snapshot_id = ? AND kind IN ('class', 'interface', 'enum', 'type')
     `).all(snapshotId) as Array<{ fq_name: string; simple_name: string }>;
     const known = new Set<string>();
@@ -2664,7 +2701,7 @@ export class V2QueryService {
       known.add(symbol.fq_name);
       known.add(symbol.simple_name);
     }
-    const imports = this.db.prepare(`
+    const imports = await this.db.prepare(`
       SELECT source FROM imports WHERE snapshot_id = ?
     `).all(snapshotId) as Array<{ source: string }>;
     const counts = new Map<string, number>();
@@ -2680,11 +2717,11 @@ export class V2QueryService {
       .map(([source, count]) => ({ source, count }));
   }
 
-  private impactedEndpoints(snapshotId: string, files: string[]): Array<Record<string, unknown>> {
+  private async impactedEndpoints(snapshotId: string, files: string[]): Promise<Array<Record<string, unknown>>> {
     const unique = [...new Set(files.filter(Boolean))].slice(0, 200);
     if (unique.length === 0) return [];
     const placeholders = unique.map(() => '?').join(', ');
-    const rows = this.db.prepare(`
+    const rows = await this.db.prepare(`
       SELECT method, path, path_resolution, path_resolution_reason,
              handler_symbol, controller, file, line, framework, confidence, file_role
       FROM endpoints
@@ -2809,6 +2846,7 @@ interface SnippetOptions {
   lines: number;
   budgetChars: number;
   usedChars: number;
+  fileCache: Map<string, string>;
 }
 
 function symbolDto(row: SymbolRow, snippets?: SnippetOptions): Record<string, unknown> {
@@ -2942,7 +2980,12 @@ function sourceSnippet(
 
   let content: string;
   try {
-    content = fs.readFileSync(absolutePath, 'utf-8');
+    if (snippets.fileCache.has(absolutePath)) {
+      content = snippets.fileCache.get(absolutePath) ?? '';
+    } else {
+      content = fs.readFileSync(absolutePath, 'utf-8');
+      snippets.fileCache.set(absolutePath, content);
+    }
   } catch {
     return undefined;
   }
@@ -5084,9 +5127,15 @@ function parseJson<T>(value: string | undefined, fallback: T): T {
   }
 }
 
-function scalar(db: DatabaseType, sql: string, ...args: unknown[]): number {
-  const row = db.prepare(sql).get(...args) as Record<string, number> | undefined;
+async function scalar(db: CodeGraphDb, sql: string, ...args: unknown[]): Promise<number> {
+  const row = await db.prepare(sql).get(...args) as Record<string, number> | undefined;
   return row ? Number(Object.values(row)[0] ?? 0) : 0;
+}
+
+function autoRefreshFileLimit(): number {
+  const raw = Number(process.env.CODEGRAPH_AUTO_REFRESH_FILE_LIMIT ?? 10_000);
+  if (!Number.isFinite(raw) || raw < 0) return 10_000;
+  return Math.floor(raw);
 }
 
 function callGraphName(symbol: string): string {

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Database as DatabaseType } from 'better-sqlite3';
+import type { CodeGraphDb } from '../storage/database.js';
 import { classifyFile } from '../index/file-role.js';
 import { scanManifest } from '../index/manifest.js';
 import { V2Indexer } from '../index/indexer.js';
@@ -151,20 +151,20 @@ export function deriveReviewProofTasks(root: string, options: { limit?: number }
   return tasks.length > 0 ? tasks : defaultReviewProofTasks();
 }
 
-export function runReviewProofEval(
-  db: DatabaseType,
+export async function runReviewProofEval(
+  db: CodeGraphDb,
   root: string,
   tasks: ReviewProofTask[],
   options: { skipIndex?: boolean } = {},
-): ReviewProofResult {
+): Promise<ReviewProofResult> {
   const indexer = new V2Indexer(db);
-  const workspace = options.skipIndex ? indexer.registerWorkspace(root) : undefined;
+  const workspace = options.skipIndex ? await indexer.registerWorkspace(root) : undefined;
   const index = options.skipIndex && workspace?.currentSnapshotId
     ? {
       workspaceId: workspace.workspaceId,
       snapshotId: workspace.currentSnapshotId,
     }
-    : indexer.indexWorkspace({ root });
+    : await indexer.indexWorkspace({ root });
   const queryService = new V2QueryService(db);
   const normalizedRoot = path.resolve(root);
   const manifest = scanBaselineManifest(normalizedRoot);
@@ -172,7 +172,7 @@ export function runReviewProofEval(
 
   for (const task of tasks) {
     const baseline = runBaselineReviewProof(manifest, task);
-    const mcp = runMcpReviewProof(queryService, index.workspaceId, task);
+    const mcp = await runMcpReviewProof(queryService, index.workspaceId, task);
     const missingExpected = (task.expectedContains ?? [])
       .filter(expected => !mcp.evidence.toLowerCase().includes(expected.toLowerCase()));
     const missingExpectedFiles = (task.expectedFiles ?? [])
@@ -323,11 +323,11 @@ function walkBaselineManifest(root: string, dir: string, files: BaselineManifest
   }
 }
 
-function runMcpReviewProof(
+async function runMcpReviewProof(
   queryService: V2QueryService,
   workspaceId: string,
   task: ReviewProofTask,
-): McpReviewProofResult & { evidence: string } {
+): Promise<McpReviewProofResult & { evidence: string }> {
   const args = {
     files: task.files,
     symbols: task.symbols,
@@ -336,7 +336,7 @@ function runMcpReviewProof(
     limit: task.limit ?? 50,
   };
   const start = Date.now();
-  const response = queryService.query({
+  const response = await queryService.query({
     workspaceId,
     toolName: 'review_patch',
     args,

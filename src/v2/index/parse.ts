@@ -23,6 +23,16 @@ export interface ParseWorkResult {
 
 export interface ParseBatchOptions {
   workers?: number;
+  progress?: (event: ParseBatchProgressEvent) => void;
+}
+
+export interface ParseBatchProgressEvent {
+  phase: 'parse';
+  status: 'start' | 'progress' | 'complete' | 'fallback';
+  completed: number;
+  total: number;
+  workers: number;
+  elapsedMs: number;
 }
 
 export function parseFile(absPath: string, rootDir: string): ParseResult {
@@ -46,7 +56,7 @@ export function parseFile(absPath: string, rootDir: string): ParseResult {
   }
 
   if (absPath.endsWith('.java')) {
-    detectFrameworkRoles(result.symbols);
+    detectFrameworkRoles(result.symbols, result.imports);
     result.symbols.push(...synthesizeLombokSymbols(result.symbols, result.file));
   }
 
@@ -55,17 +65,27 @@ export function parseFile(absPath: string, rootDir: string): ParseResult {
 
 export function parseFilesBatch(workItems: ParseWorkItem[], options: ParseBatchOptions = {}): ParseWorkResult[] {
   if (workItems.length === 0) return [];
+  const start = Date.now();
   const workerCount = parseWorkerCount(workItems.length, options.workers);
-  if (workerCount <= 1) return parseFilesSequential(workItems);
+  options.progress?.({
+    phase: 'parse',
+    status: 'start',
+    completed: 0,
+    total: workItems.length,
+    workers: workerCount,
+    elapsedMs: 0,
+  });
+  if (workerCount <= 1) return parseFilesSequential(workItems, start, options.progress);
 
   const workerPath = fileURLToPath(new URL('./parse-worker.js', import.meta.url));
-  if (!fs.existsSync(workerPath)) return parseFilesSequential(workItems);
+  if (!fs.existsSync(workerPath)) return parseFilesSequential(workItems, start, options.progress);
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-parse-'));
-  const shared = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const shared = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
   const counter = new Int32Array(shared);
   const chunks = chunkWorkItems(workItems, workerCount);
   counter[0] = chunks.length;
+  counter[1] = 0;
   const workers: Worker[] = [];
 
   try {
@@ -82,9 +102,23 @@ export function parseFilesBatch(workItems: ParseWorkItem[], options: ParseBatchO
     }
 
     const deadline = Date.now() + Math.max(30_000, workItems.length * 15_000);
+    let lastProgressAt = 0;
     while (Atomics.load(counter, 0) > 0) {
       if (Date.now() > deadline) throw new Error('Timed out waiting for parse workers.');
-      Atomics.wait(counter, 0, Atomics.load(counter, 0), 1000);
+      const completed = Atomics.load(counter, 1);
+      const now = Date.now();
+      if (now - lastProgressAt >= 5_000) {
+        lastProgressAt = now;
+        options.progress?.({
+          phase: 'parse',
+          status: 'progress',
+          completed,
+          total: workItems.length,
+          workers: chunks.length,
+          elapsedMs: now - start,
+        });
+      }
+      Atomics.wait(counter, 1, completed, 1000);
     }
 
     const results: ParseWorkResult[] = [];
@@ -96,21 +130,72 @@ export function parseFilesBatch(workItems: ParseWorkItem[], options: ParseBatchO
       if (payload.error) throw new Error(payload.error);
       results.push(...(payload.results ?? []));
     }
+    options.progress?.({
+      phase: 'parse',
+      status: 'complete',
+      completed: results.length,
+      total: workItems.length,
+      workers: chunks.length,
+      elapsedMs: Date.now() - start,
+    });
     const order = new Map(workItems.map((item, index) => [item.key, index]));
     return results.sort((a, b) => (order.get(a.key) ?? 0) - (order.get(b.key) ?? 0));
   } catch {
     for (const worker of workers) worker.terminate().catch(() => undefined);
-    return parseFilesSequential(workItems);
+    options.progress?.({
+      phase: 'parse',
+      status: 'fallback',
+      completed: 0,
+      total: workItems.length,
+      workers: 1,
+      elapsedMs: Date.now() - start,
+    });
+    return parseFilesSequential(workItems, start, options.progress);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
-function parseFilesSequential(workItems: ParseWorkItem[]): ParseWorkResult[] {
-  return workItems.map(item => ({
-    key: item.key,
-    result: parseFile(item.absPath, item.rootDir),
-  }));
+function parseFilesSequential(
+  workItems: ParseWorkItem[],
+  start: number = Date.now(),
+  progress?: (event: ParseBatchProgressEvent) => void,
+): ParseWorkResult[] {
+  let lastProgressAt = 0;
+  let reportedComplete = false;
+  const results: ParseWorkResult[] = [];
+  for (let index = 0; index < workItems.length; index++) {
+    const item = workItems[index]!;
+    results.push({
+      key: item.key,
+      result: parseFile(item.absPath, item.rootDir),
+    });
+    const completed = index + 1;
+    const now = Date.now();
+    if (progress && (completed % 100 === 0 || now - lastProgressAt >= 5_000)) {
+      lastProgressAt = now;
+      reportedComplete = completed === workItems.length;
+      progress({
+        phase: 'parse',
+        status: completed === workItems.length ? 'complete' : 'progress',
+        completed,
+        total: workItems.length,
+        workers: 1,
+        elapsedMs: now - start,
+      });
+    }
+  }
+  if (!reportedComplete) {
+    progress?.({
+      phase: 'parse',
+      status: 'complete',
+      completed: workItems.length,
+      total: workItems.length,
+      workers: 1,
+      elapsedMs: Date.now() - start,
+    });
+  }
+  return results;
 }
 
 function parseWorkerCount(itemCount: number, requested: number | undefined): number {

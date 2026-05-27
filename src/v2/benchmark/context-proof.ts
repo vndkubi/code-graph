@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Database as DatabaseType } from 'better-sqlite3';
+import type { CodeGraphDb } from '../storage/database.js';
 import { classifyFile } from '../index/file-role.js';
 import { scanManifest } from '../index/manifest.js';
 import { V2Indexer } from '../index/indexer.js';
@@ -174,20 +174,20 @@ export function deriveContextProofTasks(
   return defaultContextProofTasks();
 }
 
-export function runContextProofEval(
-  db: DatabaseType,
+export async function runContextProofEval(
+  db: CodeGraphDb,
   root: string,
   tasks: ContextProofTask[],
   options: { skipIndex?: boolean } = {},
-): ContextProofResult {
+): Promise<ContextProofResult> {
   const indexer = new V2Indexer(db);
-  const workspace = options.skipIndex ? indexer.registerWorkspace(root) : undefined;
+  const workspace = options.skipIndex ? await indexer.registerWorkspace(root) : undefined;
   const index = options.skipIndex && workspace?.currentSnapshotId
     ? {
       workspaceId: workspace.workspaceId,
       snapshotId: workspace.currentSnapshotId,
     }
-    : indexer.indexWorkspace({ root });
+    : await indexer.indexWorkspace({ root });
   const queryService = new V2QueryService(db);
   const normalizedRoot = path.resolve(root);
   const baselineManifest = scanBaselineManifest(normalizedRoot);
@@ -195,7 +195,7 @@ export function runContextProofEval(
 
   for (const task of tasks) {
     const baseline = runBaselineProof(baselineManifest, task);
-    const mcp = runMcpProof(queryService, index.workspaceId, task);
+    const mcp = await runMcpProof(queryService, index.workspaceId, task);
     const mcpEvidence = mcp.evidence.toLowerCase();
     const missingExpected = (task.expectedContains ?? [])
       .filter(expected => !mcpEvidence.includes(expected.toLowerCase()));
@@ -375,14 +375,14 @@ function walkBaselineManifest(root: string, dir: string, files: BaselineManifest
   }
 }
 
-function runMcpProof(
+async function runMcpProof(
   queryService: V2QueryService,
   workspaceId: string,
   task: ContextProofTask,
-): McpProofResult & { evidence: string } {
+): Promise<McpProofResult & { evidence: string }> {
   const workflowStart = Date.now();
   const packetStart = Date.now();
-  const packet = queryService.query({
+  const packet = await queryService.query({
     workspaceId,
     toolName: 'get_context_packet',
     args: {
@@ -404,7 +404,7 @@ function runMcpProof(
   let sliceChars = 0;
 
   for (const request of sliceRequests) {
-    const slice = queryService.query({
+    const slice = await queryService.query({
       workspaceId,
       toolName: 'get_file_slice',
       args: {

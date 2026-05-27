@@ -25,9 +25,7 @@ RUN test -f /usr/local/include/node/node.h
 
 COPY package*.json ./
 RUN npm config set cafile /etc/ssl/certs/ca-certificates.crt \
-    && npm config set nodedir /usr/local \
-    && npm config set build-from-source true \
-    && npm ci --build-from-source --nodedir=/usr/local
+    && npm ci
 
 COPY tsconfig.json ./
 COPY src/ ./src/

@@ -17,10 +17,9 @@ Inside the container, CodeGraph uses two important paths:
 | Path | Purpose |
 |------|---------|
 | `/workspace` | The source repository mounted from the host. Mount it read-only for MCP usage. |
-| `/codegraph-home` | Persistent CodeGraph state, including `codegraph.sqlite`, daemon metadata, logs, and parse cache. |
+| `/codegraph-home` | Persistent CodeGraph state, including daemon metadata, logs, and transient parse/cache metadata; indexes live in Postgres. |
 
-Always mount a persistent Docker volume to `/codegraph-home`. If the container is
-removed but the volume remains, warm indexes and parse cache survive.
+Mount a persistent Docker volume to `/codegraph-home` for daemon metadata and logs. Warm indexes and parse cache live in the Postgres database configured by `CODEGRAPH_DATABASE_URL`.
 
 Because every Docker run sees the mounted repository as `/workspace`, also set a
 unique `CODEGRAPH_WORKSPACE_KEY` for each host project or worktree. A good value
@@ -128,9 +127,10 @@ does not contain your repository indexes.
 
 ## Create the Persistent Cache Volume
 
-Create the cache volume once:
+Start the local Postgres service, then create the CodeGraph home volume once:
 
 ```powershell
+docker compose -f compose.postgres.yml up -d
 docker --context desktop-linux volume create codegraph-cache
 ```
 
@@ -152,6 +152,8 @@ docker --context desktop-linux run --rm `
   -v "D:/Personal/Projects/hadoop:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   index --root /workspace --parse-workers 8
 ```
@@ -163,6 +165,8 @@ docker --context desktop-linux run --rm `
   -v "D:/Personal/Projects/elasticsearch:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/elasticsearch" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   index --root /workspace --parse-workers 8
 ```
@@ -194,6 +198,8 @@ docker --context desktop-linux run --rm -i `
   -v "D:/Personal/Projects/hadoop:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   mcp --root /workspace --auto-refresh
 ```
@@ -206,6 +212,8 @@ docker --context desktop-linux run --rm -i `
   -v "D:/Personal/Projects/hadoop:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   -e "CODEGRAPH_MCP_TOOLS=get_flow_pack,get_research_pack" `
   mcp-code-graph:latest `
   mcp --root /workspace
@@ -239,6 +247,8 @@ and workspace key:
           "codegraph-cache:/codegraph-home",
           "-e",
           "CODEGRAPH_WORKSPACE_KEY=${workspaceFolder}",
+          "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+          "CODEGRAPH_PG_POOL_MAX=10",
           "mcp-code-graph:latest",
           "mcp",
           "--root",
@@ -269,6 +279,8 @@ args = [
   "codegraph-cache:/codegraph-home",
   "-e",
   "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop",
+          "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+          "CODEGRAPH_PG_POOL_MAX=10",
   "mcp-code-graph:latest",
   "mcp",
   "--root",
@@ -300,13 +312,15 @@ docker --context desktop-linux run --rm `
   -v "D:/Personal/Projects/hadoop:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   index --root /workspace --parse-workers 8
 ```
 
 Then ask the agent again. If an MCP process is already running with the same
 `CODEGRAPH_WORKSPACE_KEY`, it will read the updated current snapshot from the
-shared SQLite cache; restarting the MCP client is usually not required.
+shared Postgres database; restarting the MCP client is usually not required.
 
 If you started MCP with `--auto-refresh`, CodeGraph can refresh stale snapshots
 on the next tool call. Manual prewarm is still better for large repositories
@@ -350,6 +364,8 @@ docker --context desktop-linux run --rm `
   -v "D:/Personal/Projects/hadoop-main:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop-main" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   index --root /workspace --parse-workers 8
 
@@ -357,6 +373,8 @@ docker --context desktop-linux run --rm `
   -v "D:/Personal/Projects/hadoop-feature:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop-feature" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   index --root /workspace --parse-workers 8
 ```
@@ -373,6 +391,8 @@ docker --context desktop-linux run --rm `
   -v "D:/Personal/Projects/elasticsearch:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/elasticsearch" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   index --root /workspace --parse-workers 8
 ```
@@ -389,6 +409,8 @@ docker --context desktop-linux run --rm `
   -v "D:/Personal/Projects/elasticsearch:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
   -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/elasticsearch" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
   index --root /workspace --no-incremental --parse-workers 8
 ```
@@ -406,7 +428,7 @@ Keep the existing `codegraph-cache` volume unless you intentionally need a cold
 run. After a rebuild, prewarm each important repository once to confirm the new
 image and the existing cache are compatible.
 
-If you see a schema-version error from `codegraph.sqlite`, create a new volume
+If you see a schema-version error from daemon metadata/logs; indexes live in Postgres, create a new volume
 or reset the old one.
 
 ## Cold, Warm, and Incremental Measurements
@@ -428,6 +450,8 @@ Measure-Command {
     -v "D:/Personal/Projects/hadoop:/workspace:ro" `
     -v "codegraph-cache:/codegraph-home" `
     -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
     mcp-code-graph:latest `
     index --root /workspace --parse-workers 8
 }
@@ -508,7 +532,7 @@ docker --context desktop-linux run --rm `
 |---------|--------------|-----|
 | `Cannot connect to the Docker daemon` | Docker Desktop or Docker context is not running | Start Docker Desktop and run `docker --context desktop-linux ps`. |
 | Docker cannot mount `D:/...`, `/workspace` is empty, or the index sees no project files | The Windows drive is not shared with Docker Desktop | Docker Desktop -> Settings -> Resources -> File Sharing -> Add `D:\` -> Apply & Restart, then re-run the index command. |
-| `get_flow_pack` returns empty results after an index run with `filesTotal: 0` | The SQLite snapshot contains no files, symbols, or graph rows because the repository mount was empty | Fix Docker Desktop File Sharing for `D:\`, then re-run `docker run ... index --root /workspace` with the same `CODEGRAPH_WORKSPACE_KEY`. |
+| `get_flow_pack` returns empty results after an index run with `filesTotal: 0` | The Postgres snapshot contains no files, symbols, or graph rows because the repository mount was empty | Fix Docker Desktop File Sharing for `D:\`, then re-run `docker run ... index --root /workspace` with the same `CODEGRAPH_WORKSPACE_KEY`. |
 | Every repo looks like the same workspace | Missing or reused `CODEGRAPH_WORKSPACE_KEY` | Use a unique host path or stable key per repo/worktree. |
 | Warm run parses everything again | Different cache volume, different workspace key, or changed branch/files | Reuse the same volume/key and inspect index output fields. |
 | First MCP question after checkout is slow | `--auto-refresh` is refreshing a stale snapshot | Prewarm manually after checkout before asking the agent. |
@@ -518,7 +542,7 @@ docker --context desktop-linux run --rm `
 | MCP initialize times out with `fetch failed` or exit code 1 on a large Windows bind mount | Git metadata commands such as `git status --porcelain` are too slow on Docker Desktop/WSL2 NTFS and block registration | Use the current build. Git helper commands time out after 5 seconds, so CodeGraph registers without slow git metadata instead of missing the MCP initialize deadline. |
 | Docker index is much slower than local Node | Docker Desktop bind mount overhead | Prefer WSL/ext4 or local Node for very large repos. |
 | Build fails at `npm ci` behind corporate TLS | Missing corporate root CA | Build with `-CaCert` or `--ca-cert`. |
-| Unsupported SQLite schema version | Old cache volume with incompatible DB schema | Use a new volume or reset `codegraph-cache`. |
+| Unsupported Postgres schema version | Old cache volume with incompatible DB schema | Use a new volume or reset `codegraph-cache`. |
 
 ### `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` during Docker build
 
@@ -531,7 +555,7 @@ There are two common variants:
 | Failing URL | Meaning | Fix |
 |-------------|---------|-----|
 | `registry.npmjs.org` | npm cannot verify the registry TLS issuer | Build with `-CaCert` or `--ca-cert`. |
-| `unofficial-builds.nodejs.org/...node-headers...` | a native addon such as `better-sqlite3` fell back to `node-gyp` and tried to download Alpine/musl Node headers | Use the current Dockerfile. It sets both `NPM_CONFIG_*` and `npm_config_*` values plus `npm ci --build-from-source --nodedir=/usr/local`, so native addons use the local Node headers already in the image. |
+| `connect ECONNREFUSED 127.0.0.1:54329` or `host.docker.internal:54329` | Local Postgres is not running or the container cannot reach the host port | Run `docker compose -f compose.postgres.yml up -d`; use `127.0.0.1` for local Node and `host.docker.internal` from Docker MCP containers. |
 | Native addons compile again in the runtime stage | Runtime ran `npm ci --omit=dev` after the builder already compiled native modules | Use the current Dockerfile. It builds once in the builder, runs `npm prune --omit=dev`, and copies pruned `node_modules` into runtime. |
 
 Fix it by exporting the corporate root certificate as PEM/CRT and building with
@@ -566,8 +590,8 @@ certutil -encode C:\temp\corp-root-ca.cer C:\temp\corp-root-ca.crt
 Do not fix this by setting `strict-ssl=false`; that disables TLS verification
 instead of teaching the container to trust the correct issuer.
 
-If the error still points at `unofficial-builds.nodejs.org` after this fix,
-rebuild without using old Docker layers:
+If npm still fails with certificate errors after this fix, rebuild without using
+old Docker layers:
 
 ```powershell
 .\docker-build.ps1 -CaCert C:\temp\corp-root-ca.crt -NoCache

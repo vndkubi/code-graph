@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { afterEach, describe, expect, it } from 'vitest';
-import type { Database } from 'better-sqlite3';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { CodeGraphDb } from '../../src/v2/storage/database.js';
 import { openCodeGraphDb } from '../../src/v2/storage/database.js';
 import { V2Indexer } from '../../src/v2/index/indexer.js';
 import { V2QueryService } from '../../src/v2/query/service.js';
@@ -12,30 +12,39 @@ import { runContextProofEval } from '../../src/v2/benchmark/context-proof.js';
 import { runReviewProofEval } from '../../src/v2/benchmark/review-proof.js';
 
 const tempDirs: string[] = [];
-const dbs: Database[] = [];
+const dbs: CodeGraphDb[] = [];
 const JAVA_FIXTURE = path.resolve('tests/fixtures/java-project');
 
-afterEach(() => {
+beforeEach(async () => {
+  const { db } = await openCodeGraphDb();
+  try {
+    await resetDb(db);
+  } finally {
+    await db.close();
+  }
+});
+
+afterEach(async () => {
   for (const db of dbs.splice(0)) {
-    db.close();
+    await db.close();
   }
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-describe('v2 SQLite index and query service', () => {
-  it('indexes Java symbols into persistent storage and serves search queries', () => {
+describe('v2 Postgres index and query service', () => {
+  it('indexes Java symbols into persistent storage and serves search queries', async () => {
     const home = tempDir('codegraph-home-');
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: JAVA_FIXTURE });
+    const result = await indexer.indexWorkspace({ root: JAVA_FIXTURE });
 
     expect(result.filesTotal).toBeGreaterThan(0);
     expect(result.filesParsed).toBeGreaterThan(0);
 
     const queries = new V2QueryService(db);
-    const search = queries.query({
+    const search = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'PaymentService', kind: 'class' },
@@ -43,7 +52,7 @@ describe('v2 SQLite index and query service', () => {
 
     expect(search.symbols.some(symbol => symbol.name === 'PaymentService')).toBe(true);
 
-    const callers = queries.query({
+    const callers = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'get_callers',
       args: { symbol: 'PaymentGateway.processPayment' },
@@ -53,14 +62,14 @@ describe('v2 SQLite index and query service', () => {
     expect(callers.callers.some(call => call.resolution_kind === 'receiver-field' && call.confidence === 0.8)).toBe(true);
   });
 
-  it('ranks multi-token natural-language symbol searches', () => {
+  it('ranks multi-token natural-language symbol searches', async () => {
     const home = tempDir('codegraph-home-');
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: JAVA_FIXTURE });
+    const result = await indexer.indexWorkspace({ root: JAVA_FIXTURE });
     const queries = new V2QueryService(db);
 
-    const search = queries.query({
+    const search = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'Payment Gateway', kind: 'class', limit: 10 },
@@ -77,7 +86,7 @@ describe('v2 SQLite index and query service', () => {
     expect(search.symbols[0]?.matchReason).toContain('match');
   });
 
-  it('uses entry-point intent ranking and hides lombok synthetic symbols by default', () => {
+  it('uses entry-point intent ranking and hides lombok synthetic symbols by default', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-intent-');
     writeFile(repo, 'src/main/java/com/example/DemoApplication.java', `package com.example;
@@ -105,12 +114,12 @@ public class UserProfile {
 }
 `);
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: repo });
+    const result = await indexer.indexWorkspace({ root: repo });
     const queries = new V2QueryService(db);
 
-    const entrySearch = queries.query({
+    const entrySearch = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'main application entry point', explainRank: true, limit: 5 },
@@ -126,14 +135,14 @@ public class UserProfile {
     expect(entrySearch.symbols.some(symbol => symbol.name === 'main')).toBe(true);
     expect(entrySearch.symbols[0]?.name).not.toBe('PointExtractionResult');
 
-    const defaultGetterSearch = queries.query({
+    const defaultGetterSearch = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'getName', limit: 10 },
     }) as { symbols: Array<{ name: string }> };
     expect(defaultGetterSearch.symbols.some(symbol => symbol.name === 'getName')).toBe(false);
 
-    const syntheticGetterSearch = queries.query({
+    const syntheticGetterSearch = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'getName', includeSynthetic: true, limit: 10 },
@@ -141,7 +150,7 @@ public class UserProfile {
     expect(syntheticGetterSearch.symbols.some(symbol => symbol.name === 'getName' && symbol.synthetic)).toBe(true);
   });
 
-  it('composes Spring endpoint paths and reports partial path resolution', () => {
+  it('composes Spring endpoint paths and reports partial path resolution', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-spring-endpoints-');
     writeFile(repo, 'src/main/java/com/example/NotebookController.java', `package com.example;
@@ -185,12 +194,12 @@ public class PartialController {
 }
 `);
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: repo });
+    const result = await indexer.indexWorkspace({ root: repo });
     const queries = new V2QueryService(db);
 
-    const endpoints = queries.query({
+    const endpoints = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'find_endpoints',
       args: { method: 'GET', limit: 20 },
@@ -217,7 +226,7 @@ public class PartialController {
     });
     expect(partial?.pathResolutionReason).toContain('Could not resolve RequestMapping path expression');
 
-    const postEndpoints = queries.query({
+    const postEndpoints = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'find_endpoints',
       args: { method: 'POST', path: '/api/notebooks/create' },
@@ -227,7 +236,7 @@ public class PartialController {
       pathResolution: 'exact',
     });
 
-    const stats = queries.query({
+    const stats = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'get_index_stats',
       args: {},
@@ -235,14 +244,99 @@ public class PartialController {
     expect(stats.diagnostics.frameworkWarnings.endpointPathUnresolvedCount).toBeGreaterThan(0);
   });
 
-  it('serves agent-oriented file, reference, dependency, and mixed search APIs', () => {
+  it('classifies Jakarta EE 8+ annotations across javax and jakarta namespaces', async () => {
     const home = tempDir('codegraph-home-');
-    const { db } = openDb(home);
+    const repo = tempDir('codegraph-jakarta8-plus-');
+    writeFile(repo, 'src/main/java/com/example/EventSocket.java', `package com.example;
+
+import javax.annotation.sql.DataSourceDefinition;
+import javax.faces.view.ViewScoped;
+import javax.inject.Named;
+import javax.json.bind.annotation.JsonbProperty;
+import javax.transaction.Transactional;
+import javax.websocket.OnMessage;
+import javax.websocket.server.ServerEndpoint;
+
+@Named
+@ViewScoped
+@ServerEndpoint("/events/{id}")
+public class EventSocket {
+    @JsonbProperty("event_id")
+    private String eventId;
+
+    @OnMessage
+    public void onMessage(String message) {
+    }
+
+    @Transactional
+    public void save() {
+    }
+}
+
+@DataSourceDefinition(name = "java:global/jdbc/orders", className = "org.postgresql.ds.PGSimpleDataSource")
+class DataSourceConfig {
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/OrderRepository.java', `package com.example;
+
+import jakarta.data.repository.Param;
+import jakarta.data.repository.Query;
+import jakarta.data.repository.Repository;
+
+@Repository
+public interface OrderRepository {
+    @Query("where id = :id")
+    Order byId(@Param("id") String id);
+}
+
+class Order {
+}
+`);
+
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: JAVA_FIXTURE });
+    const result = await indexer.indexWorkspace({ root: repo });
     const queries = new V2QueryService(db);
 
-    const fileSearch = queries.query({
+    const websocketEndpoints = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'find_endpoints',
+      args: { method: 'WEBSOCKET', path: '/events', limit: 10 },
+    }) as { endpoints: Array<{ method: string; path: string; framework: string; handlerSymbol: string }> };
+    expect(websocketEndpoints.endpoints).toContainEqual(expect.objectContaining({
+      method: 'WEBSOCKET',
+      path: '/events/{id}',
+      framework: 'websocket',
+    }));
+
+    const roles = async (query: string, frameworkRole: string, kind?: string) => queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query, frameworkRole, kind, limit: 10 },
+    }) as Promise<{ symbols: Array<{ name: string; frameworkRole?: string }> }>;
+
+    expect((await roles('EventSocket', 'websocket:endpoint', 'class')).symbols.some(symbol => symbol.name === 'EventSocket')).toBe(true);
+    expect((await roles('eventId', 'jakarta:jsonb', 'field')).symbols.some(symbol => symbol.name === 'eventId')).toBe(true);
+    expect((await roles('save', 'jakarta:transactional', 'method')).symbols.some(symbol => symbol.name === 'save')).toBe(true);
+    expect((await roles('DataSourceConfig', 'jakarta:datasource', 'class')).symbols.some(symbol => symbol.name === 'DataSourceConfig')).toBe(true);
+    expect((await roles('OrderRepository', 'jakarta:data', 'interface')).symbols.some(symbol => symbol.name === 'OrderRepository')).toBe(true);
+    expect((await roles('byId', 'jakarta:data-query', 'method')).symbols.some(symbol => symbol.name === 'byId')).toBe(true);
+
+    const beans = await db.prepare('SELECT implementation, scope FROM beans WHERE snapshot_id = ?').all(result.snapshotId) as Array<{ implementation: string; scope: string }>;
+    expect(beans).toContainEqual(expect.objectContaining({
+      implementation: 'com.example.EventSocket',
+      scope: 'Named',
+    }));
+  });
+
+  it('serves agent-oriented file, reference, dependency, and mixed search APIs', async () => {
+    const home = tempDir('codegraph-home-');
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: JAVA_FIXTURE });
+    const queries = new V2QueryService(db);
+
+    const fileSearch = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_files',
       args: { query: 'Payment Gateway', limit: 5, explainRank: true },
@@ -260,7 +354,7 @@ public class PartialController {
     expect(fileSearch.files[0]?.topSymbols.some(symbol => symbol.name === 'PaymentGateway')).toBe(true);
     expect(fileSearch.files[0]?.rankExplanation?.length).toBeGreaterThan(0);
 
-    const references = queries.query({
+    const references = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'find_references',
       args: { symbol: 'PaymentGateway.processPayment', kind: 'all', groupBy: 'file', limit: 1 },
@@ -278,7 +372,7 @@ public class PartialController {
     expect(references.nextCursor).toBe('1');
     expect(references.groups.length).toBeGreaterThan(0);
 
-    const deps = queries.query({
+    const deps = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'trace_dependencies',
       args: {
@@ -296,7 +390,7 @@ public class PartialController {
     expect(deps.edges.some(edge => edge.toFile.includes('PaymentGateway.java'))).toBe(true);
     expect(deps.transitiveFiles.some(file => file.includes('PaymentGateway.java'))).toBe(true);
 
-    const mixed = queries.query({
+    const mixed = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_code',
       args: { query: 'PaymentService', limit: 5 },
@@ -318,14 +412,14 @@ public class PartialController {
     expect(mixed.sections.dependencies?.edges.length).toBeGreaterThan(0);
   });
 
-  it('returns bounded source snippets for symbols, files, and endpoints', () => {
+  it('returns bounded source snippets for symbols, files, and endpoints', async () => {
     const home = tempDir('codegraph-home-');
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: JAVA_FIXTURE });
+    const result = await indexer.indexWorkspace({ root: JAVA_FIXTURE });
     const queries = new V2QueryService(db);
 
-    const symbolSearch = queries.query({
+    const symbolSearch = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'PaymentService', limit: 1, includeSnippets: true, snippetLines: 5 },
@@ -334,7 +428,7 @@ public class PartialController {
     expect(symbolSearch.symbols[0]?.snippet?.text).toContain('PaymentService');
     expect(symbolSearch.symbols[0]?.snippet?.endLine).toBeGreaterThanOrEqual(symbolSearch.symbols[0]?.snippet?.startLine ?? 0);
 
-    const fileSearch = queries.query({
+    const fileSearch = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_files',
       args: { query: 'Payment Gateway', limit: 1, includeSnippets: true, snippetLines: 5 },
@@ -357,8 +451,8 @@ public class OrderResource {
     }
 }
 `);
-    const endpointIndex = indexer.indexWorkspace({ root: endpointRepo });
-    const endpoints = queries.query({
+    const endpointIndex = await indexer.indexWorkspace({ root: endpointRepo });
+    const endpoints = await queries.query({
       workspaceId: endpointIndex.workspaceId,
       toolName: 'find_endpoints',
       args: { method: 'POST', path: '/orders/create', limit: 1, includeSnippets: true, snippetLines: 5 },
@@ -367,7 +461,7 @@ public class OrderResource {
     expect(endpoints.endpoints[0]?.snippet?.text).toContain('@POST');
   });
 
-  it('builds compact context packets and exact file slices for agent routing', () => {
+  it('builds compact context packets and exact file slices for agent routing', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-context-packet-');
     writeFile(repo, 'package.json', JSON.stringify({
@@ -409,12 +503,12 @@ public class PaymentServiceTest {
 }
 `);
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: repo });
+    const result = await indexer.indexWorkspace({ root: repo });
     const queries = new V2QueryService(db);
 
-    const packet = queries.query({
+    const packet = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'get_context_packet',
       args: {
@@ -447,7 +541,7 @@ public class PaymentServiceTest {
     expect(packet.nextAction).toContain('get_file_slice');
     expect(packet.budget.estimatedResponseTokens).toBeGreaterThan(0);
 
-    const slice = queries.query({
+    const slice = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'get_file_slice',
       args: { symbol: 'PaymentService.refund', maxChars: 1000 },
@@ -460,7 +554,7 @@ public class PaymentServiceTest {
     expect(slice.resolvedSymbol?.symbol).toContain('PaymentService.refund');
   });
 
-  it('builds answer-ready research and flow packs with source evidence', () => {
+  it('builds answer-ready research and flow packs with source evidence', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-research-pack-');
     writeFile(repo, 'src/main/java/com/example/payment/PaymentGateway.java', `package com.example.payment;
@@ -484,12 +578,12 @@ public class PaymentService {
 }
 `);
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: repo });
+    const result = await indexer.indexWorkspace({ root: repo });
     const queries = new V2QueryService(db);
 
-    const researchPack = queries.query({
+    const researchPack = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'get_research_pack',
       args: {
@@ -515,7 +609,7 @@ public class PaymentService {
     expect(researchPack.nextAction).toContain('Answer');
     expect(researchPack.flowSteps.length).toBeGreaterThan(0);
 
-    const flowPack = queries.query({
+    const flowPack = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'get_flow_pack',
       args: {
@@ -533,7 +627,7 @@ public class PaymentService {
     expect(flowPack.evidenceSlices.some(slice => slice.text.includes('processRefund'))).toBe(true);
   });
 
-  it('simulates patch impact from changed files, symbols, and diffs', () => {
+  it('simulates patch impact from changed files, symbols, and diffs', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-patch-impact-');
     writeFile(repo, 'package.json', JSON.stringify({
@@ -573,9 +667,9 @@ public class OrderServiceTest {
 }
 `);
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: repo });
+    const result = await indexer.indexWorkspace({ root: repo });
     const queries = new V2QueryService(db);
     const diff = [
       'diff --git a/src/main/java/com/example/orders/OrderController.java b/src/main/java/com/example/orders/OrderController.java',
@@ -589,7 +683,7 @@ public class OrderServiceTest {
       '     }',
     ].join('\n');
 
-    const impact = queries.query({
+    const impact = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'simulate_patch_impact',
       args: {
@@ -621,7 +715,7 @@ public class OrderServiceTest {
     expect(impact.summary.changedFileCount).toBe(2);
     expect(['medium', 'high']).toContain(impact.summary.blastRadius);
 
-    const review = queries.query({
+    const review = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'review_patch',
       args: {
@@ -661,7 +755,7 @@ public class OrderServiceTest {
       '         return service.listOrders();',
       '     }',
     ].join('\n');
-    const matchingReview = queries.query({
+    const matchingReview = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'review_patch',
       args: {
@@ -676,7 +770,7 @@ public class OrderServiceTest {
     expect(matchingReview.requiredToolCalls.some(call => call.tool === 'get_file_slice')).toBe(true);
   });
 
-  it('indexes XML, JSON, YAML, and properties config evidence', () => {
+  it('indexes XML, JSON, YAML, and properties config evidence', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-config-files-');
     writeFile(repo, 'src/main/java/com/example/mapper/OrderMapper.java', `package com.example.mapper;
@@ -757,12 +851,12 @@ server:
     writeFile(repo, 'src/main/resources/application.properties', `app.feature.order-cache=true
 `);
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: repo });
+    const result = await indexer.indexWorkspace({ root: repo });
     const queries = new V2QueryService(db);
 
-    const xmlFiles = queries.query({
+    const xmlFiles = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_files',
       args: { query: 'OrderMapper selectById resultMap', limit: 10, explainRank: true },
@@ -781,7 +875,7 @@ server:
     });
     expect(mapperXml?.topSymbols.some(symbol => symbol.name === 'selectById' && symbol.frameworkRole === 'mybatis:select')).toBe(true);
 
-    const yamlSymbols = queries.query({
+    const yamlSymbols = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'spring datasource url', limit: 10 },
@@ -792,7 +886,7 @@ server:
       frameworkRole: 'spring:datasource',
     }));
 
-    const openApiEndpoints = queries.query({
+    const openApiEndpoints = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'find_endpoints',
       args: { method: 'GET', path: '/orders', limit: 10 },
@@ -804,7 +898,7 @@ server:
       file: expect.stringContaining('openapi.json'),
     }));
 
-    const elasticEndpoints = queries.query({
+    const elasticEndpoints = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'find_endpoints',
       args: { method: 'GET', path: '/_cluster/health', limit: 10 },
@@ -816,7 +910,7 @@ server:
       file: expect.stringContaining('cluster.health.json'),
     }));
 
-    const elasticParams = queries.query({
+    const elasticParams = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'wait for status green cluster health', frameworkRole: 'elastic-rest:param', limit: 10 },
@@ -827,7 +921,7 @@ server:
       frameworkRole: 'elastic-rest:param',
     }));
 
-    const elasticYamlParams = queries.query({
+    const elasticYamlParams = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: {
@@ -843,7 +937,7 @@ server:
       frameworkRole: 'elastic-rest:yaml-param',
     }));
 
-    const dockerSymbols = queries.query({
+    const dockerSymbols = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'order api image', frameworkRole: 'docker:service', limit: 10 },
@@ -854,7 +948,7 @@ server:
       frameworkRole: 'docker:service',
     }));
 
-    const propertiesSymbols = queries.query({
+    const propertiesSymbols = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'app feature order cache', limit: 10 },
@@ -865,7 +959,7 @@ server:
       frameworkRole: 'config:properties-key',
     }));
 
-    const mapperTrace = queries.query({
+    const mapperTrace = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'trace_dependencies',
       args: { target: 'OrderMapper.java', direction: 'dependencies', depth: 1 },
@@ -876,7 +970,7 @@ server:
     }));
   });
 
-  it('runs a context proof benchmark comparing baseline file reads to MCP slices', () => {
+  it('runs a context proof benchmark comparing baseline file reads to MCP slices', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-context-proof-');
     writeFile(repo, 'src/main/java/com/example/payment/PaymentGateway.java', `package com.example.payment;
@@ -925,8 +1019,8 @@ public class NoisyPayment${i} {
 `);
     }
 
-    const { db } = openDb(home);
-    const proof = runContextProofEval(db, repo, [{
+    const { db } = await openDb(home);
+    const proof = await runContextProofEval(db, repo, [{
       id: 'payment-refund-proof',
       task: 'Find PaymentService refund behavior and related tests.',
       domain: 'payment',
@@ -948,7 +1042,7 @@ public class NoisyPayment${i} {
     expect(proof.tasks[0]?.mcp.slicedFiles.some(file => file.endsWith('PaymentService.java'))).toBe(true);
   });
 
-  it('runs a review proof benchmark comparing raw file reads to review packets', () => {
+  it('runs a review proof benchmark comparing raw file reads to review packets', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-review-proof-');
     writeFile(repo, 'src/main/java/com/example/orders/OrderController.java', `package com.example.orders;
@@ -993,8 +1087,8 @@ public class NoisyOrder${i} {
 `);
     }
 
-    const { db } = openDb(home);
-    const proof = runReviewProofEval(db, repo, [{
+    const { db } = await openDb(home);
+    const proof = await runReviewProofEval(db, repo, [{
       id: 'order-service-review-proof',
       title: 'Review OrderService listOrders behavior.',
       files: ['src/main/java/com/example/orders/OrderService.java'],
@@ -1025,7 +1119,7 @@ public class NoisyOrder${i} {
     expect(proof.tasks[0]?.mcp.changedFiles.some(file => file.endsWith('OrderService.java'))).toBe(true);
   });
 
-  it('resolves Java parameter and local-variable receiver calls', () => {
+  it('resolves Java parameter and local-variable receiver calls', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-receiver-types-');
     writeFile(repo, 'src/main/java/com/example/LocalCallService.java', `package com.example;
@@ -1064,12 +1158,12 @@ public class PaymentInfo {
 }
 `);
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: repo });
+    const result = await indexer.indexWorkspace({ root: repo });
     const queries = new V2QueryService(db);
 
-    const paymentCallers = queries.query({
+    const paymentCallers = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'get_callers',
       args: { symbol: 'PaymentGateway.processPayment' },
@@ -1080,7 +1174,7 @@ public class PaymentInfo {
       resolution_kind: 'static-or-type-receiver',
     }));
 
-    const refundCallers = queries.query({
+    const refundCallers = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'get_callers',
       args: { symbol: 'PaymentGateway.processRefund' },
@@ -1091,7 +1185,7 @@ public class PaymentInfo {
       resolution_kind: 'static-or-type-receiver',
     }));
 
-    const amountCallers = queries.query({
+    const amountCallers = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'get_callers',
       args: { symbol: 'PaymentInfo.getAmount' },
@@ -1102,7 +1196,7 @@ public class PaymentInfo {
       resolution_kind: 'static-or-type-receiver',
     }));
 
-    const implementationCallers = queries.query({
+    const implementationCallers = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'get_callers',
       args: { symbol: 'InMemoryPaymentGateway.processPayment' },
@@ -1114,7 +1208,7 @@ public class PaymentInfo {
     }));
   });
 
-  it('warns about stale snapshots and can auto-refresh on query', () => {
+  it('warns about stale snapshots and can auto-refresh on query', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-stale-');
     writeFile(repo, 'src/main/java/com/example/Demo.java', `package com.example;
@@ -1123,9 +1217,9 @@ public class Demo {
 }
 `);
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: repo });
+    const result = await indexer.indexWorkspace({ root: repo });
     writeFile(repo, 'src/main/java/com/example/Demo.java', `package com.example;
 
 public class DemoChanged {
@@ -1133,7 +1227,7 @@ public class DemoChanged {
 `);
 
     const queries = new V2QueryService(db);
-    const staleSearch = queries.query({
+    const staleSearch = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'Demo', limit: 5 },
@@ -1142,7 +1236,7 @@ public class DemoChanged {
     expect(staleSearch.indexFreshness?.isStale).toBe(true);
     expect(staleSearch.indexFreshness?.dirtyFiles?.modifiedCount).toBe(1);
 
-    const refreshedSearch = queries.query({
+    const refreshedSearch = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'DemoChanged', limit: 5, autoRefresh: true },
@@ -1152,13 +1246,13 @@ public class DemoChanged {
     expect(refreshedSearch.indexFreshness).toBeUndefined();
   });
 
-  it('does not auto-refresh an empty first-time snapshot on query', () => {
+  it('does not auto-refresh an empty first-time snapshot on query', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-empty-snapshot-');
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: repo });
+    const result = await indexer.indexWorkspace({ root: repo });
     expect(result.filesTotal).toBe(0);
 
     writeFile(repo, 'src/main/java/com/example/DemoLater.java', `package com.example;
@@ -1168,7 +1262,7 @@ public class DemoLater {
 `);
 
     const queries = new V2QueryService(db);
-    const search = queries.query({
+    const search = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'DemoLater', limit: 5, autoRefresh: true },
@@ -1178,7 +1272,66 @@ public class DemoLater {
     expect(search.indexFreshness?.isStale).toBe(true);
   });
 
-  it('uses workspace keys to distinguish Docker-mounted repositories with the same container root', () => {
+  it('skips inline auto-refresh when the indexed workspace exceeds the refresh file limit', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-large-refresh-');
+    writeFile(repo, 'src/main/java/com/example/One.java', `package com.example;
+
+public class One {
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/Two.java', `package com.example;
+
+public class Two {
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    writeFile(repo, 'src/main/java/com/example/One.java', `package com.example;
+
+public class OneChanged {
+}
+`);
+
+    const previousLimit = process.env.CODEGRAPH_AUTO_REFRESH_FILE_LIMIT;
+    process.env.CODEGRAPH_AUTO_REFRESH_FILE_LIMIT = '1';
+    try {
+      const queries = new V2QueryService(db);
+      const search = await queries.query({
+        workspaceId: result.workspaceId,
+        toolName: 'search_symbol',
+        args: { query: 'OneChanged', limit: 5, autoRefresh: true },
+      }) as {
+        symbols: Array<{ name: string }>;
+        indexFreshness?: {
+          isStale: boolean;
+          autoRefreshSkipped?: {
+            reason?: string;
+            indexedFileCount?: number;
+            autoRefreshFileLimit?: number;
+          };
+        };
+      };
+
+      expect(search.symbols.some(symbol => symbol.name === 'OneChanged')).toBe(false);
+      expect(search.indexFreshness?.isStale).toBe(true);
+      expect(search.indexFreshness?.autoRefreshSkipped).toMatchObject({
+        reason: 'indexed-file-count-exceeds-auto-refresh-limit',
+        indexedFileCount: 2,
+        autoRefreshFileLimit: 1,
+      });
+    } finally {
+      if (previousLimit === undefined) {
+        delete process.env.CODEGRAPH_AUTO_REFRESH_FILE_LIMIT;
+      } else {
+        process.env.CODEGRAPH_AUTO_REFRESH_FILE_LIMIT = previousLimit;
+      }
+    }
+  });
+
+  it('uses workspace keys to distinguish Docker-mounted repositories with the same container root', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-workspace-key-');
     writeFile(repo, 'src/main/java/com/example/Demo.java', `package com.example;
@@ -1187,17 +1340,17 @@ public class Demo {
 }
 `);
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const first = indexer.indexWorkspace({ root: repo, workspaceKey: 'C:/repos/app-main' });
-    const same = indexer.indexWorkspace({ root: repo, workspaceKey: 'c:/repos/app-main' });
-    const second = indexer.indexWorkspace({ root: repo, workspaceKey: 'C:/repos/app-feature' });
+    const first = await indexer.indexWorkspace({ root: repo, workspaceKey: 'C:/repos/app-main' });
+    const same = await indexer.indexWorkspace({ root: repo, workspaceKey: 'c:/repos/app-main' });
+    const second = await indexer.indexWorkspace({ root: repo, workspaceKey: 'C:/repos/app-feature' });
 
     expect(same.workspaceId).toBe(first.workspaceId);
     expect(second.workspaceId).not.toBe(first.workspaceId);
   });
 
-  it('refreshes after git checkout when autoRefresh is enabled', () => {
+  it('refreshes after git checkout when autoRefresh is enabled', async () => {
     if (!hasGit()) return;
 
     const home = tempDir('codegraph-home-');
@@ -1223,12 +1376,12 @@ public class FeatureBranchMarker {
     runGit(repo, 'commit', '-m', 'feature branch');
     runGit(repo, 'checkout', initialBranch);
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: repo, workspaceKey: 'checkout-same-folder' });
+    const result = await indexer.indexWorkspace({ root: repo, workspaceKey: 'checkout-same-folder' });
     const queries = new V2QueryService(db);
 
-    const mainSearch = queries.query({
+    const mainSearch = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'MainBranchMarker', limit: 5 },
@@ -1237,7 +1390,7 @@ public class FeatureBranchMarker {
 
     runGit(repo, 'checkout', 'feature');
 
-    const staleFeatureSearch = queries.query({
+    const staleFeatureSearch = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'FeatureBranchMarker', limit: 5 },
@@ -1246,7 +1399,7 @@ public class FeatureBranchMarker {
     expect(staleFeatureSearch.indexFreshness?.isStale).toBe(true);
     expect(staleFeatureSearch.indexFreshness?.dirtyFiles).toBeUndefined();
 
-    const featureSearch = queries.query({
+    const featureSearch = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'FeatureBranchMarker', limit: 5, autoRefresh: true },
@@ -1256,12 +1409,12 @@ public class FeatureBranchMarker {
     expect(featureSearch.indexFreshness).toBeUndefined();
   });
 
-  it('reuses parse cache on a second snapshot', () => {
+  it('reuses parse cache on a second snapshot', async () => {
     const home = tempDir('codegraph-home-');
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const first = indexer.indexWorkspace({ root: JAVA_FIXTURE });
-    const second = indexer.indexWorkspace({ root: JAVA_FIXTURE });
+    const first = await indexer.indexWorkspace({ root: JAVA_FIXTURE });
+    const second = await indexer.indexWorkspace({ root: JAVA_FIXTURE });
 
     expect(first.filesParsed).toBeGreaterThan(0);
     expect(second.parseCacheHits).toBeGreaterThan(0);
@@ -1271,7 +1424,7 @@ public class FeatureBranchMarker {
     expect(second.skippedUnchanged).toBe(true);
   });
 
-  it('updates small changed-file indexes in place', () => {
+  it('updates small changed-file indexes in place', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-incremental-');
     writeFile(repo, 'src/main/java/com/example/Feature.java', `package com.example;
@@ -1285,16 +1438,16 @@ public class Keep {
 }
 `);
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const first = indexer.indexWorkspace({ root: repo });
+    const first = await indexer.indexWorkspace({ root: repo });
 
     writeFile(repo, 'src/main/java/com/example/Feature.java', `package com.example;
 
 public class ChangedFeature {
 }
 `);
-    const second = indexer.indexWorkspace({ root: repo });
+    const second = await indexer.indexWorkspace({ root: repo });
 
     expect(second.snapshotId).toBe(first.snapshotId);
     expect(second.incrementalUpdated).toBe(true);
@@ -1304,14 +1457,14 @@ public class ChangedFeature {
     expect(second.hashCacheHits).toBeGreaterThan(0);
 
     const queries = new V2QueryService(db);
-    const changedSearch = queries.query({
+    const changedSearch = await queries.query({
       workspaceId: second.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'ChangedFeature', limit: 5 },
     }) as { symbols: Array<{ name: string }> };
     expect(changedSearch.symbols.some(symbol => symbol.name === 'ChangedFeature')).toBe(true);
 
-    const originalSearch = queries.query({
+    const originalSearch = await queries.query({
       workspaceId: second.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'OriginalFeature', limit: 5 },
@@ -1319,12 +1472,12 @@ public class ChangedFeature {
     expect(originalSearch.symbols.some(symbol => symbol.name === 'OriginalFeature')).toBe(false);
 
     fs.rmSync(path.join(repo, 'src/main/java/com/example/Keep.java'));
-    const third = indexer.indexWorkspace({ root: repo });
+    const third = await indexer.indexWorkspace({ root: repo });
     expect(third.snapshotId).toBe(first.snapshotId);
     expect(third.incrementalUpdated).toBe(true);
     expect(third.filesDeleted).toBe(1);
 
-    const deletedSearch = queries.query({
+    const deletedSearch = await queries.query({
       workspaceId: third.workspaceId,
       toolName: 'search_symbol',
       args: { query: 'Keep', limit: 5 },
@@ -1332,16 +1485,16 @@ public class ChangedFeature {
     expect(deletedSearch.symbols.some(symbol => symbol.name === 'Keep')).toBe(false);
   });
 
-  it('discovers synthetic Jakarta endpoints', () => {
+  it('discovers synthetic Jakarta endpoints', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-synthetic-');
     generateSyntheticJavaRepo({ root: repo, files: 40, modules: 2 });
 
-    const { db } = openDb(home);
+    const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = indexer.indexWorkspace({ root: repo });
+    const result = await indexer.indexWorkspace({ root: repo });
     const queries = new V2QueryService(db);
-    const endpoints = queries.query({
+    const endpoints = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'find_endpoints',
       args: { method: 'GET' },
@@ -1357,10 +1510,30 @@ function tempDir(prefix: string): string {
   return dir;
 }
 
-function openDb(home: string): { db: Database } {
-  const opened = openCodeGraphDb(home);
+async function openDb(home: string): Promise<{ db: CodeGraphDb }> {
+  const opened = await openCodeGraphDb(home);
   dbs.push(opened.db);
   return opened;
+}
+
+async function resetDb(db: CodeGraphDb): Promise<void> {
+  await db.run(`
+    TRUNCATE TABLE
+      workspaces,
+      snapshots,
+      files,
+      parse_cache,
+      symbols,
+      imports,
+      type_refs,
+      call_edges,
+      dependency_edges,
+      annotations,
+      endpoints,
+      beans,
+      inheritance
+    RESTART IDENTITY CASCADE
+  `);
 }
 
 function writeFile(root: string, relPath: string, content: string): void {
