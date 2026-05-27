@@ -509,6 +509,13 @@ This is an npm/Node TLS trust failure inside the Docker build container. It
 usually means your network uses a corporate HTTPS inspection proxy and the
 container does not trust the corporate root CA.
 
+There are two common variants:
+
+| Failing URL | Meaning | Fix |
+|-------------|---------|-----|
+| `registry.npmjs.org` | npm cannot verify the registry TLS issuer | Build with `-CaCert` or `--ca-cert`. |
+| `unofficial-builds.nodejs.org/...node-headers...` | a native addon such as `better-sqlite3` fell back to `node-gyp` and tried to download Alpine/musl Node headers | Use the current Dockerfile. It sets `NPM_CONFIG_NODEDIR=/usr/local` and `NPM_CONFIG_BUILD_FROM_SOURCE=true` so native addons use the local Node headers already in the image. |
+
 Fix it by exporting the corporate root certificate as PEM/CRT and building with
 the CA secret:
 
@@ -540,3 +547,19 @@ certutil -encode C:\temp\corp-root-ca.cer C:\temp\corp-root-ca.crt
 
 Do not fix this by setting `strict-ssl=false`; that disables TLS verification
 instead of teaching the container to trust the correct issuer.
+
+If the error still points at `unofficial-builds.nodejs.org` after this fix,
+rebuild without using old Docker layers:
+
+```powershell
+.\docker-build.ps1 -CaCert C:\temp\corp-root-ca.crt -NoCache
+```
+
+or:
+
+```powershell
+$env:DOCKER_BUILDKIT = "1"
+docker build --no-cache `
+  --secret "id=codegraph_ca,src=C:\temp\corp-root-ca.crt" `
+  -t mcp-code-graph:latest .
+```

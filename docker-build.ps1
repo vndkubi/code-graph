@@ -5,6 +5,7 @@ param(
   [switch]$Export,
   [string]$Out = "",
   [string]$CaCert = "",
+  [switch]$NoCache,
   [switch]$Help
 )
 
@@ -18,6 +19,7 @@ Usage:
   .\docker-build.ps1 -Export
   .\docker-build.ps1 -Export -Out D:\transfer\mcp-code-graph.tar.gz
   .\docker-build.ps1 -CaCert C:\temp\corp-root-ca.crt -Export
+  .\docker-build.ps1 -CaCert C:\temp\corp-root-ca.crt -NoCache
 
 Options:
   -Run                 Build then start the MCP stdio proxy, mounting -ProjectPath.
@@ -26,6 +28,7 @@ Options:
   -Out <file>          Output path for -Export.
   -Image <name:tag>    Docker image name. Default: mcp-code-graph:latest.
   -CaCert <file>       Add a PEM/CRT corporate CA certificate to the image.
+  -NoCache             Build without Docker layer cache.
   -Help                Show this help.
 "@ | Write-Host
 }
@@ -41,6 +44,10 @@ function Write-CertificateBuildHelp {
   Write-Host ""
   Write-Host "Docker build failed with UNABLE_TO_GET_ISSUER_CERT_LOCALLY." -ForegroundColor Yellow
   Write-Host "The container does not trust the HTTPS issuer used for npm downloads."
+  Write-Host ""
+  Write-Host "If the failing URL is unofficial-builds.nodejs.org, pull the latest Dockerfile."
+  Write-Host "It forces native addons such as better-sqlite3 to use local Node headers"
+  Write-Host "with NPM_CONFIG_NODEDIR=/usr/local instead of downloading headers."
   Write-Host ""
   Write-Host "Fix:"
   Write-Host "  1. Export your corporate/root CA as PEM or CRT."
@@ -83,6 +90,9 @@ if ($Help) {
 }
 
 $buildArgs = @("build", "-t", $Image)
+if ($NoCache) {
+  $buildArgs += "--no-cache"
+}
 if ($CaCert) {
   $resolvedCaCert = (Resolve-Path -LiteralPath $CaCert).Path
   $env:DOCKER_BUILDKIT = "1"

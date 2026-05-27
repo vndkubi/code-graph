@@ -17,6 +17,7 @@ EXPORT_MODE=false
 PROJECT_PATH=""
 OUT_FILE=""
 CA_CERT=""
+NO_CACHE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +42,10 @@ while [[ $# -gt 0 ]]; do
       CA_CERT="$2"
       shift 2
       ;;
+    --no-cache)
+      NO_CACHE=true
+      shift
+      ;;
     --help|-h)
       cat <<EOF
 Usage: $0 [OPTIONS]
@@ -51,6 +56,7 @@ Options:
   --out <file>       Output path for --export.
   --image <name:tag> Docker image name. Default: mcp-code-graph:latest.
   --ca-cert <file>   Add a PEM/CRT corporate CA certificate to the build/runtime image.
+  --no-cache         Build without Docker layer cache.
   -h, --help         Show this help.
 
 Examples:
@@ -69,6 +75,9 @@ EOF
 done
 
 BUILD_ARGS=()
+if $NO_CACHE; then
+  BUILD_ARGS+=(--no-cache)
+fi
 if [[ -n "$CA_CERT" ]]; then
   CA_CERT="$(realpath "$CA_CERT")"
   if [[ ! -f "$CA_CERT" ]]; then
@@ -84,6 +93,10 @@ print_certificate_build_help() {
 
 Docker build failed with UNABLE_TO_GET_ISSUER_CERT_LOCALLY.
 The container does not trust the HTTPS issuer used for npm downloads.
+
+If the failing URL is unofficial-builds.nodejs.org, pull the latest Dockerfile.
+It forces native addons such as better-sqlite3 to use local Node headers
+with NPM_CONFIG_NODEDIR=/usr/local instead of downloading headers.
 
 Fix:
   1. Export your corporate/root CA as PEM or CRT.
