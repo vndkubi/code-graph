@@ -2,6 +2,8 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { sha256Text } from './hash.js';
 
+const GIT_COMMAND_TIMEOUT_MS = 5000;
+
 export interface GitInfo {
   root: string;
   gitCommonDir?: string;
@@ -66,6 +68,7 @@ function git(cwd: string, args: string[]): string | undefined {
       cwd,
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: GIT_COMMAND_TIMEOUT_MS,
     }).trim();
   } catch {
     return undefined;

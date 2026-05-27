@@ -43,13 +43,24 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         const workspaceKey = optionalString(body.workspaceKey);
         const workspace = indexer.registerWorkspace(root, workspaceKey);
         if (!watchers.has(workspace.root)) {
-          watchers.set(workspace.root, watchWorkspace(workspace.root, () => {
-            try {
-              indexer.indexWorkspace({ root: workspace.root, workspaceKey });
-            } catch (error) {
-              process.stderr.write(`[codegraph] watcher refresh failed: ${error instanceof Error ? error.message : String(error)}\n`);
-            }
-          }));
+          try {
+            watchers.set(workspace.root, watchWorkspace(workspace.root, () => {
+              try {
+                indexer.indexWorkspace({ root: workspace.root, workspaceKey });
+              } catch (error) {
+                process.stderr.write(`[codegraph] watcher refresh failed: ${error instanceof Error ? error.message : String(error)}\n`);
+              }
+            }));
+          } catch (error) {
+            process.stderr.write(`[codegraph] workspace watcher disabled: ${error instanceof Error ? error.message : String(error)}\n`);
+            logEvent(paths.daemonLogPath, {
+              event: 'workspace.watch.failed',
+              root: workspace.root,
+              workspaceKey,
+              workspaceId: workspace.workspaceId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
         logEvent(paths.daemonLogPath, {
           event: 'workspace.register',

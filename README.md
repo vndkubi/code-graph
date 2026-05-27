@@ -813,6 +813,8 @@ docker --context desktop-linux run --rm `
 | Corporate `npm ci` fails during build with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` | Missing trusted root CA inside the Docker build container | Use `.\docker-build.ps1 -CaCert C:\path\corp-root-ca.crt`; see [`docs/docker-setup.md`](docs/docker-setup.md#unable_to_get_issuer_cert_locally-during-docker-build) |
 | `better-sqlite3`/`node-gyp` tries to download headers from `unofficial-builds.nodejs.org` | Alpine native addon build is trying to fetch Node headers over corporate TLS | Use the latest Dockerfile, which sets npm/node-gyp `nodedir=/usr/local` and builds native addons from source against local headers |
 | Runtime stage recompiles native addons | Runtime ran `npm ci --omit=dev` after builder already compiled dependencies | Use the latest Dockerfile, which prunes dev deps in builder and copies production `node_modules` into runtime |
+| Daemon crashes on Docker bind mounts with Chokidar/inotify errors | WSL2/Windows NTFS bind mounts can reject watcher setup or emit watcher errors | Use the latest build; watcher errors are swallowed and setup failures are logged without failing workspace registration |
+| MCP initialize times out with `fetch failed` or exit code 1 on large Windows bind mounts | Slow `git status --porcelain` blocks registration until VS Code gives up | Use the latest build; git helper commands time out after 5 seconds and CodeGraph registers without slow git metadata |
 | MCP starts but agent does not use it | Editor config points to wrong command/args | Check CodeGraph logs or ask the agent to call `get_index_stats` explicitly |
 
 Windows PowerShell:

@@ -33,6 +33,7 @@ export function watchWorkspace(root: string, onChange: () => void): WorkspaceWat
   watcher.on('add', schedule);
   watcher.on('change', schedule);
   watcher.on('unlink', schedule);
+  watcher.on('error', () => undefined);
 
   return {
     async close() {
