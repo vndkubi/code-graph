@@ -693,6 +693,8 @@ Next review-quality optimization target: make `review_patch` return a compact ve
 
 Docker is optional. v2 normally runs best as a local stdio command from VS Code/Codex, but the image can be used when the workspace must be mounted into a container.
 
+For a detailed Docker operations guide covering image builds, prewarming indexes, branch checkouts, worktrees, cache resets, and performance modes, see [`docs/docker-setup.md`](docs/docker-setup.md).
+
 ### Docker setup runbook
 
 Use this checklist when setting up Docker for one or more real repositories.
