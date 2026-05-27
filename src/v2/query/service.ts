@@ -1256,23 +1256,6 @@ export class V2QueryService {
     const preferredFileRole = String(args.fileRole ?? 'main_source');
     const preferredLanguage = args.language ? String(args.language) : this.dominantResearchLanguage(snapshotId);
     const seedTerms = researchSeedTerms(target);
-    const symbolRows: Array<Record<string, unknown>> = [];
-    for (const query of researchSymbolQueries(target, seedTerms)) {
-      const result = this.searchSymbol(snapshotId, {
-        ...args,
-        query,
-        fileRole: preferredFileRole,
-        language: preferredLanguage,
-        limit: query === target ? 10 : 6,
-        includeTests: false,
-        includeGenerated: false,
-        includeFixtures: false,
-        includeSynthetic: false,
-        includeSnippets: false,
-        explainRank: query === target,
-      }) as { symbols: Array<Record<string, unknown>> };
-      symbolRows.push(...result.symbols);
-    }
     const explicitSymbols = this.explicitResearchSymbols(
       snapshotId,
       target,
@@ -1287,6 +1270,26 @@ export class V2QueryService {
       preferredLanguage,
       5,
     );
+    const explicitFastPath = explicitFiles.length >= 3;
+    const symbolRows: Array<Record<string, unknown>> = [];
+    if (!explicitFastPath) {
+      for (const query of researchSymbolQueries(target, seedTerms)) {
+        const result = this.searchSymbol(snapshotId, {
+          ...args,
+          query,
+          fileRole: preferredFileRole,
+          language: preferredLanguage,
+          limit: query === target ? 10 : 6,
+          includeTests: false,
+          includeGenerated: false,
+          includeFixtures: false,
+          includeSynthetic: false,
+          includeSnippets: false,
+          explainRank: query === target,
+        }) as { symbols: Array<Record<string, unknown>> };
+        symbolRows.push(...result.symbols);
+      }
+    }
 
     const symbolCandidates = uniqueSymbolCandidates([
       ...explicitSymbols,
@@ -1297,20 +1300,22 @@ export class V2QueryService {
       ? symbolCandidates.filter(symbol => explicitFileSet.has(symbol.file))
       : symbolCandidates;
     const relevantSymbols = (scopedSymbolCandidates.length > 0 ? scopedSymbolCandidates : symbolCandidates).slice(0, 6);
-    const fileResults = this.searchFiles(snapshotId, {
-      ...args,
-      query: target,
-      fileRole: preferredFileRole,
-      language: preferredLanguage,
-      limit: 8,
-      includeTests: false,
-      includeGenerated: false,
-      includeFixtures: false,
-      includeSnippets: true,
-      snippetLines: clampInt(Number(args.snippetLines ?? 14), 6, 40),
-      snippetTokenBudget: Math.min(5000, Math.max(1200, Math.floor(tokenBudget * 0.45))),
-      explainRank: true,
-    }) as { files: Array<Record<string, unknown>>; totalFound?: number };
+    const fileResults = explicitFastPath
+      ? { files: [] as Array<Record<string, unknown>>, totalFound: explicitFiles.length }
+      : this.searchFiles(snapshotId, {
+        ...args,
+        query: target,
+        fileRole: preferredFileRole,
+        language: preferredLanguage,
+        limit: 8,
+        includeTests: false,
+        includeGenerated: false,
+        includeFixtures: false,
+        includeSnippets: true,
+        snippetLines: clampInt(Number(args.snippetLines ?? 14), 6, 40),
+        snippetTokenBudget: Math.min(5000, Math.max(1200, Math.floor(tokenBudget * 0.45))),
+        explainRank: true,
+      }) as { files: Array<Record<string, unknown>>; totalFound?: number };
     const candidateFiles = uniqueFileCandidates([
       ...explicitFiles,
       ...(explicitFiles.length >= 3 ? [] : fileResults.files.map(row => compactFileCandidate(row))),
@@ -1325,10 +1330,10 @@ export class V2QueryService {
       })),
     ]).slice(0, 6);
 
-    const edgeSeeds = relevantSymbols.slice(0, 4);
+    const edgeSeeds = explicitFastPath ? [] : relevantSymbols.slice(0, 4);
     const candidateFileSet = new Set(candidateFiles.map(file => file.file));
-    const callersRaw = this.researchCallEdges(snapshotId, edgeSeeds, 'callers', 8);
-    const calleesRaw = this.researchCallEdges(snapshotId, edgeSeeds, 'callees', 8);
+    const callersRaw = edgeSeeds.length > 0 ? this.researchCallEdges(snapshotId, edgeSeeds, 'callers', 8) : [];
+    const calleesRaw = edgeSeeds.length > 0 ? this.researchCallEdges(snapshotId, edgeSeeds, 'callees', 8) : [];
     const callers = explicitFiles.length > 0
       ? callersRaw.filter(edge => candidateFileSet.has(edge.file)).slice(0, 8)
       : callersRaw;
@@ -1370,6 +1375,7 @@ export class V2QueryService {
     const missingFacts = researchMissingFacts({
       target,
       relevantSymbols,
+      fileCandidateCount: candidateFiles.length,
       evidenceSlices,
       flowSteps,
     });
@@ -1490,18 +1496,31 @@ export class V2QueryService {
       if (files.length >= limit * 2) break;
     }
     const orderedFiles = uniqueFilesInOrder(files).slice(0, limit * 2);
-    const order = new Map(orderedFiles.map((file, index) => [file, index]));
-    return this.fileCandidatesForPaths(snapshotId, orderedFiles, target)
-      .sort((a, b) => (order.get(a.file) ?? 9999) - (order.get(b.file) ?? 9999))
+    if (orderedFiles.length === 0) return [];
+    const placeholders = orderedFiles.map(() => '?').join(', ');
+    const rows = this.db.prepare(`
+      SELECT path, language, file_role
+      FROM files
+      WHERE snapshot_id = ? AND path IN (${placeholders})
+    `).all(snapshotId, ...orderedFiles) as Array<{ path: string; language?: string; file_role?: string }>;
+    const rowsByPath = new Map(rows.map(row => [row.path, row]));
+    return orderedFiles
       .slice(0, limit)
-      .map(candidate => ({
-        ...candidate,
-        lines: bestExplicitSourceRange(root, candidate.file, target) ?? candidate.lines,
-        whyRelevant: candidate.whyRelevant.startsWith('explicit')
-          ? candidate.whyRelevant
-          : `explicit file/class mention: ${candidate.file}`,
-        confidence: Math.max(candidate.confidence, 0.9),
-      }));
+      .map((file) => {
+        const row = rowsByPath.get(file);
+        const basename = path.posix.basename(file, path.posix.extname(file));
+        return {
+          file,
+          language: row?.language,
+          fileRole: row?.file_role,
+          lines: bestExplicitSourceRange(root, file, target) ?? '1-80',
+          whyRelevant: `explicit file/class mention: ${file}`,
+          confidence: 0.95,
+          matchedTokens: [basename],
+          topSymbols: [],
+          endpoints: [],
+        };
+      });
   }
 
   private explicitResearchSymbols(
@@ -3582,12 +3601,15 @@ function researchFlowSteps(input: {
 function researchMissingFacts(input: {
   target: string;
   relevantSymbols: ResearchSymbolCandidate[];
+  fileCandidateCount: number;
   evidenceSlices: Array<Record<string, unknown>>;
   flowSteps: Array<Record<string, unknown>>;
 }): string[] {
   const missing: string[] = [];
   if (!input.target.trim()) missing.push('Target was empty; rerun with the subsystem, class, or request flow to research.');
-  if (input.relevantSymbols.length === 0) missing.push('No ranked symbols resolved; call search_code with the exact subsystem/class names.');
+  if (input.relevantSymbols.length === 0 && input.fileCandidateCount === 0) {
+    missing.push('No ranked symbols or files resolved; call search_code with the exact subsystem/class names.');
+  }
   if (input.evidenceSlices.length === 0) missing.push('No source evidence slices were produced; call get_file_slice for the top ranked file or symbol.');
   if (input.flowSteps.length === 0 && input.evidenceSlices.length === 0) missing.push('No flow steps or source evidence were available from the index.');
   return missing;
