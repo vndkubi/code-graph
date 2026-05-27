@@ -1152,6 +1152,32 @@ public class DemoChanged {
     expect(refreshedSearch.indexFreshness).toBeUndefined();
   });
 
+  it('does not auto-refresh an empty first-time snapshot on query', () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-empty-snapshot-');
+
+    const { db } = openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = indexer.indexWorkspace({ root: repo });
+    expect(result.filesTotal).toBe(0);
+
+    writeFile(repo, 'src/main/java/com/example/DemoLater.java', `package com.example;
+
+public class DemoLater {
+}
+`);
+
+    const queries = new V2QueryService(db);
+    const search = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'DemoLater', limit: 5, autoRefresh: true },
+    }) as { symbols: Array<{ name: string }>; indexFreshness?: { isStale: boolean } };
+
+    expect(search.symbols.some(symbol => symbol.name === 'DemoLater')).toBe(false);
+    expect(search.indexFreshness?.isStale).toBe(true);
+  });
+
   it('uses workspace keys to distinguish Docker-mounted repositories with the same container root', () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-workspace-key-');
@@ -1210,6 +1236,15 @@ public class FeatureBranchMarker {
     expect(mainSearch.symbols.some(symbol => symbol.name === 'MainBranchMarker')).toBe(true);
 
     runGit(repo, 'checkout', 'feature');
+
+    const staleFeatureSearch = queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'FeatureBranchMarker', limit: 5 },
+    }) as { indexFreshness?: { isStale: boolean; dirtyFiles?: unknown } };
+
+    expect(staleFeatureSearch.indexFreshness?.isStale).toBe(true);
+    expect(staleFeatureSearch.indexFreshness?.dirtyFiles).toBeUndefined();
 
     const featureSearch = queries.query({
       workspaceId: result.workspaceId,

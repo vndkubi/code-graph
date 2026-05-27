@@ -727,6 +727,8 @@ docker --context desktop-linux run --rm `
 
 Run the same command again to confirm warm behavior. A healthy warm run should report `skippedUnchanged: true` or `filesParsed: 0`, plus high `hashCacheHits`/`parseCacheHits`.
 
+If a real repository reports `filesTotal: 0`, the container is seeing an empty mount. On Docker Desktop for Windows, open Docker Desktop -> Settings -> Resources -> File Sharing, add `D:\`, click Apply & Restart, then re-run the `index --root /workspace` command with the same `CODEGRAPH_WORKSPACE_KEY`.
+
 4. Run the MCP stdio process manually as a smoke test:
 
 ```powershell
@@ -807,12 +809,14 @@ docker --context desktop-linux run --rm `
 |---------|--------------|-----|
 | `Cannot connect to the Docker daemon` | Docker Desktop engine/context is not running | Start Docker Desktop, then try `docker --context desktop-linux ps` |
 | Docker cannot mount `D:/...`, `/workspace` is empty, or index finds no project files | Windows drive is not shared with Docker Desktop | Docker Desktop -> Settings -> Resources -> File Sharing -> Add `D:\` -> Apply & Restart, then re-run the index command |
+| `get_flow_pack` returns empty results after `filesTotal: 0` | The SQLite snapshot has no files, symbols, or graph rows because the bind mount was empty | Fix Docker Desktop File Sharing for `D:\`, then re-run `docker run ... index --root /workspace` with the same workspace key |
 | Every repo appears as the same workspace | Missing or reused `CODEGRAPH_WORKSPACE_KEY` | Set a unique host path or stable key per repo |
 | Warm run still parses everything | Cache volume changed or workspace key changed | Reuse the same volume and exact workspace key |
 | Very slow cold index on Windows | Docker Desktop bind mount overhead | Prefer local Node/stdio or WSL/ext4 for large repos; keep Docker cache volume persistent |
 | Corporate `npm ci` fails during build with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` | Missing trusted root CA inside the Docker build container | Use `.\docker-build.ps1 -CaCert C:\path\corp-root-ca.crt`; see [`docs/docker-setup.md`](docs/docker-setup.md#unable_to_get_issuer_cert_locally-during-docker-build) |
 | `better-sqlite3`/`node-gyp` tries to download headers from `unofficial-builds.nodejs.org` | Alpine native addon build is trying to fetch Node headers over corporate TLS | Use the latest Dockerfile, which sets npm/node-gyp `nodedir=/usr/local` and builds native addons from source against local headers |
 | Runtime stage recompiles native addons | Runtime ran `npm ci --omit=dev` after builder already compiled dependencies | Use the latest Dockerfile, which prunes dev deps in builder and copies production `node_modules` into runtime |
+| `autoRefresh=true` on an empty/first-time large index does not populate results | Auto-refresh skips snapshots with zero indexed files; it is intended for incremental refreshes of existing snapshots | Run explicit `docker run ... index --root /workspace` after fixing the bind mount |
 | Daemon crashes on Docker bind mounts with Chokidar/inotify errors | WSL2/Windows NTFS bind mounts can reject watcher setup or emit watcher errors | Use the latest build; watcher errors are swallowed and setup failures are logged without failing workspace registration |
 | MCP initialize times out with `fetch failed` or exit code 1 on large Windows bind mounts | Slow `git status --porcelain` blocks registration until VS Code gives up | Use the latest build; git helper commands time out after 5 seconds and CodeGraph registers without slow git metadata |
 | MCP starts but agent does not use it | Editor config points to wrong command/args | Check CodeGraph logs or ask the agent to call `get_index_stats` explicitly |

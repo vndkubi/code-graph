@@ -175,6 +175,12 @@ should report one or more of:
 - high `parseCacheHits`
 - high `hashCacheHits`
 
+If the index command reports `filesTotal: 0` for a real repository, stop and fix
+the Docker bind mount before using MCP. On Docker Desktop for Windows, share the
+drive that contains the repository: Docker Desktop -> Settings -> Resources ->
+File Sharing -> Add `D:\` -> Apply & Restart. Then re-run the `index --root
+/workspace` command.
+
 Use fewer parse workers if the machine is memory constrained. The current
 runtime caps requested parse workers at 16.
 
@@ -490,6 +496,9 @@ docker --context desktop-linux run --rm `
 - For day-to-day correctness after branch changes, use `--auto-refresh`; for
   strict performance benchmarks on a known-warm snapshot, omit `--auto-refresh`
   and manually run `index` after each checkout.
+- Do not rely on `--auto-refresh` for the first full index of a large repository
+  or for a snapshot that was created with `filesTotal: 0`. Run `docker run ...
+  index --root /workspace` manually after the bind mount is correct.
 - Do not delete the Docker cache volume unless you intentionally want a cold
   start measurement.
 
@@ -499,9 +508,11 @@ docker --context desktop-linux run --rm `
 |---------|--------------|-----|
 | `Cannot connect to the Docker daemon` | Docker Desktop or Docker context is not running | Start Docker Desktop and run `docker --context desktop-linux ps`. |
 | Docker cannot mount `D:/...`, `/workspace` is empty, or the index sees no project files | The Windows drive is not shared with Docker Desktop | Docker Desktop -> Settings -> Resources -> File Sharing -> Add `D:\` -> Apply & Restart, then re-run the index command. |
+| `get_flow_pack` returns empty results after an index run with `filesTotal: 0` | The SQLite snapshot contains no files, symbols, or graph rows because the repository mount was empty | Fix Docker Desktop File Sharing for `D:\`, then re-run `docker run ... index --root /workspace` with the same `CODEGRAPH_WORKSPACE_KEY`. |
 | Every repo looks like the same workspace | Missing or reused `CODEGRAPH_WORKSPACE_KEY` | Use a unique host path or stable key per repo/worktree. |
 | Warm run parses everything again | Different cache volume, different workspace key, or changed branch/files | Reuse the same volume/key and inspect index output fields. |
 | First MCP question after checkout is slow | `--auto-refresh` is refreshing a stale snapshot | Prewarm manually after checkout before asking the agent. |
+| `autoRefresh=true` on an empty or first-time large index does not populate results | CodeGraph skips automatic full reindexing when the current snapshot has zero indexed files; auto-refresh is for incremental refreshes of existing snapshots | Run the explicit Docker index command after fixing the bind mount. |
 | MCP answers from an old branch | MCP was run without `--auto-refresh` and the index was not refreshed | Run `index --root /workspace` with the same workspace key. |
 | Daemon crashes immediately on a Docker bind mount with a Chokidar/inotify error | Docker/WSL2/Windows NTFS can reject file watcher setup or emit watcher errors | Use the current build. Watcher errors are swallowed, and watcher setup failures are logged without breaking workspace registration. |
 | MCP initialize times out with `fetch failed` or exit code 1 on a large Windows bind mount | Git metadata commands such as `git status --porcelain` are too slow on Docker Desktop/WSL2 NTFS and block registration | Use the current build. Git helper commands time out after 5 seconds, so CodeGraph registers without slow git metadata instead of missing the MCP initialize deadline. |

@@ -24,7 +24,8 @@ export class V2QueryService {
     if (envelope.args.autoRefresh === true) {
       const freshnessBeforeRefresh = this.indexFreshness(snapshotId);
       const workspace = this.workspaceInfo(envelope.workspaceId);
-      if (freshnessBeforeRefresh?.isStale && workspace?.root) {
+      const indexedFileCount = this.indexedFileCount(snapshotId);
+      if (freshnessBeforeRefresh?.isStale && workspace?.root && indexedFileCount > 0) {
         snapshotId = this.indexer.indexWorkspace({
           root: workspace.root,
           workspaceKey: workspace.workspaceKey,
@@ -93,6 +94,10 @@ export class V2QueryService {
     return this.indexer.indexWorkspace({ root });
   }
 
+  private indexedFileCount(snapshotId: string): number {
+    return scalar(this.db, 'SELECT COUNT(*) FROM files WHERE snapshot_id = ?', snapshotId);
+  }
+
   private requireSnapshot(workspaceId: string): string {
     const row = this.db.prepare('SELECT current_snapshot_id FROM workspaces WHERE id = ?')
       .get(workspaceId) as { current_snapshot_id?: string } | undefined;
@@ -141,7 +146,7 @@ export class V2QueryService {
     const gitDirty = git.available
       ? git.headCommit !== row.head_commit || git.dirtyHash !== row.dirty_hash
       : false;
-    const dirtyFiles = !git.available || gitDirty ? this.computeDirtyFiles(snapshotId) : undefined;
+    const dirtyFiles = !git.available ? this.computeDirtyFiles(snapshotId) : undefined;
     const dirtyCounts = (dirtyFiles ?? {}) as {
       addedCount?: number;
       modifiedCount?: number;
