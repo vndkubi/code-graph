@@ -32,8 +32,8 @@ RUN npm config set cafile /etc/ssl/certs/ca-certificates.crt \
 COPY tsconfig.json ./
 COPY src/ ./src/
 
-RUN npm run build \
-    && npm prune --omit=dev
+RUN npm run build
+RUN npm prune --omit=dev
 
 FROM node:20-alpine AS runtime
 
