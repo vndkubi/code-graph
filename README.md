@@ -972,6 +972,13 @@ args = [
 
 For multiple projects, keep one MCP server entry per project or use the VS Code `${workspaceFolder}` config above. The container should keep the source mount read-only and connect CodeGraph to the local Postgres database and keep `/codegraph-home` for daemon metadata/logs.
 
+For two local clones of the same upstream repository, keep one shared
+`codegraph-cache` volume but set a different `CODEGRAPH_WORKSPACE_KEY` for each
+clone folder. Current builds write daemon metadata as container-scoped files,
+so concurrent Docker MCP containers do not overwrite each other's localhost
+daemon pointer. If one of two concurrent Copilot CLI sessions fails to start on
+an older image, rebuild `mcp-code-graph:latest`.
+
 Multi-project examples:
 
 - VS Code/Copilot: [`examples/vscode-docker-mcp.settings.jsonc`](examples/vscode-docker-mcp.settings.jsonc)
@@ -988,7 +995,7 @@ Recent Windows Docker multi-project smoke report:
 | `doughnut` cold | `1da416` | 1345 | 1341 | 0 | 169.6s |
 | `doughnut` warm | `1da416` | 1345 | 0 | 1345 | 103.5s |
 
-The smoke test used one shared Docker volume, `codegraph-cache`, with separate `CODEGRAPH_WORKSPACE_KEY` values. MCP startup was also verified through Docker for both projects, exposing 19 tools. Docker Desktop bind mounts from `D:\...` are noticeably slower than local or WSL/Linux filesystems; for very large repositories, prewarm from WSL/ext4 when possible.
+The smoke test used one shared Docker volume, `codegraph-cache`, with separate `CODEGRAPH_WORKSPACE_KEY` values. MCP startup was also verified through Docker for both projects, exposing 19 tools. Current builds use container-scoped daemon metadata inside the shared volume, so concurrent Docker MCP sessions do not share one unreachable `127.0.0.1` daemon pointer. Docker Desktop bind mounts from `D:\...` are noticeably slower than local or WSL/Linux filesystems; for very large repositories, prewarm from WSL/ext4 when possible.
 
 Recent Docker context-proof report, run on 2026-05-23 with a warmed CodeGraph index:
 

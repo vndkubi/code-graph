@@ -350,6 +350,13 @@ For multiple projects, see:
 - `examples/docker-multi-project.codex.toml.example`
 - `examples/vscode-docker-mcp.settings.jsonc`
 
+For two local clones of the same upstream repository, keep one shared
+`codegraph-cache` volume but set a different `CODEGRAPH_WORKSPACE_KEY` for each
+clone folder. Current builds write daemon metadata as container-scoped files,
+so concurrent Docker MCP containers do not overwrite each other's localhost
+daemon pointer. If one of two concurrent Copilot CLI sessions fails to start on
+an older image, rebuild `mcp-code-graph:latest`.
+
 ## Branch and Checkout Scenarios
 
 ### Scenario 1: You checkout another branch in the same folder

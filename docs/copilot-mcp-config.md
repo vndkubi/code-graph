@@ -162,6 +162,13 @@ An editable template is also available at
 Add one server entry per host repository or worktree. Keep the names and
 `CODEGRAPH_WORKSPACE_KEY` values unique.
 
+For two local clones of the same upstream repository, use the two host folder
+paths as the two workspace keys. The Docker cache volume can stay shared:
+current builds store daemon metadata per container, while graph snapshots and
+parse cache are isolated by `CODEGRAPH_WORKSPACE_KEY` in Postgres. Older images
+used one shared `daemon.json` and could make one concurrent Copilot CLI session
+fail to start; rebuild the image if you see that behavior.
+
 ```json
 {
   "mcpServers": {
@@ -335,7 +342,7 @@ node D:\Personal\Projects\code-graph\dist\cli.js index `
 | Index reports `filesTotal: 0` | Docker cannot see the bind mount. | Share the Windows drive in Docker Desktop, verify the host path, then rerun prewarm. |
 | First query is slow | The repo was not prewarmed, or `--auto-refresh` is refreshing a stale snapshot. | Run the explicit Docker `index --root /workspace` command before asking Copilot. |
 | Copilot terminates with a connection timeout | MCP startup or a tool call is blocked by prewarm, watcher refresh, stale checks, or a missing prewarm snapshot. | Rebuild the latest image, prewarm manually, keep the Copilot entry on `--no-prewarm`, and do not add `--watch`, `--warn-stale`, or `--auto-refresh` for large Docker bind mounts. |
-| Copilot reports `Timed out waiting for codegraph daemon to start` | A prior Docker MCP container left stale daemon metadata, or Postgres is blocked by an aborted index transaction. | Rebuild the latest image; startup removes stale `daemon.json`. If it persists, inspect `/codegraph-home/logs/daemon.jsonl.bootstrap.log` from the `codegraph-cache` volume and restart the stuck index/Postgres service. |
+| Copilot reports `Timed out waiting for codegraph daemon to start` | A prior Docker MCP container left stale daemon metadata, or Postgres is blocked by an aborted index transaction. | Rebuild the latest image; startup ignores other containers' daemon files and removes stale metadata for its own runtime. If it persists, inspect `/codegraph-home/logs/daemon.jsonl.bootstrap.log` from the `codegraph-cache` volume and restart the stuck index/Postgres service. |
 | Answers look stale after checkout | The index still points at the previous checkout. | Run the Docker prewarm command again with the same workspace key. |
 | Copilot uses grep/read instead of CodeGraph | The prompt did not request CodeGraph, the MCP server did not start, or tools are disabled by policy. | Ask for a direct CodeGraph tool call and inspect `/mcp show` plus CodeGraph logs. |
 | `connect ECONNREFUSED host.docker.internal:54329` | Postgres is not running or the container cannot reach it. | Run `docker compose -f compose.postgres.yml up -d` from the CodeGraph checkout. |
