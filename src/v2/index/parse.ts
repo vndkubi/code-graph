@@ -14,6 +14,7 @@ export interface ParseWorkItem {
   key: string;
   absPath: string;
   rootDir: string;
+  size?: number;
 }
 
 export interface ParseWorkResult {
@@ -207,11 +208,18 @@ function parseWorkerCount(itemCount: number, requested: number | undefined): num
   return Math.max(1, Math.min(Math.floor(requested), 16, itemCount));
 }
 
-function chunkWorkItems<T>(items: T[], chunkCount: number): T[][] {
-  const chunks = Array.from({ length: chunkCount }, () => [] as T[]);
-  items.forEach((item, index) => {
-    chunks[index % chunkCount]?.push(item);
-  });
+function chunkWorkItems(items: ParseWorkItem[], chunkCount: number): ParseWorkItem[][] {
+  const chunks = Array.from({ length: chunkCount }, () => [] as ParseWorkItem[]);
+  const weights = Array.from({ length: chunkCount }, () => 0);
+  const weightedItems = [...items].sort((a, b) => (b.size ?? 1) - (a.size ?? 1));
+  for (const item of weightedItems) {
+    let target = 0;
+    for (let index = 1; index < weights.length; index++) {
+      if ((weights[index] ?? 0) < (weights[target] ?? 0)) target = index;
+    }
+    chunks[target]?.push(item);
+    weights[target] = (weights[target] ?? 0) + (item.size ?? 1);
+  }
   return chunks.filter(chunk => chunk.length > 0);
 }
 

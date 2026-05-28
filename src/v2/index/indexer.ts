@@ -4,7 +4,7 @@ import type { ParseResult, SymbolInfo } from '../../analyzers/base-analyzer.js';
 import { getGitInfo, type GitInfo } from '../git.js';
 import { sha256Json, stableId } from '../hash.js';
 import { scanManifest, type ManifestFile, type ManifestPreviousFile } from './manifest.js';
-import { parseFilesBatch, symbolFqName } from './parse.js';
+import { parseFilesBatch, symbolFqName, type ParseWorkItem } from './parse.js';
 import { roleRank } from './file-role.js';
 
 export interface IndexWorkspaceOptions {
@@ -55,6 +55,7 @@ interface WorkspaceRow {
 }
 
 interface ParseCacheRow {
+  blob_hash: string;
   parse_json: string;
 }
 
@@ -472,7 +473,7 @@ export class V2Indexer {
   ): Promise<PreparedParseBatch> {
     const start = Date.now();
     const plans: ParsePlan[] = [];
-    const workItems: Array<{ key: string; absPath: string; rootDir: string }> = [];
+    const workItems: ParseWorkItem[] = [];
     let parseCacheHits = 0;
     let checkedFiles = 0;
     let lastCacheProgressAt = 0;
@@ -485,6 +486,9 @@ export class V2Indexer {
       total: files.length,
       elapsedMs: 0,
     });
+    const cachedByBlobHash = await this.parseCacheByBlobHash(files
+      .filter(file => file.parseable && file.language)
+      .map(file => file.blobHash));
 
     for (const file of files) {
       if (!file.parseable || !file.language) {
@@ -507,10 +511,9 @@ export class V2Indexer {
         continue;
       }
 
-      const cached = await this.db.prepare('SELECT parse_json FROM parse_cache WHERE blob_hash = ?')
-        .get(file.blobHash) as ParseCacheRow | undefined;
+      const cached = cachedByBlobHash.get(file.blobHash);
       if (cached) {
-        const result = JSON.parse(cached.parse_json) as ParseResult;
+        const result = JSON.parse(cached) as ParseResult;
         parseCacheHits++;
         plans.push({
           file,
@@ -536,6 +539,7 @@ export class V2Indexer {
         key: file.relPath,
         absPath: file.absPath,
         rootDir: root,
+        size: file.size,
       });
       checkedFiles++;
       lastCacheProgressAt = reportProgressEvery(progress, lastCacheProgressAt, {
@@ -594,6 +598,21 @@ export class V2Indexer {
       parseCacheHits,
       parseWorkers: parseFilesBatchWorkerCount(workItems.length, requestedWorkers),
     };
+  }
+
+  private async parseCacheByBlobHash(blobHashes: string[]): Promise<Map<string, string>> {
+    const unique = [...new Set(blobHashes)];
+    const cached = new Map<string, string>();
+    for (const batch of chunkArray(unique, MAX_BATCH_PARAMS)) {
+      const placeholders = batch.map(() => '?').join(', ');
+      const rows = await this.db.prepare(`
+        SELECT blob_hash, parse_json
+        FROM parse_cache
+        WHERE blob_hash IN (${placeholders})
+      `).all(...batch) as ParseCacheRow[];
+      for (const row of rows) cached.set(row.blob_hash, row.parse_json);
+    }
+    return cached;
   }
 
   private async insertParseCaches(items: ParseResultForFile[], now: string): Promise<void> {

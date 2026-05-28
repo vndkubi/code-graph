@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { classifyFile, type FileRole } from './file-role.js';
 import { sha256File } from '../hash.js';
 
@@ -47,6 +48,19 @@ export interface ManifestScanProgressEvent {
   elapsedMs: number;
 }
 
+interface GitHashLookup {
+  root: string;
+  rootPrefix: string;
+  entriesByPath: Map<string, GitIndexEntry>;
+}
+
+interface GitIndexEntry {
+  blobHash: string;
+  mtimeSec: number;
+  mtimeNanos: number;
+  size: number;
+}
+
 const DEFAULT_SKIP_DIRS = new Set([
   '.git',
   '.idea',
@@ -67,6 +81,7 @@ export function scanManifest(root: string, options: ManifestScanOptions = {}): M
   const maxFileSizeBytes = options.maxFileSizeBytes ?? 5 * 1024 * 1024;
   const files: ManifestFile[] = [];
   const previousByPath = new Map((options.previousFiles ?? []).map(file => [file.path, file]));
+  const gitHashes = loadGitHashLookup(rootDir);
   const stats = { filesHashed: 0, hashCacheHits: 0, lastProgressAt: start };
 
   options.progress?.({
@@ -78,7 +93,7 @@ export function scanManifest(root: string, options: ManifestScanOptions = {}): M
     elapsedMs: 0,
   });
 
-  walk(rootDir, rootDir, files, maxFileSizeBytes, previousByPath, stats, start, options.progress);
+  walk(rootDir, rootDir, files, maxFileSizeBytes, previousByPath, gitHashes, stats, start, options.progress);
 
   options.progress?.({
     phase: 'manifest',
@@ -105,6 +120,7 @@ function walk(
   files: ManifestFile[],
   maxFileSizeBytes: number,
   previousByPath: Map<string, ManifestPreviousFile>,
+  gitHashes: GitHashLookup | undefined,
   stats: { filesHashed: number; hashCacheHits: number; lastProgressAt: number },
   start: number,
   progress?: (event: ManifestScanProgressEvent) => void,
@@ -122,7 +138,7 @@ function walk(
 
     if (entry.isDirectory()) {
       if (DEFAULT_SKIP_DIRS.has(entry.name)) continue;
-      walk(root, absPath, files, maxFileSizeBytes, previousByPath, stats, start, progress);
+      walk(root, absPath, files, maxFileSizeBytes, previousByPath, gitHashes, stats, start, progress);
       continue;
     }
 
@@ -140,14 +156,7 @@ function walk(
     if (stat.size > maxFileSizeBytes) continue;
 
     const previous = previousByPath.get(relPath);
-    const blobHash = previous && previous.mtimeMs === stat.mtimeMs && previous.size === stat.size
-      ? previous.blobHash
-      : sha256File(absPath);
-    if (previous && previous.mtimeMs === stat.mtimeMs && previous.size === stat.size) {
-      stats.hashCacheHits++;
-    } else {
-      stats.filesHashed++;
-    }
+    const blobHash = blobHashForFile(relPath, absPath, stat, previous, gitHashes, stats);
 
     files.push({
       absPath,
@@ -174,4 +183,125 @@ function walk(
       });
     }
   }
+}
+
+function blobHashForFile(
+  relPath: string,
+  absPath: string,
+  stat: fs.Stats,
+  previous: ManifestPreviousFile | undefined,
+  gitHashes: GitHashLookup | undefined,
+  stats: { filesHashed: number; hashCacheHits: number },
+): string {
+  const gitPath = gitPathForRelPath(gitHashes, relPath);
+  const gitEntry = gitPath ? gitHashes?.entriesByPath.get(gitPath) : undefined;
+  if (gitEntry && gitIndexEntryMatchesStat(gitEntry, stat)) {
+    stats.hashCacheHits++;
+    return `git:${gitEntry.blobHash}`;
+  }
+
+  if (previous
+    && previous.mtimeMs === stat.mtimeMs
+    && previous.size === stat.size) {
+    stats.hashCacheHits++;
+    return previous.blobHash;
+  }
+
+  stats.filesHashed++;
+  return sha256File(absPath);
+}
+
+function loadGitHashLookup(root: string): GitHashLookup | undefined {
+  const topLevel = git(root, ['rev-parse', '--show-toplevel'])?.trim();
+  if (!topLevel) return undefined;
+  const gitRoot = path.resolve(topLevel);
+  const rootPrefix = toPosixPath(path.relative(gitRoot, root));
+  if (rootPrefix.startsWith('..')) return undefined;
+
+  const lsFiles = git(gitRoot, ['ls-files', '-s', '--debug', '--', pathspec(rootPrefix)], 60_000);
+  if (!lsFiles) return undefined;
+
+  return {
+    root: gitRoot,
+    rootPrefix,
+    entriesByPath: parseGitIndexEntries(lsFiles),
+  };
+}
+
+function parseGitIndexEntries(output: string): Map<string, GitIndexEntry> {
+  const entries = new Map<string, GitIndexEntry>();
+  let current: Partial<GitIndexEntry> & { path?: string } | undefined;
+
+  const flushCurrent = () => {
+    if (!current?.path
+      || !current.blobHash
+      || current.mtimeSec === undefined
+      || current.mtimeNanos === undefined
+      || current.size === undefined) {
+      return;
+    }
+    entries.set(current.path, {
+      blobHash: current.blobHash,
+      mtimeSec: current.mtimeSec,
+      mtimeNanos: current.mtimeNanos,
+      size: current.size,
+    });
+  };
+
+  for (const line of output.split(/\r?\n/)) {
+    const header = /^(\d+)\s+([0-9a-fA-F]+)\s+\d+\t(.+)$/.exec(line);
+    if (header) {
+      flushCurrent();
+      current = { blobHash: header[2]!.toLowerCase(), path: header[3]! };
+      continue;
+    }
+    if (!current) continue;
+
+    const mtime = /^\s+mtime:\s+(\d+):(\d+)/.exec(line);
+    if (mtime) {
+      current.mtimeSec = Number(mtime[1]);
+      current.mtimeNanos = Number(mtime[2]);
+      continue;
+    }
+
+    const size = /^\s+size:\s+(\d+)/.exec(line);
+    if (size) current.size = Number(size[1]);
+  }
+  flushCurrent();
+  return entries;
+}
+
+function gitIndexEntryMatchesStat(entry: GitIndexEntry, stat: fs.Stats): boolean {
+  if (entry.size !== stat.size) return false;
+  const statMtimeSec = Math.floor(stat.mtimeMs / 1000);
+  if (entry.mtimeSec !== statMtimeSec) return false;
+  const statMtimeNanos = Math.round((stat.mtimeMs - statMtimeSec * 1000) * 1_000_000);
+  return Math.abs(entry.mtimeNanos - statMtimeNanos) < 1_000_000;
+}
+
+function gitPathForRelPath(gitHashes: GitHashLookup | undefined, relPath: string): string | undefined {
+  if (!gitHashes) return undefined;
+  return gitHashes.rootPrefix ? `${gitHashes.rootPrefix}/${relPath}` : relPath;
+}
+
+function git(cwd: string, args: string[], timeout: number = 10_000): string | undefined {
+  try {
+    return execFileSync('git', args, {
+      cwd,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function pathspec(rootPrefix: string): string {
+  return rootPrefix || '.';
+}
+
+function toPosixPath(value: string): string {
+  return value.replace(/\\/g, '/');
 }
