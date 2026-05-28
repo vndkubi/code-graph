@@ -128,6 +128,8 @@ export const V2ToolSchemas = {
     symbols: z.array(z.string()).optional(),
     diff: z.string().optional(),
     limit: z.number().min(1).max(200).default(50),
+    skipLikelyTests: z.boolean().optional(),
+    callSeedLimit: z.number().min(0).max(30).optional(),
     ...FreshnessOptions,
   }),
   review_patch: z.object({

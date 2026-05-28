@@ -89,13 +89,14 @@ export async function openPostgresCodeGraphDb(): Promise<PostgresOpenResult> {
     ?? 'postgres://codegraph:codegraph_local@127.0.0.1:54329/codegraph';
   const statementTimeout = positiveInt(process.env.CODEGRAPH_DB_STATEMENT_TIMEOUT_MS, 30000);
   const lockTimeout = positiveInt(process.env.CODEGRAPH_DB_LOCK_TIMEOUT_MS, 5000);
+  const maxParallelWorkersPerGather = nonNegativeInt(process.env.CODEGRAPH_DB_MAX_PARALLEL_WORKERS_PER_GATHER, 0);
   const pool = new Pool({
     connectionString,
     max: positiveInt(process.env.CODEGRAPH_PG_POOL_MAX, 10),
     connectionTimeoutMillis: positiveInt(process.env.CODEGRAPH_PG_CONNECTION_TIMEOUT_MS, 2000),
     idleTimeoutMillis: positiveInt(process.env.CODEGRAPH_PG_IDLE_TIMEOUT_MS, 30000),
     application_name: process.env.CODEGRAPH_PG_APPLICATION_NAME ?? 'codegraph',
-    options: `-c statement_timeout=${statementTimeout} -c lock_timeout=${lockTimeout}`,
+    options: `-c statement_timeout=${statementTimeout} -c lock_timeout=${lockTimeout} -c max_parallel_workers_per_gather=${maxParallelWorkersPerGather}`,
   });
   await migratePostgres(pool);
   return {
@@ -113,6 +114,12 @@ async function migratePostgres(pool: pg.Pool): Promise<void> {
 function positiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function nonNegativeInt(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
   return Math.floor(parsed);
 }
 

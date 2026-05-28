@@ -107,7 +107,7 @@ export class V2QueryService {
       case 'search_code':
         return withFreshness(await this.searchCode(snapshotId, envelope.args));
       case 'get_index_stats':
-        return withFreshness(await this.getIndexStats(snapshotId));
+        return withFreshness(await this.getIndexStats(snapshotId, envelope.args));
       default:
         throw new Error(`Unknown v2 tool: ${envelope.toolName}`);
     }
@@ -358,6 +358,7 @@ export class V2QueryService {
     const cursorOffset = parseCursor(args.cursor);
     const explainRank = Boolean(args.explainRank ?? false);
     const tokens = tokenizeSearchQuery(query);
+    const rankingTokens = fileSearchRankingTokens(query, tokens);
     const filters = fileFiltersFor(args, query);
     const snippets = await this.snippetOptions(snapshotId, args);
     const baseClauses = ['f.snapshot_id = ?', ...filters.sql.map(sql => sql.replace(/\bfile_role\b/g, 'f.file_role'))];
@@ -402,103 +403,27 @@ export class V2QueryService {
       };
     }
 
-    const phrasePattern = `%${escapeLike(query)}%`;
-    const matchClauses = [
-      `f.path LIKE ? ESCAPE '\\'`,
-      `COALESCE(f.language, '') LIKE ? ESCAPE '\\'`,
-      `EXISTS (
-        SELECT 1 FROM symbols s
-        WHERE s.snapshot_id = f.snapshot_id
-          AND s.file = f.path
-          AND (
-            s.simple_name LIKE ? ESCAPE '\\'
-            OR s.fq_name LIKE ? ESCAPE '\\'
-            OR COALESCE(s.package_name, '') LIKE ? ESCAPE '\\'
-            OR COALESCE(s.framework_role, '') LIKE ? ESCAPE '\\'
-            OR COALESCE(s.annotations_json, '') LIKE ? ESCAPE '\\'
-          )
-      )`,
-      `EXISTS (
-        SELECT 1 FROM endpoints e
-        WHERE e.snapshot_id = f.snapshot_id
-          AND e.file = f.path
-          AND (
-            e.path LIKE ? ESCAPE '\\'
-            OR e.handler_symbol LIKE ? ESCAPE '\\'
-            OR COALESCE(e.controller, '') LIKE ? ESCAPE '\\'
-          )
-      )`,
-      `EXISTS (
-        SELECT 1 FROM imports i
-        WHERE i.snapshot_id = f.snapshot_id
-          AND i.file = f.path
-          AND i.source LIKE ? ESCAPE '\\'
-      )`,
-    ];
-    const matchParams: unknown[] = [
-      phrasePattern,
-      phrasePattern,
-      phrasePattern,
-      phrasePattern,
-      phrasePattern,
-      phrasePattern,
-      phrasePattern,
-      phrasePattern,
-      phrasePattern,
-      phrasePattern,
-      phrasePattern,
-    ];
-
-    for (const token of tokens) {
-      const pattern = `%${escapeLike(token)}%`;
-      matchClauses.push(`(
-        f.path LIKE ? ESCAPE '\\'
-        OR EXISTS (
-          SELECT 1 FROM symbols s
-          WHERE s.snapshot_id = f.snapshot_id
-            AND s.file = f.path
-            AND (
-              s.simple_name LIKE ? ESCAPE '\\'
-              OR s.fq_name LIKE ? ESCAPE '\\'
-              OR COALESCE(s.package_name, '') LIKE ? ESCAPE '\\'
-              OR COALESCE(s.framework_role, '') LIKE ? ESCAPE '\\'
-              OR COALESCE(s.annotations_json, '') LIKE ? ESCAPE '\\'
-            )
-        )
-        OR EXISTS (
-          SELECT 1 FROM endpoints e
-          WHERE e.snapshot_id = f.snapshot_id
-            AND e.file = f.path
-            AND (
-              e.path LIKE ? ESCAPE '\\'
-              OR e.handler_symbol LIKE ? ESCAPE '\\'
-              OR COALESCE(e.controller, '') LIKE ? ESCAPE '\\'
-            )
-        )
-        OR EXISTS (
-          SELECT 1 FROM imports i
-          WHERE i.snapshot_id = f.snapshot_id
-            AND i.file = f.path
-            AND i.source LIKE ? ESCAPE '\\'
-        )
-      )`);
-      matchParams.push(pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern);
-    }
-
     const broadConfigSearch = isApiSpecQuery(query) || /\b(config|yaml|json|xml|properties)\b/i.test(query);
     const candidateLimit = broadConfigSearch
       ? Math.min(Math.max((cursorOffset + limit) * 100, 1000), 5000)
       : Math.min(Math.max((cursorOffset + limit) * 40, 500), 2000);
-    const rows = await this.db.prepare(`
-      SELECT f.path, f.language, f.file_role, f.parse_status, f.size
-      FROM files f
-      WHERE ${baseWhere}
-        AND (${matchClauses.map(clause => `(${clause})`).join(' OR ')})
-      LIMIT ?
-    `).all(...baseParams, ...matchParams, candidateLimit) as FileRow[];
+    const candidateTerms = fileSearchCandidateTerms(query, rankingTokens);
+    const explicitRows = await this.explicitFileSearchRows(snapshotId, baseWhere, baseParams, query, Math.min(candidateLimit, limit * 2));
+    const useExplicitOnly = explicitRows.length > 0 && !broadConfigSearch && !isMyBatisIntent(query);
+    const rows = useExplicitOnly
+      ? explicitRows
+      : await this.fileSearchCandidateRows(
+        snapshotId,
+        baseWhere,
+        baseParams,
+        candidateTerms,
+        candidateLimit,
+        broadConfigSearch,
+        Boolean(endpointNeedleForResearch(query)) || isApiSpecQuery(query) || /\b(endpoint|route|controller)\b/i.test(query),
+      );
     const evidence = await this.fileEvidence(snapshotId, rows.map(row => row.path));
     const ranked = rows
-      .map(row => ({ row, score: scoreFileSearch(row, evidence.get(row.path), query, tokens) }))
+      .map(row => ({ row, score: scoreFileSearch(row, evidence.get(row.path), query, rankingTokens) }))
       .filter(candidate => candidate.score.matchedTokens.length > 0 || candidate.score.score > roleRank(candidate.row.file_role) / 10)
       .sort((a, b) => {
         if (b.score.score !== a.score.score) return b.score.score - a.score.score;
@@ -515,10 +440,12 @@ export class V2QueryService {
       nextCursor: cursorOffset + selected.length < ranked.length ? String(cursorOffset + selected.length) : undefined,
       facets: buildFileFacets(ranked.map(candidate => candidate.row)),
       filters: filters.effective,
-      queryTokens: tokens,
+      queryTokens: rankingTokens,
       searchMode: 'file-ranked',
       ...(explainRank ? { debug: rankDebug('search_files', [
-        'Ranking order: file path/name phrase, all-token path match, symbol evidence, endpoint evidence, dependency graph signal, file-role boost.',
+        'Ranking order: file path/name phrase, explicit symbol/file terms, symbol evidence, endpoint evidence, dependency graph signal, file-role boost.',
+        'Candidate retrieval is bounded by indexed file, symbol, and endpoint matches to avoid broad correlated scans on large workspaces.',
+        ...(useExplicitOnly ? ['Explicit file/class mention was resolved directly before fuzzy candidate retrieval.'] : []),
         `Candidate window: ${rows.length}; returned page offset ${cursorOffset}.`,
       ]) } : {}),
       confidence: ranked.some(candidate => candidate.score.score >= 80) ? 0.8 : 0.6,
@@ -527,6 +454,133 @@ export class V2QueryService {
         'Tests, generated files, and fixtures are hidden by default unless requested or implied by the query.',
       ],
     };
+  }
+
+  private async explicitFileSearchRows(
+    snapshotId: string,
+    baseWhere: string,
+    baseParams: unknown[],
+    query: string,
+    limit: number,
+  ): Promise<FileRow[]> {
+    const refs = explicitSymbolRefs(query).filter(ref => !isBroadExplicitRef(ref.className));
+    const explicitPaths = explicitFileNeedles(query)
+      .filter(needle => path.posix.extname(needle))
+      .filter(needle => !isBroadExplicitRef(path.posix.basename(needle, path.posix.extname(needle))));
+    const needles = uniqueStrings([
+      ...explicitPaths,
+      ...refs.map(ref => `${ref.className}.java`),
+      ...refs.map(ref => `${ref.className}.ts`),
+      ...refs.map(ref => `${ref.className}.py`),
+    ]).slice(0, 12);
+    if (needles.length === 0) return [];
+
+    const rows = new Map<string, FileRow>();
+    for (const needle of needles) {
+      const normalized = needle.replace(/\\/g, '/');
+      const basename = path.posix.basename(normalized);
+      const suffix = normalized.includes('/') ? normalized : basename;
+      const matches = await this.db.prepare(`
+        SELECT f.path, f.language, f.file_role, f.parse_status, f.size
+        FROM files f
+        WHERE ${baseWhere}
+          AND (f.path ILIKE ? ESCAPE '\\' OR f.path ILIKE ? ESCAPE '\\')
+        ORDER BY LENGTH(f.path), f.path
+        LIMIT ?
+      `).all(...baseParams, `%/${escapeLike(suffix)}`, `%/${escapeLike(basename)}`, Math.max(1, Math.min(5, limit))) as FileRow[];
+      for (const row of matches) {
+        if (!rows.has(row.path)) rows.set(row.path, row);
+        if (rows.size >= limit) return [...rows.values()];
+      }
+    }
+    return [...rows.values()];
+  }
+
+  private async fileSearchCandidateRows(
+    snapshotId: string,
+    baseWhere: string,
+    baseParams: unknown[],
+    terms: string[],
+    candidateLimit: number,
+    includeConfigEvidence: boolean,
+    includeEndpointEvidence: boolean,
+  ): Promise<FileRow[]> {
+    const candidates = new Map<string, FileRow>();
+    const addRows = (rows: FileRow[]) => {
+      for (const row of rows) {
+        if (!candidates.has(row.path)) candidates.set(row.path, row);
+        if (candidates.size >= candidateLimit) break;
+      }
+    };
+    const boundedTerms = terms.slice(0, 10);
+    const perTermLimit = Math.max(40, Math.min(250, Math.ceil(candidateLimit / Math.max(1, boundedTerms.length)) * 2));
+    for (const term of boundedTerms) {
+      const pattern = `%${escapeLike(term)}%`;
+      addRows(await this.db.prepare(`
+        SELECT f.path, f.language, f.file_role, f.parse_status, f.size
+        FROM files f
+        WHERE ${baseWhere}
+          AND (f.path ILIKE ? ESCAPE '\\' OR COALESCE(f.language, '') ILIKE ? ESCAPE '\\')
+        ORDER BY
+          CASE f.file_role
+            WHEN 'main_source' THEN 0
+            WHEN 'resource_config' THEN 1
+            WHEN 'build_config' THEN 2
+            WHEN 'test_source' THEN 3
+            WHEN 'mock_source' THEN 4
+            WHEN 'generated' THEN 5
+            ELSE 6
+          END,
+          LENGTH(f.path),
+          f.path
+        LIMIT ?
+      `).all(...baseParams, pattern, pattern, perTermLimit) as FileRow[]);
+
+      addRows(await this.db.prepare(`
+        SELECT DISTINCT f.path, f.language, f.file_role, f.parse_status, f.size
+        FROM symbols s
+        JOIN files f ON f.snapshot_id = s.snapshot_id AND f.path = s.file
+        WHERE s.snapshot_id = ?
+          AND ${baseWhere}
+          AND (
+            s.simple_name ILIKE ? ESCAPE '\\'
+            OR s.fq_name ILIKE ? ESCAPE '\\'
+            OR COALESCE(s.package_name, '') ILIKE ? ESCAPE '\\'
+            OR COALESCE(s.framework_role, '') ILIKE ? ESCAPE '\\'
+          )
+        LIMIT ?
+      `).all(snapshotId, ...baseParams, pattern, pattern, pattern, pattern, perTermLimit) as FileRow[]);
+
+      if (includeEndpointEvidence) {
+        addRows(await this.db.prepare(`
+          SELECT DISTINCT f.path, f.language, f.file_role, f.parse_status, f.size
+          FROM endpoints e
+          JOIN files f ON f.snapshot_id = e.snapshot_id AND f.path = e.file
+          WHERE e.snapshot_id = ?
+            AND ${baseWhere}
+            AND (
+              e.path ILIKE ? ESCAPE '\\'
+              OR e.handler_symbol ILIKE ? ESCAPE '\\'
+              OR COALESCE(e.controller, '') ILIKE ? ESCAPE '\\'
+            )
+          LIMIT ?
+        `).all(snapshotId, ...baseParams, pattern, pattern, pattern, perTermLimit) as FileRow[]);
+      }
+
+      if (includeConfigEvidence && candidates.size < candidateLimit) {
+        addRows(await this.db.prepare(`
+          SELECT DISTINCT f.path, f.language, f.file_role, f.parse_status, f.size
+          FROM imports i
+          JOIN files f ON f.snapshot_id = i.snapshot_id AND f.path = i.file
+          WHERE i.snapshot_id = ?
+            AND ${baseWhere}
+            AND i.source ILIKE ? ESCAPE '\\'
+          LIMIT ?
+        `).all(snapshotId, ...baseParams, pattern, Math.min(perTermLimit, 100)) as FileRow[]);
+      }
+    }
+
+    return [...candidates.values()].slice(0, candidateLimit);
   }
 
   private async findReferences(snapshotId: string, args: Record<string, unknown>) {
@@ -2144,7 +2198,7 @@ export class V2QueryService {
     };
   }
 
-  private async getIndexStats(snapshotId: string) {
+  private async getIndexStats(snapshotId: string, args: Record<string, unknown> = {}) {
     const snapshot = await this.db.prepare(`
       SELECT s.*, w.root AS workspace_root
       FROM snapshots s
@@ -2177,13 +2231,20 @@ export class V2QueryService {
       LIMIT 50
     `).all(snapshotId);
 
+    const staleFiles = args.warnStale === false
+      ? {
+        skipped: true,
+        reason: 'warnStale=false skips filesystem dirty-file scan for fast stats.',
+      }
+      : await this.computeDirtyFiles(snapshotId);
+
     return {
       snapshot,
       counts,
       fileRoles,
       diagnostics: {
         parseFailures,
-        staleFiles: await this.computeDirtyFiles(snapshotId),
+        staleFiles,
         topUnresolvedImports: await this.topUnresolvedImports(snapshotId),
         topUnresolvedCalls: await this.db.prepare(`
           SELECT callee, COUNT(*) AS count, MAX(confidence) AS maxConfidence
@@ -2469,15 +2530,19 @@ export class V2QueryService {
       `).all(snapshotId, pattern, pattern) as Array<{ file: string }>;
       for (const row of symbols) add(row.file, 3, `test symbol matches "${term}"`);
 
-      const calls = await this.db.prepare(`
-        SELECT DISTINCT file
-        FROM call_edges
-        WHERE snapshot_id = ?
-          AND file_role IN ('test_source', 'mock_source')
-          AND (caller LIKE ? ESCAPE '\\' OR callee LIKE ? ESCAPE '\\')
-        LIMIT 100
-      `).all(snapshotId, pattern, pattern) as Array<{ file: string }>;
-      for (const row of calls) add(row.file, 6, `test call edge mentions "${term}"`);
+      const callTerms = exactCallEdgeTestTerms(term);
+      if (callTerms.length > 0) {
+        const placeholders = callTerms.map(() => '?').join(', ');
+        const calls = await this.db.prepare(`
+          SELECT DISTINCT file
+          FROM call_edges
+          WHERE snapshot_id = ?
+            AND file_role IN ('test_source', 'mock_source')
+            AND (caller IN (${placeholders}) OR callee IN (${placeholders}))
+          LIMIT 100
+        `).all(snapshotId, ...callTerms, ...callTerms) as Array<{ file: string }>;
+        for (const row of calls) add(row.file, 6, `test call edge exactly mentions "${term}"`);
+      }
     }
 
     return [...candidates.values()]
@@ -5044,6 +5109,49 @@ function fileAllowedByRole(
   return true;
 }
 
+function fileSearchRankingTokens(query: string, tokens: string[]): string[] {
+  const pruned = tokens.filter(token => !FILE_SEARCH_STOP_WORDS.has(token) && !/^\d+$/.test(token));
+  return pruned.length > 0 ? pruned : tokens.slice(0, 6);
+}
+
+function fileSearchCandidateTerms(query: string, tokens: string[]): string[] {
+  const explicitRefs = explicitSymbolRefs(query)
+    .filter(ref => !isBroadExplicitRef(ref.className))
+    .flatMap(ref => [
+      ref.className,
+      ref.member ?? '',
+      ref.member ? `${ref.className}.${ref.member}` : '',
+    ]);
+  const explicitFiles = explicitFileNeedles(query)
+    .filter(needle => !isBroadExplicitRef(path.posix.basename(needle, path.posix.extname(needle))))
+    .flatMap(needle => [needle, path.posix.basename(needle, path.posix.extname(needle))]);
+  const endpointNeedle = endpointNeedleForResearch(query);
+  const identifiers = identifierSearchTerms(query.toLowerCase())
+    .filter(term => !FILE_SEARCH_STOP_WORDS.has(term) && !isBroadSearchTerm(term));
+  const explicitTerms = uniqueStrings([
+    ...explicitRefs,
+    ...explicitFiles,
+    endpointNeedle,
+    ...identifiers,
+  ].filter(term => term.length >= 3));
+  if (explicitTerms.length > 0) return explicitTerms.slice(0, 10);
+
+  const fallbackTerms = uniqueStrings(tokens
+    .filter(term => term.length >= 3 && !isBroadSearchTerm(term)))
+    .slice(0, 10);
+  return fallbackTerms.length > 0 ? fallbackTerms : tokens.slice(0, 6);
+}
+
+function isBroadExplicitRef(value: string): boolean {
+  return EXPLICIT_FILENAME_STOP_WORDS.has(value)
+    || FILE_SEARCH_STOP_WORDS.has(value.toLowerCase())
+    || /^[A-Z0-9_]{2,8}$/.test(value);
+}
+
+function isBroadSearchTerm(value: string): boolean {
+  return value.length < 3 || FILE_SEARCH_BROAD_TERMS.has(value.toLowerCase());
+}
+
 function tokenizeSearchQuery(query: string): string[] {
   if (!query || query === '*') return [];
   const withCamelBoundaries = query
@@ -5119,6 +5227,41 @@ const RESEARCH_STOP_WORDS = new Set([
   'works',
 ]);
 
+const FILE_SEARCH_STOP_WORDS = new Set([
+  ...RESEARCH_STOP_WORDS,
+  'business',
+  'deep',
+  'deepdive',
+  'detail',
+  'details',
+  'dive',
+  'glossary',
+  'mcp',
+  'study',
+]);
+
+const FILE_SEARCH_BROAD_TERMS = new Set([
+  'app',
+  'application',
+  'business',
+  'codebase',
+  'detail',
+  'details',
+  'flow',
+  'glossary',
+  'hadoop',
+  'hdfs',
+  'implementation',
+  'mcp',
+  'project',
+  'request',
+  'response',
+  'search',
+  'service',
+  'study',
+  'system',
+]);
+
 function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, ch => `\\${ch}`);
 }
@@ -5161,6 +5304,18 @@ function searchTermsForTarget(target: string): string[] {
     parts[parts.length - 1] ?? '',
   ].map(term => term.trim()).filter(term => term.length >= 2);
   return [...new Set(terms)];
+}
+
+function exactCallEdgeTestTerms(term: string): string[] {
+  const withoutParams = term.replace(/\([^)]*\)$/, '').trim();
+  if (!withoutParams || withoutParams.length < 4) return [];
+  const parts = withoutParams.split(/[.#]/g).filter(Boolean);
+  const compact = callGraphName(withoutParams);
+  return uniqueStrings([
+    withoutParams,
+    compact,
+    parts.length >= 2 ? `${parts[parts.length - 2]}.${parts[parts.length - 1]}` : '',
+  ].filter(value => value.length >= 4 && !isBroadSearchTerm(value)));
 }
 
 function isServiceLike(symbol: Record<string, unknown>): boolean {
