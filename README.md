@@ -705,7 +705,7 @@ Next review-quality optimization target: make `review_patch` return a compact ve
 
 Docker is optional. v2 normally runs best as a local stdio command from VS Code/Codex, but the image can be used when the workspace must be mounted into a container.
 
-For a detailed Docker operations guide covering image builds, prewarming indexes, branch checkouts, worktrees, cache resets, and performance modes, see [`docs/docker-setup.md`](docs/docker-setup.md).
+For a detailed Docker operations guide covering image builds, prewarming indexes, branch checkouts, worktrees, cache resets, and performance modes, see [`docs/docker-setup.md`](docs/docker-setup.md). For GitHub Copilot CLI with Docker and `~/.copilot/mcp-config.json`, use the step-by-step guide in [`docs/copilot-mcp-config.md`](docs/copilot-mcp-config.md).
 
 ### Docker setup runbook
 
@@ -758,6 +758,8 @@ docker --context desktop-linux run --rm -i `
 ```
 
 This command is expected to keep running because it is an MCP stdio server. Stop it with `Ctrl+C` after confirming the container starts without errors.
+
+For GitHub Copilot CLI, create `~/.copilot/mcp-config.json` with a Docker-backed CodeGraph entry after prewarm. Use [`docs/copilot-mcp-config.md`](docs/copilot-mcp-config.md) for the full JSON template and verification steps.
 
 5. Use a different `CODEGRAPH_WORKSPACE_KEY` for every host project, even though all containers mount the repo at `/workspace`:
 
@@ -883,6 +885,8 @@ docker run --rm -i \
   -v "/absolute/path/to/project:/workspace:ro" \
   -v codegraph-cache:/codegraph-home \
   -e CODEGRAPH_WORKSPACE_KEY="/absolute/path/to/project" \
+  -e CODEGRAPH_DATABASE_URL="postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" \
+  -e CODEGRAPH_PG_POOL_MAX=10 \
   mcp-code-graph \
   mcp --root /workspace --auto-refresh
 ```
@@ -921,7 +925,9 @@ VS Code MCP config using Docker:
           "codegraph-cache:/codegraph-home",
           "-e",
           "CODEGRAPH_WORKSPACE_KEY=${workspaceFolder}",
+          "-e",
           "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+          "-e",
           "CODEGRAPH_PG_POOL_MAX=10",
           "mcp-code-graph:latest",
           "mcp",
@@ -951,8 +957,10 @@ args = [
   "codegraph-cache:/codegraph-home",
   "-e",
   "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/mall",
-          "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
-          "CODEGRAPH_PG_POOL_MAX=10",
+  "-e",
+  "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+  "-e",
+  "CODEGRAPH_PG_POOL_MAX=10",
   "mcp-code-graph:latest",
   "mcp",
   "--root",

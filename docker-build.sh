@@ -137,7 +137,7 @@ if $EXPORT_MODE; then
   echo "  docker load -i \"$OUT_FILE\""
   echo ""
   echo "To run after loading:"
-  echo "  docker run --rm -i -v \"/path/to/project:/workspace:ro\" -v codegraph-cache:/codegraph-home -e CODEGRAPH_WORKSPACE_KEY=\"/path/to/project\" $IMAGE mcp --root /workspace --auto-refresh"
+  echo "  docker run --rm -i -v \"/path/to/project:/workspace:ro\" -v codegraph-cache:/codegraph-home -e CODEGRAPH_WORKSPACE_KEY=\"/path/to/project\" -e CODEGRAPH_DATABASE_URL=\"postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph\" -e CODEGRAPH_PG_POOL_MAX=10 $IMAGE mcp --root /workspace --auto-refresh"
 fi
 
 if $RUN_MODE; then
@@ -157,6 +157,8 @@ if $RUN_MODE; then
     -v "${ABS_PATH}:/workspace:ro" \
     -v codegraph-cache:/codegraph-home \
     -e "CODEGRAPH_WORKSPACE_KEY=${ABS_PATH}" \
+    -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" \
+    -e "CODEGRAPH_PG_POOL_MAX=10" \
     "$IMAGE" \
     mcp --root /workspace --auto-refresh
 fi
@@ -170,8 +172,8 @@ if ! $RUN_MODE && ! $EXPORT_MODE; then
   echo "    $0 --ca-cert /mnt/c/temp/corp-root-ca.crt --export"
   echo ""
   echo "  Run MCP stdio proxy directly:"
-  echo "    docker run --rm -i -v \"/path/to/project:/workspace:ro\" -v codegraph-cache:/codegraph-home -e CODEGRAPH_WORKSPACE_KEY=\"/path/to/project\" $IMAGE mcp --root /workspace --auto-refresh"
+  echo "    docker run --rm -i -v \"/path/to/project:/workspace:ro\" -v codegraph-cache:/codegraph-home -e CODEGRAPH_WORKSPACE_KEY=\"/path/to/project\" -e CODEGRAPH_DATABASE_URL=\"postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph\" -e CODEGRAPH_PG_POOL_MAX=10 $IMAGE mcp --root /workspace --auto-refresh"
   echo ""
   echo "  VS Code .vscode/settings.json:"
-  echo '    { "mcp": { "servers": { "code-graph": { "type": "stdio", "command": "docker", "args": ["run", "--rm", "-i", "-v", "${workspaceFolder}:/workspace:ro", "-v", "codegraph-cache:/codegraph-home", "-e", "CODEGRAPH_WORKSPACE_KEY=${workspaceFolder}", "'${IMAGE}'", "mcp", "--root", "/workspace", "--auto-refresh"] } } } }'
+  echo '    { "mcp": { "servers": { "code-graph": { "type": "stdio", "command": "docker", "args": ["run", "--rm", "-i", "-v", "${workspaceFolder}:/workspace:ro", "-v", "codegraph-cache:/codegraph-home", "-e", "CODEGRAPH_WORKSPACE_KEY=${workspaceFolder}", "-e", "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph", "-e", "CODEGRAPH_PG_POOL_MAX=10", "'${IMAGE}'", "mcp", "--root", "/workspace", "--auto-refresh"] } } } }'
 fi

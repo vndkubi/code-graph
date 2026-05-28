@@ -170,6 +170,8 @@ if ($Run) {
     -v "${absPath}:/workspace:ro" `
     -v "codegraph-cache:/codegraph-home" `
     -e "CODEGRAPH_WORKSPACE_KEY=$absPath" `
+    -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+    -e "CODEGRAPH_PG_POOL_MAX=10" `
     $Image `
     mcp --root /workspace --auto-refresh
   Assert-LastExitCode "Docker run failed."
@@ -186,5 +188,5 @@ if (-not $Run -and -not $Export) {
   Write-Host "    .\docker-build.ps1 -Export"
   Write-Host ""
   Write-Host "  VS Code/Copilot MCP command:"
-  Write-Host '    docker run --rm -i -v "${workspaceFolder}:/workspace:ro" -v codegraph-cache:/codegraph-home -e CODEGRAPH_WORKSPACE_KEY="${workspaceFolder}" mcp-code-graph:latest mcp --root /workspace --auto-refresh'
+  Write-Host '    docker run --rm -i -v "${workspaceFolder}:/workspace:ro" -v codegraph-cache:/codegraph-home -e CODEGRAPH_WORKSPACE_KEY="${workspaceFolder}" -e CODEGRAPH_DATABASE_URL="postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" -e CODEGRAPH_PG_POOL_MAX=10 mcp-code-graph:latest mcp --root /workspace --auto-refresh'
 }

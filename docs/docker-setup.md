@@ -225,6 +225,52 @@ exploration.
 
 ## MCP Client Configuration
 
+### GitHub Copilot CLI
+
+Copilot CLI uses `~/.copilot/mcp-config.json` with a top-level `mcpServers`
+object. Use one server entry per repository or worktree, and keep the Docker
+mount path and `CODEGRAPH_WORKSPACE_KEY` identical to the prewarm command.
+
+```json
+{
+  "mcpServers": {
+    "codegraph-hadoop": {
+      "type": "local",
+      "command": "docker",
+      "args": [
+        "--context",
+        "desktop-linux",
+        "run",
+        "--rm",
+        "-i",
+        "-v",
+        "D:/Personal/Projects/hadoop:/workspace:ro",
+        "-v",
+        "codegraph-cache:/codegraph-home",
+        "-e",
+        "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop",
+        "-e",
+        "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+        "-e",
+        "CODEGRAPH_PG_POOL_MAX=10",
+        "mcp-code-graph:latest",
+        "mcp",
+        "--root",
+        "/workspace",
+        "--no-prewarm"
+      ],
+      "env": {},
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+Use `--no-prewarm` after an explicit Docker index run so Copilot startup stays
+fast. Replace it with `--auto-refresh` only when you want the first MCP tool
+call to refresh stale snapshots automatically. For the full step-by-step
+Copilot CLI runbook, see [`docs/copilot-mcp-config.md`](copilot-mcp-config.md).
+
 ### VS Code / Copilot
 
 Use `${workspaceFolder}` so each editor window passes the correct source path
@@ -247,7 +293,9 @@ and workspace key:
           "codegraph-cache:/codegraph-home",
           "-e",
           "CODEGRAPH_WORKSPACE_KEY=${workspaceFolder}",
+          "-e",
           "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+          "-e",
           "CODEGRAPH_PG_POOL_MAX=10",
           "mcp-code-graph:latest",
           "mcp",
@@ -279,8 +327,10 @@ args = [
   "codegraph-cache:/codegraph-home",
   "-e",
   "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop",
-          "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
-          "CODEGRAPH_PG_POOL_MAX=10",
+  "-e",
+  "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+  "-e",
+  "CODEGRAPH_PG_POOL_MAX=10",
   "mcp-code-graph:latest",
   "mcp",
   "--root",

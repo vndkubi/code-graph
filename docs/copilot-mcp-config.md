@@ -1,44 +1,80 @@
 # GitHub Copilot CLI MCP Config
 
-This guide sets up CodeGraph in GitHub Copilot CLI through
+This guide shows how to connect CodeGraph to GitHub Copilot CLI through
 `~/.copilot/mcp-config.json`.
 
-GitHub Copilot CLI uses an `mcpServers` object in this file. This is different
-from VS Code settings, which use `mcp.servers`.
+GitHub Copilot CLI uses a top-level `mcpServers` object in this file. This is
+different from VS Code settings, which use `mcp.servers`.
 
-## 1. Build CodeGraph
+The recommended Docker setup is:
+
+1. Build the CodeGraph Docker image.
+2. Start the local Postgres service and create the persistent CodeGraph volume.
+3. Prewarm the target repository with `index --root /workspace`.
+4. Add a Docker-backed CodeGraph entry to `~/.copilot/mcp-config.json`.
+5. Verify Copilot can call a CodeGraph tool.
+
+## Docker + Copilot CLI Step By Step
+
+Use Docker when Copilot should run CodeGraph against a repository mounted into a
+container. This is useful when your MCP runtime should match a containerized
+toolchain. For very large Windows repositories, Docker Desktop bind mounts from
+`D:\...` are still slower than WSL/ext4 or local Node, so prewarm manually.
+
+### 1. Build the Docker image
 
 From the CodeGraph checkout:
 
 ```powershell
 cd D:\Personal\Projects\code-graph
-npm install
-npm run build
+docker --context desktop-linux build -t mcp-code-graph:latest .
 ```
 
-The MCP entrypoint used by Copilot is:
+If your active Docker context is already Docker Desktop Linux, you can omit
+`--context desktop-linux`.
 
-```text
-D:/Personal/Projects/code-graph/dist/cli.js
-```
+### 2. Start Postgres and create the cache volume
 
-Use forward slashes in JSON paths on Windows. They avoid escaping backslashes.
-
-## 2. Prewarm the target repository
-
-Prewarm before connecting Copilot. This avoids a cold index during MCP startup
-or the first question.
+CodeGraph stores indexes in Postgres. The Docker container reaches the host
+Postgres service through `host.docker.internal`.
 
 ```powershell
-node D:\Personal\Projects\code-graph\dist\cli.js index `
-  --root D:\Personal\Projects\your-repo `
-  --workspace-key D:\Personal\Projects\your-repo
+cd D:\Personal\Projects\code-graph
+docker compose -f compose.postgres.yml up -d
+docker --context desktop-linux volume create codegraph-cache
 ```
 
-Use the same `--workspace-key` in the MCP config. This keeps the prewarmed
-snapshot and the Copilot MCP server attached to the same workspace identity.
+Use the same `codegraph-cache` volume for prewarm and MCP runs. It stores
+daemon metadata and logs; indexed graph rows and parse cache live in Postgres.
 
-## 3. Create the Copilot config file
+### 3. Prewarm the repository
+
+Every Docker run sees the mounted repository as `/workspace`, so set a stable
+`CODEGRAPH_WORKSPACE_KEY` to the host repository path. This prevents different
+repositories from colliding as the same `/workspace` identity.
+
+Hadoop example:
+
+```powershell
+docker --context desktop-linux run --rm `
+  -v "D:/Personal/Projects/hadoop:/workspace:ro" `
+  -v "codegraph-cache:/codegraph-home" `
+  -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
+  mcp-code-graph:latest `
+  index --root /workspace --parse-workers 8
+```
+
+Run the same command again after the cold prewarm if you want to confirm warm
+behavior. A healthy warm run should show `skippedUnchanged: true` or
+`filesParsed: 0`, with high `hashCacheHits` and/or `parseCacheHits`.
+
+If `filesTotal` is `0`, Docker is not seeing your repository. On Docker Desktop
+for Windows, share the drive that contains the repo: Docker Desktop -> Settings
+-> Resources -> File Sharing -> add `D:\`, apply, restart, then rerun prewarm.
+
+### 4. Create `mcp-config.json`
 
 On Windows:
 
@@ -47,117 +83,38 @@ New-Item -ItemType Directory -Force "$HOME\.copilot"
 notepad "$HOME\.copilot\mcp-config.json"
 ```
 
-On macOS or Linux:
+On macOS, Linux, or WSL:
 
 ```bash
 mkdir -p ~/.copilot
 $EDITOR ~/.copilot/mcp-config.json
 ```
 
-## 4. Add a local CodeGraph server
-
-Use one server entry per repository or worktree.
-
-```json
-{
-  "mcpServers": {
-    "codegraph-your-repo": {
-      "type": "stdio",
-      "command": "node",
-      "args": [
-        "D:/Personal/Projects/code-graph/dist/cli.js",
-        "mcp",
-        "--root",
-        "D:/Personal/Projects/your-repo",
-        "--workspace-key",
-        "D:/Personal/Projects/your-repo",
-        "--no-prewarm"
-      ],
-      "env": {},
-      "tools": ["*"],
-      "timeout": 180000
-    }
-  }
-}
-```
-
-Why these options:
-
-- `--root` is the source repository Copilot should query.
-- `--workspace-key` must match the prewarm command when you use one.
-- `--no-prewarm` keeps MCP startup fast. Run `codegraph index` manually after a
-  checkout or large change instead of indexing inside Copilot startup.
-- `tools: ["*"]` exposes all CodeGraph tools. Use a smaller list if your
-  environment requires tool allowlisting.
-- `timeout` is in milliseconds. Normal warm CodeGraph calls should be much
-  faster, but this avoids short client-side timeouts on large workspaces.
-
-## 5. Multiple repositories
-
-Add another server entry with a different name and root.
+Paste this JSON and replace the host path and server name for your repository.
+JSON does not allow comments, so keep the file comment-free.
 
 ```json
 {
   "mcpServers": {
     "codegraph-hadoop": {
-      "type": "stdio",
-      "command": "node",
-      "args": [
-        "D:/Personal/Projects/code-graph/dist/cli.js",
-        "mcp",
-        "--root",
-        "D:/Personal/Projects/hadoop",
-        "--workspace-key",
-        "D:/Personal/Projects/hadoop",
-        "--no-prewarm"
-      ],
-      "env": {},
-      "tools": ["*"],
-      "timeout": 180000
-    },
-    "codegraph-elasticsearch": {
-      "type": "stdio",
-      "command": "node",
-      "args": [
-        "D:/Personal/Projects/code-graph/dist/cli.js",
-        "mcp",
-        "--root",
-        "D:/Personal/Projects/elasticsearch",
-        "--workspace-key",
-        "D:/Personal/Projects/elasticsearch",
-        "--no-prewarm"
-      ],
-      "env": {},
-      "tools": ["*"],
-      "timeout": 180000
-    }
-  }
-}
-```
-
-Prewarm each repository with the matching `--workspace-key`.
-
-## 6. Optional Docker config
-
-Use Docker when Copilot should run CodeGraph inside the same environment as the
-source tree. Keep the source mount read-only and persist `/codegraph-home`.
-
-```json
-{
-  "mcpServers": {
-    "codegraph-docker-your-repo": {
-      "type": "stdio",
+      "type": "local",
       "command": "docker",
       "args": [
+        "--context",
+        "desktop-linux",
         "run",
         "--rm",
         "-i",
         "-v",
-        "D:/Personal/Projects/your-repo:/workspace:ro",
+        "D:/Personal/Projects/hadoop:/workspace:ro",
         "-v",
         "codegraph-cache:/codegraph-home",
         "-e",
-        "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/your-repo",
+        "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop",
+        "-e",
+        "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+        "-e",
+        "CODEGRAPH_PG_POOL_MAX=10",
         "mcp-code-graph:latest",
         "mcp",
         "--root",
@@ -165,59 +122,170 @@ source tree. Keep the source mount read-only and persist `/codegraph-home`.
         "--no-prewarm"
       ],
       "env": {},
-      "tools": ["*"],
-      "timeout": 180000
+      "tools": ["*"]
     }
   }
 }
 ```
 
-Prewarm with the same Docker volume and workspace key:
+Why these options:
 
-```powershell
-docker run --rm `
-  -v "D:/Personal/Projects/your-repo:/workspace:ro" `
-  -v "codegraph-cache:/codegraph-home" `
-  -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/your-repo" `
-  mcp-code-graph:latest `
-  index --root /workspace
+- `type: "local"` tells Copilot CLI to start a local STDIO process.
+- `command: "docker"` starts CodeGraph through Docker instead of local Node.
+- `--context desktop-linux` makes Windows Docker Desktop target explicit.
+- `-i` is required because MCP communicates over stdin/stdout.
+- `-v <repo>:/workspace:ro` mounts source read-only inside the container.
+- `-v codegraph-cache:/codegraph-home` reuses daemon metadata and logs.
+- `CODEGRAPH_WORKSPACE_KEY` must match the prewarm command.
+- `CODEGRAPH_DATABASE_URL` must use `host.docker.internal` from inside Docker.
+- `--no-prewarm` keeps MCP startup fast. Run the explicit prewarm command after
+  checkout, pull, rebase, or large generated-file changes.
+
+For smaller repos where startup latency is acceptable, replace `--no-prewarm`
+with `--auto-refresh` so CodeGraph refreshes stale snapshots on the first tool
+call. For large repos, manual prewarm is more predictable.
+
+An editable template is also available at
+[`examples/copilot-docker-mcp-config.json`](../examples/copilot-docker-mcp-config.json).
+
+### 5. Configure multiple repositories
+
+Add one server entry per host repository or worktree. Keep the names and
+`CODEGRAPH_WORKSPACE_KEY` values unique.
+
+```json
+{
+  "mcpServers": {
+    "codegraph-hadoop": {
+      "type": "local",
+      "command": "docker",
+      "args": [
+        "--context",
+        "desktop-linux",
+        "run",
+        "--rm",
+        "-i",
+        "-v",
+        "D:/Personal/Projects/hadoop:/workspace:ro",
+        "-v",
+        "codegraph-cache:/codegraph-home",
+        "-e",
+        "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop",
+        "-e",
+        "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+        "-e",
+        "CODEGRAPH_PG_POOL_MAX=10",
+        "mcp-code-graph:latest",
+        "mcp",
+        "--root",
+        "/workspace",
+        "--no-prewarm"
+      ],
+      "env": {},
+      "tools": ["*"]
+    },
+    "codegraph-elasticsearch": {
+      "type": "local",
+      "command": "docker",
+      "args": [
+        "--context",
+        "desktop-linux",
+        "run",
+        "--rm",
+        "-i",
+        "-v",
+        "D:/Personal/Projects/elasticsearch:/workspace:ro",
+        "-v",
+        "codegraph-cache:/codegraph-home",
+        "-e",
+        "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/elasticsearch",
+        "-e",
+        "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
+        "-e",
+        "CODEGRAPH_PG_POOL_MAX=10",
+        "mcp-code-graph:latest",
+        "mcp",
+        "--root",
+        "/workspace",
+        "--no-prewarm"
+      ],
+      "env": {},
+      "tools": ["*"]
+    }
+  }
+}
 ```
 
-## 7. Verify Copilot sees CodeGraph
+Prewarm each repository with the matching mount path and workspace key before
+asking Copilot to use it.
 
-List configured MCP servers:
+### 6. Verify Copilot sees CodeGraph
 
-```powershell
-copilot mcp list
-copilot mcp get codegraph-your-repo --json
+Start Copilot CLI interactive mode, then run:
+
+```text
+/mcp show
+/mcp show codegraph-hadoop
 ```
 
-Then ask Copilot:
+Ask Copilot for a direct tool call:
+
+```text
+Use codegraph MCP tool get_research_pack for "How does Hadoop handle BlockManager.processReport?" with tokenBudget 2000. Do not use shell search first.
+```
+
+For a smaller repo, this simpler smoke test is fine:
 
 ```text
 Use codegraph MCP tool get_index_stats and tell me the indexed file count.
 ```
 
-For large repositories mounted through Docker Desktop, prefer a flow-pack smoke
-test because `get_index_stats` includes stale-file diagnostics that may rescan
-the bind mount:
-
-```text
-Use codegraph MCP get_flow_pack for "How does Hadoop handle BlockManager.processReport?" with tokenBudget 2000. Do not use shell search first.
-```
-
-Check CodeGraph daemon logs from the CodeGraph checkout:
+Check CodeGraph logs from the Docker volume:
 
 ```powershell
-node D:\Personal\Projects\code-graph\dist\cli.js logs --tail 20
+docker --context desktop-linux run --rm `
+  -v "codegraph-cache:/codegraph-home" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  mcp-code-graph:latest `
+  logs --tail 50
 ```
 
 A real MCP call should produce a log line with `event: "query"` and a
-`toolName` such as `get_index_stats`, `get_flow_pack`, or `search_symbol`.
+`toolName` such as `get_research_pack`, `get_index_stats`, or `search_symbol`.
 
-## 8. Refresh after checkout or large changes
+### 7. Refresh after checkout or large changes
 
-For predictable performance, refresh manually:
+After `git checkout`, `git pull`, `git rebase`, or generated-file changes, run
+the same Docker prewarm command again:
+
+```powershell
+docker --context desktop-linux run --rm `
+  -v "D:/Personal/Projects/hadoop:/workspace:ro" `
+  -v "codegraph-cache:/codegraph-home" `
+  -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop" `
+  -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
+  -e "CODEGRAPH_PG_POOL_MAX=10" `
+  mcp-code-graph:latest `
+  index --root /workspace --parse-workers 8
+```
+
+The MCP config can stay unchanged because it uses the same workspace key and
+Postgres database.
+
+## Optional Local Node Setup
+
+Use local Node when you want the fastest path on the host filesystem and do not
+need a containerized runtime.
+
+### 1. Build CodeGraph
+
+```powershell
+cd D:\Personal\Projects\code-graph
+npm install
+npm run build
+```
+
+### 2. Prewarm the target repository
 
 ```powershell
 node D:\Personal\Projects\code-graph\dist\cli.js index `
@@ -225,21 +293,43 @@ node D:\Personal\Projects\code-graph\dist\cli.js index `
   --workspace-key D:\Personal\Projects\your-repo
 ```
 
-For small repositories, you can add `--auto-refresh` to the MCP args. For large
-repositories, manual prewarm is more predictable because it keeps indexing out
-of Copilot tool calls.
+### 3. Add a local server to `mcp-config.json`
+
+```json
+{
+  "mcpServers": {
+    "codegraph-your-repo": {
+      "type": "local",
+      "command": "node",
+      "args": [
+        "D:/Personal/Projects/code-graph/dist/cli.js",
+        "mcp",
+        "--root",
+        "D:/Personal/Projects/your-repo",
+        "--workspace-key",
+        "D:/Personal/Projects/your-repo",
+        "--no-prewarm"
+      ],
+      "env": {},
+      "tools": ["*"]
+    }
+  }
+}
+```
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| `Cannot find module ... dist/cli.js` | CodeGraph was not built, or the path points to an old clone. | Run `npm run build` and verify the exact `dist/cli.js` path. |
-| Copilot lists no CodeGraph server | Config file path or JSON shape is wrong. | Use `~/.copilot/mcp-config.json` and the top-level `mcpServers` object. |
-| First query is slow | The repository was not prewarmed, or the MCP server was started without a current snapshot. | Run `codegraph index` with the same `--root` and `--workspace-key`. |
-| Answers look stale after branch checkout | The index still points at the previous checkout. | Run `codegraph index` again after checkout. |
-| Copilot uses grep/read instead of CodeGraph | The prompt did not request CodeGraph, or the server did not start. | Ask for `get_index_stats` explicitly and inspect CodeGraph logs. |
+| Copilot lists no CodeGraph server | Config file path or JSON shape is wrong. | Use `~/.copilot/mcp-config.json` with top-level `mcpServers`, then run `/mcp show` inside Copilot CLI. |
+| Docker says it cannot connect to the daemon | Docker Desktop or the selected Docker context is not running. | Start Docker Desktop and run `docker --context desktop-linux ps`. |
+| Index reports `filesTotal: 0` | Docker cannot see the bind mount. | Share the Windows drive in Docker Desktop, verify the host path, then rerun prewarm. |
+| First query is slow | The repo was not prewarmed, or `--auto-refresh` is refreshing a stale snapshot. | Run the explicit Docker `index --root /workspace` command before asking Copilot. |
+| Answers look stale after checkout | The index still points at the previous checkout. | Run the Docker prewarm command again with the same workspace key. |
+| Copilot uses grep/read instead of CodeGraph | The prompt did not request CodeGraph, the MCP server did not start, or tools are disabled by policy. | Ask for a direct CodeGraph tool call and inspect `/mcp show` plus CodeGraph logs. |
+| `connect ECONNREFUSED host.docker.internal:54329` | Postgres is not running or the container cannot reach it. | Run `docker compose -f compose.postgres.yml up -d` from the CodeGraph checkout. |
 
 ## References
 
-- [Adding MCP servers for GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers)
-- [GitHub Copilot CLI command reference: MCP server configuration](https://docs.github.com/copilot/reference/cli-command-reference#mcp-server-configuration)
+- [Adding MCP servers for GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers)
+- [GitHub Copilot CLI command reference: MCP server configuration](https://docs.github.com/copilot/reference/cli-command-reference)
