@@ -11,15 +11,18 @@ export interface RunMcpProxyOptions {
   refreshOnStart?: boolean;
   workspaceKey?: string;
   autoRefresh?: boolean;
+  watch?: boolean;
+  warnStale?: boolean;
   toolAllowlist?: string;
 }
 
 export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
   const daemon = await DaemonClient.ensure(options.homeDir);
-  let workspace = await daemon.registerWorkspace(options.root, options.workspaceKey);
+  const registerOptions = { watch: options.watch === true };
+  let workspace = await daemon.registerWorkspace(options.root, options.workspaceKey, registerOptions);
   if (options.prewarm !== false && !workspace.currentSnapshotId) {
     await daemon.refreshWorkspace(workspace.root, options.workspaceKey);
-    workspace = await daemon.registerWorkspace(workspace.root, options.workspaceKey);
+    workspace = await daemon.registerWorkspace(workspace.root, options.workspaceKey, registerOptions);
   } else if (options.refreshOnStart) {
     await daemon.refreshWorkspace(workspace.root, options.workspaceKey, { background: true });
   }
@@ -49,9 +52,11 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
       const args = parseToolArgs(request.params.name, request.params.arguments);
       if (isAnswerPackTool(request.params.name) && options.autoRefresh !== true) {
         args.autoRefresh = false;
-        args.warnStale = false;
       } else if (options.autoRefresh && args.autoRefresh === undefined) {
         args.autoRefresh = true;
+      }
+      if (options.warnStale !== true && args.warnStale === undefined) {
+        args.warnStale = false;
       }
       const result = await daemon.query(workspace.workspaceId, request.params.name, args);
       return {

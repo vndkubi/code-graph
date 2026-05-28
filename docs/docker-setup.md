@@ -271,6 +271,12 @@ fast. Replace it with `--auto-refresh` only when you want the first MCP tool
 call to refresh stale snapshots automatically. For the full step-by-step
 Copilot CLI runbook, see [`docs/copilot-mcp-config.md`](copilot-mcp-config.md).
 
+The Docker MCP process keeps latency-oriented defaults: it does not watch the
+workspace and does not run stale checks unless you pass `--watch` or
+`--warn-stale`. Keep both flags off for large Windows bind mounts. The current
+watcher queues a full manifest refresh after file events, so path-delta watcher
+refresh is the next step before using watch mode for very large repositories.
+
 ### VS Code / Copilot
 
 Use `${workspaceFolder}` so each editor window passes the correct source path

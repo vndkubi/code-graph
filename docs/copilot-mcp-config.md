@@ -140,10 +140,19 @@ Why these options:
 - `CODEGRAPH_DATABASE_URL` must use `host.docker.internal` from inside Docker.
 - `--no-prewarm` keeps MCP startup fast. Run the explicit prewarm command after
   checkout, pull, rebase, or large generated-file changes.
+- MCP does not enable the filesystem watcher or freshness checks by default.
+  This keeps Copilot tool calls from paying Docker bind-mount scans or slow
+  `git status` checks on every request.
 
 For smaller repos where startup latency is acceptable, replace `--no-prewarm`
 with `--auto-refresh` so CodeGraph refreshes stale snapshots on the first tool
 call. For large repos, manual prewarm is more predictable.
+
+Use `--watch` only when you want the daemon to queue background refreshes after
+local filesystem events. Current watcher refreshes still run a full manifest
+scan, so keep it off for very large Docker bind mounts until path-delta
+watching is enabled. Use `--warn-stale` only when stale-index metadata is more
+important than lowest-latency Copilot responses.
 
 An editable template is also available at
 [`examples/copilot-docker-mcp-config.json`](../examples/copilot-docker-mcp-config.json).
@@ -325,6 +334,7 @@ node D:\Personal\Projects\code-graph\dist\cli.js index `
 | Docker says it cannot connect to the daemon | Docker Desktop or the selected Docker context is not running. | Start Docker Desktop and run `docker --context desktop-linux ps`. |
 | Index reports `filesTotal: 0` | Docker cannot see the bind mount. | Share the Windows drive in Docker Desktop, verify the host path, then rerun prewarm. |
 | First query is slow | The repo was not prewarmed, or `--auto-refresh` is refreshing a stale snapshot. | Run the explicit Docker `index --root /workspace` command before asking Copilot. |
+| Copilot terminates with a connection timeout | MCP startup or a tool call is blocked by prewarm, watcher refresh, stale checks, or a missing prewarm snapshot. | Rebuild the latest image, prewarm manually, keep the Copilot entry on `--no-prewarm`, and do not add `--watch`, `--warn-stale`, or `--auto-refresh` for large Docker bind mounts. |
 | Answers look stale after checkout | The index still points at the previous checkout. | Run the Docker prewarm command again with the same workspace key. |
 | Copilot uses grep/read instead of CodeGraph | The prompt did not request CodeGraph, the MCP server did not start, or tools are disabled by policy. | Ask for a direct CodeGraph tool call and inspect `/mcp show` plus CodeGraph logs. |
 | `connect ECONNREFUSED host.docker.internal:54329` | Postgres is not running or the container cannot reach it. | Run `docker compose -f compose.postgres.yml up -d` from the CodeGraph checkout. |

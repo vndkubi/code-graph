@@ -127,11 +127,12 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         const body = await readJson(req);
         const root = requireString(body.root, 'root');
         const workspaceKey = optionalString(body.workspaceKey);
+        const watch = body.watch === true;
         const workspace = await indexer.registerWorkspace(root, workspaceKey);
         const rootKeys = workspaceKeysByRoot.get(workspace.root) ?? new Set<string>();
         rootKeys.add(workspaceKeyValue(workspaceKey));
         workspaceKeysByRoot.set(workspace.root, rootKeys);
-        if (!watchers.has(workspace.root)) {
+        if (watch && !watchers.has(workspace.root)) {
           try {
             watchers.set(workspace.root, watchWorkspace(workspace.root, () => {
               const keys = workspaceKeysByRoot.get(workspace.root) ?? new Set([workspaceKeyValue(workspaceKey)]);
@@ -156,6 +157,7 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
           workspaceKey,
           workspaceId: workspace.workspaceId,
           hasSnapshot: Boolean(workspace.currentSnapshotId),
+          watch,
           durationMs: Date.now() - startedAt,
         });
         sendJson(res, 200, workspace);

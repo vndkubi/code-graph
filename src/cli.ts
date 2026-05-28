@@ -31,6 +31,8 @@ async function main(): Promise<void> {
         refreshOnStart: parsed.flags.get('refresh-on-start') === true || envFlag('CODEGRAPH_REFRESH_ON_START'),
         workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
         autoRefresh: parsed.flags.get('auto-refresh') === true || envFlag('CODEGRAPH_AUTO_REFRESH'),
+        watch: parsed.flags.get('watch') === true || envFlag('CODEGRAPH_WATCH'),
+        warnStale: parsed.flags.get('warn-stale') === true || envFlag('CODEGRAPH_WARN_STALE'),
         toolAllowlist: getFlag(parsed, 'mcp-tools') ?? process.env.CODEGRAPH_MCP_TOOLS,
       });
       return;
@@ -267,6 +269,8 @@ Options:
   --quiet                                Suppress index progress logs on stderr
   --auto-refresh                         Refresh stale snapshots automatically before MCP tool calls
   --refresh-on-start                     Queue a workspace refresh when MCP starts, without blocking startup
+  --watch                                Watch workspace files and queue background refreshes on changes
+  --warn-stale                           Include freshness checks in MCP tool responses
   --mcp-tools <a,b,c>                    Comma-separated MCP tool allowlist; also CODEGRAPH_MCP_TOOLS
 `);
 }

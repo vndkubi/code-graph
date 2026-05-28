@@ -43,8 +43,16 @@ export class DaemonClient {
     }
   }
 
-  async registerWorkspace(root: string, workspaceKey?: string): Promise<{ workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string }> {
-    return this.request('/workspaces/register', 'POST', { root, workspaceKey }) as Promise<{
+  async registerWorkspace(
+    root: string,
+    workspaceKey?: string,
+    options: { watch?: boolean } = {},
+  ): Promise<{ workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string }> {
+    return this.request('/workspaces/register', 'POST', {
+      root,
+      workspaceKey,
+      watch: options.watch === true,
+    }) as Promise<{
       workspaceId: string;
       root: string;
       workspaceKey?: string;

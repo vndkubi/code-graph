@@ -1025,6 +1025,9 @@ Options:
   --incremental-file-limit <number>    Max changed/deleted files for incremental index path
   --workspace-key <key>                Stable workspace identity key for Docker/WSL path remapping
   --auto-refresh                       Refresh stale snapshots automatically before MCP tool calls
+  --refresh-on-start                   Queue a workspace refresh when MCP starts, without blocking startup
+  --watch                              Watch workspace files and queue background refreshes on changes
+  --warn-stale                         Include freshness checks in MCP tool responses
 ```
 
 **Examples:**
