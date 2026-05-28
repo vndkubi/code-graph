@@ -842,6 +842,7 @@ docker --context desktop-linux run --rm `
 | `autoRefresh=true` on an empty/first-time large index does not populate results | Auto-refresh skips snapshots with zero indexed files; it is intended for incremental refreshes of existing snapshots | Run explicit `docker run ... index --root /workspace` after fixing the bind mount |
 | Daemon crashes on Docker bind mounts with Chokidar/inotify errors | WSL2/Windows NTFS bind mounts can reject watcher setup or emit watcher errors | Use the latest build; watcher errors are swallowed and setup failures are logged without failing workspace registration |
 | MCP initialize times out with `fetch failed` or exit code 1 on large Windows bind mounts | Slow `git status --porcelain` blocks registration until VS Code gives up | Use the latest build; git helper commands time out after 5 seconds and CodeGraph registers without slow git metadata |
+| MCP exits with `Timed out waiting for codegraph daemon to start` | Stale daemon metadata from a previous Docker MCP container, or Postgres lock contention from an aborted index | Use the latest build; startup removes stale daemon metadata. If it persists, inspect `/codegraph-home/logs/daemon.jsonl.bootstrap.log` in the cache volume and clear the stuck index/Postgres process |
 | MCP starts but agent does not use it | Editor config points to wrong command/args | Check CodeGraph logs or ask the agent to call `get_index_stats` explicitly |
 
 Windows PowerShell:

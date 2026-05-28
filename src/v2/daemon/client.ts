@@ -20,6 +20,7 @@ export class DaemonClient {
     if (existing) {
       const client = new DaemonClient(existing);
       if (await client.isAlive()) return client;
+      removeStaleDaemonInfo(homeDir, existing);
     }
 
     await startDaemonProcess(homeDir);
@@ -108,16 +109,38 @@ export async function stopDaemon(homeDir?: string): Promise<boolean> {
 }
 
 function startDaemonProcess(homeDir?: string): Promise<void> {
+  const paths = getCodeGraphPaths(homeDir);
+  fs.mkdirSync(paths.logDir, { recursive: true });
+  const bootstrapLogPath = `${paths.daemonLogPath}.bootstrap.log`;
+  const stdout = fs.openSync(bootstrapLogPath, 'a');
+  const stderr = fs.openSync(bootstrapLogPath, 'a');
   const cliPath = process.argv[1];
   const args = [cliPath, 'daemon', 'run'];
   if (homeDir) args.push('--home', homeDir);
-  const child = spawn(process.execPath, args, {
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: true,
-  });
-  child.unref();
-  return Promise.resolve();
+  try {
+    const child = spawn(process.execPath, args, {
+      detached: true,
+      stdio: ['ignore', stdout, stderr],
+      windowsHide: true,
+    });
+    child.unref();
+    return Promise.resolve();
+  } finally {
+    fs.closeSync(stdout);
+    fs.closeSync(stderr);
+  }
+}
+
+function removeStaleDaemonInfo(homeDir: string | undefined, existing: DaemonInfo): void {
+  const paths = getCodeGraphPaths(homeDir);
+  try {
+    const current = DaemonClient.readInfo(homeDir);
+    if (current?.pid === existing.pid && current?.port === existing.port && current?.token === existing.token) {
+      fs.unlinkSync(paths.daemonInfoPath);
+    }
+  } catch {
+    // Stale daemon metadata is best-effort cleanup only.
+  }
 }
 
 function sleep(ms: number): Promise<void> {

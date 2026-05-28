@@ -246,6 +246,7 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
   const close = async () => {
     await Promise.all([...watchers.values()].map(watcher => watcher.close().catch(() => undefined)));
     await db.close();
+    removeDaemonInfo(paths.daemonInfoPath, info);
   };
   process.once('SIGINT', () => { void close().finally(() => process.exit(0)); });
   process.once('SIGTERM', () => { void close().finally(() => process.exit(0)); });
@@ -308,6 +309,17 @@ function logEvent(logPath: string, event: Record<string, unknown>): void {
     fs.appendFileSync(logPath, `${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`);
   } catch {
     // Logging must never break daemon query handling.
+  }
+}
+
+function removeDaemonInfo(infoPath: string, info: DaemonInfo): void {
+  try {
+    const current = JSON.parse(fs.readFileSync(infoPath, 'utf-8')) as DaemonInfo;
+    if (current.pid === info.pid && current.port === info.port && current.token === info.token) {
+      fs.unlinkSync(infoPath);
+    }
+  } catch {
+    // Shutdown cleanup is best-effort; startup validates stale metadata.
   }
 }
 
