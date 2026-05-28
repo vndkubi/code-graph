@@ -1303,7 +1303,8 @@ export class V2QueryService {
       preferredLanguage,
       5,
     );
-    const explicitFastPath = explicitFiles.length >= 3;
+    const explicitMemberTarget = explicitSymbolRefs(target).some(ref => Boolean(ref.member));
+    const explicitFastPath = explicitFiles.length >= 3 || (explicitMemberTarget && explicitFiles.length > 0);
     const symbolRows: Array<Record<string, unknown>> = [];
     if (!explicitFastPath) {
       for (const query of researchSymbolQueries(target, seedTerms)) {
@@ -1332,7 +1333,11 @@ export class V2QueryService {
     const scopedSymbolCandidates = explicitFiles.length > 0
       ? symbolCandidates.filter(symbol => explicitFileSet.has(symbol.file))
       : symbolCandidates;
-    const relevantSymbols = (scopedSymbolCandidates.length > 0 ? scopedSymbolCandidates : symbolCandidates).slice(0, 6);
+    const relevantSymbols = (scopedSymbolCandidates.length > 0
+      ? scopedSymbolCandidates
+      : explicitFastPath
+        ? []
+        : symbolCandidates).slice(0, 6);
     const fileResults = explicitFastPath
       ? { files: [] as Array<Record<string, unknown>>, totalFound: explicitFiles.length }
       : await this.searchFiles(snapshotId, {

@@ -37,7 +37,7 @@ export interface IndexWorkspaceResult {
 }
 
 export interface IndexProgressEvent {
-  phase: 'start' | 'workspace' | 'manifest' | 'diff' | 'parse-cache' | 'parse' | 'write' | 'edges' | 'complete';
+  phase: 'start' | 'workspace' | 'manifest' | 'diff' | 'parse-cache' | 'parse' | 'write' | 'edges' | 'analyze' | 'complete';
   status: 'start' | 'progress' | 'complete' | 'skipped' | 'fallback';
   message?: string;
   current?: number;
@@ -86,6 +86,15 @@ interface PreparedParseBatch {
 }
 
 type SqlValue = string | number | null | undefined;
+
+const POST_INDEX_ANALYZE_TABLES = [
+  'files',
+  'symbols',
+  'call_edges',
+  'dependency_edges',
+  'imports',
+  'endpoints',
+];
 
 interface BatchInsertOptions {
   ignoreConflicts?: boolean;
@@ -414,6 +423,7 @@ export class V2Indexer {
     });
 
     await tx();
+    await this.analyzeQueryTables(options.progress, start);
 
     options.progress?.({
       phase: 'complete',
@@ -440,6 +450,30 @@ export class V2Indexer {
       manifestScanMs: manifest.scanTimeMs,
       indexTimeMs: Date.now() - start,
     };
+  }
+
+  private async analyzeQueryTables(progress: IndexWorkspaceOptions['progress'], start: number): Promise<void> {
+    progress?.({
+      phase: 'analyze',
+      status: 'start',
+      message: 'updating Postgres planner statistics',
+      current: 0,
+      total: POST_INDEX_ANALYZE_TABLES.length,
+      elapsedMs: Date.now() - start,
+    });
+    let current = 0;
+    for (const table of POST_INDEX_ANALYZE_TABLES) {
+      await this.db.prepare(`ANALYZE ${table}`).run();
+      current++;
+      progress?.({
+        phase: 'analyze',
+        status: current === POST_INDEX_ANALYZE_TABLES.length ? 'complete' : 'progress',
+        message: `analyzed ${table}`,
+        current,
+        total: POST_INDEX_ANALYZE_TABLES.length,
+        elapsedMs: Date.now() - start,
+      });
+    }
   }
 
   private async getWorkspace(workspaceId: string): Promise<WorkspaceRow | undefined> {
