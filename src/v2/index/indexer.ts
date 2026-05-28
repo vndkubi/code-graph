@@ -147,7 +147,8 @@ export class V2Indexer {
 
   async registerWorkspace(root: string, workspaceKey?: string): Promise<{ workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string }> {
     const realRoot = path.resolve(root);
-    const git = getGitInfo(realRoot);
+    const resolvedWorkspaceKey = normalizeWorkspaceKey(workspaceKey ?? process.env.CODEGRAPH_WORKSPACE_KEY);
+    const git = resolvedWorkspaceKey ? workspaceKeyRegisterGitInfo(realRoot) : getGitInfo(realRoot);
     return this.registerWorkspaceWithGit(realRoot, workspaceKey, git);
   }
 
@@ -163,8 +164,8 @@ export class V2Indexer {
       ON CONFLICT(id) DO UPDATE SET
         root = excluded.root,
         workspace_key = excluded.workspace_key,
-        git_remote = excluded.git_remote,
-        git_common_dir = excluded.git_common_dir,
+        git_remote = COALESCE(excluded.git_remote, workspaces.git_remote),
+        git_common_dir = COALESCE(excluded.git_common_dir, workspaces.git_common_dir),
         last_seen_at = excluded.last_seen_at
     `).run(workspaceId, realRoot, resolvedWorkspaceKey, git.remoteUrl, git.gitCommonDir, now, now);
 
@@ -1457,6 +1458,14 @@ function chunkArray<T>(items: T[], chunkSize: number): T[][] {
 function normalizeWorkspaceKey(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed.toLowerCase().replace(/\\/g, '/') : undefined;
+}
+
+function workspaceKeyRegisterGitInfo(root: string): GitInfo {
+  return {
+    root,
+    dirtyHash: 'workspace-key-register',
+    available: false,
+  };
 }
 
 function manifestMatchesPreviousFiles(files: ManifestFile[], previousFiles: ManifestPreviousFile[]): boolean {
