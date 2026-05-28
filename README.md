@@ -625,8 +625,9 @@ Each editor window normally starts its own stdio proxy, so you usually do not ru
 ## Performance model
 
 - Postgres is the source of truth; the daemon does not load the full graph object model into memory.
-- Cold indexing scans the manifest, classifies `file_role`, hashes files, parses cache misses, and materializes symbols/imports/calls/endpoints into Postgres.
-- Warm indexing reuses previous `blob_hash` values when `mtime_ms` and `size` match, reuses `parse_cache` entries keyed by `blob_hash`, and skips rebuilding a new snapshot when the manifest, HEAD, and dirty state are unchanged.
+- Cold indexing scans the manifest, classifies `file_role`, computes `blob_hash`, parses cache misses, and materializes symbols/imports/calls/endpoints into Postgres.
+- For Git worktrees, clean tracked files use the Git index object id (`git:<blob>`), validated against index stat metadata. Dirty, untracked, or non-Git files still fall back to content hashing, so full graph completeness is preserved without reading every clean file to SHA-256 it.
+- Warm indexing reuses previous `blob_hash` values when `mtime_ms` and `size` match, batch-checks `parse_cache` entries keyed by `blob_hash`, and skips rebuilding a new snapshot when the manifest, HEAD, and dirty state are unchanged.
 - Cold or cache-miss parsing can fan out across worker threads after build; small updates use an in-place incremental path that reparses changed files, removes deleted file rows, and rebuilds dependency/call graph rows for affected files instead of copying and resolving the whole snapshot.
 - Multiple windows/repositories share the same daemon and global cache, but each `--root` has its own workspace snapshot.
 - Search is fastest and most accurate when agents use graph tools first, especially `get_research_pack`, then fall back to broad text search only for unresolved names.
@@ -654,6 +655,15 @@ Real-project index benchmark, run on 2026-05-24 against local checkouts under `D
 | `elasticsearch` | Cold index | 1,314.6s | 663.1s | 49.6% faster | 1,024.0s | 660.9s | 35.5% faster | 4 parse workers |
 | `elasticsearch` | Warm unchanged | 19.8s | 9.6s | 51.7% faster | 17.7s | 7.5s | 57.9% faster | skipped unchanged |
 | `elasticsearch` | Modify 1 file | 404.0s | 22.2s | 94.5% faster | 403.3s | 20.8s | 94.8% faster | incremental |
+
+Hadoop Docker full-index benchmark, run on 2026-05-28 from Docker Desktop against `D:/Personal/Projects/hadoop` mounted read-only as `/workspace`, Postgres on `host.docker.internal:54329`, `CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop`, and `--parse-workers 8`. Both runs indexed the full graph (`filesTotal=14082`, `filesParsed=14082`); no source/test files were excluded for the speedup.
+
+| Build | Total index time | Manifest scan | Parse-cache check | Parse | Files hashed | Hash cache hits | Parse cache hits | Notes |
+|-------|-----------------:|--------------:|------------------:|------:|-------------:|----------------:|-----------------:|-------|
+| Before Git manifest + batch cache lookup | 643,472ms (10m43s) | ~3m52s | ~34-36s | ~3m26s | 14,082 | 0 | 0 | Content-hashed every indexed file and checked parse cache one row at a time |
+| After Git manifest + batch cache lookup | 487,237ms (8m07s) | 134,259ms (2m14s) | 0s | ~3m23s | 0 | 14,082 | 0 | Uses Git index blob ids for clean tracked files, batch parse-cache lookup, and size-weighted parse chunks |
+
+This is a cold full snapshot after the test suite reset the database, so `parseCacheHits=0` is expected. The time reduction comes from manifest/cache overhead, not from skipping graph content.
 
 Review-packet proof benchmark, run on 2026-05-24 against warmed indexes for the same local checkouts. It compares baseline raw file reads/search against one `review_patch` packet per task. Token counts use the documented `ceil(character_count / 4)` estimator, not actual model API usage.
 
