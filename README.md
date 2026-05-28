@@ -977,7 +977,8 @@ For two local clones of the same upstream repository, keep one shared
 clone folder. Current builds write daemon metadata as container-scoped files,
 so concurrent Docker MCP containers do not overwrite each other's localhost
 daemon pointer. If one of two concurrent Copilot CLI sessions fails to start on
-an older image, rebuild `mcp-code-graph:latest`.
+an older image, rebuild `mcp-code-graph:latest`. For the detailed Copilot CLI
+two-clone runbook, see [`docs/copilot-two-local-clones.md`](docs/copilot-two-local-clones.md).
 
 Multi-project examples:
 

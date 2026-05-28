@@ -167,7 +167,9 @@ paths as the two workspace keys. The Docker cache volume can stay shared:
 current builds store daemon metadata per container, while graph snapshots and
 parse cache are isolated by `CODEGRAPH_WORKSPACE_KEY` in Postgres. Older images
 used one shared `daemon.json` and could make one concurrent Copilot CLI session
-fail to start; rebuild the image if you see that behavior.
+fail to start; rebuild the image if you see that behavior. For the full
+two-clone runbook and real Copilot CLI verification steps, see
+[`docs/copilot-two-local-clones.md`](copilot-two-local-clones.md).
 
 ```json
 {
