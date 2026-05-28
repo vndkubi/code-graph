@@ -665,6 +665,15 @@ Hadoop Docker full-index benchmark, run on 2026-05-28 from Docker Desktop agains
 
 This is a cold full snapshot after the test suite reset the database, so `parseCacheHits=0` is expected. The time reduction comes from manifest/cache overhead, not from skipping graph content.
 
+Write materialization checkpoint, run on 2026-05-28 from local Node against the same Hadoop checkout and Postgres database with fresh workspace keys, hot parse cache, and `--parse-workers 8`. Both runs built a full new snapshot (`filesTotal=14082`, `filesParsed=0`, `parseCacheHits=14082`, `filesHashed=0`, `hashCacheHits=14082`); no source/test files or graph rows were skipped.
+
+| Write batch params | Index time | Wall time | Change | Graph check |
+|-------------------:|-----------:|----------:|-------:|-------------|
+| 10,000 | 132,008ms | 132,674ms | baseline | - |
+| 50,000 default | 122,280ms | 122,929ms | 7.4% faster | `dependency_edges` diff vs 10,000: 0/0 |
+
+Write insert/update statements now use `CODEGRAPH_WRITE_BATCH_PARAMS` with a default of `50000`; query-side lookup batches remain at `10000`. Set `CODEGRAPH_WRITE_BATCH_PARAMS=10000` to reproduce the previous behavior or reduce statement size for constrained Postgres deployments.
+
 Review-packet proof benchmark, run on 2026-05-24 against warmed indexes for the same local checkouts. It compares baseline raw file reads/search against one `review_patch` packet per task. Token counts use the documented `ceil(character_count / 4)` estimator, not actual model API usage.
 
 | Repo | Tasks | Baseline correct | Review packet correct | Input token change | Output token change | File-open change | `review_patch` p95 |

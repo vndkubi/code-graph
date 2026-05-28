@@ -106,7 +106,8 @@ interface ParseResultForFile {
   result: ParseResult;
 }
 
-const MAX_BATCH_PARAMS = 10_000;
+const MAX_QUERY_BATCH_PARAMS = 10_000;
+const MAX_WRITE_BATCH_PARAMS = boundedInt(process.env.CODEGRAPH_WRITE_BATCH_PARAMS, 50_000, 1_000, 60_000);
 const WRITE_FILE_BATCH_SIZE = 250;
 
 const HTTP_METHOD_ANNOTATIONS = new Map([
@@ -508,6 +509,11 @@ export class V2Indexer {
   ): Promise<PreparedParseBatch> {
     const start = Date.now();
     const plans: ParsePlan[] = [];
+    const plannedPaths = new Set<string>();
+    const addPlan = (plan: ParsePlan): void => {
+      plans.push(plan);
+      plannedPaths.add(plan.file.relPath);
+    };
     const workItems: ParseWorkItem[] = [];
     let parseCacheHits = 0;
     let checkedFiles = 0;
@@ -527,7 +533,7 @@ export class V2Indexer {
 
     for (const file of files) {
       if (!file.parseable || !file.language) {
-        plans.push({
+        addPlan({
           file,
           cacheHit: false,
           cacheInsert: false,
@@ -550,7 +556,7 @@ export class V2Indexer {
       if (cached) {
         const result = JSON.parse(cached) as ParseResult;
         parseCacheHits++;
-        plans.push({
+        addPlan({
           file,
           result,
           cacheHit: true,
@@ -612,10 +618,10 @@ export class V2Indexer {
     const parsedByPath = new Map(parsed.map(item => [item.key, item.result]));
     for (const file of files) {
       if (!file.parseable || !file.language) continue;
-      if (plans.some(plan => plan.file.relPath === file.relPath)) continue;
+      if (plannedPaths.has(file.relPath)) continue;
       const result = parsedByPath.get(file.relPath);
       if (!result) continue;
-      plans.push({
+      addPlan({
         file,
         result,
         cacheHit: false,
@@ -638,7 +644,7 @@ export class V2Indexer {
   private async parseCacheByBlobHash(blobHashes: string[]): Promise<Map<string, string>> {
     const unique = [...new Set(blobHashes)];
     const cached = new Map<string, string>();
-    for (const batch of chunkArray(unique, MAX_BATCH_PARAMS)) {
+    for (const batch of chunkArray(unique, MAX_QUERY_BATCH_PARAMS)) {
       const placeholders = batch.map(() => '?').join(', ');
       const rows = await this.db.prepare(`
         SELECT blob_hash, parse_json
@@ -1030,6 +1036,7 @@ export class V2Indexer {
     const symbols = await this.db.prepare(`
       SELECT simple_name, fq_name, file FROM symbols
       WHERE snapshot_id = ? AND kind IN ('class', 'interface', 'enum', 'type')
+      ORDER BY file, line, fq_name
     `).all(snapshotId) as Array<{ simple_name: string; fq_name: string; file: string }>;
     for (const sym of symbols) {
       if (!classToFile.has(sym.simple_name)) classToFile.set(sym.simple_name, sym.file);
@@ -1197,7 +1204,7 @@ export class V2Indexer {
   private async updateCallEdges(rows: SqlValue[][]): Promise<void> {
     if (rows.length === 0) return;
     const columns = ['row_id', 'callee', 'confidence', 'resolution_kind'];
-    const maxRows = Math.max(1, Math.floor(MAX_BATCH_PARAMS / columns.length));
+    const maxRows = Math.max(1, Math.floor(MAX_WRITE_BATCH_PARAMS / columns.length));
     for (const batch of chunkArray(rows, maxRows)) {
       const params: SqlValue[] = [];
       const placeholders = batch.map(row => {
@@ -1225,7 +1232,7 @@ export class V2Indexer {
     options: BatchInsertOptions = {},
   ): Promise<void> {
     if (rows.length === 0) return;
-    const maxRows = Math.max(1, Math.floor(MAX_BATCH_PARAMS / columns.length));
+    const maxRows = Math.max(1, Math.floor(MAX_WRITE_BATCH_PARAMS / columns.length));
     const insertKeyword = options.ignoreConflicts ? 'INSERT OR IGNORE INTO' : 'INSERT INTO';
     const columnList = columns.map(sqlColumnName).join(', ');
     for (const batch of chunkArray(rows, maxRows)) {
@@ -1487,6 +1494,12 @@ function chunkArray<T>(items: T[], chunkSize: number): T[][] {
     chunks.push(items.slice(index, index + chunkSize));
   }
   return chunks;
+}
+
+function boundedInt(value: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
 }
 
 function normalizeWorkspaceKey(value: string | undefined): string | undefined {

@@ -179,6 +179,11 @@ should report one or more of:
 - high `parseCacheHits`
 - high `hashCacheHits`
 
+Write-heavy full snapshots use `CODEGRAPH_WRITE_BATCH_PARAMS=50000` by default
+to reduce Postgres round trips during graph materialization. If a constrained
+Postgres deployment rejects large statements, set `CODEGRAPH_WRITE_BATCH_PARAMS=10000`
+to use the previous smaller batch size.
+
 If the index command reports `filesTotal: 0` for a real repository, stop and fix
 the Docker bind mount before using MCP. On Docker Desktop for Windows, share the
 drive that contains the repository: Docker Desktop -> Settings -> Resources ->
