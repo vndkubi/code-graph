@@ -910,6 +910,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
                   const funcName = parentClass ? `${parentClass}.${nameNode.text}` : nameNode.text;
                   this.extractCallsFromNode(value, file, lines, calls, references, funcName);
                 }
+                if (value?.type === 'object') {
+                  this.extractTypeScriptObjectPropertySymbols(value, file, lines, symbols, nameNode.text);
+                }
               }
             }
           }
@@ -925,6 +928,42 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           break;
       }
     }
+  }
+
+  private extractTypeScriptObjectPropertySymbols(
+    objectNode: SyntaxNode,
+    file: string,
+    lines: string[],
+    symbols: SymbolInfo[],
+    parentName: string,
+  ): void {
+    for (const pair of objectNode.namedChildren.filter(child => child.type === 'pair')) {
+      const keyNode = pair.childForFieldName('key') ?? pair.namedChildren[0];
+      const name = this.tsObjectPropertyName(keyNode);
+      if (!name) continue;
+      symbols.push({
+        name,
+        kind: 'field',
+        file,
+        line: pair.startPosition.row + 1,
+        column: pair.startPosition.column + 1,
+        endLine: pair.endPosition.row + 1,
+        signature: this.getLineText(lines, pair.startPosition.row).trim(),
+        visibility: 'public',
+        module: this.getTsModule(file),
+        parent: parentName,
+      });
+    }
+  }
+
+  private tsObjectPropertyName(node: SyntaxNode | null | undefined): string | undefined {
+    if (!node) return undefined;
+    if (node.type === 'property_identifier' || node.type === 'identifier') return node.text;
+    if (node.type === 'string') {
+      const fragment = node.namedChildren.find(child => child.type === 'string_fragment');
+      return fragment?.text;
+    }
+    return undefined;
   }
 
   private collectImportedNames(node: SyntaxNode, names: string[]): void {

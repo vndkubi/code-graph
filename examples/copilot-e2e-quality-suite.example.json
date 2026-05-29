@@ -1,0 +1,261 @@
+{
+  "version": 2,
+  "purpose": "Executable quality benchmark suite for real Copilot CLI runs. Use -Modes codegraph,baseline to compare CodeGraph MCP against normal repository tools. Quality is validator pass/fail, not JSON shape.",
+  "models": [
+    {
+      "id": "gpt-5-mini",
+      "effort": "low"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "fixture-implement-reserve-before-charge",
+      "type": "implement",
+      "repoRoot": "${codeGraphRoot}/tests/fixtures/ts-project",
+      "workspaceMode": "copy",
+      "prompt": "Use only CodeGraph MCP server ${mcpServer} for source context before editing. Implement inventory reservation in OrderService.create: after checkAvailability succeeds and before paymentService.charge, call inventoryService.reserve(request.items). Keep the public create/findById API unchanged. Edit only src/order-service.ts. Do not run git commit. Return compact JSON with keys changedFiles and validation.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Implement inventory reservation in OrderService.create: after checkAvailability succeeds and before paymentService.charge, call inventoryService.reserve(request.items). Keep the public create/findById API unchanged. Edit only src/order-service.ts. Do not run git commit. Return compact JSON with keys changedFiles and validation.",
+      "validation": {
+        "maxChangedFiles": 1,
+        "requiredChangedFiles": ["src/order-service.ts"],
+        "requiredDiffRegex": ["reserve\\(request\\.items\\)"],
+        "orderedFileContains": [
+          {
+            "file": "src/order-service.ts",
+            "patterns": [
+              "checkAvailability\\(request\\.items\\)",
+              "reserve\\(request\\.items\\)",
+              "charge\\(request\\.customerId, 100\\)"
+            ]
+          }
+        ],
+        "commands": [
+          {
+            "name": "tsc",
+            "command": "node '${codeGraphRoot}\\node_modules\\typescript\\bin\\tsc' --noEmit -p tsconfig.json",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          },
+          {
+            "name": "behavior-test-green",
+            "command": "node '${codeGraphRoot}\\node_modules\\tsx\\dist\\cli.mjs' --test 'src/order-service.behavior.test.ts'",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "fixture-debug-missing-reservation",
+      "type": "debug",
+      "repoRoot": "${codeGraphRoot}/tests/fixtures/ts-project",
+      "workspaceMode": "copy",
+      "prePatch": "diff --git a/src/order-service.ts b/src/order-service.ts\n--- a/src/order-service.ts\n+++ b/src/order-service.ts\n@@ -8,6 +8,7 @@ export class OrderService {\n   ) {}\n \n   async create(request: { items: string[]; customerId: string }): Promise<{ id: string; status: string }> {\n+    // BUG: reservation was accidentally removed, so items can be sold twice under concurrent orders.\n     await this.inventoryService.checkAvailability(request.items);\n     await this.paymentService.charge(request.customerId, 100);\n     return { id: '1', status: 'created' };\n",
+      "prompt": "Use only CodeGraph MCP server ${mcpServer} for source context before editing. Debug the failing behavior test for OrderService.create. The business rule is: availability check, reserve inventory, then charge payment. Fix the bug with the smallest diff and edit only src/order-service.ts. Do not run git commit. Return compact JSON with keys rootCause, changedFiles, validation.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Debug the failing behavior test for OrderService.create. The business rule is: availability check, reserve inventory, then charge payment. Fix the bug with the smallest diff and edit only src/order-service.ts. Do not run git commit. Return compact JSON with keys rootCause, changedFiles, validation.",
+      "validation": {
+        "beforeCommands": [
+          {
+            "name": "behavior-test-red-before-fix",
+            "command": "node '${codeGraphRoot}\\node_modules\\tsx\\dist\\cli.mjs' --test 'src/order-service.behavior.test.ts'",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 1
+          }
+        ],
+        "maxChangedFiles": 1,
+        "requiredChangedFiles": ["src/order-service.ts"],
+        "requiredDiffRegex": ["reserve\\(request\\.items\\)"],
+        "orderedFileContains": [
+          {
+            "file": "src/order-service.ts",
+            "patterns": [
+              "checkAvailability\\(request\\.items\\)",
+              "reserve\\(request\\.items\\)",
+              "charge\\(request\\.customerId, 100\\)"
+            ]
+          }
+        ],
+        "commands": [
+          {
+            "name": "tsc",
+            "command": "node '${codeGraphRoot}\\node_modules\\typescript\\bin\\tsc' --noEmit -p tsconfig.json",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          },
+          {
+            "name": "behavior-test-green-after-fix",
+            "command": "node '${codeGraphRoot}\\node_modules\\tsx\\dist\\cli.mjs' --test 'src/order-service.behavior.test.ts'",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "fixture-create-testcase-reservation-order",
+      "type": "create-testcase",
+      "repoRoot": "${codeGraphRoot}/tests/fixtures/ts-project",
+      "workspaceMode": "copy",
+      "prePatch": "diff --git a/src/order-service.ts b/src/order-service.ts\n--- a/src/order-service.ts\n+++ b/src/order-service.ts\n@@ -9,6 +9,7 @@ export class OrderService {\n \n   async create(request: { items: string[]; customerId: string }): Promise<{ id: string; status: string }> {\n     await this.inventoryService.checkAvailability(request.items);\n+    await this.inventoryService.reserve(request.items);\n     await this.paymentService.charge(request.customerId, 100);\n     return { id: '1', status: 'created' };\n   }\n",
+      "prompt": "Use only CodeGraph MCP server ${mcpServer} for source context before editing. Create exactly one focused Node.js built-in test in src/order-service.test.ts using node:test and node:assert/strict. The test must prove OrderService.create checks availability, reserves request.items, and only then charges the customer. Import OrderService from './order-service' without a .ts extension. Constructor mocks must satisfy PaymentService and InventoryService, including a no-op refund method. Do not add unavailable-item, error-path, refund-behavior, HTTP, or database tests. Do not install packages, create node_modules, or modify package files. Do not delete or modify src/order-service.behavior.test.ts. Do not change production files. Do not use Jest or Vitest. Do not run git commit. Return compact JSON with keys testFile, assertions, validation.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Create exactly one focused Node.js built-in test in src/order-service.test.ts using node:test and node:assert/strict. The test must prove OrderService.create checks availability, reserves request.items, and only then charges the customer. Import OrderService from './order-service' without a .ts extension. Constructor mocks must satisfy PaymentService and InventoryService, including a no-op refund method. Do not add unavailable-item, error-path, refund-behavior, HTTP, or database tests. Do not install packages, create node_modules, or modify package files. Do not delete or modify src/order-service.behavior.test.ts. Do not change production files. Do not use Jest or Vitest. Do not run git commit. Return compact JSON with keys testFile, assertions, validation.",
+      "validation": {
+        "maxChangedFiles": 1,
+        "requiredChangedFiles": ["src/order-service.test.ts"],
+        "forbiddenChangedFiles": ["src/order-service.ts"],
+        "fileContains": [
+          {
+            "file": "src/order-service.test.ts",
+            "regex": "node:test"
+          },
+          {
+            "file": "src/order-service.test.ts",
+            "regex": "node:assert/strict|node:assert"
+          },
+          {
+            "file": "src/order-service.test.ts",
+            "regex": "reserve"
+          },
+          {
+            "file": "src/order-service.test.ts",
+            "regex": "charge"
+          },
+          {
+            "file": "src/order-service.test.ts",
+            "regex": "checkAvailability"
+          }
+        ],
+        "commands": [
+          {
+            "name": "tsc",
+            "command": "node '${codeGraphRoot}\\node_modules\\typescript\\bin\\tsc' --noEmit -p tsconfig.json",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          },
+          {
+            "name": "new-test-green",
+            "command": "node '${codeGraphRoot}\\node_modules\\tsx\\dist\\cli.mjs' --test 'src/order-service.test.ts'",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          },
+          {
+            "name": "mutation-red-without-reserve",
+            "command": "$path='src/order-service.ts'; $original=Get-Content -LiteralPath $path -Raw; $mutated=$original -replace '\\r?\\n\\s*await this\\.inventoryService\\.reserve\\(request\\.items\\);',''; Set-Content -LiteralPath $path -Value $mutated -NoNewline; & node '${codeGraphRoot}\\node_modules\\tsx\\dist\\cli.mjs' --test 'src/order-service.test.ts'; $exit=$LASTEXITCODE; Set-Content -LiteralPath $path -Value $original -NoNewline; if ($exit -eq 0) { exit 1 } else { exit 0 }",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "fixture-codereview-seeded-risk",
+      "type": "codereview",
+      "repoRoot": "${codeGraphRoot}/tests/fixtures/ts-project",
+      "workspaceMode": "copy",
+      "prompt": "Use only CodeGraph MCP server ${mcpServer}. Do not edit files. Review this seeded diff and return findings first with file/line, severity, why, and suggested fix. Diff summary: in src/order-service.ts, a patch logs customerId and items in create, clears request.items before availability check, then charges the customer. Focus on behavior and security risk. Return JSON with keys findings, tests, confidence.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Do not edit files. Review this seeded diff and return findings first with file/line, severity, why, and suggested fix. Diff summary: in src/order-service.ts, a patch logs customerId and items in create, clears request.items before availability check, then charges the customer. Focus on behavior and security risk. Return JSON with keys findings, tests, confidence.",
+      "validation": {
+        "maxChangedFiles": 0,
+        "goldenFindings": [
+          "customerId|sensitive|log",
+          "clear|mutat|request\\.items|availability",
+          "charge|payment|incorrect|wrong"
+        ],
+        "goldenFacts": [
+          "src/order-service\\.ts",
+          "line",
+          "severity"
+        ]
+      }
+    },
+    {
+      "id": "fixture-investigate-order-flow",
+      "type": "investigate",
+      "repoRoot": "${codeGraphRoot}/tests/fixtures/ts-project",
+      "workspaceMode": "copy",
+      "prompt": "Use only CodeGraph MCP server ${mcpServer}. Do not edit files. Investigate OrderService.create end-to-end and explain the business flow, key files with file/line evidence, risks, and glossary. Return JSON with keys keyFiles, flow, risks, glossary, confidence.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Do not edit files. Investigate OrderService.create end-to-end and explain the business flow, key files with file/line evidence, risks, and glossary. Return JSON with keys keyFiles, flow, risks, glossary, confidence.",
+      "validation": {
+        "maxChangedFiles": 0,
+        "goldenFacts": [
+          "src/order-service\\.ts",
+          "checkAvailability",
+          "paymentService\\.charge|charge",
+          "OrderService\\.create",
+          "line|lines|10|11|12"
+        ],
+        "forbiddenClaims": [
+          "database transaction",
+          "HTTP endpoint"
+        ]
+      }
+    },
+    {
+      "id": "fixture-break-task-reservation-feature",
+      "type": "break-task",
+      "repoRoot": "${codeGraphRoot}/tests/fixtures/ts-project",
+      "workspaceMode": "copy",
+      "prompt": "Use only CodeGraph MCP server ${mcpServer}. Do not edit files. Break down the work to add inventory reservation to OrderService.create into ordered engineering tasks with dependencies, validation steps, risks, and definition of done. Return JSON with keys epics, tasks, order, testMilestones, risks, definitionOfDone.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Do not edit files. Break down the work to add inventory reservation to OrderService.create into ordered engineering tasks with dependencies, validation steps, risks, and definition of done. Return JSON with keys epics, tasks, order, testMilestones, risks, definitionOfDone.",
+      "validation": {
+        "maxChangedFiles": 0,
+        "expectedDagNodes": [
+          "inspect|study|OrderService",
+          "reserve|InventoryService",
+          "test|coverage|behavior",
+          "validation|definitionOfDone|done",
+          "risk|rollback|failure"
+        ]
+      }
+    },
+    {
+      "id": "fixture-refactor-create-helper",
+      "type": "refactor",
+      "repoRoot": "${codeGraphRoot}/tests/fixtures/ts-project",
+      "workspaceMode": "copy",
+      "prompt": "Use only CodeGraph MCP server ${mcpServer} for source context before editing. Refactor OrderService.create so the availability check and inventory reservation are isolated in a private helper. The current implementation is missing the reservation step; the refactor must add inventoryService.reserve(items) after checkAvailability and before paymentService.charge. Preserve the public create/findById API and payment behavior. Edit only src/order-service.ts. Do not run git commit. Return JSON with keys changedFiles, behaviorPreserved, validation.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Refactor OrderService.create so the availability check and inventory reservation are isolated in a private helper. The current implementation is missing the reservation step; the refactor must add inventoryService.reserve(items) after checkAvailability and before paymentService.charge. Preserve the public create/findById API and payment behavior. Edit only src/order-service.ts. Do not run git commit. Return JSON with keys changedFiles, behaviorPreserved, validation.",
+      "validation": {
+        "maxChangedFiles": 1,
+        "requiredChangedFiles": ["src/order-service.ts"],
+        "requiredAddedRegex": ["reserve\\(", "private\\s+async\\s+.*(reserve|Inventory|availability)"],
+        "fileContains": [
+          {
+            "file": "src/order-service.ts",
+            "regex": "private\\s+async\\s+.*(reserve|Inventory|availability)"
+          },
+          {
+            "file": "src/order-service.ts",
+            "regex": "checkAvailability\\("
+          },
+          {
+            "file": "src/order-service.ts",
+            "regex": "reserve\\("
+          },
+          {
+            "file": "src/order-service.ts",
+            "regex": "paymentService\\.charge\\(request\\.customerId, 100\\)"
+          },
+          {
+            "file": "src/order-service.ts",
+            "regex": "async\\s+findById\\(id: string\\): Promise<\\{ id: string; status: string \\}>"
+          }
+        ],
+        "commands": [
+          {
+            "name": "tsc",
+            "command": "node '${codeGraphRoot}\\node_modules\\typescript\\bin\\tsc' --noEmit -p tsconfig.json",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          },
+          {
+            "name": "behavior-test-green",
+            "command": "node '${codeGraphRoot}\\node_modules\\tsx\\dist\\cli.mjs' --test 'src/order-service.behavior.test.ts'",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          }
+        ]
+      }
+    }
+  ]
+}

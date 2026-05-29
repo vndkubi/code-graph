@@ -24,6 +24,11 @@ export interface ManifestScanResult {
   hashCacheHits: number;
 }
 
+export interface ManifestPathScanResult extends ManifestScanResult {
+  deletedPaths: string[];
+  skippedPaths: string[];
+}
+
 export interface ManifestPreviousFile {
   path: string;
   blobHash: string;
@@ -114,6 +119,53 @@ export function scanManifest(root: string, options: ManifestScanOptions = {}): M
   };
 }
 
+export function scanManifestPaths(root: string, changedPaths: string[], options: ManifestScanOptions = {}): ManifestPathScanResult {
+  const start = Date.now();
+  const rootDir = path.resolve(root);
+  const maxFileSizeBytes = options.maxFileSizeBytes ?? 5 * 1024 * 1024;
+  const previousByPath = new Map((options.previousFiles ?? []).map(file => [file.path, file]));
+  const gitHashes = loadGitHashLookup(rootDir);
+  const stats = { filesHashed: 0, hashCacheHits: 0 };
+  const files: ManifestFile[] = [];
+  const deletedPaths: string[] = [];
+  const skippedPaths: string[] = [];
+  const seen = new Set<string>();
+
+  for (const rawPath of changedPaths) {
+    const relPath = normalizeChangedPath(rootDir, rawPath);
+    if (!relPath || seen.has(relPath)) continue;
+    seen.add(relPath);
+    const absPath = path.join(rootDir, relPath);
+    let stat: fs.Stats | undefined;
+    try {
+      stat = fs.statSync(absPath);
+    } catch {
+      deletedPaths.push(relPath);
+      continue;
+    }
+    if (!stat.isFile()) {
+      if (previousByPath.has(relPath)) deletedPaths.push(relPath);
+      else skippedPaths.push(relPath);
+      continue;
+    }
+    const file = manifestFileForPath(rootDir, absPath, relPath, stat, maxFileSizeBytes, previousByPath, gitHashes, stats);
+    if (file) files.push(file);
+    else if (previousByPath.has(relPath)) deletedPaths.push(relPath);
+    else skippedPaths.push(relPath);
+  }
+
+  return {
+    root: rootDir,
+    files,
+    deletedPaths,
+    skippedPaths,
+    scannedAt: new Date().toISOString(),
+    scanTimeMs: Date.now() - start,
+    filesHashed: stats.filesHashed,
+    hashCacheHits: stats.hashCacheHits,
+  };
+}
+
 function walk(
   root: string,
   dir: string,
@@ -144,30 +196,15 @@ function walk(
 
     if (!entry.isFile()) continue;
 
-    const classification = classifyFile(relPath);
-    if (!classification.indexable) continue;
-
     let stat: fs.Stats;
     try {
       stat = fs.statSync(absPath);
     } catch {
       continue;
     }
-    if (stat.size > maxFileSizeBytes) continue;
-
-    const previous = previousByPath.get(relPath);
-    const blobHash = blobHashForFile(relPath, absPath, stat, previous, gitHashes, stats);
-
-    files.push({
-      absPath,
-      relPath,
-      mtimeMs: stat.mtimeMs,
-      size: stat.size,
-      blobHash,
-      language: classification.language,
-      role: classification.role,
-      parseable: classification.parseable,
-    });
+    const file = manifestFileForPath(root, absPath, relPath, stat, maxFileSizeBytes, previousByPath, gitHashes, stats);
+    if (!file) continue;
+    files.push(file);
 
     const now = Date.now();
     if (progress && (files.length % 500 === 0 || now - stats.lastProgressAt >= 5_000)) {
@@ -183,6 +220,47 @@ function walk(
       });
     }
   }
+}
+
+function manifestFileForPath(
+  root: string,
+  absPath: string,
+  relPath: string,
+  stat: fs.Stats,
+  maxFileSizeBytes: number,
+  previousByPath: Map<string, ManifestPreviousFile>,
+  gitHashes: GitHashLookup | undefined,
+  stats: { filesHashed: number; hashCacheHits: number },
+): ManifestFile | undefined {
+  if (!isInsideRoot(root, absPath)) return undefined;
+  const classification = classifyFile(relPath);
+  if (!classification.indexable) return undefined;
+  if (stat.size > maxFileSizeBytes) return undefined;
+
+  const previous = previousByPath.get(relPath);
+  const blobHash = blobHashForFile(relPath, absPath, stat, previous, gitHashes, stats);
+  return {
+    absPath,
+    relPath,
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    blobHash,
+    language: classification.language,
+    role: classification.role,
+    parseable: classification.parseable,
+  };
+}
+
+function normalizeChangedPath(root: string, rawPath: string): string | undefined {
+  if (!rawPath.trim()) return undefined;
+  const absolute = path.isAbsolute(rawPath) ? path.resolve(rawPath) : path.resolve(root, rawPath);
+  if (!isInsideRoot(root, absolute)) return undefined;
+  return path.relative(root, absolute).replace(/\\/g, '/');
+}
+
+function isInsideRoot(root: string, absPath: string): boolean {
+  const relative = path.relative(root, absPath);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
 function blobHashForFile(

@@ -525,6 +525,14 @@ public class PaymentServiceTest {
       relevantSymbols: Array<{ symbol: string; lines: string }>;
       testsLikelyRelevant: Array<{ file: string }>;
       validation: { targetedTestFiles: string[]; suggestedCommands: string[] };
+      taskOracle: {
+        successCriteria: string[];
+        expectedVerification: { commands: string[]; targetedTestFiles: string[]; redGreenRequired: boolean };
+        likelyTests: Array<{ file: string }>;
+        goldenFacts: Array<{ kind: string; value?: string; file?: string }>;
+      };
+      sliceHints: Array<{ file: string; lines?: string; symbol?: string }>;
+      toolHints: Array<{ tool: string; args: { slices?: Array<{ file?: string; lines?: string; symbol?: string }> } }>;
       nextAction: string;
       budget: { estimatedResponseTokens: number };
     };
@@ -538,6 +546,12 @@ public class PaymentServiceTest {
     expect(packet.testsLikelyRelevant.some(test => test.file.endsWith('PaymentServiceTest.java'))).toBe(true);
     expect(packet.validation.targetedTestFiles.some(file => file.endsWith('PaymentServiceTest.java'))).toBe(true);
     expect(packet.validation.suggestedCommands.some(command => command.includes('npm test'))).toBe(true);
+    expect(packet.taskOracle.expectedVerification.targetedTestFiles.some(file => file.endsWith('PaymentServiceTest.java'))).toBe(true);
+    expect(packet.taskOracle.likelyTests.some(test => test.file.endsWith('PaymentServiceTest.java'))).toBe(true);
+    expect(packet.taskOracle.successCriteria.join(' ')).toContain('source-of-truth');
+    expect(packet.taskOracle.goldenFacts.some(fact => String(fact.value ?? fact.file).includes('PaymentService'))).toBe(true);
+    expect(packet.sliceHints.some(hint => hint.file.endsWith('PaymentService.java'))).toBe(true);
+    expect(packet.toolHints.some(hint => hint.tool === 'get_file_slice' && Array.isArray(hint.args.slices))).toBe(true);
     expect(packet.nextAction).toContain('get_file_slice');
     expect(packet.budget.estimatedResponseTokens).toBeGreaterThan(0);
 
@@ -552,6 +566,52 @@ public class PaymentServiceTest {
     expect(slice.text).toContain('processRefund');
     expect(slice.truncated).toBe(false);
     expect(slice.resolvedSymbol?.symbol).toContain('PaymentService.refund');
+
+    const batchSlice = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_file_slice',
+      args: {
+        maxChars: 1000,
+        slices: [
+          { symbol: 'PaymentService.refund' },
+          { file: 'src/main/java/com/example/payment/PaymentGateway.java', lines: '1-4', maxChars: 600 },
+        ],
+      },
+    }) as { batch: boolean; slices: Array<{ file: string; text?: string; error?: string }>; returnedCount: number };
+
+    expect(batchSlice.batch).toBe(true);
+    expect(batchSlice.returnedCount).toBe(2);
+    expect(batchSlice.slices[0]?.text).toContain('processRefund');
+    expect(batchSlice.slices[1]?.text).toContain('PaymentGateway');
+
+    const changePack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_change_pack',
+      args: {
+        task: 'debug duplicate refund timeout in PaymentService.refund',
+        changeType: 'debug',
+        maxFiles: 4,
+        maxSymbols: 6,
+        tokenBudget: 4000,
+      },
+    }) as {
+      files: Array<{ file: string }>;
+      symbols: Array<{ symbol: string }>;
+      editRanges: Array<{ file?: string; lines?: string; symbol?: string }>;
+      testsLikelyRelevant: Array<{ file: string }>;
+      invariants: string[];
+      expectedVerification: { targetedTestFiles?: string[]; redGreenRequired?: boolean };
+      taskOracle: { goldenFacts: Array<{ value?: string; file?: string }> };
+      routing: { firstToolCall?: { tool: string } };
+    };
+
+    expect(changePack.files.some(file => file.file.endsWith('PaymentService.java'))).toBe(true);
+    expect(changePack.symbols.some(symbol => symbol.symbol.includes('PaymentService'))).toBe(true);
+    expect(changePack.editRanges.some(range => range.file?.endsWith('PaymentService.java') || range.symbol?.includes('PaymentService'))).toBe(true);
+    expect(changePack.testsLikelyRelevant.some(test => test.file.endsWith('PaymentServiceTest.java'))).toBe(true);
+    expect(changePack.invariants.some(invariant => invariant.includes('red-to-green'))).toBe(true);
+    expect(changePack.expectedVerification.redGreenRequired).toBe(true);
+    expect(changePack.routing.firstToolCall?.tool).toBe('get_file_slice');
   });
 
   it('builds answer-ready research and flow packs with source evidence', async () => {
@@ -598,6 +658,17 @@ public class PaymentService {
       nextAction: string;
       definitionCandidates: Array<{ symbol: string; file: string }>;
       flowSteps: unknown[];
+      taskOracle: {
+        successCriteria: string[];
+        expectedVerification: { fallback: string };
+        goldenFacts: Array<{ kind: string; value?: string; file?: string }>;
+      };
+      compressedEvidence: {
+        factCards: Array<{ kind: string; subject?: string; file?: string }>;
+        callGraphEdges: Array<{ caller?: string; callee?: string }>;
+        sourceSliceRefs: Array<{ file?: string; textPreview?: string }>;
+        compressionRatio: number;
+      };
     };
 
     expect(researchPack.completeness.sufficientForAnswer).toBe(true);
@@ -608,6 +679,11 @@ public class PaymentService {
     expect(researchPack.answerGuidance.join(' ')).toContain('Answer directly');
     expect(researchPack.nextAction).toContain('Answer');
     expect(researchPack.flowSteps.length).toBeGreaterThan(0);
+    expect(researchPack.taskOracle.successCriteria.join(' ')).toContain('file and line evidence');
+    expect(researchPack.taskOracle.goldenFacts.some(fact => String(fact.value ?? fact.file).includes('PaymentService'))).toBe(true);
+    expect(researchPack.compressedEvidence.factCards.some(card => String(card.subject ?? card.file).includes('PaymentService'))).toBe(true);
+    expect(researchPack.compressedEvidence.sourceSliceRefs.some(slice => slice.file?.endsWith('PaymentService.java'))).toBe(true);
+    expect(researchPack.compressedEvidence.compressionRatio).toBeLessThan(1);
 
     const flowPack = await queries.query({
       workspaceId: result.workspaceId,
@@ -625,6 +701,65 @@ public class PaymentService {
     expect(flowPack.taskType).toBe('architecture');
     expect(flowPack.routing.answerDirectly).toBe(true);
     expect(flowPack.evidenceSlices.some(slice => slice.text.includes('processRefund'))).toBe(true);
+  });
+
+  it('prioritizes exact TypeScript tool symbols in research packs', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-ts-tool-research-');
+    writeFile(repo, 'src/v2/mcp/tools.ts', `export const V2ToolSchemas = {
+  search_symbol: {},
+  review_patch: {},
+};
+
+export const V2_TOOL_DEFINITIONS = Object.entries(V2ToolSchemas);
+`);
+    writeFile(repo, 'src/v2/query/service.ts', `export class V2QueryService {
+  async query(toolName: string): Promise<unknown> {
+    if (toolName === 'review_patch') return this.reviewPatch();
+    return {};
+  }
+
+  private async reviewPatch(): Promise<unknown> {
+    return { verdict: 'ok' };
+  }
+}
+`);
+    writeFile(repo, 'src/v2/benchmark/review-proof.ts', `export async function runMcpReviewProof(queryService: { query(input: unknown): Promise<unknown> }) {
+  return queryService.query({ toolName: 'review_patch' });
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const symbolSearch = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'review_patch', limit: 5 },
+    }) as { symbols: Array<{ fqName: string; file: string }> };
+    expect(symbolSearch.symbols.some(symbol => symbol.fqName.includes('V2ToolSchemas.review_patch'))).toBe(true);
+
+    const researchPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_research_pack',
+      args: {
+        target: 'review_patch MCP',
+        taskType: 'architecture',
+        tokenBudget: 5000,
+      },
+    }) as {
+      definitionCandidates: Array<{ symbol: string; file: string }>;
+      topFiles: string[];
+      evidenceSlices: Array<{ file: string; text: string }>;
+    };
+
+    expect(researchPack.definitionCandidates.some(symbol => symbol.symbol.includes('V2ToolSchemas.review_patch'))).toBe(true);
+    expect(researchPack.definitionCandidates.some(symbol => symbol.symbol.includes('V2QueryService.reviewPatch'))).toBe(true);
+    expect(researchPack.topFiles[0]).toBe('src/v2/mcp/tools.ts');
+    expect(researchPack.evidenceSlices.some(slice => slice.file === 'src/v2/mcp/tools.ts' && slice.text.includes('review_patch'))).toBe(true);
+    expect(researchPack.evidenceSlices.some(slice => slice.file === 'src/v2/query/service.ts' && slice.text.includes('reviewPatch'))).toBe(true);
   });
 
   it('simulates patch impact from changed files, symbols, and diffs', async () => {
@@ -728,21 +863,43 @@ public class OrderServiceTest {
     }) as {
       outputMode: string;
       reviewStatus: string;
-      reviewFindings: Array<{ id: string; priority: string }>;
+      reviewFindings: Array<{ id: string; priority: string; severity?: string; category?: string; suggestedFix?: string }>;
       lineFocus: Array<{ file: string; changeKinds: string[]; lineMappingConfidence?: string }>;
+      reviewTargets: Array<{
+        file: string;
+        changedSymbol?: { symbol?: string; name?: string };
+        graphContext?: { callers?: unknown[]; tests?: unknown[]; counts?: { callers?: number } };
+        recommendedChecks?: string[];
+      }>;
+      seededRiskCategories: Array<{ id: string; severity: string }>;
+      mustCheckInvariants: string[];
+      knownSensitiveDataPatterns: Array<{ id: string; pattern: string }>;
+      precisionTargets: { requireFileLineForBlockers: boolean; maxUnsupportedClaims: number };
+      agentGuidance?: { findingContract?: { requiredFields?: string[] }; reviewOrder?: unknown[] };
       requiredToolCalls: Array<{ tool: string }>;
-      metrics: { findingCount: number; omittedHunks: number };
+      metrics: { findingCount: number; omittedHunks: number; reviewTargetCount: number };
     };
 
     expect(review.outputMode).toBe('compact');
     expect(review.reviewStatus).toBe('needs-attention');
     expect(review.reviewFindings.some(finding => finding.id === 'review-endpoint-contract')).toBe(true);
     expect(review.reviewFindings.some(finding => finding.id.includes('review-debug-output'))).toBe(true);
+    expect(review.reviewFindings.some(finding => finding.severity === 'medium' && finding.category === 'observability')).toBe(true);
+    expect(review.reviewFindings.some(finding => finding.suggestedFix)).toBe(true);
     expect(review.lineFocus.some(hunk => hunk.file.endsWith('OrderController.java') && hunk.changeKinds.includes('debug-output'))).toBe(true);
     expect(review.lineFocus.some(hunk => hunk.file.endsWith('OrderController.java') && hunk.lineMappingConfidence === 'low')).toBe(true);
+    expect(review.reviewTargets.some(target => target.file.endsWith('OrderController.java')
+      && target.changedSymbol?.symbol?.includes('OrderController.list')
+      && target.recommendedChecks?.some(check => check.includes('debug output')))).toBe(true);
+    expect(review.seededRiskCategories.some(category => category.id === 'api-contract')).toBe(true);
+    expect(review.mustCheckInvariants.some(invariant => invariant.includes('Endpoint/API changes'))).toBe(true);
+    expect(review.knownSensitiveDataPatterns.some(pattern => pattern.id === 'identifier-logging')).toBe(true);
+    expect(review.precisionTargets).toMatchObject({ requireFileLineForBlockers: true, maxUnsupportedClaims: 0 });
+    expect(review.agentGuidance?.findingContract?.requiredFields).toContain('suggestedFix');
     expect(review.requiredToolCalls.some(call => call.tool === 'get_file_summary')).toBe(true);
     expect(review.metrics.findingCount).toBeGreaterThan(0);
     expect(review.metrics.omittedHunks).toBe(0);
+    expect(review.metrics.reviewTargetCount).toBeGreaterThan(0);
 
     const matchingDiff = [
       'diff --git a/src/main/java/com/example/orders/OrderController.java b/src/main/java/com/example/orders/OrderController.java',
@@ -1476,6 +1633,66 @@ public class ChangedFeature {
     expect(third.snapshotId).toBe(first.snapshotId);
     expect(third.incrementalUpdated).toBe(true);
     expect(third.filesDeleted).toBe(1);
+
+    const deletedSearch = await queries.query({
+      workspaceId: third.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'Keep', limit: 5 },
+    }) as { symbols: Array<{ name: string }> };
+    expect(deletedSearch.symbols.some(symbol => symbol.name === 'Keep')).toBe(false);
+  });
+
+  it('refreshes specific changed paths without a full manifest scan', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-path-delta-');
+    writeFile(repo, 'src/main/java/com/example/Feature.java', `package com.example;
+
+public class OriginalFeature {
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/Keep.java', `package com.example;
+
+public class Keep {
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const first = await indexer.indexWorkspace({ root: repo });
+
+    writeFile(repo, 'src/main/java/com/example/Feature.java', `package com.example;
+
+public class PathDeltaFeature {
+}
+`);
+    const second = await indexer.refreshWorkspacePaths({
+      root: repo,
+      changedPaths: ['src/main/java/com/example/Feature.java'],
+    });
+
+    expect(second.snapshotId).toBe(first.snapshotId);
+    expect(second.pathDeltaUpdated).toBe(true);
+    expect(second.incrementalUpdated).toBe(true);
+    expect(second.filesChanged).toBe(1);
+    expect(second.filesDeleted).toBe(0);
+    expect(second.filesTotal).toBe(2);
+
+    const queries = new V2QueryService(db);
+    const changedSearch = await queries.query({
+      workspaceId: second.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'PathDeltaFeature', limit: 5 },
+    }) as { symbols: Array<{ name: string }> };
+    expect(changedSearch.symbols.some(symbol => symbol.name === 'PathDeltaFeature')).toBe(true);
+
+    fs.rmSync(path.join(repo, 'src/main/java/com/example/Keep.java'));
+    const third = await indexer.refreshWorkspacePaths({
+      root: repo,
+      changedPaths: [path.join(repo, 'src/main/java/com/example/Keep.java')],
+    });
+    expect(third.pathDeltaUpdated).toBe(true);
+    expect(third.filesDeleted).toBe(1);
+    expect(third.filesTotal).toBe(1);
 
     const deletedSearch = await queries.query({
       workspaceId: third.workspaceId,

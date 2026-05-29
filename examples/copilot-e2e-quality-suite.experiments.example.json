@@ -1,0 +1,254 @@
+{
+  "version": 2,
+  "purpose": "Experiment matrix for testing which CodeGraph usage strategy is actually worth applying. Run with -Modes baseline,codegraph and analyze with examples/copilot-e2e-quality-analyze.ps1.",
+  "models": [
+    {
+      "id": "gpt-5-mini",
+      "effort": "low"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "lowhint-strict-implement-reservation",
+      "type": "implement",
+      "experiment": "low-hint-strict",
+      "family": "reservation-implementation",
+      "promptStrategy": "strict-codegraph-context",
+      "toolset": "default-context-tools",
+      "mcpTools": ["get_context_packet", "get_file_slice", "find_tests_for", "search_symbol"],
+      "repoRoot": "${codeGraphRoot}/tests/fixtures/ts-project",
+      "workspaceMode": "copy",
+      "prompt": "Use only CodeGraph MCP server ${mcpServer} for source context before editing. In the order creation workflow, the system currently checks inventory availability and then charges payment. The business rule is to reserve inventory between those two steps. Find the relevant production source, implement the smallest fix, preserve public APIs, do not modify tests or package files, and do not run git commit. Return compact JSON with keys changedFiles and validation.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. In the order creation workflow, the system currently checks inventory availability and then charges payment. The business rule is to reserve inventory between those two steps. Find the relevant production source, implement the smallest fix, preserve public APIs, do not modify tests or package files, and do not run git commit. Return compact JSON with keys changedFiles and validation.",
+      "validation": {
+        "maxChangedFiles": 1,
+        "requiredChangedFiles": ["src/order-service.ts"],
+        "requiredDiffRegex": ["reserve\\(request\\.items\\)"],
+        "orderedFileContains": [
+          {
+            "file": "src/order-service.ts",
+            "patterns": [
+              "checkAvailability\\(request\\.items\\)",
+              "reserve\\(request\\.items\\)",
+              "charge\\(request\\.customerId, 100\\)"
+            ]
+          }
+        ],
+        "commands": [
+          {
+            "name": "tsc",
+            "command": "node '${codeGraphRoot}\\node_modules\\typescript\\bin\\tsc' --noEmit -p tsconfig.json",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          },
+          {
+            "name": "behavior-test-green",
+            "command": "node '${codeGraphRoot}\\node_modules\\tsx\\dist\\cli.mjs' --test 'src/order-service.behavior.test.ts'",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "lowhint-hybrid-implement-reservation",
+      "type": "implement",
+      "experiment": "low-hint-hybrid",
+      "family": "reservation-implementation",
+      "promptStrategy": "codegraph-first-then-normal-tools",
+      "toolset": "default-context-tools",
+      "mcpTools": ["get_context_packet", "get_file_slice", "find_tests_for", "search_symbol"],
+      "repoRoot": "${codeGraphRoot}/tests/fixtures/ts-project",
+      "workspaceMode": "copy",
+      "prompt": "Use CodeGraph MCP server ${mcpServer} first to locate the relevant order creation flow, source file, and likely validation command. Once the target source is known, use normal repository tools for precise editing and validation. The workflow currently checks inventory availability and then charges payment; it must reserve inventory between those two steps. Implement the smallest fix, preserve public APIs, do not modify tests or package files, and do not run git commit. Return compact JSON with keys changedFiles and validation.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Locate the relevant order creation flow, source file, and likely validation command. The workflow currently checks inventory availability and then charges payment; it must reserve inventory between those two steps. Implement the smallest fix, preserve public APIs, do not modify tests or package files, and do not run git commit. Return compact JSON with keys changedFiles and validation.",
+      "validation": {
+        "maxChangedFiles": 1,
+        "requiredChangedFiles": ["src/order-service.ts"],
+        "requiredDiffRegex": ["reserve\\(request\\.items\\)"],
+        "orderedFileContains": [
+          {
+            "file": "src/order-service.ts",
+            "patterns": [
+              "checkAvailability\\(request\\.items\\)",
+              "reserve\\(request\\.items\\)",
+              "charge\\(request\\.customerId, 100\\)"
+            ]
+          }
+        ],
+        "commands": [
+          {
+            "name": "tsc",
+            "command": "node '${codeGraphRoot}\\node_modules\\typescript\\bin\\tsc' --noEmit -p tsconfig.json",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          },
+          {
+            "name": "behavior-test-green",
+            "command": "node '${codeGraphRoot}\\node_modules\\tsx\\dist\\cli.mjs' --test 'src/order-service.behavior.test.ts'",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "lowhint-changepack-implement-reservation",
+      "type": "implement",
+      "experiment": "low-hint-change-pack",
+      "family": "reservation-implementation",
+      "promptStrategy": "single-change-pack-first",
+      "toolset": "change-pack-slim",
+      "mcpTools": ["get_change_pack", "get_file_slice", "find_tests_for"],
+      "repoRoot": "${codeGraphRoot}/tests/fixtures/ts-project",
+      "workspaceMode": "copy",
+      "prompt": "Use CodeGraph MCP server ${mcpServer} and make get_change_pack your first source-context call for this implementation task. If the packet gives enough context, avoid broader CodeGraph searches. The order creation workflow currently checks inventory availability and then charges payment; it must reserve inventory between those two steps. Implement the smallest fix, preserve public APIs, do not modify tests or package files, and do not run git commit. Return compact JSON with keys changedFiles and validation.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. The order creation workflow currently checks inventory availability and then charges payment; it must reserve inventory between those two steps. Implement the smallest fix, preserve public APIs, do not modify tests or package files, and do not run git commit. Return compact JSON with keys changedFiles and validation.",
+      "validation": {
+        "maxChangedFiles": 1,
+        "requiredChangedFiles": ["src/order-service.ts"],
+        "requiredDiffRegex": ["reserve\\(request\\.items\\)"],
+        "orderedFileContains": [
+          {
+            "file": "src/order-service.ts",
+            "patterns": [
+              "checkAvailability\\(request\\.items\\)",
+              "reserve\\(request\\.items\\)",
+              "charge\\(request\\.customerId, 100\\)"
+            ]
+          }
+        ],
+        "commands": [
+          {
+            "name": "tsc",
+            "command": "node '${codeGraphRoot}\\node_modules\\typescript\\bin\\tsc' --noEmit -p tsconfig.json",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          },
+          {
+            "name": "behavior-test-green",
+            "command": "node '${codeGraphRoot}\\node_modules\\tsx\\dist\\cli.mjs' --test 'src/order-service.behavior.test.ts'",
+            "timeoutSeconds": 60,
+            "expectedExitCode": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "graphfit-research-review-patch-flow",
+      "type": "investigate",
+      "experiment": "graph-fit-research",
+      "family": "codegraph-internals",
+      "promptStrategy": "research-pack-first",
+      "toolset": "research-slim",
+      "mcpTools": ["get_research_pack", "get_flow_pack", "get_file_slice", "search_symbol"],
+      "codegraphDenyTools": ["grep", "view"],
+      "repoRoot": "${codeGraphRoot}",
+      "workspaceMode": "git-worktree",
+      "prompt": "Use CodeGraph MCP server ${mcpServer}. Do not edit files. Investigate how the review_patch MCP tool is defined, exposed, routed, and executed in this repository. Explain the flow with file/line evidence, key symbols, failure risks, and validation ideas. Return JSON with keys keyFiles, flow, risks, validation, confidence.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Do not edit files. Investigate how the review_patch MCP tool is defined, exposed, routed, and executed in this repository. Explain the flow with file/line evidence, key symbols, failure risks, and validation ideas. Return JSON with keys keyFiles, flow, risks, validation, confidence.",
+      "validation": {
+        "maxChangedFiles": 0,
+        "goldenFacts": [
+          "src[\\\\/]v2[\\\\/]mcp[\\\\/]tools\\.ts",
+          "V2ToolSchemas",
+          "review_patch",
+          "src[\\\\/]v2[\\\\/]query[\\\\/]service\\.ts",
+          "reviewPatch",
+          "line|lines"
+        ],
+        "forbiddenClaims": [
+          "REST endpoint",
+          "Python implementation"
+        ]
+      }
+    },
+    {
+      "id": "graphfit-targeted-review-patch-flow",
+      "type": "investigate",
+      "experiment": "graph-fit-targeted-symbols",
+      "family": "codegraph-internals",
+      "promptStrategy": "targeted-symbol-slices",
+      "toolset": "symbol-slice-slim",
+      "mcpTools": ["search_symbol", "get_file_slice"],
+      "codegraphDenyTools": ["grep", "view"],
+      "repoRoot": "${codeGraphRoot}",
+      "workspaceMode": "git-worktree",
+      "prompt": "Use CodeGraph MCP server ${mcpServer}. Do not edit files. Investigate how the review_patch MCP tool is defined, exposed, routed, and executed in this repository. For source context, first search exact symbols or names V2ToolSchemas, review_patch, and reviewPatch, then use one batched file-slice call for the relevant files. Explain the flow with file/line evidence, key symbols, failure risks, and validation ideas. Return JSON with keys keyFiles, flow, risks, validation, confidence.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Do not edit files. Investigate how the review_patch MCP tool is defined, exposed, routed, and executed in this repository. For source context, search exact symbols or names V2ToolSchemas, review_patch, and reviewPatch, then read the relevant files. Explain the flow with file/line evidence, key symbols, failure risks, and validation ideas. Return JSON with keys keyFiles, flow, risks, validation, confidence.",
+      "validation": {
+        "maxChangedFiles": 0,
+        "goldenFacts": [
+          "src[\\\\/]v2[\\\\/]mcp[\\\\/]tools\\.ts",
+          "V2ToolSchemas",
+          "review_patch",
+          "src[\\\\/]v2[\\\\/]query[\\\\/]service\\.ts",
+          "reviewPatch",
+          "line|lines"
+        ],
+        "forbiddenClaims": [
+          "REST endpoint",
+          "Python implementation"
+        ]
+      }
+    },
+    {
+      "id": "graphfit-research-index-refresh-flow",
+      "type": "investigate",
+      "experiment": "graph-fit-research",
+      "family": "codegraph-internals",
+      "promptStrategy": "research-pack-first",
+      "toolset": "research-slim",
+      "mcpTools": ["get_research_pack", "get_flow_pack", "get_file_slice", "search_symbol"],
+      "codegraphDenyTools": ["grep", "view"],
+      "repoRoot": "${codeGraphRoot}",
+      "workspaceMode": "git-worktree",
+      "prompt": "Use CodeGraph MCP server ${mcpServer}. Do not edit files. Investigate the indexing refresh flow: how a workspace is registered, how indexing decides between full and incremental work, and how changed paths are refreshed. Explain with file/line evidence, key symbols, risks, and validation ideas. Return JSON with keys keyFiles, flow, risks, validation, confidence.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Do not edit files. Investigate the indexing refresh flow: how a workspace is registered, how indexing decides between full and incremental work, and how changed paths are refreshed. Explain with file/line evidence, key symbols, risks, and validation ideas. Return JSON with keys keyFiles, flow, risks, validation, confidence.",
+      "validation": {
+        "maxChangedFiles": 0,
+        "goldenFacts": [
+          "src[\\\\/]v2[\\\\/]index[\\\\/]indexer\\.ts",
+          "registerWorkspace",
+          "indexWorkspace",
+          "refreshWorkspacePaths",
+          "incremental|full",
+          "line|lines"
+        ],
+        "forbiddenClaims": [
+          "runtime webpack",
+          "browser localStorage"
+        ]
+      }
+    },
+    {
+      "id": "graphfit-targeted-index-refresh-flow",
+      "type": "investigate",
+      "experiment": "graph-fit-targeted-symbols",
+      "family": "codegraph-internals",
+      "promptStrategy": "targeted-symbol-slices",
+      "toolset": "symbol-slice-slim",
+      "mcpTools": ["search_symbol", "get_file_slice"],
+      "codegraphDenyTools": ["grep", "view"],
+      "repoRoot": "${codeGraphRoot}",
+      "workspaceMode": "git-worktree",
+      "prompt": "Use CodeGraph MCP server ${mcpServer}. Do not edit files. Investigate the indexing refresh flow: how a workspace is registered, how indexing decides between full and incremental work, and how changed paths are refreshed. For source context, first search exact symbols V2Indexer, registerWorkspace, indexWorkspace, refreshWorkspacePaths, and shouldUseIncrementalUpdate, then use one batched file-slice call for the relevant files. Explain with file/line evidence, key symbols, risks, and validation ideas. Return JSON with keys keyFiles, flow, risks, validation, confidence.",
+      "baselinePrompt": "Do not use any MCP server or CodeGraph. Use normal repository tools only. Do not edit files. Investigate the indexing refresh flow: how a workspace is registered, how indexing decides between full and incremental work, and how changed paths are refreshed. For source context, search exact symbols V2Indexer, registerWorkspace, indexWorkspace, refreshWorkspacePaths, and shouldUseIncrementalUpdate, then read the relevant files. Explain with file/line evidence, key symbols, risks, and validation ideas. Return JSON with keys keyFiles, flow, risks, validation, confidence.",
+      "validation": {
+        "maxChangedFiles": 0,
+        "goldenFacts": [
+          "src[\\\\/]v2[\\\\/]index[\\\\/]indexer\\.ts",
+          "registerWorkspace",
+          "indexWorkspace",
+          "refreshWorkspacePaths",
+          "incremental|full",
+          "line|lines"
+        ],
+        "forbiddenClaims": [
+          "runtime webpack",
+          "browser localStorage"
+        ]
+      }
+    }
+  ]
+}

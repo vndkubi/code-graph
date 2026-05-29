@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { openCodeGraphDb } from './v2/storage/database.js';
 import { V2Indexer, type IndexProgressEvent } from './v2/index/indexer.js';
 import { runDaemon } from './v2/daemon/server.js';
@@ -115,9 +118,64 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     }
+    case 'copilot-e2e':
+      runCopilotE2eBenchmark(parsed);
+      return;
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|copilot-e2e');
   }
+}
+
+function runCopilotE2eBenchmark(parsed: ParsedArgs): void {
+  const scriptPath = path.resolve(getFlag(parsed, 'script') ?? path.join(projectRootForCli(), 'examples', 'copilot-e2e-quality-bench.ps1'));
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`Copilot E2E benchmark script not found: ${scriptPath}`);
+  }
+
+  const args = [
+    '-NoProfile',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-File',
+    scriptPath,
+  ];
+  appendPowerShellFlag(args, '-SuitePath', getFlag(parsed, 'suite') ?? getFlag(parsed, 'tasks'));
+  appendPowerShellFlag(args, '-RunDir', getFlag(parsed, 'run-dir'));
+  appendPowerShellFlag(args, '-CodeGraphRoot', getFlag(parsed, 'codegraph-root') ?? projectRootForCli());
+  appendPowerShellFlag(args, '-DatabaseUrl', getFlag(parsed, 'database-url'));
+  appendPowerShellFlag(args, '-Models', getFlag(parsed, 'models'));
+  appendPowerShellFlag(args, '-TaskIds', getFlag(parsed, 'task-ids') ?? getFlag(parsed, 'task'));
+  appendPowerShellFlag(args, '-Modes', getFlag(parsed, 'modes'));
+  appendPowerShellFlag(args, '-ParseWorkers', getFlag(parsed, 'parse-workers'));
+  appendPowerShellFlag(args, '-CopilotTimeoutSeconds', getFlag(parsed, 'copilot-timeout-seconds'));
+  appendPowerShellSwitch(args, '-SkipIndex', parsed.flags.get('no-index') === true);
+  appendPowerShellSwitch(args, '-DryRun', parsed.flags.get('dry-run') === true);
+  appendPowerShellSwitch(args, '-KeepWorktrees', parsed.flags.get('keep-worktrees') === true);
+
+  const result = spawnSync(powerShellExecutable(), args, {
+    cwd: process.cwd(),
+    stdio: 'inherit',
+    windowsHide: true,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
+
+function appendPowerShellFlag(args: string[], name: string, value: string | undefined): void {
+  if (!value) return;
+  args.push(name, value);
+}
+
+function appendPowerShellSwitch(args: string[], name: string, enabled: boolean): void {
+  if (enabled) args.push(name);
+}
+
+function powerShellExecutable(): string {
+  return process.platform === 'win32' ? 'powershell' : 'pwsh';
+}
+
+function projectRootForCli(): string {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 }
 
 async function runDaemonCommand(subcommand: string | undefined, parsed: ParsedArgs): Promise<void> {
@@ -251,7 +309,7 @@ Usage:
   codegraph index --root <workspace>     Prewarm persistent index
   codegraph doctor                       Inspect local configuration
   codegraph logs --tail <number>         Print recent daemon query/index events
-  codegraph benchmark generate|index|eval|proof|review
+  codegraph benchmark generate|index|eval|proof|review|copilot-e2e
                                              Generate synthetic repos, measure indexing, run evals, or prove context/review savings
 
 Options:
@@ -272,6 +330,10 @@ Options:
   --watch                                Watch workspace files and queue background refreshes on changes
   --warn-stale                           Include freshness checks in MCP tool responses
   --mcp-tools <a,b,c>                    Comma-separated MCP tool allowlist; also CODEGRAPH_MCP_TOOLS
+  --models <a,b,c>                       Copilot E2E model list for benchmark copilot-e2e
+  --modes <codegraph,baseline>           Copilot E2E comparison modes
+  --task-ids <a,b,c>                     Copilot E2E task ids
+  --dry-run                              Print benchmark plan without running Copilot
 `);
 }
 

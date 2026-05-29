@@ -14,6 +14,8 @@ export interface QueryEnvelope {
 
 export class V2QueryService {
   private readonly indexer: V2Indexer;
+  private readonly inFlightBatchSliceKeys = new Map<string, number>();
+  private readonly inFlightRefreshes = new Map<string, Promise<string>>();
 
   constructor(private readonly db: CodeGraphDb) {
     this.indexer = new V2Indexer(db);
@@ -21,6 +23,15 @@ export class V2QueryService {
 
   async query(envelope: QueryEnvelope): Promise<unknown> {
     let snapshotId = await this.requireSnapshot(envelope.workspaceId);
+    if (envelope.toolName === 'get_file_slice') {
+      this.cleanupInFlightBatchSliceKeys();
+      const sliceArgs = envelope.args;
+      if (Array.isArray(sliceArgs.slices)) {
+        this.markInFlightBatchSlices(snapshotId, sliceArgs.slices);
+      } else if (this.isCoveredByInFlightBatch(snapshotId, sliceArgs)) {
+        return duplicateBatchSliceResponse(sliceArgs);
+      }
+    }
     let autoRefreshSkipped: Record<string, unknown> | undefined;
     let freshnessBeforeRefresh: Record<string, unknown> | undefined;
     let snapshotRefreshed = false;
@@ -30,10 +41,7 @@ export class V2QueryService {
       const indexedFileCount = await this.indexedFileCount(snapshotId);
       const refreshLimit = autoRefreshFileLimit();
       if (freshnessBeforeRefresh?.isStale && workspace?.root && indexedFileCount > 0 && indexedFileCount <= refreshLimit) {
-        snapshotId = (await this.indexer.indexWorkspace({
-          root: workspace.root,
-          workspaceKey: workspace.workspaceKey,
-        })).snapshotId;
+        snapshotId = await this.refreshWorkspaceOnce(envelope.workspaceId, workspace.root, workspace.workspaceKey);
         snapshotRefreshed = true;
       } else if (freshnessBeforeRefresh?.isStale && workspace?.root && indexedFileCount > refreshLimit) {
         autoRefreshSkipped = {
@@ -104,6 +112,8 @@ export class V2QueryService {
         return withFreshness(await this.getResearchPack(snapshotId, envelope.args));
       case 'get_context_packet':
         return withFreshness(await this.getContextPacket(snapshotId, envelope.args));
+      case 'get_change_pack':
+        return withFreshness(await this.getChangePack(snapshotId, envelope.args));
       case 'search_code':
         return withFreshness(await this.searchCode(snapshotId, envelope.args));
       case 'get_index_stats':
@@ -115,6 +125,40 @@ export class V2QueryService {
 
   async ensureIndexed(root: string): ReturnType<V2Indexer['indexWorkspace']> {
     return this.indexer.indexWorkspace({ root });
+  }
+
+  private markInFlightBatchSlices(snapshotId: string, slices: unknown[]) {
+    const expiresAt = Date.now() + 30_000;
+    for (const slice of slices) {
+      if (!slice || typeof slice !== 'object') continue;
+      const key = rawSliceRequestKey(snapshotId, slice as Record<string, unknown>);
+      if (key) this.inFlightBatchSliceKeys.set(key, expiresAt);
+    }
+  }
+
+  private isCoveredByInFlightBatch(snapshotId: string, args: Record<string, unknown>): boolean {
+    const key = rawSliceRequestKey(snapshotId, args);
+    return Boolean(key && this.inFlightBatchSliceKeys.has(key));
+  }
+
+  private cleanupInFlightBatchSliceKeys() {
+    const now = Date.now();
+    for (const [key, expiresAt] of this.inFlightBatchSliceKeys) {
+      if (expiresAt <= now) this.inFlightBatchSliceKeys.delete(key);
+    }
+  }
+
+  private async refreshWorkspaceOnce(workspaceId: string, root: string, workspaceKey?: string): Promise<string> {
+    const key = `${workspaceId}:${root}:${workspaceKey ?? ''}`;
+    const existing = this.inFlightRefreshes.get(key);
+    if (existing) return existing;
+    const refresh = this.indexer.indexWorkspace({ root, workspaceKey })
+      .then(result => result.snapshotId)
+      .finally(() => {
+        this.inFlightRefreshes.delete(key);
+      });
+    this.inFlightRefreshes.set(key, refresh);
+    return refresh;
   }
 
   private async indexedFileCount(snapshotId: string): Promise<number> {
@@ -722,9 +766,47 @@ export class V2QueryService {
   }
 
   private async getFileSlice(snapshotId: string, args: Record<string, unknown>) {
+    const requestedSlices = Array.isArray(args.slices)
+      ? args.slices.filter(slice => slice && typeof slice === 'object') as Array<Record<string, unknown>>
+      : [];
+    if (requestedSlices.length > 0) {
+      const maxSlices = Math.min(requestedSlices.length, 20);
+      const defaultMaxChars = clampInt(Number(args.maxChars ?? 2400), 200, 30000);
+      const batchKeys = requestedSlices
+        .slice(0, maxSlices)
+        .map(request => rawSliceRequestKey(snapshotId, request))
+        .filter((key): key is string => Boolean(key));
+      const slices = [];
+      try {
+        for (const request of requestedSlices.slice(0, maxSlices)) {
+          slices.push(await this.getSingleFileSlice(snapshotId, {
+            ...request,
+            maxChars: clampInt(Number(request.maxChars ?? defaultMaxChars), 200, 30000),
+          }));
+        }
+      } finally {
+        const duplicateWindowExpiresAt = Date.now() + 5_000;
+        for (const key of batchKeys) this.inFlightBatchSliceKeys.set(key, duplicateWindowExpiresAt);
+      }
+      return {
+        batch: true,
+        slices,
+        totalRequested: requestedSlices.length,
+        returnedCount: slices.length,
+        omittedCount: Math.max(0, requestedSlices.length - slices.length),
+        guidance: [
+          'Batch slices are independent; inspect each item for an error before using it as evidence.',
+          'Prefer this batch mode over repeated get_file_slice calls when exact ranges are already known.',
+        ],
+      };
+    }
+    return this.getSingleFileSlice(snapshotId, args);
+  }
+
+  private async getSingleFileSlice(snapshotId: string, args: Record<string, unknown>) {
     const requestedFile = args.file ? String(args.file) : '';
     const requestedSymbol = args.symbol ? String(args.symbol) : '';
-    const maxChars = clampInt(Number(args.maxChars ?? 8000), 200, 30000);
+    const maxChars = clampInt(Number(args.maxChars ?? 3000), 200, 30000);
     let resolved = requestedFile ? await this.resolveFile(snapshotId, requestedFile) : undefined;
     const symbol = requestedSymbol ? await this.lookupBestSymbol(snapshotId, requestedSymbol, resolved) : undefined;
     if (symbol) resolved = symbol.file;
@@ -1240,6 +1322,13 @@ export class V2QueryService {
       .slice(0, budget.maxLineFocus)
       .map(hunk => compactPatchHunk(hunk, lineMapping.get(hunk)))
       .map(hunk => compactReviewObject(hunk, budget.maxEvidencePerFinding, 2) as Record<string, unknown>);
+    const reviewTargets = await this.patchReviewTargets(
+      snapshotId,
+      hunks,
+      lineMapping,
+      budget.maxReviewTargets,
+      budget.maxEvidencePerFinding,
+    );
     const priorityCounts = reviewPriorityCounts(findings);
     const cappedRiskFlags = riskFlags
       .slice(0, budget.maxRiskFlags)
@@ -1256,9 +1345,15 @@ export class V2QueryService {
       changedFiles,
       diffStats,
       reviewPlan: reviewPlanForPatch(diffStats, findings, impact),
+      seededRiskCategories: seededRiskCategoriesForReview(focus, findings, riskFlags, diffStats),
+      mustCheckInvariants: mustCheckInvariantsForReview(focus, changedFiles, impact, findings),
+      knownSensitiveDataPatterns: knownSensitiveDataPatternsForReview(focus),
+      precisionTargets: precisionTargetsForReview(focus, findings),
       reviewFindings: findings,
       reviewFocus: reviewFocusForPatch(focus, impact, findings, budget.maxEvidencePerFinding),
       lineFocus,
+      reviewTargets,
+      agentGuidance: reviewAgentGuidance(focus, findings, reviewTargets),
       riskFlags: cappedRiskFlags,
       testsLikelyRelevant: cappedTests,
       validation: compactReviewObject(validation, budget.maxEvidencePerFinding, 2),
@@ -1268,6 +1363,7 @@ export class V2QueryService {
         changedFileCount: changedFiles.length,
         diffHunkCount: allHunks.length,
         reportedLineFocusCount: lineFocus.length,
+        reviewTargetCount: reviewTargets.length,
         findingCount: findings.length,
         totalFindingCount: allFindings.length,
         priorityCounts,
@@ -1320,6 +1416,117 @@ export class V2QueryService {
       result.set(hunk, patchLineMappingFor(hunk, sourceLines));
     }
     return result;
+  }
+
+  private async patchReviewTargets(
+    snapshotId: string,
+    hunks: PatchHunk[],
+    lineMapping: Map<PatchHunk, PatchLineMapping>,
+    maxTargets: number,
+    maxEvidence: number,
+  ): Promise<Array<Record<string, unknown>>> {
+    const targets: Array<Record<string, unknown>> = [];
+    const targetHunks = hunks.slice(0, maxTargets);
+    for (let index = 0; index < targetHunks.length; index++) {
+      const hunk = targetHunks[index]!;
+      const resolvedFile = await this.resolveFile(snapshotId, hunk.file) ?? hunk.file;
+      const mapping = lineMapping.get(hunk);
+      const symbolRow = resolvedFile ? await this.symbolForPatchHunk(snapshotId, resolvedFile, hunk) : undefined;
+      const symbol = symbolRow
+        ? compactSymbolCandidate(symbolDto(symbolRow), 'nearest indexed symbol for this changed hunk')
+        : undefined;
+      const symbolNeedle = symbol?.symbol || symbol?.name || '';
+      const callers = symbolNeedle
+        ? ((await this.getCallers(snapshotId, { symbol: symbolNeedle, limit: 6 })) as { callers: CallEdgeRow[] }).callers
+        : [];
+      const callees = symbolNeedle
+        ? ((await this.getCallees(snapshotId, { symbol: symbolNeedle, limit: 6 })) as { callees: CallEdgeRow[] }).callees
+        : [];
+      const dependencies = resolvedFile ? (await this.dependencyRows(snapshotId, resolvedFile, 'from_file')).slice(0, 6) : [];
+      const dependents = resolvedFile ? (await this.dependencyRows(snapshotId, resolvedFile, 'to_file')).slice(0, 6) : [];
+      const endpoints = compactEndpointCandidates(
+        resolvedFile ? await this.impactedEndpoints(snapshotId, [resolvedFile]) : [],
+      ).slice(0, 6);
+      const testSeeds = uniqueStrings([
+        symbol?.symbol ?? '',
+        symbol?.name ?? '',
+        resolvedFile ? path.posix.basename(resolvedFile, path.posix.extname(resolvedFile)) : '',
+      ]);
+      const tests = testSeeds.length > 0
+        ? await this.findRelevantTestsForSeeds(snapshotId, testSeeds, 6)
+        : [];
+
+      const hunkSummary = compactPatchHunk(hunk, mapping);
+      targets.push({
+        targetId: `hunk-${index + 1}`,
+        file: resolvedFile,
+        diffFile: hunk.file !== resolvedFile ? hunk.file : undefined,
+        newLines: hunkSummary.newLines,
+        fileSliceLines: hunkSummary.fileSliceLines,
+        oldLines: hunkSummary.oldLines,
+        lineMappingConfidence: hunkSummary.lineMappingConfidence,
+        lineMappingReason: hunkSummary.lineMappingReason,
+        riskScore: patchHunkRiskScore(hunk),
+        riskLevel: patchHunkRiskLevel(hunk),
+        changeKinds: hunk.changeKinds,
+        changedSymbol: symbol,
+        graphContext: {
+          callers: callers.slice(0, maxEvidence).map(compactCallEdge),
+          callees: callees.slice(0, maxEvidence).map(compactCallEdge),
+          dependents: compactReviewObject(dependents, maxEvidence, 2),
+          dependencies: compactReviewObject(dependencies, maxEvidence, 2),
+          endpoints: compactReviewObject(endpoints, maxEvidence, 2),
+          counts: {
+            callers: callers.length,
+            callees: callees.length,
+            dependents: dependents.length,
+            dependencies: dependencies.length,
+            endpoints: endpoints.length,
+          },
+        },
+        testsLikelyRelevant: compactReviewObject(tests, maxEvidence, 2),
+        recommendedChecks: reviewTargetChecksFor(hunk, symbol, endpoints, tests),
+      });
+    }
+    return targets;
+  }
+
+  private async symbolForPatchHunk(snapshotId: string, file: string, hunk: PatchHunk): Promise<SymbolRow | undefined> {
+    const targetLine = hunk.addedLines[0]?.line ?? hunk.newStart;
+    const containing = await this.db.prepare(`
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+             package_name, return_type, parameter_types_json, annotations_json,
+             framework_role, framework_meta_json, file_role
+      FROM symbols
+      WHERE snapshot_id = ?
+        AND file = ?
+        AND line <= ?
+        AND COALESCE(end_line, line) >= ?
+      ORDER BY
+        CASE kind
+          WHEN 'method' THEN 0
+          WHEN 'function' THEN 0
+          WHEN 'constructor' THEN 0
+          WHEN 'class' THEN 1
+          WHEN 'interface' THEN 1
+          ELSE 2
+        END,
+        (COALESCE(end_line, line) - line) ASC,
+        line DESC
+      LIMIT 1
+    `).get(snapshotId, file, targetLine, targetLine) as SymbolRow | undefined;
+    if (containing) return containing;
+
+    return await this.db.prepare(`
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+             package_name, return_type, parameter_types_json, annotations_json,
+             framework_role, framework_meta_json, file_role
+      FROM symbols
+      WHERE snapshot_id = ?
+        AND file = ?
+      ORDER BY ABS(line - ?), line
+      LIMIT 1
+    `).get(snapshotId, file, targetLine) as SymbolRow | undefined;
   }
 
   private async findTestsFor(snapshotId: string, args: Record<string, unknown>) {
@@ -1410,7 +1617,6 @@ export class V2QueryService {
       }) as { files: Array<Record<string, unknown>>; totalFound?: number };
     const candidateFiles = uniqueFileCandidates([
       ...explicitFiles,
-      ...(explicitFiles.length >= 3 ? [] : fileResults.files.map(row => compactFileCandidate(row))),
       ...relevantSymbols.map(symbol => ({
         file: symbol.file,
         lines: symbol.lines,
@@ -1420,6 +1626,7 @@ export class V2QueryService {
         topSymbols: [symbol],
         endpoints: [],
       })),
+      ...(explicitFiles.length >= 3 ? [] : fileResults.files.map(row => compactFileCandidate(row))),
     ]).slice(0, 6);
 
     const edgeSeeds = explicitFastPath ? [] : relevantSymbols.slice(0, 4);
@@ -1479,6 +1686,33 @@ export class V2QueryService {
     const returnedEndpoints = impactedEndpoints.slice(0, 4);
     const returnedTopFiles = topFiles.slice(0, 6);
     const returnedSeedTerms = seedTerms.slice(0, 10);
+    const oracleTests = await this.findRelevantTestsForSeeds(
+      snapshotId,
+      uniqueStrings([
+        target,
+        ...returnedDefinitions.flatMap(symbol => [symbol.symbol, symbol.name]),
+        ...returnedTopFiles.map(file => path.basename(file, path.extname(file))),
+      ]),
+      8,
+    );
+    const oracleValidation = await this.validationHints(snapshotId, oracleTests, returnedTopFiles);
+    const taskOracle = taskOracleFor({
+      task: target,
+      taskType: String(args.taskType ?? 'research'),
+      candidateFiles: candidateFiles.slice(0, 6),
+      relevantSymbols: returnedDefinitions,
+      testsLikelyRelevant: oracleTests,
+      validation: oracleValidation,
+      flowSteps: returnedFlowSteps,
+      evidenceSlices,
+    });
+    const compressedEvidence = compressedEvidenceForResearch({
+      flowSteps: returnedFlowSteps,
+      callers: returnedCallers,
+      callees: returnedCallees,
+      evidenceSlices,
+      definitions: returnedDefinitions,
+    });
 
     return {
       target,
@@ -1498,6 +1732,8 @@ export class V2QueryService {
       impactedEndpoints: returnedEndpoints,
       topFiles: returnedTopFiles,
       evidenceSlices,
+      compressedEvidence,
+      taskOracle,
       completeness: {
         sufficientForAnswer,
         evidenceSliceCount: evidenceSlices.length,
@@ -1535,7 +1771,7 @@ export class V2QueryService {
           callees: returnedCallees,
           impactedEndpoints: returnedEndpoints,
           topFiles: returnedTopFiles,
-          evidenceSlices,
+          compressedEvidence,
         })),
       },
     };
@@ -1917,6 +2153,20 @@ export class V2QueryService {
       ...relevantSymbols.map(row => row.file),
       ...myBatisContext.topFiles,
     ].filter(Boolean)).slice(0, maxFiles);
+    const sliceHints = contextSliceHints(candidateFiles, relevantSymbols, Math.min(5, maxFiles));
+    const toolHints = sliceHints.length > 0 ? [{
+      tool: 'get_file_slice',
+      args: {
+        slices: sliceHints.map(hint => ({
+          file: hint.file,
+          lines: hint.lines,
+          symbol: hint.symbol,
+          maxChars: hint.maxChars,
+        })),
+      },
+      when: 'Use this exact batch call when source context is required for several candidate files/ranges.',
+      batching: 'Call get_file_slice once with args.slices; do not loop single-slice calls for these hints.',
+    }] : [];
     const testSeeds = [
       task,
       domain ?? '',
@@ -1928,6 +2178,16 @@ export class V2QueryService {
       : [];
     const validation = await this.validationHints(snapshotId, testsLikelyRelevant, topFiles);
     const inferredDomain = domain ?? inferDomain(task, topFiles);
+    const taskOracle = taskOracleFor({
+      task,
+      taskType: taskKindForOracle(task),
+      candidateFiles,
+      relevantSymbols,
+      testsLikelyRelevant,
+      validation,
+      flowSteps: [],
+      evidenceSlices: [],
+    });
 
     const result = {
       task,
@@ -1940,9 +2200,12 @@ export class V2QueryService {
         constraints: [
           'No full-file content is returned by default.',
           'Generated, fixture, and test files are excluded from implementation candidates by default.',
-          'Use get_file_slice for the exact edit range before changing a file.',
+          'Use get_file_slice for the exact edit range before changing a file; use its slices batch argument for multiple ranges.',
         ],
+        nextTool: toolHints[0],
       },
+      sliceHints,
+      toolHints,
       myBatis: isMyBatisIntent(query) ? {
         mapperFiles: myBatisContext.topFiles.filter(file => file.endsWith('.xml')).slice(0, maxFiles),
         relatedJavaFiles: myBatisContext.topFiles.filter(file => file.endsWith('.java')).slice(0, maxFiles),
@@ -1952,13 +2215,14 @@ export class V2QueryService {
       endpointCandidates,
       testsLikelyRelevant,
       validation,
+      taskOracle,
       topFiles,
       omissions: {
         fileCandidates: Math.max(0, Number(files.totalFound ?? candidateFiles.length) - candidateFiles.length),
         symbolCandidates: Math.max(0, Number(symbols.totalFound ?? relevantSymbols.length) - relevantSymbols.length),
         endpointCandidates: Math.max(0, Number(endpointSearch.totalCount ?? endpointCandidates.length) - endpointSearch.endpoints.length),
       },
-      nextAction: nextContextAction(candidateFiles, relevantSymbols),
+      nextAction: nextContextAction(candidateFiles, relevantSymbols, sliceHints),
       confidence: packetConfidence(candidateFiles, relevantSymbols, testsLikelyRelevant),
       confidenceNotes: [
         'Candidate ranking combines path, symbol, endpoint, file-role, and graph evidence available in the local index.',
@@ -2057,6 +2321,93 @@ export class V2QueryService {
         ...relevantSymbols.map(symbol => symbol.file),
         ...relatedFiles,
       ]).slice(0, Math.max(maxFiles * 2, 12)),
+    };
+  }
+
+  private async getChangePack(snapshotId: string, args: Record<string, unknown>) {
+    const task = String(args.task ?? args.target ?? '').trim();
+    if (!task) return { error: 'get_change_pack requires a non-empty task.' };
+    const changeType = normalizeOracleTaskType(String(args.changeType ?? taskKindForOracle(task)));
+    const context = await this.getContextPacket(snapshotId, {
+      ...args,
+      task,
+      tokenBudget: args.tokenBudget ?? 8000,
+      maxFiles: args.maxFiles ?? 8,
+      maxSymbols: args.maxSymbols ?? 12,
+      includeTests: args.includeTests !== false,
+      includeSnippets: args.includeSnippets ?? false,
+    }) as Record<string, unknown>;
+    const taskOracle = isPlainObject(context.taskOracle) ? context.taskOracle : {};
+    const validation = isPlainObject(context.validation) ? context.validation : {};
+    const candidateFiles = arrayRecords(context.candidateFiles);
+    const relevantSymbols = arrayRecords(context.relevantSymbols);
+    const sliceHints = arrayRecords(context.sliceHints);
+    const testsLikelyRelevant = arrayRecords(context.testsLikelyRelevant);
+    const topFiles = stringArray(context.topFiles);
+    const requestedFiles = stringArray(args.files);
+    const requestedSymbols = stringArray(args.symbols);
+    const diff = stringOrUndefined(args.diff);
+    const shouldSimulatePatch = requestedFiles.length > 0 || requestedSymbols.length > 0 || Boolean(diff);
+    const patchImpact = shouldSimulatePatch
+      ? await this.simulatePatchImpact(snapshotId, {
+        files: requestedFiles,
+        symbols: requestedSymbols,
+        diff,
+        limit: Math.max(20, Number(args.maxFiles ?? 8) * 4),
+      }) as Record<string, unknown>
+      : undefined;
+    const commands = stringArray(validation.suggestedCommands);
+    const editRanges = sliceHints
+      .slice(0, 8)
+      .map(hint => ({
+        file: stringOrUndefined(hint.file),
+        lines: stringOrUndefined(hint.lines),
+        symbol: stringOrUndefined(hint.symbol),
+        maxChars: typeof hint.maxChars === 'number' ? hint.maxChars : 1200,
+        why: 'Open this exact range before editing.',
+      }))
+      .filter(range => range.file || range.symbol);
+
+    return {
+      task,
+      changeType,
+      routing: {
+        intendedUse: 'edit-ready implementation/debug/refactor packet',
+        expectedToolCallsBeforeEdit: editRanges.length > 0 ? 1 : 0,
+        firstToolCall: editRanges.length > 0 ? {
+          tool: 'get_file_slice',
+          args: { slices: editRanges.map(range => ({ file: range.file, lines: range.lines, symbol: range.symbol, maxChars: range.maxChars })) },
+        } : undefined,
+        stopCondition: 'After opening listed edit ranges, edit only scoped files and run expectedVerification commands.',
+      },
+      files: candidateFiles,
+      symbols: relevantSymbols,
+      editRanges,
+      testsLikelyRelevant,
+      invariants: changePackInvariants(changeType, taskOracle, patchImpact),
+      expectedVerification: isPlainObject(taskOracle.expectedVerification)
+        ? taskOracle.expectedVerification
+        : { commands, targetedTestFiles: stringArray(validation.targetedTestFiles) },
+      commands,
+      taskOracle,
+      patchImpact: patchImpact ? compactReviewObject(patchImpact, 8, 3) : undefined,
+      topFiles,
+      nextAction: editRanges.length > 0
+        ? 'Call get_file_slice once with routing.firstToolCall.args, then make the smallest scoped edit.'
+        : 'Resolve a concrete file/symbol first with search_symbol or search_files before editing.',
+      confidence: context.confidence ?? 0.4,
+      budget: {
+        tokenBudget: Number(args.tokenBudget ?? 8000),
+        estimatedResponseTokens: estimateTokens(JSON.stringify({
+          files: candidateFiles,
+          symbols: relevantSymbols,
+          editRanges,
+          testsLikelyRelevant,
+          commands,
+          taskOracle,
+          patchImpact,
+        })),
+      },
     };
   }
 
@@ -3443,10 +3794,51 @@ function inferDomain(task: string, files: string[]): string {
   return tokens[0] ?? 'unknown';
 }
 
+function contextSliceHints(
+  files: Array<{ file: string; lines?: string; whyRelevant?: string }>,
+  symbols: Array<{ symbol: string; name?: string; file: string; lines?: string }>,
+  limit: number,
+): Array<{ file: string; lines?: string; symbol?: string; maxChars: number; why: string }> {
+  const hints: Array<{ file: string; lines?: string; symbol?: string; maxChars: number; why: string }> = [];
+  const seen = new Set<string>();
+  const addHint = (hint: { file: string; lines?: string; symbol?: string; maxChars: number; why: string }) => {
+    if (!hint.file || (!hint.lines && !hint.symbol)) return;
+    const key = `${hint.file}:${hint.lines ?? ''}:${hint.symbol ?? ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    hints.push(hint);
+  };
+
+  for (const file of files) {
+    addHint({
+      file: file.file,
+      lines: file.lines,
+      maxChars: 1200,
+      why: file.whyRelevant ?? 'ranked candidate file',
+    });
+    if (hints.length >= limit) return hints;
+  }
+  for (const symbol of symbols) {
+    addHint({
+      file: symbol.file,
+      lines: symbol.lines,
+      symbol: symbol.symbol,
+      maxChars: 1200,
+      why: symbol.name ? `ranked symbol ${symbol.name}` : 'ranked symbol',
+    });
+    if (hints.length >= limit) return hints;
+  }
+  return hints;
+}
+
 function nextContextAction(
   files: Array<{ file: string; lines?: string }>,
   symbols: Array<{ symbol: string; file: string; lines?: string }>,
+  sliceHints: Array<{ file: string; lines?: string; symbol?: string }> = [],
 ): string {
+  if (sliceHints.length > 1) {
+    return 'Call get_file_slice once with args.slices from toolHints[0] for exact edit context, then run the suggested targeted validation.';
+  }
   const firstFile = files.find(file => file.file);
   if (firstFile?.lines) {
     return `Call get_file_slice with file="${firstFile.file}" lines="${firstFile.lines}" for exact edit context, then run the suggested targeted validation.`;
@@ -3484,6 +3876,170 @@ function confidenceFromScore(value: unknown): number {
 
 function estimateTokens(value: string): number {
   return Math.ceil(value.length / 4);
+}
+
+interface TaskOracleInput {
+  task: string;
+  taskType: string;
+  candidateFiles: Array<{ file: string; lines?: string; whyRelevant?: string; confidence?: number }>;
+  relevantSymbols: Array<{ symbol: string; name?: string; file: string; lines?: string; confidence?: number }>;
+  testsLikelyRelevant: Array<Record<string, unknown>>;
+  validation: Record<string, unknown>;
+  flowSteps: Array<Record<string, unknown>>;
+  evidenceSlices: Array<Record<string, unknown>>;
+}
+
+function taskOracleFor(input: TaskOracleInput): Record<string, unknown> {
+  const taskType = normalizeOracleTaskType(input.taskType);
+  const topFiles = uniqueStrings(input.candidateFiles.map(file => file.file).filter(Boolean)).slice(0, 6);
+  const topSymbols = uniqueStrings(input.relevantSymbols.map(symbol => symbol.symbol || symbol.name || '').filter(Boolean)).slice(0, 8);
+  const likelyTests = input.testsLikelyRelevant
+    .slice(0, 8)
+    .map(test => ({
+      file: String(test.file ?? ''),
+      why: Array.isArray(test.reasons) ? (test.reasons as unknown[]).map(String).slice(0, 3) : undefined,
+      score: typeof test.score === 'number' ? test.score : undefined,
+    }))
+    .filter(test => test.file);
+  const suggestedCommands = stringArray(input.validation.suggestedCommands).slice(0, 4);
+  const targetedTestFiles = stringArray(input.validation.targetedTestFiles).slice(0, 8);
+
+  return {
+    taskType,
+    successCriteria: oracleSuccessCriteria(taskType, topFiles, topSymbols),
+    expectedVerification: {
+      commands: suggestedCommands,
+      targetedTestFiles,
+      fallback: suggestedCommands.length > 0
+        ? 'Run the first targeted command before broader validation.'
+        : 'Identify the smallest compile/test/lint command for the top candidate file before finalizing.',
+      redGreenRequired: taskType === 'debug' || taskType === 'create-testcase',
+    },
+    likelyTests,
+    goldenFacts: oracleGoldenFacts(input, topFiles, topSymbols),
+    editGuardrails: oracleEditGuardrails(taskType, topFiles),
+    passSignal: oraclePassSignal(taskType),
+  };
+}
+
+function normalizeOracleTaskType(value: string): string {
+  const lower = value.toLowerCase();
+  if (/debug|bug|fix|failing/.test(lower)) return 'debug';
+  if (/test|case|coverage/.test(lower)) return 'create-testcase';
+  if (/review/.test(lower)) return 'codereview';
+  if (/break|plan|task/.test(lower)) return 'break-task';
+  if (/refactor/.test(lower)) return 'refactor';
+  if (/implement|change|edit|feature/.test(lower)) return 'implement';
+  return lower || 'investigate';
+}
+
+function taskKindForOracle(task: string): string {
+  return normalizeOracleTaskType(task);
+}
+
+function oracleSuccessCriteria(taskType: string, topFiles: string[], topSymbols: string[]): string[] {
+  const criteria = [
+    topFiles[0] ? `Use ${topFiles[0]} as the first source-of-truth file.` : 'Resolve at least one concrete source file before editing or answering.',
+    topSymbols[0] ? `Anchor reasoning on ${topSymbols[0]}.` : 'Anchor reasoning on concrete symbols or line-numbered source evidence.',
+  ];
+  if (taskType === 'implement' || taskType === 'debug' || taskType === 'refactor') {
+    criteria.push('Keep the diff scoped to the files needed for the requested behavior.');
+    criteria.push('Run targeted validation and report the command result.');
+  } else if (taskType === 'create-testcase') {
+    criteria.push('The new test must fail against the seeded buggy behavior and pass after the implementation is correct.');
+    criteria.push('Avoid changing production files unless the task explicitly asks for a fix.');
+  } else if (taskType === 'codereview') {
+    criteria.push('Report only findings with file/line evidence or a concrete validation gap.');
+    criteria.push('Separate deterministic blockers from hypotheses that require follow-up slices/tests.');
+  } else {
+    criteria.push('Cite file and line evidence for each important claim.');
+    criteria.push('List missing facts instead of guessing beyond the indexed evidence.');
+  }
+  return criteria;
+}
+
+function oracleGoldenFacts(input: TaskOracleInput, topFiles: string[], topSymbols: string[]): Array<Record<string, unknown>> {
+  const facts: Array<Record<string, unknown>> = [];
+  for (const file of topFiles.slice(0, 4)) facts.push({ kind: 'file', value: file });
+  for (const symbol of topSymbols.slice(0, 4)) facts.push({ kind: 'symbol', value: symbol });
+  for (const step of input.flowSteps.slice(0, 4)) {
+    facts.push({
+      kind: String(step.kind ?? 'flow'),
+      value: String(step.summary ?? step.symbol ?? step.file ?? ''),
+      file: stringOrUndefined(step.file),
+      lines: stringOrUndefined(step.lines) ?? (typeof step.line === 'number' ? String(step.line) : undefined),
+    });
+  }
+  for (const slice of input.evidenceSlices.slice(0, 3)) {
+    facts.push({
+      kind: 'evidence',
+      file: stringOrUndefined(slice.file),
+      lines: stringOrUndefined(slice.lines),
+      value: truncateString(String(slice.why ?? slice.symbol ?? slice.file ?? ''), 180),
+    });
+  }
+  return facts.filter(fact => String(fact.value ?? fact.file ?? '').length > 0).slice(0, 12);
+}
+
+function oracleEditGuardrails(taskType: string, topFiles: string[]): string[] {
+  const guardrails = [
+    'Open exact slices before editing; avoid broad repo reads once the oracle has top files.',
+  ];
+  if (topFiles.length > 0) guardrails.push(`Prefer editing only: ${topFiles.slice(0, 4).join(', ')}.`);
+  if (taskType === 'refactor') guardrails.push('Preserve public API signatures unless the prompt explicitly asks for an API change.');
+  if (taskType === 'debug') guardrails.push('Keep the failing test red before the fix when the suite defines a before-command.');
+  if (taskType === 'create-testcase') guardrails.push('Do not make the test pass by weakening assertions or deleting existing tests.');
+  return guardrails;
+}
+
+function oraclePassSignal(taskType: string): string {
+  if (taskType === 'codereview') return 'Golden findings are covered with file/line/severity and no unsupported blockers.';
+  if (taskType === 'investigate') return 'Golden facts are covered with file/line evidence and no unsupported claims.';
+  if (taskType === 'break-task') return 'Task DAG includes dependencies, order, risks, validation milestones, and definition of done.';
+  return 'Diff, compile/tests, and requested file/API assertions pass.';
+}
+
+function changePackInvariants(
+  changeType: string,
+  taskOracle: Record<string, unknown>,
+  patchImpact: Record<string, unknown> | undefined,
+): string[] {
+  const invariants = [
+    ...stringArray(taskOracle.successCriteria),
+    ...stringArray(taskOracle.editGuardrails),
+  ];
+  const summary = patchImpact && isPlainObject(patchImpact.summary) ? patchImpact.summary : {};
+  if (Number(summary.impactedEndpointCount ?? 0) > 0) {
+    invariants.push('Preserve endpoint request/response compatibility or update contract tests intentionally.');
+  }
+  if (changeType === 'debug') invariants.push('Prove red-to-green behavior with the smallest targeted failing test.');
+  if (changeType === 'refactor') invariants.push('Behavior tests must pass and public API signatures must remain unchanged.');
+  if (changeType === 'implement') invariants.push('Implement only the requested behavior; avoid opportunistic refactors.');
+  return uniqueStrings(invariants).slice(0, 12);
+}
+
+function rawSliceRequestKey(snapshotId: string, args: Record<string, unknown>): string | undefined {
+  const file = stringOrUndefined(args.file)?.replace(/\\/g, '/').toLowerCase() ?? '';
+  const lines = stringOrUndefined(args.lines) ?? '';
+  const symbol = stringOrUndefined(args.symbol) ?? '';
+  if (!file && !symbol) return undefined;
+  if (!lines && !symbol) return undefined;
+  return `${snapshotId}:${file}:${lines}:${symbol}`;
+}
+
+function duplicateBatchSliceResponse(args: Record<string, unknown>): Record<string, unknown> {
+  return {
+    duplicateOfBatch: true,
+    file: stringOrUndefined(args.file),
+    lines: stringOrUndefined(args.lines),
+    symbol: stringOrUndefined(args.symbol),
+    text: '',
+    guidance: [
+      'This exact slice is already covered by an in-flight batch get_file_slice call.',
+      'Use the batch get_file_slice result as the source evidence; do not repeat the single-slice call.',
+    ],
+    confidence: 0.8,
+  };
 }
 
 function stringOrUndefined(value: unknown): string | undefined {
@@ -3610,21 +4166,33 @@ function uniqueCallEdges(rows: CallEdgeRow[]): CallEdgeRow[] {
 
 function researchSeedTerms(target: string): string[] {
   const identifierTerms = target.match(/\b[A-Za-z_$][\w$]*(?:(?:::|\.)[A-Za-z_$][\w$]*)+\b/g) ?? [];
+  const explicitIdentifierTerms = target.match(/\b[A-Za-z_$][A-Za-z0-9_$]*(?:_[A-Za-z0-9_$]+)+\b/g) ?? [];
   const symbolTerms = target.match(/\b(?:[A-Z][A-Za-z0-9_$]{2,}|[a-z]+[A-Z][A-Za-z0-9_$]*)\b/g) ?? [];
   const tokenTerms = tokenizeSearchQuery(target)
     .filter(token => token.length >= 3 && !RESEARCH_STOP_WORDS.has(token))
     .slice(0, 12);
-  return uniqueStrings([...identifierTerms, ...symbolTerms, ...tokenTerms]).slice(0, 18);
+  return uniqueStrings([
+    ...identifierTerms,
+    ...explicitIdentifierTerms,
+    ...explicitIdentifierTerms.map(snakeToLowerCamel),
+    ...symbolTerms,
+    ...tokenTerms,
+  ].filter(Boolean)).slice(0, 18);
 }
 
 function researchSymbolQueries(target: string, seedTerms: string[]): string[] {
-  const identifiers = seedTerms.filter(term => /[A-Z_.:$]/.test(term));
+  const identifiers = seedTerms.filter(term => /[A-Z_.$:]/.test(term));
   const queryGroups = [
-    target,
+    ...identifiers.slice(0, 5),
     identifiers.slice(0, 4).join(' '),
     seedTerms.slice(0, 6).join(' '),
+    target,
   ];
-  return uniqueStrings(queryGroups.filter(query => query.trim().length >= 3)).slice(0, 3);
+  return uniqueStrings(queryGroups.filter(query => query.trim().length >= 3)).slice(0, 7);
+}
+
+function snakeToLowerCamel(value: string): string {
+  return value.replace(/_+([A-Za-z0-9_$])/g, (_match, char: string) => char.toUpperCase());
 }
 
 function endpointNeedleForResearch(target: string): string {
@@ -3731,6 +4299,68 @@ function researchMissingFacts(input: {
   if (input.evidenceSlices.length === 0) missing.push('No source evidence slices were produced; call get_file_slice for the top ranked file or symbol.');
   if (input.flowSteps.length === 0 && input.evidenceSlices.length === 0) missing.push('No flow steps or source evidence were available from the index.');
   return missing;
+}
+
+function compressedEvidenceForResearch(input: {
+  flowSteps: Array<Record<string, unknown>>;
+  callers: Array<Record<string, unknown>>;
+  callees: Array<Record<string, unknown>>;
+  evidenceSlices: Array<Record<string, unknown>>;
+  definitions: ResearchSymbolCandidate[];
+}): Record<string, unknown> {
+  const factCards = [
+    ...input.definitions.slice(0, 5).map(symbol => ({
+      kind: 'definition',
+      subject: symbol.symbol,
+      file: symbol.file,
+      lines: symbol.lines,
+      confidence: symbol.confidence,
+    })),
+    ...input.flowSteps.slice(0, 6).map(step => ({
+      kind: String(step.kind ?? 'flow'),
+      subject: String(step.summary ?? step.symbol ?? step.file ?? ''),
+      file: stringOrUndefined(step.file),
+      lines: stringOrUndefined(step.lines) ?? (typeof step.line === 'number' ? String(step.line) : undefined),
+      confidence: typeof step.confidence === 'number' ? step.confidence : undefined,
+    })),
+  ].filter(card => card.subject || card.file).slice(0, 10);
+  const callGraphEdges = [...input.callers, ...input.callees]
+    .map(edge => ({
+      caller: stringOrUndefined(edge.caller),
+      callee: stringOrUndefined(edge.callee),
+      file: stringOrUndefined(edge.file),
+      line: typeof edge.line === 'number' ? edge.line : undefined,
+      confidence: typeof edge.confidence === 'number' ? edge.confidence : undefined,
+    }))
+    .filter(edge => edge.caller && edge.callee)
+    .slice(0, 10);
+  const sourceSliceRefs = input.evidenceSlices
+    .slice(0, 6)
+    .map(slice => ({
+      file: stringOrUndefined(slice.file),
+      lines: stringOrUndefined(slice.lines),
+      symbol: stringOrUndefined(slice.symbol),
+      why: truncateOptional(slice.why, 120),
+      textPreview: truncateOptional(slice.text, 180),
+    }))
+    .filter(slice => slice.file);
+  const fullEvidenceTokens = estimateTokens(JSON.stringify({
+    flowSteps: input.flowSteps,
+    callers: input.callers,
+    callees: input.callees,
+    evidenceSlices: input.evidenceSlices,
+    definitions: input.definitions,
+  }));
+  const compressedTokens = estimateTokens(JSON.stringify({ factCards, callGraphEdges, sourceSliceRefs }));
+  return {
+    intendedUse: 'Read this first for small-model routing; open full evidenceSlices only when a fact needs exact source text.',
+    factCards,
+    callGraphEdges,
+    sourceSliceRefs,
+    estimatedTokens: compressedTokens,
+    fullEvidenceEstimatedTokens: fullEvidenceTokens,
+    compressionRatio: fullEvidenceTokens > 0 ? Math.round((compressedTokens / fullEvidenceTokens) * 100) / 100 : 1,
+  };
 }
 
 function patchRiskFlags(input: {
@@ -3915,10 +4545,16 @@ interface PatchHunk {
 interface ReviewFinding {
   id: string;
   priority: 'P0' | 'P1' | 'P2';
+  severity?: 'blocker' | 'high' | 'medium';
+  category?: string;
+  file?: string;
+  line?: number;
+  hunk?: Record<string, unknown>;
   title: string;
   why: string;
   evidence?: unknown;
   suggestedCheck: string;
+  suggestedFix?: string;
   confidence: number;
 }
 
@@ -3933,6 +4569,7 @@ interface ReviewBudget {
   outputMode: ReviewOutputMode;
   maxFindings: number;
   maxLineFocus: number;
+  maxReviewTargets: number;
   maxRiskFlags: number;
   maxTests: number;
   maxEvidencePerFinding: number;
@@ -3951,14 +4588,15 @@ function normalizeReviewOutputMode(value: string): ReviewOutputMode {
 
 function reviewBudgetFor(outputMode: ReviewOutputMode, args: Record<string, unknown>, limit: number): ReviewBudget {
   const defaults = outputMode === 'full'
-    ? { maxFindings: limit, maxLineFocus: limit, maxRiskFlags: limit, maxTests: Math.min(limit, 50), maxEvidencePerFinding: 12, maxRequiredToolCalls: 8 }
+    ? { maxFindings: limit, maxLineFocus: limit, maxReviewTargets: Math.min(limit, 20), maxRiskFlags: limit, maxTests: Math.min(limit, 50), maxEvidencePerFinding: 12, maxRequiredToolCalls: 8 }
     : outputMode === 'balanced'
-      ? { maxFindings: 10, maxLineFocus: 20, maxRiskFlags: 12, maxTests: 8, maxEvidencePerFinding: 5, maxRequiredToolCalls: 4 }
-      : { maxFindings: 6, maxLineFocus: 10, maxRiskFlags: 8, maxTests: 5, maxEvidencePerFinding: 3, maxRequiredToolCalls: 3 };
+      ? { maxFindings: 10, maxLineFocus: 20, maxReviewTargets: 10, maxRiskFlags: 12, maxTests: 8, maxEvidencePerFinding: 5, maxRequiredToolCalls: 4 }
+      : { maxFindings: 6, maxLineFocus: 10, maxReviewTargets: 6, maxRiskFlags: 8, maxTests: 5, maxEvidencePerFinding: 3, maxRequiredToolCalls: 3 };
   return {
     outputMode,
     maxFindings: clampInt(Number(args.maxFindings ?? defaults.maxFindings), 1, limit),
     maxLineFocus: clampInt(Number(args.maxLineFocus ?? defaults.maxLineFocus), 1, limit),
+    maxReviewTargets: clampInt(defaults.maxReviewTargets, 1, limit),
     maxRiskFlags: clampInt(defaults.maxRiskFlags, 1, limit),
     maxTests: clampInt(defaults.maxTests, 0, limit),
     maxEvidencePerFinding: clampInt(Number(args.maxEvidencePerFinding ?? defaults.maxEvidencePerFinding), 1, 20),
@@ -4299,6 +4937,40 @@ function reviewFocusForPatch(
   return focusItems;
 }
 
+function reviewAgentGuidance(
+  focus: ReviewFocus,
+  findings: ReviewFinding[],
+  reviewTargets: Array<Record<string, unknown>>,
+): Record<string, unknown> {
+  const highPriorityFindings = findings.filter(finding => finding.priority === 'P0' || finding.priority === 'P1');
+  const targetOrder = reviewTargets
+    .slice(0, 6)
+    .map(target => ({
+      targetId: target.targetId,
+      file: target.file,
+      lines: target.fileSliceLines ?? target.newLines,
+      symbol: isPlainObject(target.changedSymbol) ? target.changedSymbol.symbol : undefined,
+      riskLevel: target.riskLevel,
+      changeKinds: target.changeKinds,
+    }));
+  return {
+    mode: focus,
+    firstPass: highPriorityFindings.length > 0
+      ? 'Validate P0/P1 findings against reviewTargets and exact file slices before broad repository search.'
+      : 'Review targets in risk order, then inspect tests and validation hints.',
+    reviewOrder: targetOrder,
+    findingContract: {
+      requiredFields: ['priority', 'severity', 'category', 'file', 'line', 'why', 'suggestedFix', 'confidence'],
+      commentRule: 'Only leave a final review comment after confirming the changed line or symbol through reviewTargets or get_file_slice.',
+    },
+    stopRules: [
+      'Do not open unrelated files until the listed reviewTargets have been checked.',
+      'For each issue, include a concrete failure mode or caller/endpoint path, not only style preference.',
+      'If no targeted tests are listed for production code, report that gap or request the smallest validation command.',
+    ],
+  };
+}
+
 function reviewToolCalls(
   changedFiles: string[],
   lineFocus: Array<Record<string, unknown>>,
@@ -4347,6 +5019,36 @@ function patchHunkRiskScore(hunk: PatchHunk): number {
   return score;
 }
 
+function patchHunkRiskLevel(hunk: PatchHunk): 'critical' | 'high' | 'medium' | 'low' {
+  const score = patchHunkRiskScore(hunk);
+  if (score >= 160) return 'critical';
+  if (score >= 90) return 'high';
+  if (score >= 40) return 'medium';
+  return 'low';
+}
+
+function reviewTargetChecksFor(
+  hunk: PatchHunk,
+  symbol: ReturnType<typeof compactSymbolCandidate> | undefined,
+  endpoints: Array<{ method: string; path: string }>,
+  tests: Array<Record<string, unknown>>,
+): string[] {
+  const checks: string[] = [];
+  if (symbol) checks.push(`Inspect changed symbol ${symbol.symbol} before reviewing unrelated code.`);
+  if (endpoints.length > 0 || hunk.changeKinds.includes('endpoint')) {
+    checks.push('Verify endpoint compatibility, auth assumptions, status codes, and request/response shape.');
+  }
+  if (hunk.changeKinds.includes('security')) checks.push('Review secret/auth/input handling and add a negative security test if applicable.');
+  if (hunk.changeKinds.includes('sql')) checks.push('Verify SQL/query construction uses binding or a safe query builder.');
+  if (hunk.changeKinds.includes('error-handling')) checks.push('Check exception semantics, retries, rollback behavior, and logging.');
+  if (hunk.changeKinds.includes('config')) checks.push('Check defaults, deployment overrides, and rollback impact.');
+  if (hunk.changeKinds.includes('debug-output')) checks.push('Remove debug output or replace it with structured logging at an appropriate level.');
+  checks.push(tests.length > 0
+    ? 'Run or inspect the listed likely targeted tests.'
+    : 'Identify the smallest targeted test or command before approval.');
+  return uniqueStrings(checks).slice(0, 6);
+}
+
 function patchDiffStats(hunks: PatchHunk[], diff: string): Record<string, unknown> {
   const files = new Set(hunks.map(hunk => hunk.file).filter(Boolean));
   const addedLineCount = hunks.reduce((sum, hunk) => sum + hunk.addedLines.length, 0);
@@ -4367,12 +5069,59 @@ function patchDiffStats(hunks: PatchHunk[], diff: string): Record<string, unknow
   };
 }
 
+function reviewFindingAgentFields(finding: ReviewFinding): Partial<ReviewFinding> {
+  const evidence = isPlainObject(finding.evidence) ? finding.evidence : undefined;
+  const file = finding.file ?? stringOrUndefined(evidence?.file);
+  const line = finding.line ?? (typeof evidence?.line === 'number' ? evidence.line : undefined);
+  return {
+    severity: finding.severity ?? reviewSeverityForPriority(finding.priority),
+    category: finding.category ?? reviewFindingCategory(finding),
+    file,
+    line,
+    hunk: finding.hunk ?? (file ? {
+      file,
+      line,
+      preview: stringOrUndefined(evidence?.text),
+    } : undefined),
+  };
+}
+
+function reviewSeverityForPriority(priority: ReviewFinding['priority']): 'blocker' | 'high' | 'medium' {
+  if (priority === 'P0') return 'blocker';
+  if (priority === 'P1') return 'high';
+  return 'medium';
+}
+
+function reviewFindingCategory(finding: ReviewFinding): string {
+  const text = `${finding.id} ${finding.title}`.toLowerCase();
+  if (/(secret|sql|command|security|auth|credential|token)/.test(text)) return 'security';
+  if (/(endpoint|api|contract|public)/.test(text)) return 'api-contract';
+  if (/(test|validation|assertion)/.test(text)) return 'tests';
+  if (/(config|default|deployment)/.test(text)) return 'configuration';
+  if (/(fanout|dependent|caller|impact)/.test(text)) return 'impact';
+  if (/(debug|logging)/.test(text)) return 'observability';
+  return 'correctness';
+}
+
+function suggestedFixForReviewFinding(finding: ReviewFinding): string {
+  const category = reviewFindingCategory(finding);
+  if (category === 'security') return 'Constrain or remove the risky path, prefer safe APIs/secret management, and add a negative test around the changed behavior.';
+  if (category === 'api-contract') return 'Confirm compatibility for callers and endpoint consumers; add or update contract/integration tests when behavior changes.';
+  if (category === 'tests') return 'Add or restore a targeted assertion that fails on the previous broken behavior and passes with this patch.';
+  if (category === 'configuration') return 'Document the default/override behavior and verify startup or deployment rollback with the changed config.';
+  if (category === 'observability') return 'Remove ad-hoc debug output or replace it with structured logging at an appropriate level.';
+  return finding.suggestedCheck;
+}
+
 function compactReviewFinding(finding: ReviewFinding, maxEvidence: number): ReviewFinding {
+  const agentFields = reviewFindingAgentFields(finding);
   return {
     ...finding,
+    ...agentFields,
     evidence: finding.evidence === undefined ? undefined : compactReviewObject(finding.evidence, maxEvidence, 3),
     why: truncateString(finding.why, 420),
     suggestedCheck: truncateString(finding.suggestedCheck, 320),
+    suggestedFix: truncateString(finding.suggestedFix ?? suggestedFixForReviewFinding(finding), 320),
   };
 }
 
@@ -4435,6 +5184,84 @@ function reviewPlanForPatch(
     action: 'Report missing targeted tests as a review finding; broad test suites are secondary evidence.',
   });
   return plan;
+}
+
+function seededRiskCategoriesForReview(
+  focus: ReviewFocus,
+  findings: ReviewFinding[],
+  riskFlags: Array<Record<string, unknown>>,
+  diffStats: Record<string, unknown>,
+): Array<Record<string, unknown>> {
+  const categories = new Map<string, Record<string, unknown>>();
+  const add = (id: string, reason: string, severity: string, evidence?: unknown) => {
+    if (categories.has(id)) return;
+    categories.set(id, { id, severity, reason, evidence });
+  };
+  for (const finding of findings) {
+    add(reviewFindingCategory(finding), `Seeded by finding ${finding.id}.`, finding.severity ?? reviewSeverityForPriority(finding.priority), {
+      file: finding.file,
+      line: finding.line,
+      title: finding.title,
+    });
+  }
+  for (const flag of riskFlags) {
+    add(String(flag.type ?? 'risk'), String(flag.reason ?? 'Graph impact risk.'), String(flag.severity ?? 'medium'), flag.evidence);
+  }
+  if (focus === 'security') add('security', 'Security-focused review must check secrets, injection, auth, and unsafe IO paths.', 'high');
+  if (focus === 'api-contract') add('api-contract', 'API-contract review must check endpoint compatibility and downstream consumers.', 'high');
+  if (Number(diffStats.changedLineCount ?? 0) > 500) {
+    add('large-diff-sampling', 'Large diffs require risk-based batching instead of line-by-line review.', 'medium');
+  }
+  return [...categories.values()].slice(0, 12);
+}
+
+function mustCheckInvariantsForReview(
+  focus: ReviewFocus,
+  changedFiles: string[],
+  impact: Record<string, unknown>,
+  findings: ReviewFinding[],
+): string[] {
+  const summary = isPlainObject(impact.summary) ? impact.summary : {};
+  const invariants = [
+    'Every blocking finding must include file, line or slice, severity, why, and a suggested fix.',
+    'Do not report a blocker from graph proximity alone; confirm with exact source evidence or a failing validation signal.',
+    'If validation is missing, report the missing targeted test separately from behavior findings.',
+  ];
+  if (changedFiles.some(isConfigPatchFile)) invariants.push('Config changes must preserve default behavior, rollback path, and environment-specific overrides.');
+  if (Number(summary.impactedEndpointCount ?? 0) > 0 || focus === 'api-contract') {
+    invariants.push('Endpoint/API changes must preserve request/response/error compatibility or name the breaking contract explicitly.');
+  }
+  if (focus === 'security' || findings.some(finding => reviewFindingCategory(finding) === 'security')) {
+    invariants.push('Security-sensitive paths must avoid plaintext secrets, unsafe command execution, SQL/string injection, and auth bypass.');
+  }
+  if (findings.some(finding => reviewFindingCategory(finding) === 'observability')) {
+    invariants.push('Ad-hoc debug output must not leak identifiers or bypass existing logging controls.');
+  }
+  return uniqueStrings(invariants).slice(0, 10);
+}
+
+function knownSensitiveDataPatternsForReview(focus: ReviewFocus): Array<Record<string, unknown>> {
+  const patterns = [
+    { id: 'secret-assignment', pattern: '(password|secret|token|apiKey|credential)\\s*[:=]', severity: 'high' },
+    { id: 'identifier-logging', pattern: '(customerId|userId|email|phone|ssn|token).*log', severity: 'medium' },
+    { id: 'command-execution', pattern: '(Runtime\\.exec|ProcessBuilder|child_process|exec\\()', severity: 'high' },
+    { id: 'sql-string-concat', pattern: '(SELECT|UPDATE|DELETE|INSERT).*(\\+|\\$\\{)', severity: 'high' },
+  ];
+  if (focus === 'security') return patterns;
+  return patterns.slice(0, 2);
+}
+
+function precisionTargetsForReview(focus: ReviewFocus, findings: ReviewFinding[]): Record<string, unknown> {
+  const blockerCount = findings.filter(finding => finding.priority === 'P0' || finding.priority === 'P1').length;
+  return {
+    requireFileLineForBlockers: true,
+    maxUnsupportedClaims: 0,
+    maxUnconfirmedBlockers: 0,
+    preferredFindingCount: focus === 'general' ? '1-5 highest-confidence findings' : 'all confirmed findings in focus area',
+    blockerEvidenceRule: 'Each P0/P1 must cite exact changed line, source slice, or failing validation command.',
+    precisionBeforeRecallWhenNoEvidence: true,
+    currentBlockerCandidates: blockerCount,
+  };
 }
 
 function patchLineMappingFor(hunk: PatchHunk, sourceLines: string[] | undefined): PatchLineMapping {

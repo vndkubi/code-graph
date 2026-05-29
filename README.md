@@ -18,16 +18,17 @@ Java/Jakarta EE is the primary semantic target. TypeScript/JavaScript and Python
 | `find_tests_for` | Find tests likely relevant to a symbol using test names, test symbols, and indexed call edges |
 | `get_callees` | Find symbols called by a caller symbol |
 | `get_callers` | Find call sites that call a symbol |
-| `get_context_packet` | Route a natural-language task to a compact packet with candidate files/symbols, line ranges, snippets, tests, validation hints, confidence, omissions, and a next action |
+| `get_change_pack` | Build an edit-ready packet for implement/debug/refactor tasks: candidate files/symbols, edit ranges, invariants, tests, validation commands, and a task oracle |
+| `get_context_packet` | Route a natural-language task to a compact packet with candidate files/symbols, line ranges, snippets, tests, task oracle, validation hints, confidence, omissions, and a next action |
 | `get_dependencies` | List direct dependencies for a file/module |
 | `get_dependents` | List direct dependents for a file/module |
 | `get_file_slice` | Return one bounded source slice by file line range or indexed symbol before editing |
 | `get_file_summary` | Summarize symbols, imports, dependencies, and dependents for a file |
 | `get_impact_radius` | Estimate blast radius for a target |
 | `get_index_stats` | Inspect current snapshot counts and file roles |
-| `get_research_pack` | Return a token-budgeted research pack with definitions, callers, callees, impacted endpoints, top files, and confidence notes |
+| `get_research_pack` | Return a token-budgeted research pack with definitions, callers, callees, impacted endpoints, top files, task oracle, compressed evidence, and confidence notes |
 | `impact_of_symbol` | Return an impact slice for a symbol: definitions, callers, callees, affected endpoints, likely tests, and top files |
-| `review_patch` | Build a code review packet from files, symbols, or a unified diff: findings, line focus, impact, tests, validation, and reviewer questions |
+| `review_patch` | Build a code review packet from files, symbols, or a unified diff: findings, line focus, impact, seeded risk categories, invariants, precision targets, tests, validation, and reviewer questions |
 | `search_code` | Mixed retrieval across files, symbols, endpoints, references, and dependencies |
 | `search_files` | Find relevant files with top symbols/endpoints, facets, pagination, and rank evidence |
 | `search_symbol` | Search indexed symbols with intent-aware ranking, pagination, facets, and optional rank explanations |
@@ -49,6 +50,7 @@ Use prompts like these to make the agent reach for graph tools before opening ma
 - "Use `search_files` first: which files are relevant to creating a notebook?"
 - "Use `search_code` with `explainRank: true`: find files, symbols, endpoints, references, and dependencies for payment flow."
 - "Use `get_context_packet` for 'fix duplicate refund timeout in payment service' with tokenBudget 4000, then call `get_file_slice` for the top candidate before editing."
+- "Use `get_change_pack` for 'debug missing inventory reservation in OrderService.create', then open the listed edit ranges and run expectedVerification."
 - "Use `trace_dependencies`: if I change `UserEntity`, what files and endpoints are affected?"
 - "Use `find_tests_for`: which tests are likely relevant for `NotebookController.createNotebook`?"
 - "Use `explain_endpoint` with snippets: explain `GET /notebooks` from controller to service/repository/DTO/tests."
@@ -81,6 +83,22 @@ Example MCP arguments:
 
 Use this before loading large files. The intended agent flow is `simulate_patch_impact` -> `get_file_slice` for the top changed/impacted file -> targeted validation from the simulator response.
 
+### Change Pack
+
+`get_change_pack` is the implementation/debug/refactor entry point. It wraps
+context routing, likely tests, validation hints, task oracle, and optional patch
+impact into one edit-ready response:
+
+- `editRanges`: exact `get_file_slice` ranges to open before editing.
+- `invariants`: behavior/API/test constraints the agent must preserve.
+- `expectedVerification`: targeted test files and commands.
+- `taskOracle`: success criteria, golden facts, likely tests, and pass signal.
+- `patchImpact`: optional compact impact when `files`, `symbols`, or `diff` are provided.
+
+Use it before editing. The intended flow is `get_change_pack` -> one batched
+`get_file_slice` call from `routing.firstToolCall` -> scoped edit -> targeted
+validation commands.
+
 ### Code Review Packet
 
 `review_patch` builds on `simulate_patch_impact` and adds review-specific evidence:
@@ -88,6 +106,7 @@ Use this before loading large files. The intended agent flow is `simulate_patch_
 - `reviewFindings`: deterministic risk hypotheses with `P0`/`P1`/`P2`, not unsupported claims.
 - `lineFocus`: changed hunks, line ranges, added/removed previews, and change kinds such as `endpoint`, `contract`, `security`, `debug-output`, or `test`.
 - `reviewFocus`: what the reviewer should inspect first: behavior impact, API contract, tests, or security.
+- `seededRiskCategories`, `mustCheckInvariants`, `knownSensitiveDataPatterns`, and `precisionTargets`: review-oracle fields for higher recall without unsupported blockers.
 - `requiredToolCalls`: exact follow-up graph/slice calls an agent should make before writing final review comments.
 - `reviewerQuestions`: concise questions to ask when evidence is incomplete.
 - `includeLikelyTests: true`: optional slower deep test lookup. The default review path stays fast and raises a validation gap when tests are not inferred.
@@ -267,7 +286,7 @@ Expected log line:
 
 If the UI only shows shell commands, file reads, or text search and the CodeGraph log has no `query` event, the agent did not use CodeGraph for that step.
 
-For GitHub Copilot CLI user-level setup in `~/.copilot/mcp-config.json`, see [`docs/copilot-mcp-config.md`](docs/copilot-mcp-config.md).
+For GitHub Copilot CLI user-level setup in `~/.copilot/mcp-config.json`, see [`docs/copilot-mcp-config.md`](docs/copilot-mcp-config.md). For day-to-day Copilot agent prompting and tool workflows, see [`docs/copilot-agent-usage-guide.vi.md`](docs/copilot-agent-usage-guide.vi.md). To benchmark real Copilot sessions with executable quality validators and actual `session.shutdown` token usage, see [`docs/copilot-e2e-quality-benchmark.md`](docs/copilot-e2e-quality-benchmark.md).
 
 ---
 
@@ -629,6 +648,7 @@ Each editor window normally starts its own stdio proxy, so you usually do not ru
 - For Git worktrees, clean tracked files use the Git index object id (`git:<blob>`), validated against index stat metadata. Dirty, untracked, or non-Git files still fall back to content hashing, so full graph completeness is preserved without reading every clean file to SHA-256 it.
 - Warm indexing reuses previous `blob_hash` values when `mtime_ms` and `size` match, batch-checks `parse_cache` entries keyed by `blob_hash`, and skips rebuilding a new snapshot when the manifest, HEAD, and dirty state are unchanged.
 - Cold or cache-miss parsing can fan out across worker threads after build; small updates use an in-place incremental path that reparses changed files, removes deleted file rows, and rebuilds dependency/call graph rows for affected files instead of copying and resolving the whole snapshot.
+- With `mcp --watch`, filesystem events now use path-delta refresh: the watcher batches changed paths, refreshes only those files/deletions in the current snapshot, and falls back to a normal refresh only when the path set is missing or too large. Tune with `CODEGRAPH_PATH_DELTA_FILE_LIMIT`.
 - Multiple windows/repositories share the same daemon and global cache, but each `--root` has its own workspace snapshot.
 - Search is fastest and most accurate when agents use graph tools first, especially `get_research_pack`, then fall back to broad text search only for unresolved names.
 - On very large repositories, Docker Desktop bind mounts from Windows paths are usually slower than local NTFS or WSL/ext4. Prewarm large repos from the same environment where the MCP server will run, and prefer persistent `CODEGRAPH_HOME`/Docker volumes so warm runs can reuse hashes and snapshots.
@@ -1027,7 +1047,7 @@ codegraph daemon start|stop|status     Manage local daemon
 codegraph daemon run                   Run daemon in the foreground
 codegraph index --root <workspace>     Prewarm persistent index
 codegraph doctor                       Inspect local configuration
-codegraph benchmark generate|index|eval|proof|review
+codegraph benchmark generate|index|eval|proof|review|copilot-e2e
                                       Generate synthetic repos, measure indexing, run evals, or prove context/review savings
 
 Options:
@@ -1046,6 +1066,10 @@ Options:
   --refresh-on-start                   Queue a workspace refresh when MCP starts, without blocking startup
   --watch                              Watch workspace files and queue background refreshes on changes
   --warn-stale                         Include freshness checks in MCP tool responses
+  --models <a,b,c>                     Copilot E2E model list for benchmark copilot-e2e
+  --modes <codegraph,baseline>         Copilot E2E comparison modes
+  --task-ids <a,b,c>                   Copilot E2E task ids
+  --dry-run                            Print Copilot E2E plan without running sessions
 ```
 
 **Examples:**
@@ -1068,6 +1092,9 @@ node dist/cli.js benchmark proof --root /path/to/project --tasks examples/contex
 
 # Compare baseline raw review context with review_patch packets
 node dist/cli.js benchmark review --root /path/to/project --tasks examples/review-proof-tasks.example.json --home /tmp/codegraph-proof-home
+
+# Run the official Copilot CLI E2E benchmark harness in dry-run mode
+node dist/cli.js benchmark copilot-e2e --dry-run --models gpt-5-mini --modes codegraph,baseline
 ```
 
 ---

@@ -3,6 +3,9 @@
 This guide shows how to connect CodeGraph to GitHub Copilot CLI through
 `~/.copilot/mcp-config.json`.
 
+After setup, use [`copilot-agent-usage-guide.vi.md`](copilot-agent-usage-guide.vi.md)
+for prompt patterns and daily agent workflows.
+
 GitHub Copilot CLI uses a top-level `mcpServers` object in this file. This is
 different from VS Code settings, which use `mcp.servers`.
 
@@ -149,10 +152,11 @@ with `--auto-refresh` so CodeGraph refreshes stale snapshots on the first tool
 call. For large repos, manual prewarm is more predictable.
 
 Use `--watch` only when you want the daemon to queue background refreshes after
-local filesystem events. Current watcher refreshes still run a full manifest
-scan, so keep it off for very large Docker bind mounts until path-delta
-watching is enabled. Use `--warn-stale` only when stale-index metadata is more
-important than lowest-latency Copilot responses.
+local filesystem events. Watch mode now uses path-delta refresh for small save
+batches and falls back to a normal refresh when the changed-path set is missing
+or too large. Keep it off for very large Docker bind mounts unless you have
+validated save latency for your repo. Use `--warn-stale` only when stale-index
+metadata is more important than lowest-latency Copilot responses.
 
 An editable template is also available at
 [`examples/copilot-docker-mcp-config.json`](../examples/copilot-docker-mcp-config.json).

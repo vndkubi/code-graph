@@ -5,7 +5,7 @@ import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { TreeSitterAnalyzer } from '../../analyzers/tree-sitter-analyzer.js';
 import { detectFrameworkRoles, synthesizeLombokSymbols } from '../../analyzers/java-framework-detector.js';
-import type { ParseResult } from '../../analyzers/base-analyzer.js';
+import type { ImportInfo, ParseResult, SymbolInfo } from '../../analyzers/base-analyzer.js';
 import { parseConfigFile } from './config-parser.js';
 
 const analyzer = new TreeSitterAnalyzer();
@@ -45,6 +45,8 @@ export function parseFile(absPath: string, rootDir: string): ParseResult {
   try {
     result = analyzer.parse(absPath, content, rootDir);
   } catch {
+    const fallback = fallbackParseSource(absPath, content, rootDir);
+    if (fallback) return fallback;
     return {
       file: path.relative(rootDir, absPath).replace(/\\/g, '/'),
       symbols: [],
@@ -62,6 +64,122 @@ export function parseFile(absPath: string, rootDir: string): ParseResult {
   }
 
   return result;
+}
+
+function fallbackParseSource(absPath: string, content: string, rootDir: string): ParseResult | undefined {
+  const ext = path.extname(absPath).toLowerCase();
+  if (!['.ts', '.tsx', '.js', '.jsx'].includes(ext)) return undefined;
+
+  const file = path.relative(rootDir, absPath).replace(/\\/g, '/');
+  const lines = content.split(/\r?\n/);
+  const symbols: SymbolInfo[] = [];
+  const imports: ImportInfo[] = [];
+  let currentClass: { name: string; depth: number } | undefined;
+  let objectParent: { name: string; depth: number } | undefined;
+  let braceDepth = 0;
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index] ?? '';
+    const lineNumber = index + 1;
+    const trimmed = line.trim();
+
+    const importMatch = trimmed.match(/^import\s+(?:type\s+)?(.+?)\s+from\s+['"]([^'"]+)['"]/);
+    if (importMatch) {
+      imports.push({
+        source: importMatch[2] ?? '',
+        symbols: importedNamesFromText(importMatch[1] ?? ''),
+        file,
+        line: lineNumber,
+        isExternal: !String(importMatch[2] ?? '').startsWith('.'),
+      });
+    }
+
+    const classMatch = trimmed.match(/^(?:export\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/);
+    if (classMatch) {
+      const name = classMatch[1] ?? '';
+      symbols.push(fallbackSymbol(name, 'class', file, lineNumber, line, undefined));
+      currentClass = { name, depth: braceDepth + countBraceDelta(line) };
+    }
+
+    const functionMatch = trimmed.match(/^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/);
+    if (functionMatch) {
+      symbols.push(fallbackSymbol(functionMatch[1] ?? '', 'function', file, lineNumber, line, undefined));
+    }
+
+    const variableMatch = trimmed.match(/^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/);
+    if (variableMatch) {
+      const name = variableMatch[1] ?? '';
+      const isArrowFunction = /=>/.test(line);
+      symbols.push(fallbackSymbol(name, isArrowFunction ? 'function' : 'variable', file, lineNumber, line, undefined));
+      if (/[{]\s*$/.test(trimmed) || /=\s*[{]/.test(trimmed)) {
+        objectParent = { name, depth: braceDepth + countBraceDelta(line) };
+      }
+    }
+
+    if (currentClass && trimmed && !/^(if|for|while|switch|catch)\b/.test(trimmed)) {
+      const methodMatch = trimmed.match(/^(?:public\s+|private\s+|protected\s+)?(?:static\s+)?(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::[^{]+)?[{;]/);
+      if (methodMatch && !['constructor'].includes(methodMatch[1] ?? '')) {
+        symbols.push(fallbackSymbol(methodMatch[1] ?? '', 'method', file, lineNumber, line, currentClass.name));
+      }
+    }
+
+    if (objectParent && objectParent.name && braceDepth <= objectParent.depth) {
+      const propertyMatch = trimmed.match(/^['"]?([A-Za-z_$][\w$-]*)['"]?\s*:/);
+      if (propertyMatch) {
+        symbols.push(fallbackSymbol(propertyMatch[1] ?? '', 'field', file, lineNumber, line, objectParent.name));
+      }
+    }
+
+    braceDepth += countBraceDelta(line);
+    if (currentClass && braceDepth < currentClass.depth) currentClass = undefined;
+    if (objectParent && braceDepth < objectParent.depth) objectParent = undefined;
+  }
+
+  return {
+    file,
+    symbols,
+    imports,
+    calls: [],
+    references: [],
+    hasParseErrors: true,
+    parseConfidence: symbols.length > 0 ? 0.35 : 0,
+  };
+}
+
+function fallbackSymbol(
+  name: string,
+  kind: SymbolInfo['kind'],
+  file: string,
+  line: number,
+  signature: string,
+  parent: string | undefined,
+): SymbolInfo {
+  return {
+    name,
+    kind,
+    file,
+    line,
+    column: Math.max(1, signature.indexOf(name) + 1),
+    endLine: line,
+    signature: signature.trim(),
+    visibility: signature.includes('private ') ? 'private' : signature.includes('protected ') ? 'protected' : 'public',
+    module: path.posix.dirname(file),
+    parent,
+  };
+}
+
+function importedNamesFromText(text: string): string[] {
+  const names = new Set<string>();
+  for (const match of text.matchAll(/\b([A-Za-z_$][\w$]*)\b/g)) {
+    const value = match[1] ?? '';
+    if (!['type', 'as', 'from'].includes(value)) names.add(value);
+  }
+  return [...names];
+}
+
+function countBraceDelta(line: string): number {
+  const withoutStrings = line.replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '');
+  return (withoutStrings.match(/{/g)?.length ?? 0) - (withoutStrings.match(/}/g)?.length ?? 0);
 }
 
 export function parseFilesBatch(workItems: ParseWorkItem[], options: ParseBatchOptions = {}): ParseWorkResult[] {

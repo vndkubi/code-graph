@@ -3,7 +3,7 @@ import type { CodeGraphDb } from '../storage/database.js';
 import type { ParseResult, SymbolInfo } from '../../analyzers/base-analyzer.js';
 import { getGitInfo, type GitInfo } from '../git.js';
 import { sha256Json, stableId } from '../hash.js';
-import { scanManifest, type ManifestFile, type ManifestPreviousFile } from './manifest.js';
+import { scanManifest, scanManifestPaths, type ManifestFile, type ManifestPreviousFile } from './manifest.js';
 import { parseFilesBatch, symbolFqName, type ParseWorkItem } from './parse.js';
 import { roleRank } from './file-role.js';
 
@@ -16,6 +16,16 @@ export interface IndexWorkspaceOptions {
   incremental?: boolean;
   incrementalFileLimit?: number;
   incrementalFileRatio?: number;
+  progress?: (event: IndexProgressEvent) => void;
+}
+
+export interface RefreshWorkspacePathsOptions {
+  root: string;
+  changedPaths: string[];
+  workspaceKey?: string;
+  maxFileSizeBytes?: number;
+  parseWorkers?: number;
+  incrementalFileLimit?: number;
   progress?: (event: IndexProgressEvent) => void;
 }
 
@@ -34,6 +44,8 @@ export interface IndexWorkspaceResult {
   parseWorkers: number;
   manifestScanMs: number;
   indexTimeMs: number;
+  pathDeltaUpdated?: boolean;
+  pathDeltaFallback?: string;
 }
 
 export interface IndexProgressEvent {
@@ -451,6 +463,106 @@ export class V2Indexer {
       manifestScanMs: manifest.scanTimeMs,
       indexTimeMs: Date.now() - start,
     };
+  }
+
+  async refreshWorkspacePaths(options: RefreshWorkspacePathsOptions): Promise<IndexWorkspaceResult> {
+    const start = Date.now();
+    const realRoot = path.resolve(options.root);
+    const normalizedChangedPaths = uniqueStrings(options.changedPaths
+      .map(file => normalizeRefreshPath(realRoot, file))
+      .filter(Boolean));
+    const fileLimit = options.incrementalFileLimit ?? 200;
+    if (normalizedChangedPaths.length === 0) {
+      const result = await this.indexWorkspace({ ...options, root: realRoot });
+      return { ...result, pathDeltaUpdated: false, pathDeltaFallback: 'no-paths' };
+    }
+    if (normalizedChangedPaths.length > fileLimit) {
+      const result = await this.indexWorkspace({ ...options, root: realRoot });
+      return { ...result, pathDeltaUpdated: false, pathDeltaFallback: 'path-count-exceeds-limit' };
+    }
+
+    options.progress?.({
+      phase: 'start',
+      status: 'start',
+      message: `path-delta refresh ${realRoot}`,
+      elapsedMs: 0,
+      details: { changedPaths: normalizedChangedPaths.length, workspaceKey: options.workspaceKey ?? process.env.CODEGRAPH_WORKSPACE_KEY },
+    });
+    const git = getGitInfo(realRoot);
+    const workspace = await this.registerWorkspaceWithGit(realRoot, options.workspaceKey, git);
+    const latestSnapshotId = (await this.getWorkspace(workspace.workspaceId))?.current_snapshot_id;
+    if (!latestSnapshotId) {
+      const result = await this.indexWorkspace({ ...options, root: realRoot });
+      return { ...result, pathDeltaUpdated: false, pathDeltaFallback: 'no-current-snapshot' };
+    }
+    const previousFiles = await this.previousFilesForSnapshot(latestSnapshotId);
+    const previousByPath = new Map(previousFiles.map(file => [file.path, file]));
+    const pathManifest = scanManifestPaths(realRoot, normalizedChangedPaths, {
+      maxFileSizeBytes: options.maxFileSizeBytes,
+      previousFiles,
+    });
+    const changedFiles = pathManifest.files.filter(file => previousByPath.get(file.relPath)?.blobHash !== file.blobHash);
+    const deletedPaths = uniqueStrings([
+      ...pathManifest.deletedPaths,
+      ...normalizedChangedPaths.filter(file => previousByPath.has(file) && !pathManifest.files.some(changed => changed.relPath === file)),
+    ]).filter(file => previousByPath.has(file));
+    const changeCount = changedFiles.length + deletedPaths.length;
+    options.progress?.({
+      phase: 'diff',
+      status: 'complete',
+      message: 'path-delta diff complete',
+      current: changeCount,
+      total: normalizedChangedPaths.length,
+      elapsedMs: Date.now() - start,
+      details: {
+        changedFiles: changedFiles.length,
+        deletedFiles: deletedPaths.length,
+        skippedPaths: pathManifest.skippedPaths.length,
+      },
+    });
+
+    if (changeCount === 0) {
+      return {
+        workspaceId: workspace.workspaceId,
+        snapshotId: latestSnapshotId,
+        filesTotal: previousFiles.length,
+        filesParsed: 0,
+        parseCacheHits: 0,
+        filesHashed: pathManifest.filesHashed,
+        hashCacheHits: pathManifest.hashCacheHits,
+        skippedUnchanged: true,
+        incrementalUpdated: false,
+        filesChanged: 0,
+        filesDeleted: 0,
+        parseWorkers: 0,
+        manifestScanMs: pathManifest.scanTimeMs,
+        indexTimeMs: Date.now() - start,
+        pathDeltaUpdated: true,
+      };
+    }
+
+    const prepared = await this.prepareParseBatch(realRoot, changedFiles, options.parseWorkers, options.progress);
+    const addedCount = changedFiles.filter(file => !previousByPath.has(file.relPath)).length;
+    const filesTotal = Math.max(0, previousFiles.length + addedCount - deletedPaths.length);
+    const result = await this.updateSnapshotIncrementally({
+      start,
+      workspaceId: workspace.workspaceId,
+      snapshotId: latestSnapshotId,
+      workspaceRoot: realRoot,
+      git,
+      manifestFilesTotal: filesTotal,
+      manifestScanMs: pathManifest.scanTimeMs,
+      filesHashed: pathManifest.filesHashed,
+      hashCacheHits: pathManifest.hashCacheHits,
+      changes: {
+        changedFiles,
+        deletedPaths,
+        unchangedFiles: [],
+      },
+      prepared,
+      progress: options.progress,
+    });
+    return { ...result, pathDeltaUpdated: true };
   }
 
   private async analyzeQueryTables(progress: IndexWorkspaceOptions['progress'], start: number): Promise<void> {
@@ -1494,6 +1606,19 @@ function chunkArray<T>(items: T[], chunkSize: number): T[][] {
     chunks.push(items.slice(index, index + chunkSize));
   }
   return chunks;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function normalizeRefreshPath(root: string, value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  const absolute = path.isAbsolute(trimmed) ? path.resolve(trimmed) : path.resolve(root, trimmed);
+  const relative = path.relative(root, absolute);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) return '';
+  return relative.replace(/\\/g, '/');
 }
 
 function boundedInt(value: string | undefined, fallback: number, min: number, max: number): number {

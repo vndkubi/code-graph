@@ -1,11 +1,13 @@
 import chokidar, { type FSWatcher } from 'chokidar';
+import path from 'node:path';
 
 export interface WorkspaceWatchHandle {
   close(): Promise<void>;
 }
 
-export function watchWorkspace(root: string, onChange: () => void): WorkspaceWatchHandle {
+export function watchWorkspace(root: string, onChange: (changedPaths: string[]) => void): WorkspaceWatchHandle {
   let timer: NodeJS.Timeout | undefined;
+  const pendingPaths = new Set<string>();
   const watcher: FSWatcher = chokidar.watch(root, {
     ignoreInitial: true,
     ignored: [
@@ -22,11 +24,15 @@ export function watchWorkspace(root: string, onChange: () => void): WorkspaceWat
     },
   });
 
-  const schedule = () => {
+  const schedule = (changedPath: string) => {
+    const relPath = normalizeWatchPath(root, changedPath);
+    if (relPath) pendingPaths.add(relPath);
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => {
+      const changedPaths = [...pendingPaths];
+      pendingPaths.clear();
       timer = undefined;
-      onChange();
+      onChange(changedPaths);
     }, 750);
   };
 
@@ -41,4 +47,11 @@ export function watchWorkspace(root: string, onChange: () => void): WorkspaceWat
       await watcher.close();
     },
   };
+}
+
+function normalizeWatchPath(root: string, changedPath: string): string | undefined {
+  const absolute = path.isAbsolute(changedPath) ? path.resolve(changedPath) : path.resolve(root, changedPath);
+  const relative = path.relative(path.resolve(root), absolute);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) return undefined;
+  return relative.replace(/\\/g, '/');
 }

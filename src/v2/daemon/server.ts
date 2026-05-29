@@ -23,11 +23,12 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
     running: boolean;
     pending: boolean;
     reason: string;
+    changedPaths: Set<string>;
     timer?: NodeJS.Timeout;
   }>();
   const refreshDelayMs = refreshDebounceMs();
 
-  const scheduleWorkspaceRefresh = (root: string, workspaceKey: string | undefined, reason: string) => {
+  const scheduleWorkspaceRefresh = (root: string, workspaceKey: string | undefined, reason: string, changedPaths: string[] = []) => {
     const key = refreshJobKey(root, workspaceKey);
     let job = refreshJobs.get(key);
     if (!job) {
@@ -37,11 +38,13 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         running: false,
         pending: false,
         reason,
+        changedPaths: new Set<string>(),
       };
       refreshJobs.set(key, job);
     }
     job.pending = true;
     job.reason = reason;
+    for (const changedPath of changedPaths) job.changedPaths.add(changedPath);
     if (job.running) return;
     if (job.timer) clearTimeout(job.timer);
     job.timer = setTimeout(() => {
@@ -56,21 +59,33 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
     running: boolean;
     pending: boolean;
     reason: string;
+    changedPaths: Set<string>;
     timer?: NodeJS.Timeout;
   }) => {
     if (job.running || !job.pending) return;
     job.running = true;
     job.pending = false;
     const reason = job.reason;
+    const changedPaths = [...job.changedPaths];
+    job.changedPaths.clear();
     const startedAt = Date.now();
     try {
-      const result = await indexer.indexWorkspace({ root: job.root, workspaceKey: job.workspaceKey });
+      const result = reason === 'watch' && changedPaths.length > 0
+        ? await indexer.refreshWorkspacePaths({
+          root: job.root,
+          workspaceKey: job.workspaceKey,
+          changedPaths,
+          incrementalFileLimit: pathDeltaRefreshFileLimit(),
+        })
+        : await indexer.indexWorkspace({ root: job.root, workspaceKey: job.workspaceKey });
       logEvent(paths.daemonLogPath, {
         event: 'workspace.refresh',
-        mode: 'background',
+        mode: result.pathDeltaUpdated ? 'path-delta' : 'background',
+        pathDeltaFallback: result.pathDeltaFallback,
         reason,
         root: job.root,
         workspaceKey: job.workspaceKey,
+        changedPathCount: changedPaths.length,
         workspaceId: result.workspaceId,
         snapshotId: result.snapshotId,
         filesTotal: result.filesTotal,
@@ -134,10 +149,10 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         workspaceKeysByRoot.set(workspace.root, rootKeys);
         if (watch && !watchers.has(workspace.root)) {
           try {
-            watchers.set(workspace.root, watchWorkspace(workspace.root, () => {
+            watchers.set(workspace.root, watchWorkspace(workspace.root, (changedPaths) => {
               const keys = workspaceKeysByRoot.get(workspace.root) ?? new Set([workspaceKeyValue(workspaceKey)]);
               for (const key of keys) {
-                scheduleWorkspaceRefresh(workspace.root, workspaceKeyFromValue(key), 'watch');
+                scheduleWorkspaceRefresh(workspace.root, workspaceKeyFromValue(key), 'watch', changedPaths);
               }
             }));
           } catch (error) {
@@ -169,16 +184,22 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         const body = await readJson(req);
         const root = requireString(body.root, 'root');
         const workspaceKey = optionalString(body.workspaceKey);
+        const changedPaths = Array.isArray(body.changedPaths) ? body.changedPaths.map(String) : [];
         if (body.background === true) {
-          scheduleWorkspaceRefresh(root, workspaceKey, 'startup');
-          sendJson(res, 202, { queued: true, root, workspaceKey });
+          scheduleWorkspaceRefresh(root, workspaceKey, changedPaths.length > 0 ? 'watch' : 'startup', changedPaths);
+          sendJson(res, 202, { queued: true, root, workspaceKey, changedPathCount: changedPaths.length });
           return;
         }
-        const result = await indexer.indexWorkspace({ root, workspaceKey });
+        const result = changedPaths.length > 0
+          ? await indexer.refreshWorkspacePaths({ root, workspaceKey, changedPaths, incrementalFileLimit: pathDeltaRefreshFileLimit() })
+          : await indexer.indexWorkspace({ root, workspaceKey });
         logEvent(paths.daemonLogPath, {
           event: 'workspace.refresh',
+          mode: result.pathDeltaUpdated ? 'path-delta' : 'foreground',
+          pathDeltaFallback: result.pathDeltaFallback,
           root,
           workspaceKey,
+          changedPathCount: changedPaths.length,
           workspaceId: result.workspaceId,
           snapshotId: result.snapshotId,
           filesTotal: result.filesTotal,
@@ -202,13 +223,15 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
           toolName,
           args,
         });
+        const resultJson = JSON.stringify(result);
         logEvent(paths.daemonLogPath, {
           event: 'query',
           workspaceId,
           toolName,
           args: summarizeArgs(args),
           durationMs: Date.now() - startedAt,
-          responseChars: JSON.stringify(result).length,
+          responseChars: resultJson.length,
+          telemetry: queryTelemetryForLog(toolName, args, result, Date.now() - startedAt),
         });
         sendJson(res, 200, result);
         return;
@@ -300,6 +323,12 @@ function refreshDebounceMs(): number {
   return Math.min(Math.floor(raw), 60_000);
 }
 
+function pathDeltaRefreshFileLimit(): number {
+  const raw = Number(process.env.CODEGRAPH_PATH_DELTA_FILE_LIMIT ?? 200);
+  if (!Number.isFinite(raw) || raw < 1) return 200;
+  return Math.min(Math.floor(raw), 5000);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -310,6 +339,49 @@ function logEvent(logPath: string, event: Record<string, unknown>): void {
   } catch {
     // Logging must never break daemon query handling.
   }
+}
+
+export function queryTelemetryForLog(
+  toolName: string,
+  args: Record<string, unknown>,
+  result: unknown,
+  durationMs: number,
+): Record<string, unknown> {
+  const requestJson = JSON.stringify({ toolName, args });
+  const responseJson = JSON.stringify(result);
+  const resultObject = isRecord(result) ? result : {};
+  const requiredToolCalls = Array.isArray(resultObject.requiredToolCalls) ? resultObject.requiredToolCalls.length : 0;
+  const toolHints = Array.isArray(resultObject.toolHints) ? resultObject.toolHints.length : 0;
+  const routing = isRecord(resultObject.routing) ? resultObject.routing : {};
+  const firstToolCall = isRecord(routing.firstToolCall) ? 1 : 0;
+  const missingFacts = Array.isArray(resultObject.missingFacts) ? resultObject.missingFacts.length : 0;
+  const taskOracle = isRecord(resultObject.taskOracle) ? resultObject.taskOracle : undefined;
+  return {
+    durationMs,
+    requestChars: requestJson.length,
+    responseChars: responseJson.length,
+    estimatedInputTokens: estimateLogTokens(requestJson),
+    estimatedOutputTokens: estimateLogTokens(responseJson),
+    responseSize: responseJson.length > 60_000 ? 'large'
+      : responseJson.length > 16_000 ? 'medium'
+        : 'small',
+    followUpToolCallCount: requiredToolCalls + toolHints + firstToolCall,
+    requiredToolCallCount: requiredToolCalls,
+    toolHintCount: toolHints + firstToolCall,
+    missingFactCount: missingFacts,
+    hasTaskOracle: Boolean(taskOracle),
+    hasExpectedVerification: Boolean(taskOracle && isRecord(taskOracle.expectedVerification)),
+    hasCompressedEvidence: Boolean(isRecord(resultObject.compressedEvidence)),
+    resultQualitySignals: {
+      hasValidation: Boolean(isRecord(resultObject.validation) || isRecord(resultObject.expectedVerification)),
+      hasLikelyTests: Array.isArray(resultObject.testsLikelyRelevant) && resultObject.testsLikelyRelevant.length > 0,
+      hasGoldenFacts: Boolean(taskOracle && Array.isArray(taskOracle.goldenFacts) && taskOracle.goldenFacts.length > 0),
+    },
+  };
+}
+
+function estimateLogTokens(value: string): number {
+  return Math.ceil(value.length / 4);
 }
 
 function removeDaemonInfo(infoPath: string, info: DaemonInfo): void {

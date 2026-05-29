@@ -1,0 +1,535 @@
+{
+  "version": 1,
+  "purpose": "Reusable real-agent prompt suite for testing CodeGraph MCP behavior on developer workflows.",
+  "defaultRunConfig": {
+    "model": "gpt-5-mini",
+    "effort": "low",
+    "outputFormat": "json",
+    "disableBuiltinMcps": true,
+    "requiredMcpServer": "codegraph-bench",
+    "strictJson": true,
+    "maxCharsPerAnswer": 2600
+  },
+  "passCriteria": {
+    "exitCode": 0,
+    "mustUseOnlyCodeGraphMcp": true,
+    "mustNotUseShellReadWriteEdit": true,
+    "mustReturnJsonObject": true,
+    "requiredKeysPresent": true,
+    "requiredToolsCalled": true,
+    "expectedContainsPresent": true,
+    "expectedFilesPresent": true
+  },
+  "tasks": [
+    {
+      "id": "dev-investigate-review-patch-flow",
+      "category": "investigate",
+      "intent": "Study one feature deeply and explain how it works.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Investigate review_patch end-to-end in src/v2/query/service.ts. Call get_context_packet for review_patch reviewTargets agentGuidance service.ts, then use returned toolHints or sliceHints with one batch get_file_slice call when exact source is needed. Return valid compact JSON only, no markdown, max 2600 chars, with keys: task,toolCallsUsed,batchSliceUsed,keyFiles,dataFlow,agentWorkflow,risks,glossary,confidence. Final JSON must include these exact repository-relative file path strings: src/v2/query/service.ts. Final JSON must include these exact terms somewhere in string values: review_patch, reviewTargets, agentGuidance.",
+      "requiredTools": [
+        "get_context_packet"
+      ],
+      "allowedOptionalTools": [
+        "get_file_slice",
+        "get_research_pack",
+        "get_flow_pack"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "task",
+          "toolCallsUsed",
+          "keyFiles",
+          "dataFlow",
+          "agentWorkflow",
+          "risks",
+          "glossary",
+          "confidence"
+        ],
+        "expectedContains": [
+          "review_patch",
+          "reviewTargets",
+          "agentGuidance"
+        ],
+        "expectedFiles": [
+          "src/v2/query/service.ts"
+        ],
+        "qualityChecks": [
+          "dataFlow describes input args, diff parsing, findings, reviewTargets, and requiredToolCalls",
+          "agentWorkflow explains how an agent should use reviewTargets before final review comments",
+          "glossary defines reviewTargets and agentGuidance"
+        ]
+      }
+    },
+    {
+      "id": "dev-implement-path-delta-refresh",
+      "category": "implement-plan",
+      "intent": "Plan a code change across multiple modules without editing files.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Design path-delta incremental refresh for local source changes without sacrificing full graph completeness. You must call get_context_packet, not get_research_pack, for path delta watcher incremental refresh watcher indexer manifest daemon. Then use returned toolHints or sliceHints with one batch get_file_slice call when exact source is needed. Return valid compact JSON only, no markdown, max 2800 chars, with keys: task,toolCallsUsed,batchSliceUsed,files,proposedApi,algorithm,concurrencyAndPerf,fullGraphCompleteness,testPlan,rollbackPlan,risks. Final JSON must include these exact repository-relative file path strings: src/v2/index/watcher.ts, src/v2/index/indexer.ts, src/v2/index/manifest.ts. Final JSON must include these exact terms somewhere in string values: watcher, indexer, manifest, full graph.",
+      "requiredTools": [
+        "get_context_packet"
+      ],
+      "allowedOptionalTools": [
+        "get_file_slice",
+        "search_symbol",
+        "get_research_pack"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "task",
+          "files",
+          "proposedApi",
+          "algorithm",
+          "concurrencyAndPerf",
+          "fullGraphCompleteness",
+          "testPlan",
+          "rollbackPlan",
+          "risks"
+        ],
+        "expectedContains": [
+          "watcher",
+          "indexer",
+          "manifest",
+          "full graph"
+        ],
+        "expectedFiles": [
+          "src/v2/index/watcher.ts",
+          "src/v2/index/indexer.ts",
+          "src/v2/index/manifest.ts"
+        ],
+        "qualityChecks": [
+          "algorithm distinguishes small path-delta refresh from large full refresh fallback",
+          "fullGraphCompleteness states that no files are skipped and fallback full refresh remains available",
+          "testPlan includes unit/integration coverage for changed, deleted, renamed, and branch checkout cases"
+        ]
+      }
+    },
+    {
+      "id": "dev-break-down-incremental-refresh",
+      "category": "break-task",
+      "intent": "Turn a complex implementation into ordered tasks.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_research_pack. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Break down path-delta incremental refresh into implementable engineering tasks. Call get_research_pack for watcher indexer daemon manifest incremental refresh task breakdown. Return valid compact JSON only, no markdown, max 1800 chars, with keys: epics,tasks,order,files,testMilestones,risks,definitionOfDone. Final JSON must include these exact repository-relative file path strings: src/v2/index/watcher.ts, src/v2/index/indexer.ts. Final JSON must include these exact terms somewhere in string values: incremental, watcher, tests. Use short string values and avoid embedded double quotes inside strings.",
+      "requiredTools": [
+        "get_research_pack"
+      ],
+      "allowedOptionalTools": [
+        "get_context_packet",
+        "get_file_slice"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "epics",
+          "tasks",
+          "order",
+          "files",
+          "testMilestones",
+          "risks",
+          "definitionOfDone"
+        ],
+        "expectedContains": [
+          "incremental",
+          "watcher",
+          "tests"
+        ],
+        "expectedFiles": [
+          "src/v2/index/watcher.ts",
+          "src/v2/index/indexer.ts"
+        ],
+        "qualityChecks": [
+          "tasks are sequenced and independently testable",
+          "definitionOfDone includes latency and completeness checks"
+        ]
+      }
+    },
+    {
+      "id": "dev-review-multihunk-security",
+      "category": "code-review",
+      "intent": "Review a realistic multi-file diff with security and behavior risks.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: review_patch. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Review this multi-file diff. When calling review_patch, pass files src/v2/query/service.ts and src/v2/index/watcher.ts, and pass symbols V2QueryService.reviewPatch and watchWorkspace. Call review_patch with focus security outputMode balanced includeLikelyTests true, then use requiredToolCalls/reviewTargets with get_file_slice if exact source is needed. Return valid compact JSON only, no markdown, max 1800 chars, with keys: status,topFindings,reviewTargets,callerOrEndpointImpact,tests,agentGuidance,confidence.\n\ndiff --git a/src/v2/query/service.ts b/src/v2/query/service.ts\n--- a/src/v2/query/service.ts\n+++ b/src/v2/query/service.ts\n@@ -1207,6 +1207,8 @@ private async reviewPatch(snapshotId: string, args: Record<string, unknown>) {\n+    console.log('review diff', diff);\n+    const unsafeFocus = String(args.focus ?? '');\n@@ -1245,6 +1247,7 @@ private async reviewPatch(snapshotId: string, args: Record<string, unknown>) {\n+      debugFocus: unsafeFocus,\n }\ndiff --git a/src/v2/index/watcher.ts b/src/v2/index/watcher.ts\n--- a/src/v2/index/watcher.ts\n+++ b/src/v2/index/watcher.ts\n@@ -15,7 +15,7 @@ export function watchWorkspace(root: string, onChange: () => void): WorkspaceWatchHandle {\n-    if (eventType === 'rename' || eventType === 'change') {\n+    if (eventType === 'change') {\n       onChange();\n     }\n } Final JSON must include these exact repository-relative file path strings: src/v2/query/service.ts, src/v2/index/watcher.ts. Final JSON must include these exact terms somewhere in string values: console.log, rename, debug, watcher.",
+      "requiredTools": [
+        "review_patch"
+      ],
+      "allowedOptionalTools": [
+        "get_file_slice"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "status",
+          "topFindings",
+          "reviewTargets",
+          "tests",
+          "agentGuidance",
+          "confidence"
+        ],
+        "expectedContains": [
+          "console.log",
+          "rename",
+          "debug",
+          "watcher"
+        ],
+        "expectedFiles": [
+          "src/v2/query/service.ts",
+          "src/v2/index/watcher.ts"
+        ],
+        "qualityChecks": [
+          "topFindings include debug/raw diff logging risk",
+          "topFindings include missing rename event behavior risk",
+          "findings include file, line or target, why, severity, and suggestedFix"
+        ]
+      }
+    },
+    {
+      "id": "dev-create-test-strategy",
+      "category": "create-testcase",
+      "intent": "Design a rigorous test plan for a code change.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet, find_tests_for, get_file_slice. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Create a rigorous test strategy for review_patch reviewTargets and agentGuidance plus watcher path-delta incremental refresh. Call get_context_packet for tests review_patch reviewTargets agentGuidance watcher incremental refresh, call find_tests_for for src/v2/query/service.ts, and call get_file_slice for tests/v2/index-query.test.ts. Return valid compact JSON only, no markdown, max 2800 chars, with keys: task,toolCallsUsed,existingCoverage,newTestCases,fixtures,assertions,commands,edgeCases,qualityGate. Final JSON must include these exact repository-relative file path strings: tests/v2/index-query.test.ts. Final JSON must include these exact terms somewhere in string values: reviewTargets, agentGuidance, watcher, vitest.",
+      "requiredTools": [
+        "get_context_packet",
+        "find_tests_for",
+        "get_file_slice"
+      ],
+      "allowedOptionalTools": [
+        "search_symbol"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "task",
+          "existingCoverage",
+          "newTestCases",
+          "fixtures",
+          "assertions",
+          "commands",
+          "edgeCases",
+          "qualityGate"
+        ],
+        "expectedContains": [
+          "reviewTargets",
+          "agentGuidance",
+          "watcher",
+          "vitest"
+        ],
+        "expectedFiles": [
+          "tests/v2/index-query.test.ts"
+        ],
+        "qualityChecks": [
+          "newTestCases cover success path, missing target, generated/fixture exclusion, and batch slice hints",
+          "commands include focused vitest command and broader validation command"
+        ]
+      }
+    },
+    {
+      "id": "dev-debug-failing-test",
+      "category": "debug",
+      "intent": "Investigate a failing test from symptom text.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. A test named builds compact context packets and exact file slices for agent routing fails because packet.toolHints is missing. Debug likely root cause. Call get_context_packet for get_context_packet toolHints sliceHints tests index-query, then call get_file_slice with batch slices if exact source is needed. Return valid compact JSON only, no markdown, max 2400 chars, with keys: symptom,likelyRootCause,keyFiles,debugPath,fixPlan,tests,confidence. Final JSON must include these exact repository-relative file path strings: src/v2/query/service.ts, tests/v2/index-query.test.ts. Final JSON must include these exact terms somewhere in string values: toolHints, sliceHints, get_context_packet.",
+      "requiredTools": [
+        "get_context_packet"
+      ],
+      "allowedOptionalTools": [
+        "get_file_slice",
+        "find_tests_for"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "symptom",
+          "likelyRootCause",
+          "keyFiles",
+          "debugPath",
+          "fixPlan",
+          "tests",
+          "confidence"
+        ],
+        "expectedContains": [
+          "toolHints",
+          "sliceHints",
+          "get_context_packet"
+        ],
+        "expectedFiles": [
+          "src/v2/query/service.ts",
+          "tests/v2/index-query.test.ts"
+        ],
+        "qualityChecks": [
+          "fixPlan points to getContextPacket result construction",
+          "tests mention focused index-query vitest case"
+        ]
+      }
+    },
+    {
+      "id": "dev-impact-analysis-public-api",
+      "category": "impact-analysis",
+      "intent": "Estimate blast radius of a public API change.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Analyze impact of changing get_file_slice input schema to support batch slices. Call get_context_packet for get_file_slice schema slices parseToolArgs V2ToolSchemas query service tests, then use get_file_slice batch if exact source is needed. Return valid compact JSON only, no markdown, max 2600 chars, with keys: change,publicSurface,impactedFiles,callersOrConsumers,compatibilityRisks,testPlan,docsToUpdate,confidence. Final JSON must include these exact repository-relative file path strings: src/v2/mcp/tools.ts, src/v2/query/service.ts. Final JSON must include these exact terms somewhere in string values: get_file_slice, V2ToolSchemas, parseToolArgs.",
+      "requiredTools": [
+        "get_context_packet"
+      ],
+      "allowedOptionalTools": [
+        "get_file_slice",
+        "get_callers",
+        "search_symbol"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "change",
+          "publicSurface",
+          "impactedFiles",
+          "compatibilityRisks",
+          "testPlan",
+          "docsToUpdate",
+          "confidence"
+        ],
+        "expectedContains": [
+          "get_file_slice",
+          "V2ToolSchemas",
+          "parseToolArgs"
+        ],
+        "expectedFiles": [
+          "src/v2/mcp/tools.ts",
+          "src/v2/query/service.ts"
+        ],
+        "qualityChecks": [
+          "compatibilityRisks states existing single-slice args remain supported",
+          "docsToUpdate mentions MCP tool docs or README/examples"
+        ]
+      }
+    },
+    {
+      "id": "dev-refactor-plan-query-service",
+      "category": "refactor-plan",
+      "intent": "Plan a safe refactor of a large service without changing behavior.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Propose a safe refactor plan for V2QueryService so review_patch and context packet logic are easier to maintain. Call get_context_packet for V2QueryService reviewPatch getContextPacket helper extraction tests. Return valid compact JSON only, no markdown, max 2500 chars, with keys: goal,modulesToExtract,dependencyBoundaries,steps,tests,risks,noBehaviorChangeChecks. Final JSON must include these exact repository-relative file path strings: src/v2/query/service.ts. Final JSON must include these exact terms somewhere in string values: V2QueryService, reviewPatch, getContextPacket.",
+      "requiredTools": [
+        "get_context_packet"
+      ],
+      "allowedOptionalTools": [
+        "get_file_slice",
+        "search_symbol"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "goal",
+          "modulesToExtract",
+          "dependencyBoundaries",
+          "steps",
+          "tests",
+          "risks",
+          "noBehaviorChangeChecks"
+        ],
+        "expectedContains": [
+          "V2QueryService",
+          "reviewPatch",
+          "getContextPacket"
+        ],
+        "expectedFiles": [
+          "src/v2/query/service.ts"
+        ],
+        "qualityChecks": [
+          "steps are incremental and preserve public tool outputs",
+          "noBehaviorChangeChecks include snapshot/golden output comparisons"
+        ]
+      }
+    },
+    {
+      "id": "dev-security-threat-model-mcp-tool",
+      "category": "security",
+      "intent": "Threat model an MCP tool and its inputs.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Threat model get_file_slice and review_patch as MCP tools receiving agent-controlled input. Call get_context_packet for get_file_slice review_patch MCP schema input validation safeResolve diff logging, then use get_file_slice batch if exact source is needed. Return valid compact JSON only, no markdown, max 2600 chars, with keys: assets,entryPoints,trustBoundaries,threats,existingControls,gaps,recommendedTests,confidence. Final JSON must include these exact repository-relative file path strings: src/v2/query/service.ts, src/v2/mcp/tools.ts. Final JSON must include these exact terms somewhere in string values: safeResolve, diff, schema, path.",
+      "requiredTools": [
+        "get_context_packet"
+      ],
+      "allowedOptionalTools": [
+        "get_file_slice",
+        "get_research_pack"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "assets",
+          "entryPoints",
+          "trustBoundaries",
+          "threats",
+          "existingControls",
+          "gaps",
+          "recommendedTests",
+          "confidence"
+        ],
+        "expectedContains": [
+          "safeResolve",
+          "diff",
+          "schema",
+          "path"
+        ],
+        "expectedFiles": [
+          "src/v2/query/service.ts",
+          "src/v2/mcp/tools.ts"
+        ],
+        "qualityChecks": [
+          "threats include path traversal, oversized output, sensitive diff logging, and stale-index risk",
+          "existingControls mention schema validation and safe path resolution"
+        ]
+      }
+    },
+    {
+      "id": "dev-performance-regression-investigation",
+      "category": "performance",
+      "intent": "Investigate a performance regression with tool-call evidence.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Investigate why Copilot agents may loop get_file_slice/search_symbol after get_context_packet. Call get_context_packet for toolHints sliceHints get_file_slice search_symbol agent loop performance, then use batch get_file_slice once if exact source is needed. Return valid compact JSON only, no markdown, max 2600 chars, with keys: hypothesis,evidence,keyFiles,performanceRisks,mitigations,benchmarkPlan,successMetrics,confidence. Final JSON must include these exact repository-relative file path strings: src/v2/query/service.ts, src/v2/mcp/tools.ts. Final JSON must include these exact terms somewhere in string values: toolHints, sliceHints, batch, latency.",
+      "requiredTools": [
+        "get_context_packet"
+      ],
+      "allowedOptionalTools": [
+        "get_file_slice",
+        "get_research_pack"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "hypothesis",
+          "evidence",
+          "keyFiles",
+          "performanceRisks",
+          "mitigations",
+          "benchmarkPlan",
+          "successMetrics",
+          "confidence"
+        ],
+        "expectedContains": [
+          "toolHints",
+          "sliceHints",
+          "batch",
+          "latency"
+        ],
+        "expectedFiles": [
+          "src/v2/query/service.ts",
+          "src/v2/mcp/tools.ts"
+        ],
+        "qualityChecks": [
+          "successMetrics include no repeated single get_file_slice calls when batch hints are available",
+          "benchmarkPlan uses real Copilot CLI JSONL logs"
+        ]
+      }
+    },
+    {
+      "id": "dev-api-contract-doc-update",
+      "category": "docs",
+      "intent": "Plan documentation updates for a developer-facing API change.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Plan documentation updates for batch get_file_slice and context packet toolHints. Call get_context_packet for README get_file_slice toolHints MCP config Copilot docs examples. Return valid compact JSON only, no markdown, max 2200 chars, with keys: docGoal,audience,sectionsToUpdate,examples,validationSteps,risks. Final JSON must include these exact repository-relative file path strings: README.md, docs/copilot-mcp-config.md. Final JSON must include these exact terms somewhere in string values: get_file_slice, toolHints, Copilot.",
+      "requiredTools": [
+        "get_context_packet"
+      ],
+      "allowedOptionalTools": [
+        "get_file_slice",
+        "search_files"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "docGoal",
+          "audience",
+          "sectionsToUpdate",
+          "examples",
+          "validationSteps",
+          "risks"
+        ],
+        "expectedContains": [
+          "get_file_slice",
+          "toolHints",
+          "Copilot"
+        ],
+        "expectedFiles": [
+          "README.md",
+          "docs/copilot-mcp-config.md"
+        ],
+        "qualityChecks": [
+          "examples include single-slice and batch-slice usage",
+          "validationSteps include a Copilot CLI MCP run"
+        ]
+      }
+    },
+    {
+      "id": "dev-endpoint-flow-generalization",
+      "category": "endpoint-flow",
+      "intent": "Trace a request or command flow using graph packs.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_flow_pack. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Explain the MCP request flow from Copilot tool call to V2QueryService.query and back to JSON content. You must call get_flow_pack first for MCP proxy query daemon service flow. Return valid compact JSON only, no markdown, max 2600 chars, with keys: flow,entryPoints,keyFiles,protocolSteps,errorHandling,performanceNotes,glossary,confidence. Final JSON must include these exact repository-relative file path strings: src/v2/mcp/proxy.ts, src/v2/daemon/client.ts, src/v2/query/service.ts. Final JSON must include these exact terms somewhere in string values: runMcpProxy, DaemonClient, V2QueryService.query.",
+      "requiredTools": [
+        "get_flow_pack"
+      ],
+      "allowedOptionalTools": [
+        "get_research_pack",
+        "get_file_slice"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "flow",
+          "entryPoints",
+          "keyFiles",
+          "protocolSteps",
+          "errorHandling",
+          "performanceNotes",
+          "glossary",
+          "confidence"
+        ],
+        "expectedContains": [
+          "runMcpProxy",
+          "DaemonClient",
+          "V2QueryService.query"
+        ],
+        "expectedFiles": [
+          "src/v2/mcp/proxy.ts",
+          "src/v2/daemon/client.ts",
+          "src/v2/query/service.ts"
+        ],
+        "qualityChecks": [
+          "flow starts at CallToolRequest handler and ends with JSON content response",
+          "performanceNotes mention avoiding repeated granular tools after answer-ready packs"
+        ]
+      }
+    },
+    {
+      "id": "dev-release-risk-checklist",
+      "category": "release-risk",
+      "intent": "Create a release checklist for a code change.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Build a release-risk checklist for shipping batch get_file_slice and review agent guidance changes. Call get_context_packet for get_file_slice review_patch agentGuidance tests docs release risk. Return valid compact JSON only, no markdown, max 2400 chars, with keys: scope,risks,compatibilityChecks,performanceChecks,securityChecks,testCommands,rollback,signoffCriteria. Final JSON must include these exact repository-relative file path strings: src/v2/query/service.ts, tests/v2/index-query.test.ts. Final JSON must include these exact terms somewhere in string values: batch, review_patch, test.",
+      "requiredTools": [
+        "get_context_packet"
+      ],
+      "allowedOptionalTools": [
+        "find_tests_for",
+        "get_file_slice"
+      ],
+      "expectedOutput": {
+        "type": "object",
+        "requiredKeys": [
+          "scope",
+          "risks",
+          "compatibilityChecks",
+          "performanceChecks",
+          "securityChecks",
+          "testCommands",
+          "rollback",
+          "signoffCriteria"
+        ],
+        "expectedContains": [
+          "batch",
+          "review_patch",
+          "test"
+        ],
+        "expectedFiles": [
+          "src/v2/query/service.ts",
+          "tests/v2/index-query.test.ts"
+        ],
+        "qualityChecks": [
+          "testCommands include lint, build, and focused/full vitest",
+          "rollback explains single-slice compatibility remains unchanged"
+        ]
+      }
+    }
+  ]
+}

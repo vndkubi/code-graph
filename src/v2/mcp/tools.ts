@@ -64,7 +64,13 @@ export const V2ToolSchemas = {
     file: z.string().optional(),
     lines: z.string().optional(),
     symbol: z.string().optional(),
-    maxChars: z.number().min(200).max(30000).default(8000),
+    slices: z.array(z.object({
+      file: z.string().optional(),
+      lines: z.string().optional(),
+      symbol: z.string().optional(),
+      maxChars: z.number().min(200).max(30000).optional(),
+    })).max(20).optional(),
+    maxChars: z.number().min(200).max(30000).default(3000),
     ...FreshnessOptions,
   }),
   get_dependencies: z.object({
@@ -175,6 +181,20 @@ export const V2ToolSchemas = {
     ...SnippetOptions,
     ...FreshnessOptions,
   }),
+  get_change_pack: z.object({
+    task: z.string(),
+    target: z.string().optional(),
+    changeType: z.enum(['implement', 'debug', 'refactor', 'test', 'review', 'investigate']).default('implement'),
+    files: z.array(z.string()).optional(),
+    symbols: z.array(z.string()).optional(),
+    diff: z.string().optional(),
+    tokenBudget: z.number().min(1000).max(30000).default(8000),
+    maxFiles: z.number().min(1).max(20).default(8),
+    maxSymbols: z.number().min(1).max(50).default(12),
+    includeTests: z.boolean().default(true),
+    ...SnippetOptions,
+    ...FreshnessOptions,
+  }),
   search_code: z.object({
     query: z.string(),
     limit: z.number().min(1).max(50).default(10),
@@ -217,7 +237,9 @@ function descriptionFor(name: V2ToolName): string {
     case 'get_research_pack':
       return 'PRIMARY TOOL for research/architecture questions. Returns an answer-ready pack with flow steps, ranked definitions, related edges, top files, and capped source evidence in ONE call. Usually enough to answer without search_code/search_symbol/get_file_slice; call those only when missingFacts lists a specific gap.';
     case 'get_context_packet':
-      return 'Route an implementation/debugging task to a compact context packet with domain guess, candidate files/symbols, small snippets, likely tests, validation hints, confidence, omissions, and a next action. For architecture/how-does-X-work questions prefer get_research_pack/get_flow_pack first.';
+      return 'Route an implementation/debugging task to a compact context packet with domain guess, candidate files/symbols, sliceHints/toolHints, likely tests, validation hints, confidence, omissions, and a next action. If toolHints contains get_file_slice args.slices, use that ONE batch call instead of repeated get_file_slice calls. For architecture/how-does-X-work questions prefer get_research_pack/get_flow_pack first.';
+    case 'get_change_pack':
+      return 'PRIMARY TOOL for implementation/debug/refactor tasks. Returns candidate files/symbols, exact edit ranges, invariants, task oracle, likely tests, suggested validation commands, and optional patch impact in one packet before editing.';
     case 'search_symbol':
       return 'Search indexed symbols with intent-aware ranking, pagination, facets, and optional rank explanations. Hides Lombok synthetic symbols, tests, generated files, and fixtures by default unless requested or implied by the query.';
     case 'search_files':
@@ -227,7 +249,7 @@ function descriptionFor(name: V2ToolName): string {
     case 'get_file_summary':
       return 'Summarize a file using persistent symbols, imports, dependencies, and dependents.';
     case 'get_file_slice':
-      return 'Return one bounded source slice by file and line range, or by indexed symbol, with exact line numbers and truncation metadata. Use for editing or for one explicit missing range; do not loop this after get_research_pack/get_flow_pack when evidenceSlices already contain the needed source.';
+      return 'Return bounded source slices with exact line numbers and truncation metadata. Supports one slice via file+lines or symbol, and batch mode via slices:[{file,lines|symbol,maxChars}] for multiple explicit ranges in ONE call. Use batch mode instead of looping when a prompt asks for several files/ranges.';
     case 'get_dependencies':
       return 'Return direct dependency edges for a file or module.';
     case 'get_dependents':
