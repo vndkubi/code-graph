@@ -187,6 +187,7 @@ function Initialize-Workspace([pscustomobject]$Task, [string]$TaskRunDir, [strin
 function Write-McpConfig([string]$Path, [string]$Workspace, [string]$WorkspaceKey, [string]$HomeDir, [string]$CodeGraphRoot, [string]$DatabaseUrl, [string[]]$McpTools = @()) {
   $cliPath = Join-Path $CodeGraphRoot 'dist\cli.js'
   $defaultMcpTools = @(
+    'get_change_pack',
     'get_flow_pack',
     'get_research_pack',
     'get_context_packet',

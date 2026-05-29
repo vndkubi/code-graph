@@ -612,6 +612,32 @@ public class PaymentServiceTest {
     expect(changePack.invariants.some(invariant => invariant.includes('red-to-green'))).toBe(true);
     expect(changePack.expectedVerification.redGreenRequired).toBe(true);
     expect(changePack.routing.firstToolCall?.tool).toBe('get_file_slice');
+
+    const microChangePack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_change_pack',
+      args: {
+        task: 'debug duplicate refund timeout in PaymentService.refund',
+        changeType: 'debug',
+        profile: 'micro',
+        maxFiles: 10,
+        maxSymbols: 20,
+        tokenBudget: 12000,
+      },
+    }) as {
+      files: Array<{ file: string }>;
+      symbols: Array<{ symbol: string }>;
+      editRanges: Array<{ file?: string; lines?: string; symbol?: string }>;
+      testsLikelyRelevant: Array<{ file: string }>;
+      budget: { profile: string; tokenBudget: number };
+    };
+
+    expect(microChangePack.budget.profile).toBe('micro');
+    expect(microChangePack.budget.tokenBudget).toBe(3000);
+    expect(microChangePack.files.length).toBeLessThanOrEqual(4);
+    expect(microChangePack.symbols.length).toBeLessThanOrEqual(6);
+    expect(microChangePack.editRanges.length).toBeLessThanOrEqual(4);
+    expect(microChangePack.testsLikelyRelevant.length).toBeLessThanOrEqual(4);
   });
 
   it('builds answer-ready research and flow packs with source evidence', async () => {

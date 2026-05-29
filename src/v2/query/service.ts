@@ -1546,7 +1546,44 @@ export class V2QueryService {
 
   private async getResearchPack(snapshotId: string, args: Record<string, unknown>) {
     const target = String(args.target ?? '').trim();
-    const tokenBudget = clampInt(Number(args.tokenBudget ?? 8000), 1000, 12000);
+    const profile = normalizePackProfile(args.profile);
+    const requestedTaskType = normalizeOracleTaskType(String(args.taskType ?? 'research'));
+    if (requestedTaskType === 'implement' || requestedTaskType === 'debug' || requestedTaskType === 'refactor' || requestedTaskType === 'create-testcase') {
+      return {
+        target,
+        taskType: args.taskType ?? requestedTaskType,
+        profile,
+        routing: {
+          intendedUse: 'redirect edit/debug request to edit-ready context',
+          expectedToolCalls: 1,
+          answerDirectly: false,
+          followUpRule: 'Call get_change_pack with the full user task before searching or opening files.',
+        },
+        redirectTool: {
+          tool: 'get_change_pack',
+          args: {
+            task: target || '<full user task>',
+            target: target || undefined,
+            changeType: requestedTaskType === 'create-testcase' ? 'test' : requestedTaskType,
+            profile,
+          },
+          note: 'Use the full user task text for task when available; the current research target may be too narrow.',
+        },
+        missingFacts: ['Edit/debug tasks need change_pack edit ranges, invariants, and targeted validation.'],
+        nextAction: 'Call get_change_pack with the full user task, then open only routing.firstToolCall slices before editing.',
+        confidence: 0.45,
+        budget: {
+          profile,
+          estimatedResponseTokens: 120,
+        },
+      };
+    }
+    const defaultTokenBudget = packProfileValue(profile, 3500, 6000, 8000);
+    const maxTokenBudget = packProfileValue(profile, 3500, 6000, 12000);
+    const tokenBudget = Math.min(
+      clampInt(Number(args.tokenBudget ?? defaultTokenBudget), 1000, 12000),
+      maxTokenBudget,
+    );
     const preferredFileRole = String(args.fileRole ?? 'main_source');
     const preferredLanguage = args.language ? String(args.language) : await this.dominantResearchLanguage(snapshotId);
     const seedTerms = researchSeedTerms(target);
@@ -1555,14 +1592,14 @@ export class V2QueryService {
       target,
       preferredFileRole,
       preferredLanguage,
-      8,
+      packProfileValue(profile, 6, 8, 8),
     );
     const explicitFiles = await this.explicitResearchFiles(
       snapshotId,
       target,
       preferredFileRole,
       preferredLanguage,
-      5,
+      packProfileValue(profile, 4, 5, 5),
     );
     const explicitMemberTarget = explicitSymbolRefs(target).some(ref => Boolean(ref.member));
     const explicitFastPath = explicitFiles.length >= 3 || (explicitMemberTarget && explicitFiles.length > 0);
@@ -1574,7 +1611,7 @@ export class V2QueryService {
           query,
           fileRole: preferredFileRole,
           language: preferredLanguage,
-          limit: query === target ? 10 : 6,
+          limit: query === target ? packProfileValue(profile, 6, 8, 10) : packProfileValue(profile, 4, 5, 6),
           includeTests: false,
           includeGenerated: false,
           includeFixtures: false,
@@ -1598,7 +1635,7 @@ export class V2QueryService {
       ? scopedSymbolCandidates
       : explicitFastPath
         ? []
-        : symbolCandidates).slice(0, 6);
+        : symbolCandidates).slice(0, packProfileValue(profile, 4, 5, 6));
     const fileResults = explicitFastPath
       ? { files: [] as Array<Record<string, unknown>>, totalFound: explicitFiles.length }
       : await this.searchFiles(snapshotId, {
@@ -1606,13 +1643,13 @@ export class V2QueryService {
         query: target,
         fileRole: preferredFileRole,
         language: preferredLanguage,
-        limit: 8,
+        limit: packProfileValue(profile, 4, 6, 8),
         includeTests: false,
         includeGenerated: false,
         includeFixtures: false,
         includeSnippets: true,
-        snippetLines: clampInt(Number(args.snippetLines ?? 14), 6, 40),
-        snippetTokenBudget: Math.min(5000, Math.max(1200, Math.floor(tokenBudget * 0.45))),
+        snippetLines: clampInt(Number(args.snippetLines ?? packProfileValue(profile, 8, 10, 14)), 6, 40),
+        snippetTokenBudget: Math.min(packProfileValue(profile, 1600, 2800, 5000), Math.max(900, Math.floor(tokenBudget * 0.4))),
         explainRank: true,
       }) as { files: Array<Record<string, unknown>>; totalFound?: number };
     const candidateFiles = uniqueFileCandidates([
@@ -1627,12 +1664,12 @@ export class V2QueryService {
         endpoints: [],
       })),
       ...(explicitFiles.length >= 3 ? [] : fileResults.files.map(row => compactFileCandidate(row))),
-    ]).slice(0, 6);
+    ]).slice(0, packProfileValue(profile, 4, 5, 6));
 
-    const edgeSeeds = explicitFastPath ? [] : relevantSymbols.slice(0, 4);
+    const edgeSeeds = explicitFastPath ? [] : relevantSymbols.slice(0, packProfileValue(profile, 3, 4, 4));
     const candidateFileSet = new Set(candidateFiles.map(file => file.file));
-    const callersRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callers', 8) : [];
-    const calleesRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callees', 8) : [];
+    const callersRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callers', packProfileValue(profile, 6, 8, 8)) : [];
+    const calleesRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callees', packProfileValue(profile, 6, 8, 8)) : [];
     const callers = explicitFiles.length > 0
       ? callersRaw.filter(edge => candidateFileSet.has(edge.file)).slice(0, 8)
       : callersRaw;
@@ -1645,24 +1682,24 @@ export class V2QueryService {
         ...args,
         path: endpointNeedle,
         method: args.method ?? 'all',
-        limit: 8,
+        limit: packProfileValue(profile, 4, 6, 8),
         includeSnippets: false,
       }) as { endpoints: Array<Record<string, unknown>>; totalCount?: number }
       : { endpoints: [], totalCount: 0 };
-    const impactedEndpoints = compactEndpointCandidates(endpointSearch.endpoints).slice(0, 6);
+    const impactedEndpoints = compactEndpointCandidates(endpointSearch.endpoints).slice(0, packProfileValue(profile, 4, 5, 6));
     const topFiles = uniqueFilesInOrder([
       ...candidateFiles.map(file => file.file),
       ...relevantSymbols.map(symbol => symbol.file),
       ...callers.map(edge => edge.file),
       ...callees.map(edge => edge.file),
       ...impactedEndpoints.map(endpoint => endpoint.file),
-    ]).slice(0, 8);
+    ]).slice(0, packProfileValue(profile, 5, 6, 8));
     const evidenceSlices = await this.researchEvidenceSlices(
       snapshotId,
       relevantSymbols,
       candidateFiles,
       seedTerms,
-      Math.max(1400, Math.min(4500, Math.floor(tokenBudget * 4 * 0.22))),
+      Math.max(1200, Math.min(packProfileValue(profile, 2200, 3200, 4500), Math.floor(tokenBudget * 4 * 0.22))),
     );
     const flowSteps = researchFlowSteps({
       symbols: relevantSymbols,
@@ -1679,13 +1716,13 @@ export class V2QueryService {
       flowSteps,
     });
     const sufficientForAnswer = missingFacts.length === 0;
-    const returnedFlowSteps = flowSteps.slice(0, 8);
-    const returnedDefinitions = relevantSymbols.slice(0, 4);
-    const returnedCallers = callers.slice(0, 4).map(compactCallEdge);
-    const returnedCallees = callees.slice(0, 4).map(compactCallEdge);
-    const returnedEndpoints = impactedEndpoints.slice(0, 4);
-    const returnedTopFiles = topFiles.slice(0, 6);
-    const returnedSeedTerms = seedTerms.slice(0, 10);
+    const returnedFlowSteps = flowSteps.slice(0, packProfileValue(profile, 5, 6, 8));
+    const returnedDefinitions = relevantSymbols.slice(0, packProfileValue(profile, 3, 4, 4));
+    const returnedCallers = callers.slice(0, packProfileValue(profile, 3, 4, 4)).map(compactCallEdge);
+    const returnedCallees = callees.slice(0, packProfileValue(profile, 3, 4, 4)).map(compactCallEdge);
+    const returnedEndpoints = impactedEndpoints.slice(0, packProfileValue(profile, 3, 4, 4));
+    const returnedTopFiles = topFiles.slice(0, packProfileValue(profile, 5, 6, 6));
+    const returnedSeedTerms = seedTerms.slice(0, packProfileValue(profile, 8, 10, 10));
     const oracleTests = await this.findRelevantTestsForSeeds(
       snapshotId,
       uniqueStrings([
@@ -1693,13 +1730,13 @@ export class V2QueryService {
         ...returnedDefinitions.flatMap(symbol => [symbol.symbol, symbol.name]),
         ...returnedTopFiles.map(file => path.basename(file, path.extname(file))),
       ]),
-      8,
+      packProfileValue(profile, 5, 6, 8),
     );
     const oracleValidation = await this.validationHints(snapshotId, oracleTests, returnedTopFiles);
     const taskOracle = taskOracleFor({
       task: target,
       taskType: String(args.taskType ?? 'research'),
-      candidateFiles: candidateFiles.slice(0, 6),
+      candidateFiles: candidateFiles.slice(0, packProfileValue(profile, 4, 5, 6)),
       relevantSymbols: returnedDefinitions,
       testsLikelyRelevant: oracleTests,
       validation: oracleValidation,
@@ -1718,6 +1755,7 @@ export class V2QueryService {
       target,
       taskType: args.taskType ?? 'research',
       tokenBudget,
+      profile,
       routing: {
         intendedUse: 'answer-ready architecture/research context',
         expectedToolCalls: sufficientForAnswer ? 1 : 2,
@@ -1731,9 +1769,9 @@ export class V2QueryService {
       callees: returnedCallees,
       impactedEndpoints: returnedEndpoints,
       topFiles: returnedTopFiles,
-      evidenceSlices,
+      evidenceSlices: slimEvidenceSlicesForPack(evidenceSlices, profile),
       compressedEvidence,
-      taskOracle,
+      taskOracle: slimTaskOracleForPack(taskOracle, profile),
       completeness: {
         sufficientForAnswer,
         evidenceSliceCount: evidenceSlices.length,
@@ -1762,6 +1800,7 @@ export class V2QueryService {
         'Use granular tools only for explicit missing facts, not for broad rediscovery.',
       ],
       budget: {
+        profile,
         preferredFileRole,
         preferredLanguage,
         estimatedResponseTokens: estimateTokens(JSON.stringify({
@@ -2061,15 +2100,28 @@ export class V2QueryService {
     const task = String(args.task ?? '').trim();
     if (!task) return { error: 'get_context_packet requires a non-empty task.' };
 
+    const profile = normalizePackProfile(args.profile);
     const domain = args.domain ? String(args.domain).trim() : undefined;
-    const tokenBudget = clampInt(Number(args.tokenBudget ?? 8000), 1000, 30000);
-    const maxFiles = clampInt(Number(args.maxFiles ?? 8), 1, 20);
-    const maxSymbols = clampInt(Number(args.maxSymbols ?? 12), 1, 50);
+    const defaultTokenBudget = packProfileValue(profile, 3000, 5000, 8000);
+    const maxTokenBudget = packProfileValue(profile, 3000, 5000, 30000);
+    const tokenBudget = Math.min(
+      clampInt(Number(args.tokenBudget ?? defaultTokenBudget), 1000, 30000),
+      maxTokenBudget,
+    );
+    const defaultMaxFiles = packProfileValue(profile, 4, 5, 8);
+    const maxFileCap = packProfileValue(profile, 4, 5, 20);
+    const maxFiles = Math.min(clampInt(Number(args.maxFiles ?? defaultMaxFiles), 1, 20), maxFileCap);
+    const defaultMaxSymbols = packProfileValue(profile, 6, 8, 12);
+    const maxSymbolCap = packProfileValue(profile, 6, 8, 50);
+    const maxSymbols = Math.min(clampInt(Number(args.maxSymbols ?? defaultMaxSymbols), 1, 50), maxSymbolCap);
     const includeTests = args.includeTests !== false;
-    const includeSnippets = args.includeSnippets !== false;
-    const snippetLines = clampInt(Number(args.snippetLines ?? 12), 3, 40);
+    const includeSnippets = profile === 'full' ? args.includeSnippets !== false : args.includeSnippets === true;
+    const snippetLines = clampInt(Number(args.snippetLines ?? packProfileValue(profile, 5, 8, 12)), 3, 40);
     const snippetTokenBudget = clampInt(
-      Number(args.snippetTokenBudget ?? Math.min(6000, Math.max(800, Math.floor(tokenBudget * 0.45)))),
+      Number(args.snippetTokenBudget ?? Math.min(
+        packProfileValue(profile, 800, 2000, 6000),
+        Math.max(500, Math.floor(tokenBudget * packProfileValue(profile, 0.25, 0.35, 0.45))),
+      )),
       100,
       12000,
     );
@@ -2153,7 +2205,7 @@ export class V2QueryService {
       ...relevantSymbols.map(row => row.file),
       ...myBatisContext.topFiles,
     ].filter(Boolean)).slice(0, maxFiles);
-    const sliceHints = contextSliceHints(candidateFiles, relevantSymbols, Math.min(5, maxFiles));
+    const sliceHints = contextSliceHints(candidateFiles, relevantSymbols, Math.min(packProfileValue(profile, 3, 4, 5), maxFiles));
     const toolHints = sliceHints.length > 0 ? [{
       tool: 'get_file_slice',
       args: {
@@ -2189,10 +2241,20 @@ export class V2QueryService {
       evidenceSlices: [],
     });
 
+    const packedCandidateFiles = slimCandidateFilesForPack(candidateFiles, profile);
+    const packedRelevantSymbols = slimSymbolsForPack(relevantSymbols, profile);
+    const packedEndpointCandidates = profile === 'full'
+      ? endpointCandidates
+      : endpointCandidates.slice(0, profile === 'micro' ? 3 : 5);
+    const packedTestsLikelyRelevant = slimTestsForPack(testsLikelyRelevant, profile);
+    const packedValidation = slimValidationForPack(validation, profile);
+    const packedTaskOracle = slimTaskOracleForPack(taskOracle, profile);
+
     const result = {
       task,
       domain: inferredDomain,
       query,
+      profile,
       router: {
         strategy: isMyBatisIntent(query)
           ? 'mybatis-aware file/symbol/config retrieval over the persistent index'
@@ -2210,12 +2272,12 @@ export class V2QueryService {
         mapperFiles: myBatisContext.topFiles.filter(file => file.endsWith('.xml')).slice(0, maxFiles),
         relatedJavaFiles: myBatisContext.topFiles.filter(file => file.endsWith('.java')).slice(0, maxFiles),
       } : undefined,
-      candidateFiles,
-      relevantSymbols,
-      endpointCandidates,
-      testsLikelyRelevant,
-      validation,
-      taskOracle,
+      candidateFiles: packedCandidateFiles,
+      relevantSymbols: packedRelevantSymbols,
+      endpointCandidates: packedEndpointCandidates,
+      testsLikelyRelevant: packedTestsLikelyRelevant,
+      validation: packedValidation,
+      taskOracle: packedTaskOracle,
       topFiles,
       omissions: {
         fileCandidates: Math.max(0, Number(files.totalFound ?? candidateFiles.length) - candidateFiles.length),
@@ -2234,6 +2296,7 @@ export class V2QueryService {
     return {
       ...result,
       budget: {
+        profile,
         tokenBudget,
         maxFiles,
         maxSymbols,
@@ -2327,18 +2390,21 @@ export class V2QueryService {
   private async getChangePack(snapshotId: string, args: Record<string, unknown>) {
     const task = String(args.task ?? args.target ?? '').trim();
     if (!task) return { error: 'get_change_pack requires a non-empty task.' };
+    const profile = normalizePackProfile(args.profile);
     const changeType = normalizeOracleTaskType(String(args.changeType ?? taskKindForOracle(task)));
     const context = await this.getContextPacket(snapshotId, {
       ...args,
       task,
-      tokenBudget: args.tokenBudget ?? 8000,
-      maxFiles: args.maxFiles ?? 8,
-      maxSymbols: args.maxSymbols ?? 12,
+      profile,
+      tokenBudget: args.tokenBudget ?? packProfileValue(profile, 3000, 5000, 8000),
+      maxFiles: args.maxFiles ?? packProfileValue(profile, 4, 5, 8),
+      maxSymbols: args.maxSymbols ?? packProfileValue(profile, 6, 8, 12),
       includeTests: args.includeTests !== false,
       includeSnippets: args.includeSnippets ?? false,
     }) as Record<string, unknown>;
     const taskOracle = isPlainObject(context.taskOracle) ? context.taskOracle : {};
     const validation = isPlainObject(context.validation) ? context.validation : {};
+    const contextBudget = isPlainObject(context.budget) ? context.budget : {};
     const candidateFiles = arrayRecords(context.candidateFiles);
     const relevantSymbols = arrayRecords(context.relevantSymbols);
     const sliceHints = arrayRecords(context.sliceHints);
@@ -2358,7 +2424,7 @@ export class V2QueryService {
       : undefined;
     const commands = stringArray(validation.suggestedCommands);
     const editRanges = sliceHints
-      .slice(0, 8)
+      .slice(0, packProfileValue(profile, 4, 6, 8))
       .map(hint => ({
         file: stringOrUndefined(hint.file),
         lines: stringOrUndefined(hint.lines),
@@ -2383,21 +2449,24 @@ export class V2QueryService {
       files: candidateFiles,
       symbols: relevantSymbols,
       editRanges,
-      testsLikelyRelevant,
-      invariants: changePackInvariants(changeType, taskOracle, patchImpact),
+      testsLikelyRelevant: slimTestsForPack(testsLikelyRelevant, profile),
+      invariants: changePackInvariants(changeType, taskOracle, patchImpact).slice(0, packProfileValue(profile, 5, 8, 12)),
       expectedVerification: isPlainObject(taskOracle.expectedVerification)
         ? taskOracle.expectedVerification
         : { commands, targetedTestFiles: stringArray(validation.targetedTestFiles) },
       commands,
-      taskOracle,
-      patchImpact: patchImpact ? compactReviewObject(patchImpact, 8, 3) : undefined,
+      taskOracle: slimTaskOracleForPack(taskOracle, profile),
+      patchImpact: patchImpact ? compactReviewObject(patchImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined,
       topFiles,
       nextAction: editRanges.length > 0
         ? 'Call get_file_slice once with routing.firstToolCall.args, then make the smallest scoped edit.'
         : 'Resolve a concrete file/symbol first with search_symbol or search_files before editing.',
       confidence: context.confidence ?? 0.4,
       budget: {
-        tokenBudget: Number(args.tokenBudget ?? 8000),
+        profile,
+        tokenBudget: typeof contextBudget.tokenBudget === 'number'
+          ? contextBudget.tokenBudget
+          : Number(args.tokenBudget ?? packProfileValue(profile, 3000, 5000, 8000)),
         estimatedResponseTokens: estimateTokens(JSON.stringify({
           files: candidateFiles,
           symbols: relevantSymbols,
@@ -3876,6 +3945,123 @@ function confidenceFromScore(value: unknown): number {
 
 function estimateTokens(value: string): number {
   return Math.ceil(value.length / 4);
+}
+
+type PackProfile = 'micro' | 'compact' | 'full';
+
+function normalizePackProfile(value: unknown, fallback: PackProfile = 'full'): PackProfile {
+  const profile = String(value ?? '').trim().toLowerCase();
+  if (profile === 'micro' || profile === 'compact' || profile === 'full') return profile;
+  return fallback;
+}
+
+function packProfileValue(profile: PackProfile, micro: number, compact: number, full: number): number {
+  if (profile === 'micro') return micro;
+  if (profile === 'full') return full;
+  return compact;
+}
+
+function slimCandidateFilesForPack(files: Array<Record<string, unknown>>, profile: PackProfile): Array<Record<string, unknown>> {
+  if (profile === 'full') return files;
+  const symbolLimit = profile === 'micro' ? 2 : 3;
+  const endpointLimit = profile === 'micro' ? 1 : 2;
+  const reasonLimit = profile === 'micro' ? 120 : 180;
+  return files.map(file => {
+    const snippet = isPlainObject(file.snippet)
+      ? {
+        startLine: file.snippet.startLine,
+        endLine: file.snippet.endLine,
+        text: truncateOptional(file.snippet.text, profile === 'micro' ? 420 : 900),
+        truncated: Boolean(file.snippet.truncated),
+      }
+      : undefined;
+    return {
+      file: String(file.file ?? ''),
+      lines: stringOrUndefined(file.lines),
+      whyRelevant: truncateOptional(file.whyRelevant, reasonLimit),
+      confidence: typeof file.confidence === 'number' ? file.confidence : undefined,
+      language: stringOrUndefined(file.language),
+      fileRole: stringOrUndefined(file.fileRole),
+      snippet,
+      topSymbols: slimSymbolsForPack(arrayRecords(file.topSymbols).slice(0, symbolLimit), profile),
+      endpoints: arrayRecords(file.endpoints)
+        .slice(0, endpointLimit)
+        .map(endpoint => compactReviewObject(endpoint, endpointLimit, 1)),
+    };
+  });
+}
+
+function slimSymbolsForPack(symbols: Array<Record<string, unknown>>, profile: PackProfile): Array<Record<string, unknown>> {
+  if (profile === 'full') return symbols;
+  const reasonLimit = profile === 'micro' ? 120 : 180;
+  const signatureLimit = profile === 'micro' ? 120 : 180;
+  return symbols.map(symbol => ({
+    symbol: String(symbol.symbol ?? symbol.fqName ?? symbol.name ?? ''),
+    name: String(symbol.name ?? symbol.symbol ?? ''),
+    kind: stringOrUndefined(symbol.kind),
+    file: String(symbol.file ?? ''),
+    lines: stringOrUndefined(symbol.lines ?? symbol.line),
+    signature: truncateOptional(symbol.signature, signatureLimit),
+    frameworkRole: stringOrUndefined(symbol.frameworkRole),
+    whyRelevant: truncateOptional(symbol.whyRelevant ?? symbol.matchReason, reasonLimit),
+    confidence: typeof symbol.confidence === 'number' ? symbol.confidence : undefined,
+  }));
+}
+
+function slimTestsForPack(tests: Array<Record<string, unknown>>, profile: PackProfile): Array<Record<string, unknown>> {
+  if (profile === 'full') return tests;
+  const limit = profile === 'micro' ? 4 : 6;
+  return tests.slice(0, limit).map(test => ({
+    file: String(test.file ?? ''),
+    symbol: stringOrUndefined(test.symbol),
+    score: typeof test.score === 'number' ? test.score : undefined,
+    reasons: stringArray(test.reasons).slice(0, profile === 'micro' ? 1 : 2),
+  })).filter(test => test.file);
+}
+
+function slimValidationForPack(validation: Record<string, unknown>, profile: PackProfile): Record<string, unknown> {
+  if (profile === 'full') return validation;
+  return {
+    targetedTestFiles: stringArray(validation.targetedTestFiles).slice(0, profile === 'micro' ? 4 : 6),
+    suggestedCommands: stringArray(validation.suggestedCommands).slice(0, profile === 'micro' ? 2 : 3),
+    packageManager: stringOrUndefined(validation.packageManager),
+  };
+}
+
+function slimTaskOracleForPack(taskOracle: Record<string, unknown>, profile: PackProfile): Record<string, unknown> {
+  if (profile === 'full') return taskOracle;
+  const factLimit = profile === 'micro' ? 5 : 8;
+  return {
+    taskType: stringOrUndefined(taskOracle.taskType),
+    successCriteria: stringArray(taskOracle.successCriteria).slice(0, profile === 'micro' ? 3 : 5),
+    expectedVerification: isPlainObject(taskOracle.expectedVerification)
+      ? {
+        commands: stringArray(taskOracle.expectedVerification.commands).slice(0, profile === 'micro' ? 2 : 3),
+        targetedTestFiles: stringArray(taskOracle.expectedVerification.targetedTestFiles).slice(0, profile === 'micro' ? 4 : 6),
+        fallback: stringOrUndefined(taskOracle.expectedVerification.fallback),
+        redGreenRequired: taskOracle.expectedVerification.redGreenRequired,
+      }
+      : undefined,
+    likelyTests: slimTestsForPack(arrayRecords(taskOracle.likelyTests), profile),
+    goldenFacts: arrayRecords(taskOracle.goldenFacts).slice(0, factLimit),
+    editGuardrails: stringArray(taskOracle.editGuardrails).slice(0, profile === 'micro' ? 2 : 4),
+    passSignal: stringOrUndefined(taskOracle.passSignal),
+  };
+}
+
+function slimEvidenceSlicesForPack(slices: Array<Record<string, unknown>>, profile: PackProfile): Array<Record<string, unknown>> {
+  if (profile === 'full') return slices;
+  const limit = profile === 'micro' ? 3 : 4;
+  const textLimit = profile === 'micro' ? 700 : 1100;
+  return slices.slice(0, limit).map(slice => ({
+    file: String(slice.file ?? ''),
+    lines: stringOrUndefined(slice.lines),
+    symbol: stringOrUndefined(slice.symbol),
+    why: truncateOptional(slice.why, profile === 'micro' ? 100 : 150),
+    text: truncateOptional(slice.text, textLimit),
+    truncated: Boolean(slice.truncated),
+    confidence: typeof slice.confidence === 'number' ? slice.confidence : undefined,
+  }));
 }
 
 interface TaskOracleInput {

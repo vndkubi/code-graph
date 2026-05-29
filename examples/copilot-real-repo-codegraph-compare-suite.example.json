@@ -1,0 +1,99 @@
+{
+  "name": "copilot-real-repo-codegraph-compare",
+  "description": "Read-only Copilot quality benchmark on real Elasticsearch and Hadoop repositories.",
+  "tasks": [
+    {
+      "id": "hadoop-blockmanager-process-report",
+      "repoRoot": "D:/Personal/Projects/hadoop",
+      "prompt": "Use the ${mcpServer} MCP server for source context first. In the repository at ${workspace}, investigate how HDFS NameNode handles DataNode full block reports through BlockManager.processReport. Explain the RPC entry point, the key BlockManager methods, storage/lease/invalidation handling, and the most relevant tests. Do not edit files. Return JSON only with keys: keyFiles, flow, risks, tests, confidence. Include concrete file paths and line numbers.",
+      "baselinePrompt": "In the repository at ${workspace}, investigate how HDFS NameNode handles DataNode full block reports through BlockManager.processReport. Explain the RPC entry point, the key BlockManager methods, storage/lease/invalidation handling, and the most relevant tests. Do not use CodeGraph or MCP tools. Do not edit files. Return JSON only with keys: keyFiles, flow, risks, tests, confidence. Include concrete file paths and line numbers.",
+      "validation": {
+        "maxChangedFiles": 0,
+        "goldenFacts": [
+          "BlockManager\\.java",
+          "processReport",
+          "NameNodeRpcServer\\.java",
+          "DatanodeStorage|DatanodeStorageInfo",
+          "invalidatedBlocks|invalidate",
+          "TestBlockManager\\.java|TestBlockReportLease\\.java",
+          "line|lines|:\\d+"
+        ],
+        "forbiddenClaims": [
+          "Elasticsearch",
+          "HTTP endpoint",
+          "database transaction"
+        ]
+      }
+    },
+    {
+      "id": "hadoop-fsnamesystem-complete-file",
+      "repoRoot": "D:/Personal/Projects/hadoop",
+      "prompt": "Use the ${mcpServer} MCP server for source context first. In the repository at ${workspace}, trace how HDFS completes a file from the client-side DFSOutputStream through NameNodeRpcServer into FSNamesystem.completeFile and FSDirWriteFileOp.completeFile. Explain locks/retry semantics where visible, namespace/block finalization, and relevant tests. Do not edit files. Return JSON only with keys: keyFiles, flow, risks, tests, confidence. Include concrete file paths and line numbers.",
+      "baselinePrompt": "In the repository at ${workspace}, trace how HDFS completes a file from the client-side DFSOutputStream through NameNodeRpcServer into FSNamesystem.completeFile and FSDirWriteFileOp.completeFile. Explain locks/retry semantics where visible, namespace/block finalization, and relevant tests. Do not use CodeGraph or MCP tools. Do not edit files. Return JSON only with keys: keyFiles, flow, risks, tests, confidence. Include concrete file paths and line numbers.",
+      "validation": {
+        "maxChangedFiles": 0,
+        "goldenFacts": [
+          "DFSOutputStream\\.java",
+          "NameNodeRpcServer\\.java",
+          "FSNamesystem\\.java",
+          "FSDirWriteFileOp\\.java",
+          "completeFile",
+          "TestDFSOutputStream\\.java|TestPipelinesFailover\\.java|TestReplication\\.java",
+          "line|lines|:\\d+"
+        ],
+        "forbiddenClaims": [
+          "Elasticsearch",
+          "REST API",
+          "Lucene"
+        ]
+      }
+    },
+    {
+      "id": "elasticsearch-transport-search-action",
+      "repoRoot": "D:/Personal/Projects/elasticsearch",
+      "prompt": "Use the ${mcpServer} MCP server for source context first. In the repository at ${workspace}, investigate search request execution around TransportSearchAction.doExecute. Explain request validation/rewrite, how SearchTransportService and SearchPhaseController fit in, where async search phases are created, and the most relevant tests. Do not edit files. Return JSON only with keys: keyFiles, flow, risks, tests, confidence. Include concrete file paths and line numbers.",
+      "baselinePrompt": "In the repository at ${workspace}, investigate search request execution around TransportSearchAction.doExecute. Explain request validation/rewrite, how SearchTransportService and SearchPhaseController fit in, where async search phases are created, and the most relevant tests. Do not use CodeGraph or MCP tools. Do not edit files. Return JSON only with keys: keyFiles, flow, risks, tests, confidence. Include concrete file paths and line numbers.",
+      "validation": {
+        "maxChangedFiles": 0,
+        "goldenFacts": [
+          "TransportSearchAction\\.java",
+          "doExecute",
+          "SearchRequest",
+          "SearchTransportService",
+          "SearchPhaseController",
+          "AbstractSearchAsyncAction|async search phase|search phase",
+          "TransportSearchActionTests\\.java",
+          "line|lines|:\\d+"
+        ],
+        "forbiddenClaims": [
+          "HDFS",
+          "NameNode",
+          "DataNode"
+        ]
+      }
+    },
+    {
+      "id": "elasticsearch-allocation-service-reroute",
+      "repoRoot": "D:/Personal/Projects/elasticsearch",
+      "prompt": "Use the ${mcpServer} MCP server for source context first. In the repository at ${workspace}, investigate shard allocation reroute flow in AllocationService.reroute. Compare command reroute with reason/listener reroute, explain RoutingAllocation creation, shardsAllocator.allocate, BatchedRerouteService/RerouteService integration, and relevant tests. Do not edit files. Return JSON only with keys: keyFiles, flow, risks, tests, confidence. Include concrete file paths and line numbers.",
+      "baselinePrompt": "In the repository at ${workspace}, investigate shard allocation reroute flow in AllocationService.reroute. Compare command reroute with reason/listener reroute, explain RoutingAllocation creation, shardsAllocator.allocate, BatchedRerouteService/RerouteService integration, and relevant tests. Do not use CodeGraph or MCP tools. Do not edit files. Return JSON only with keys: keyFiles, flow, risks, tests, confidence. Include concrete file paths and line numbers.",
+      "validation": {
+        "maxChangedFiles": 0,
+        "goldenFacts": [
+          "AllocationService\\.java",
+          "reroute",
+          "RoutingAllocation",
+          "shardsAllocator\\.allocate|allocate\\(",
+          "BatchedRerouteService\\.java",
+          "RerouteService\\.java",
+          "line|lines|:\\d+"
+        ],
+        "forbiddenClaims": [
+          "HDFS",
+          "NameNode",
+          "DataNode"
+        ]
+      }
+    }
+  ]
+}
