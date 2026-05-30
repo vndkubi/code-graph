@@ -134,8 +134,12 @@ interface ParseResultForFile {
 const MAX_QUERY_BATCH_PARAMS = 10_000;
 const MAX_WRITE_BATCH_PARAMS = boundedInt(process.env.CODEGRAPH_WRITE_BATCH_PARAMS, 50_000, 1_000, 60_000);
 const WRITE_FILE_BATCH_SIZE = boundedInt(process.env.CODEGRAPH_WRITE_FILE_BATCH_SIZE, 750, 100, 2_000);
-const MAX_CALL_ENDPOINT_LENGTH = 512;
+const COPY_INSERT_MIN_ROWS = boundedInt(process.env.CODEGRAPH_COPY_MIN_ROWS, 1_000, 100, 50_000);
+const BULK_REBUILD_CALL_INDEX_MIN_FILES = boundedInt(process.env.CODEGRAPH_BULK_REBUILD_CALL_INDEX_MIN_FILES, 2_000, 0, 100_000);
+const COPY_INSERT_TABLES = new Set(['symbols', 'imports', 'call_edges', 'dependency_edges']);
+const MAX_CALL_ENDPOINT_LENGTH = 2048;
 const CALL_ENDPOINT_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$/;
+type CallSignalTier = 'primary' | 'low_signal' | 'provider';
 const LOW_SIGNAL_UNQUALIFIED_CALLS = new Set([
   'assertArrayEquals',
   'assertEquals',
@@ -396,6 +400,7 @@ export class V2Indexer {
     const parsePlanByPath = new Map(prepared.plans.map(plan => [plan.file.relPath, plan]));
     filesParsed = prepared.filesParsed;
     parseCacheHits = changes.unchangedFiles.length + prepared.parseCacheHits;
+    const rebuildCallSearchIndexes = changes.changedFiles.length >= BULK_REBUILD_CALL_INDEX_MIN_FILES;
 
     const tx = this.db.transaction(async () => {
       options.progress?.({
@@ -427,6 +432,16 @@ export class V2Indexer {
         JSON.stringify(providerSet.providerVersions),
         JSON.stringify(providerSet.config),
       );
+
+      if (rebuildCallSearchIndexes) {
+        options.progress?.({
+          phase: 'write',
+          status: 'start',
+          message: 'dropping call search indexes for bulk load',
+          elapsedMs: Date.now() - start,
+        });
+        await this.dropCallSearchIndexesForBulkLoad();
+      }
 
       const parseStatusByPath = new Map<string, string>();
       for (const file of manifest.files) {
@@ -486,6 +501,15 @@ export class V2Indexer {
         elapsedMs: Date.now() - start,
       });
       await this.resolveCallEdges(snapshotId);
+      if (rebuildCallSearchIndexes) {
+        options.progress?.({
+          phase: 'edges',
+          status: 'start',
+          message: 'rebuilding call search indexes',
+          elapsedMs: Date.now() - start,
+        });
+        await this.rebuildCallSearchIndexesAfterBulkLoad();
+      }
       options.progress?.({
         phase: 'edges',
         status: 'start',
@@ -1220,7 +1244,7 @@ export class V2Indexer {
       }
 
       for (const call of result.calls) {
-        const normalizedCall = normalizedCallEndpoints(call);
+        const normalizedCall = classifyCallEdge(call);
         if (!normalizedCall) continue;
         callRows.push([
           snapshotId,
@@ -1228,9 +1252,11 @@ export class V2Indexer {
           normalizedCall.callee,
           file.relPath,
           call.line,
-          call.confidence ?? 0.4,
+          normalizedCall.confidence,
           call.resolutionKind ?? 'name-only',
           file.role,
+          normalizedCall.signalTier,
+          JSON.stringify(normalizedCall.signalReasons),
         ]);
       }
     }
@@ -1336,6 +1362,7 @@ export class V2Indexer {
       FROM call_edges
       WHERE snapshot_id = ?
         AND resolution_kind = 'name-only'
+        AND signal_tier = 'primary'
         AND callee ~ '^(this[.])?[A-Za-z_$][A-Za-z0-9_$]*[.][A-Za-z_$][A-Za-z0-9_$]*$'
       ${fileFilter ? `AND file IN (${filePlaceholders})` : ''}
     `).all(...(fileFilter ? [snapshotId, ...fileFilter] : [snapshotId])) as Array<{
@@ -1410,6 +1437,8 @@ export class V2Indexer {
           0.65,
           'interface-implementation',
           row.file_role,
+          'primary',
+          JSON.stringify(['interface implementation expansion']),
         ]);
       }
     };
@@ -1460,6 +1489,24 @@ export class V2Indexer {
     }
   }
 
+  private async dropCallSearchIndexesForBulkLoad(): Promise<void> {
+    await this.db.prepare('SET LOCAL statement_timeout = 0').run();
+    await this.db.prepare('DROP INDEX IF EXISTS idx_call_edges_caller_signal_trgm').run();
+    await this.db.prepare('DROP INDEX IF EXISTS idx_call_edges_callee_signal_trgm').run();
+  }
+
+  private async rebuildCallSearchIndexesAfterBulkLoad(): Promise<void> {
+    await this.db.prepare('SET LOCAL statement_timeout = 0').run();
+    await this.db.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_call_edges_caller_signal_trgm ON call_edges USING gin (caller gin_trgm_ops)
+      WHERE signal_tier IN ('primary', 'provider')
+    `).run();
+    await this.db.prepare(`
+      CREATE INDEX IF NOT EXISTS idx_call_edges_callee_signal_trgm ON call_edges USING gin (callee gin_trgm_ops)
+      WHERE signal_tier IN ('primary', 'provider')
+    `).run();
+  }
+
   private async insertRows(
     table: string,
     columns: string[],
@@ -1467,6 +1514,10 @@ export class V2Indexer {
     options: BatchInsertOptions = {},
   ): Promise<void> {
     if (rows.length === 0) return;
+    if (COPY_INSERT_TABLES.has(table) && rows.length >= COPY_INSERT_MIN_ROWS) {
+      const copied = await this.db.copyFromRows(table, columns, rows, options);
+      if (copied) return;
+    }
     const maxRows = Math.max(1, Math.floor(MAX_WRITE_BATCH_PARAMS / columns.length));
     const insertKeyword = options.ignoreConflicts ? 'INSERT OR IGNORE INTO' : 'INSERT INTO';
     const columnList = columns.map(sqlColumnName).join(', ');
@@ -1700,7 +1751,10 @@ function copyableColumnsFor(table: string): string[] {
     case 'type_refs':
       return ['snapshot_id', 'file', 'referenced_type', 'context', 'line', 'file_role'];
     case 'call_edges':
-      return ['snapshot_id', 'caller', 'callee', 'file', 'line', 'confidence', 'resolution_kind', 'file_role'];
+      return [
+        'snapshot_id', 'caller', 'callee', 'file', 'line', 'confidence', 'resolution_kind', 'file_role',
+        'signal_tier', 'signal_reasons_json',
+      ];
     case 'dependency_edges':
       return ['snapshot_id', 'from_file', 'to_file', 'kind', 'confidence', 'resolution_kind'];
     case 'annotations':
@@ -1838,24 +1892,50 @@ function optionalStringsEqual(left: string | null | undefined, right: string | n
   return (left ?? undefined) === (right ?? undefined);
 }
 
-function normalizedCallEndpoints(call: {
+function classifyCallEdge(call: {
   caller: string;
   callee: string;
+  confidence?: number;
   resolutionKind?: string;
-}): { caller: string; callee: string } | undefined {
+}): { caller: string; callee: string; confidence: number; signalTier: CallSignalTier; signalReasons: string[] } | undefined {
   const semanticProviderCall = call.resolutionKind === 'scip-reference';
   const caller = normalizedCallEndpoint(call.caller, semanticProviderCall);
   const callee = normalizedCallEndpoint(call.callee, semanticProviderCall);
   if (!caller || !callee) return undefined;
-  if (!semanticProviderCall && !callee.includes('.') && LOW_SIGNAL_UNQUALIFIED_CALLS.has(callee)) return undefined;
-  return { caller, callee };
+  const baseConfidence = call.confidence ?? 0.4;
+  if (semanticProviderCall) {
+    return {
+      caller,
+      callee,
+      confidence: Math.max(baseConfidence, 0.9),
+      signalTier: 'provider',
+      signalReasons: ['semantic provider fact'],
+    };
+  }
+
+  const signalReasons: string[] = [];
+  if (!CALL_ENDPOINT_PATTERN.test(caller)) signalReasons.push('caller is an expression');
+  if (!CALL_ENDPOINT_PATTERN.test(callee)) signalReasons.push('callee is an expression');
+  if (!callee.includes('.') && LOW_SIGNAL_UNQUALIFIED_CALLS.has(callee)) {
+    signalReasons.push('low-signal unqualified helper call');
+  }
+
+  const signalTier: CallSignalTier = signalReasons.length > 0 ? 'low_signal' : 'primary';
+  return {
+    caller,
+    callee,
+    confidence: signalTier === 'low_signal' ? Math.min(baseConfidence, 0.25) : baseConfidence,
+    signalTier,
+    signalReasons,
+  };
 }
 
 function normalizedCallEndpoint(value: string, allowProviderSymbol: boolean): string | undefined {
   const trimmed = value.trim();
   if (!trimmed || trimmed.length > MAX_CALL_ENDPOINT_LENGTH) return undefined;
-  if (allowProviderSymbol) return /[\r\n]/.test(trimmed) ? undefined : trimmed;
-  return CALL_ENDPOINT_PATTERN.test(trimmed) ? trimmed : undefined;
+  if (/[\r\n]/.test(trimmed)) return undefined;
+  if (allowProviderSymbol) return trimmed;
+  return trimmed;
 }
 
 function defaultParseWorkerLimit(): number {

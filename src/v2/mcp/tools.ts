@@ -18,6 +18,10 @@ const PackProfileOption = {
   profile: z.enum(['micro', 'compact', 'full']).optional(),
 };
 
+const CallSignalOption = {
+  includeLowSignal: z.boolean().optional(),
+};
+
 export const V2ToolSchemas = {
   search_symbol: z.object({
     query: z.string().default('*'),
@@ -57,6 +61,7 @@ export const V2ToolSchemas = {
     includeTests: z.boolean().optional(),
     includeGenerated: z.boolean().optional(),
     includeFixtures: z.boolean().optional(),
+    ...CallSignalOption,
     ...FreshnessOptions,
   }),
   get_file_summary: z.object({
@@ -88,11 +93,13 @@ export const V2ToolSchemas = {
   get_callers: z.object({
     symbol: z.string(),
     limit: z.number().min(1).max(200).default(100),
+    ...CallSignalOption,
     ...FreshnessOptions,
   }),
   get_callees: z.object({
     symbol: z.string(),
     limit: z.number().min(1).max(200).default(100),
+    ...CallSignalOption,
     ...FreshnessOptions,
   }),
   find_endpoints: z.object({
@@ -165,6 +172,7 @@ export const V2ToolSchemas = {
     target: z.string(),
     taskType: z.string().default('architecture'),
     tokenBudget: z.number().min(1000).max(12000).default(8000),
+    ...CallSignalOption,
     ...PackProfileOption,
     ...SnippetOptions,
     ...FreshnessOptions,
@@ -173,6 +181,7 @@ export const V2ToolSchemas = {
     target: z.string(),
     taskType: z.string().default('research'),
     tokenBudget: z.number().min(1000).max(12000).default(8000),
+    ...CallSignalOption,
     ...PackProfileOption,
     ...SnippetOptions,
     ...FreshnessOptions,
@@ -184,6 +193,7 @@ export const V2ToolSchemas = {
     maxFiles: z.number().min(1).max(20).default(8),
     maxSymbols: z.number().min(1).max(50).default(12),
     includeTests: z.boolean().default(true),
+    ...CallSignalOption,
     ...PackProfileOption,
     ...SnippetOptions,
     ...FreshnessOptions,
@@ -216,6 +226,7 @@ export const V2ToolSchemas = {
     groupBy: z.enum(['none', 'file', 'kind', 'caller']).default('file'),
     depth: z.number().min(1).max(5).default(1),
     method: z.string().default('all'),
+    ...CallSignalOption,
     ...SnippetOptions,
     ...FreshnessOptions,
   }),

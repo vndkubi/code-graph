@@ -1,13 +1,21 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { once } from 'node:events';
+import type { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
+import { from as copyFrom } from 'pg-copy-streams';
 
 const { Pool } = pg;
 type PgRow = pg.QueryResultRow;
-type PgQueryable = Pick<pg.Pool, 'query'>;
+type PgQueryable = pg.PoolClient;
 const transactionClient = new AsyncLocalStorage<PgQueryable>();
+
+export interface CopyFromRowsOptions {
+  ignoreConflicts?: boolean;
+  suffix?: string;
+}
 
 export interface PostgresOpenResult {
   db: PostgresCodeGraphDb;
@@ -55,6 +63,32 @@ export class PostgresCodeGraphDb {
     return row ? Number(Object.values(row)[0] ?? 0) : 0;
   }
 
+  async copyFromRows(
+    table: string,
+    columns: string[],
+    rows: unknown[][],
+    options: CopyFromRowsOptions = {},
+  ): Promise<boolean> {
+    if (rows.length === 0) return true;
+    const activeClient = transactionClient.getStore();
+    const client = activeClient ?? await this.pool.connect();
+    const savepoint = activeClient ? `codegraph_copy_${Date.now().toString(36)}` : undefined;
+    try {
+      if (savepoint) await client.query(`SAVEPOINT ${savepoint}`);
+      await this.copyFromRowsUnsafe(client, table, columns, rows, options);
+      if (savepoint) await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+      return true;
+    } catch {
+      if (savepoint) {
+        await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+      }
+      return false;
+    } finally {
+      if (!activeClient) client.release();
+    }
+  }
+
   transaction<T>(fn: () => T | Promise<T>): () => Promise<T> {
     return () => this.runTransaction(fn);
   }
@@ -82,6 +116,33 @@ export class PostgresCodeGraphDb {
     const converted = convertSql(sql);
     return (transactionClient.getStore() ?? this.pool).query(converted, params) as Promise<pg.QueryResult<T>>;
   }
+
+  private async copyFromRowsUnsafe(
+    client: pg.PoolClient,
+    table: string,
+    columns: string[],
+    rows: unknown[][],
+    options: CopyFromRowsOptions,
+  ): Promise<void> {
+    if (options.ignoreConflicts || options.suffix) {
+      const tempTable = `__codegraph_copy_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+      await client.query(`CREATE TEMP TABLE ${quoteIdentifier(tempTable)} (LIKE ${quoteIdentifier(table)} INCLUDING DEFAULTS) ON COMMIT DROP`);
+      await copyRowsInto(client, tempTable, columns, rows);
+      const columnList = columns.map(quoteIdentifier).join(', ');
+      const selectList = columns.map(quoteIdentifier).join(', ');
+      const suffix = options.suffix ?? 'ON CONFLICT DO NOTHING';
+      await client.query(`
+        INSERT INTO ${quoteIdentifier(table)} (${columnList})
+        SELECT ${selectList}
+        FROM ${quoteIdentifier(tempTable)}
+        ${suffix}
+      `);
+      await client.query(`DROP TABLE ${quoteIdentifier(tempTable)}`);
+      return;
+    }
+
+    await copyRowsInto(client, table, columns, rows);
+  }
 }
 
 export async function openPostgresCodeGraphDb(): Promise<PostgresOpenResult> {
@@ -108,7 +169,14 @@ export async function openPostgresCodeGraphDb(): Promise<PostgresOpenResult> {
 async function migratePostgres(pool: pg.Pool): Promise<void> {
   const schemaPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'postgres-schema.sql');
   const schema = fs.readFileSync(schemaPath, 'utf-8');
-  await pool.query(schema);
+  const client = await pool.connect();
+  try {
+    await client.query("SELECT pg_advisory_lock(hashtext('codegraph_schema_migration'))");
+    await client.query(schema);
+  } finally {
+    await client.query("SELECT pg_advisory_unlock(hashtext('codegraph_schema_migration'))").catch(() => undefined);
+    client.release();
+  }
 }
 
 function positiveInt(value: string | undefined, fallback: number): number {
@@ -121,6 +189,36 @@ function nonNegativeInt(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) return fallback;
   return Math.floor(parsed);
+}
+
+async function copyRowsInto(client: pg.PoolClient, table: string, columns: string[], rows: unknown[][]): Promise<void> {
+  const columnList = columns.map(quoteIdentifier).join(', ');
+  const stream = client.query(copyFrom(
+    `COPY ${quoteIdentifier(table)} (${columnList}) FROM STDIN WITH (FORMAT text)`,
+  ) as never) as Writable;
+  const finished = new Promise<void>((resolve, reject) => {
+    stream.once('finish', resolve);
+    stream.once('error', reject);
+  });
+  for (const row of rows) {
+    const line = `${row.map(copyTextValue).join('\t')}\n`;
+    if (!stream.write(line)) await once(stream, 'drain');
+  }
+  stream.end();
+  await finished;
+}
+
+function copyTextValue(value: unknown): string {
+  if (value === null || value === undefined) return '\\N';
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/\t/g, '\\t')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r');
+}
+
+function quoteIdentifier(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
 }
 
 export function convertSql(sql: string): string {

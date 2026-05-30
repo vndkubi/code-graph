@@ -79,7 +79,7 @@ interface ScipSymbolInformation {
 }
 
 const TREE_SITTER_PROVIDER_ID = 'tree-sitter';
-const TREE_SITTER_PROVIDER_VERSION = 'tree-sitter-analyzer-v3-call-filter';
+const TREE_SITTER_PROVIDER_VERSION = 'tree-sitter-analyzer-v5-signal-tier-raw2048';
 const SCIP_PROVIDER_ID = 'scip';
 const SYMBOL_ROLE_DEFINITION = 0x1;
 const SYMBOL_ROLE_IMPORT = 0x2;

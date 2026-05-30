@@ -663,7 +663,7 @@ export class V2QueryService {
       branches.push(`
         SELECT file, line, column, 'definition' AS kind, simple_name AS symbol_name,
                fq_name AS source, NULL::text AS caller, NULL::text AS callee, NULL::double precision AS confidence,
-               NULL::text AS resolution_kind, file_role
+               NULL::text AS resolution_kind, NULL::text AS signal_tier, NULL::text AS signal_reasons_json, file_role
         FROM symbols
         WHERE ${where}
       `);
@@ -680,7 +680,7 @@ export class V2QueryService {
       branches.push(`
         SELECT file, line, 1 AS column, 'import' AS kind, source AS symbol_name,
                source, NULL::text AS caller, NULL::text AS callee, NULL::double precision AS confidence,
-               NULL::text AS resolution_kind, file_role
+               NULL::text AS resolution_kind, NULL::text AS signal_tier, NULL::text AS signal_reasons_json, file_role
         FROM imports
         WHERE ${where}
       `);
@@ -696,7 +696,7 @@ export class V2QueryService {
       ].join(' AND ');
       branches.push(`
         SELECT file, line, 1 AS column, 'call' AS kind, callee AS symbol_name,
-               callee AS source, caller, callee, confidence, resolution_kind, file_role
+               callee AS source, caller, callee, confidence, resolution_kind, signal_tier, signal_reasons_json, file_role
         FROM call_edges
         WHERE ${where}
       `);
@@ -917,11 +917,13 @@ export class V2QueryService {
 
   private async getCallers(snapshotId: string, args: Record<string, unknown>) {
     const symbol = String(args.symbol ?? args.target ?? '');
+    const signalFilter = callSignalFilter(args);
     const rows = await this.db.prepare(`
-      SELECT caller, callee, file, line, confidence, resolution_kind
+      SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
       FROM call_edges
       WHERE snapshot_id = ? AND callee LIKE ? ESCAPE '\\'
-      ORDER BY confidence DESC, file, line
+        ${signalFilter}
+      ORDER BY ${callSignalOrder()}, confidence DESC, file, line
       LIMIT ?
     `).all(snapshotId, `%${escapeLike(symbol)}%`, Number(args.limit ?? 100)) as CallEdgeRow[];
     return { symbol, callers: rows, totalCount: rows.length };
@@ -929,11 +931,13 @@ export class V2QueryService {
 
   private async getCallees(snapshotId: string, args: Record<string, unknown>) {
     const symbol = String(args.symbol ?? args.source ?? '');
+    const signalFilter = callSignalFilter(args);
     const rows = await this.db.prepare(`
-      SELECT caller, callee, file, line, confidence, resolution_kind
+      SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
       FROM call_edges
       WHERE snapshot_id = ? AND caller LIKE ? ESCAPE '\\'
-      ORDER BY confidence DESC, file, line
+        ${signalFilter}
+      ORDER BY ${callSignalOrder()}, confidence DESC, file, line
       LIMIT ?
     `).all(snapshotId, `%${escapeLike(symbol)}%`, Number(args.limit ?? 100)) as CallEdgeRow[];
     return { symbol, callees: rows, totalCount: rows.length };
@@ -990,10 +994,11 @@ export class V2QueryService {
     const symbolLike = `%${escapeLike(target)}%`;
     const direct = file ? await this.dependencyRows(snapshotId, file, 'to_file') : [];
     const callers = await this.db.prepare(`
-      SELECT caller, callee, file, line, confidence, resolution_kind
+      SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
       FROM call_edges
       WHERE snapshot_id = ? AND callee LIKE ? ESCAPE '\\'
-      ORDER BY confidence DESC
+        ${callSignalFilter(args)}
+      ORDER BY ${callSignalOrder()}, confidence DESC
       LIMIT 100
     `).all(snapshotId, symbolLike) as CallEdgeRow[];
     const endpoints = await this.impactedEndpoints(snapshotId, direct.map(row => String(row.modulePath ?? row.file ?? '')));
@@ -1683,8 +1688,9 @@ export class V2QueryService {
 
     const edgeSeeds = explicitFastPath ? [] : relevantSymbols.slice(0, packProfileValue(profile, 3, 4, 4));
     const candidateFileSet = new Set(candidateFiles.map(file => file.file));
-    const callersRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callers', packProfileValue(profile, 6, 8, 8)) : [];
-    const calleesRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callees', packProfileValue(profile, 6, 8, 8)) : [];
+    const includeLowSignal = args.includeLowSignal === true;
+    const callersRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callers', packProfileValue(profile, 6, 8, 8), includeLowSignal) : [];
+    const calleesRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callees', packProfileValue(profile, 6, 8, 8), includeLowSignal) : [];
     const callers = explicitFiles.length > 0
       ? callersRaw.filter(edge => candidateFileSet.has(edge.file)).slice(0, 8)
       : callersRaw;
@@ -2018,6 +2024,7 @@ export class V2QueryService {
     symbols: ResearchSymbolCandidate[],
     direction: 'callers' | 'callees',
     limit: number,
+    includeLowSignal = false,
   ): Promise<CallEdgeRow[]> {
     const column = direction === 'callers' ? 'callee' : 'caller';
     const needles = researchEdgeNeedles(symbols).slice(0, 8);
@@ -2025,12 +2032,13 @@ export class V2QueryService {
     const clauses = needles.map(() => `${column} LIKE ? ESCAPE '\\'`).join(' OR ');
     const params = [snapshotId, ...needles.map(needle => `%${escapeLike(needle)}%`), limit];
     const rows = await this.db.prepare(`
-      SELECT caller, callee, file, line, confidence, resolution_kind
+      SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
       FROM call_edges
       WHERE snapshot_id = ?
         AND file_role != 'test_source'
+        ${includeLowSignal ? '' : "AND signal_tier IN ('primary', 'provider')"}
         AND (${clauses})
-      ORDER BY confidence DESC, file, line
+      ORDER BY ${callSignalOrder()}, confidence DESC, file, line
       LIMIT ?
     `).all(...params) as CallEdgeRow[];
     return uniqueCallEdges(rows);
@@ -2645,6 +2653,10 @@ export class V2QueryService {
       symbols: await scalar(this.db, 'SELECT COUNT(*) FROM symbols WHERE snapshot_id = ?', snapshotId),
       imports: await scalar(this.db, 'SELECT COUNT(*) FROM imports WHERE snapshot_id = ?', snapshotId),
       callEdges: await scalar(this.db, 'SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ?', snapshotId),
+      callEdgesRaw: await scalar(this.db, 'SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ?', snapshotId),
+      callEdgesPrimary: await scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier IN ('primary', 'provider')", snapshotId),
+      callEdgesLowSignal: await scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'low_signal'", snapshotId),
+      callEdgesProvider: await scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'provider'", snapshotId),
       dependencyEdges: await scalar(this.db, 'SELECT COUNT(*) FROM dependency_edges WHERE snapshot_id = ?', snapshotId),
       endpoints: await scalar(this.db, 'SELECT COUNT(*) FROM endpoints WHERE snapshot_id = ?', snapshotId),
       beans: await scalar(this.db, 'SELECT COUNT(*) FROM beans WHERE snapshot_id = ?', snapshotId),
@@ -2684,7 +2696,7 @@ export class V2QueryService {
         topUnresolvedCalls: await this.db.prepare(`
           SELECT callee, COUNT(*) AS count, MAX(confidence) AS maxConfidence
           FROM call_edges
-          WHERE snapshot_id = ? AND resolution_kind = 'name-only'
+          WHERE snapshot_id = ? AND resolution_kind = 'name-only' AND signal_tier IN ('primary', 'provider')
           GROUP BY callee
           ORDER BY count DESC, callee
           LIMIT 20
@@ -2821,10 +2833,11 @@ export class V2QueryService {
       if (current.depth >= maxDepth || seenCallers.has(current.caller)) continue;
       seenCallers.add(current.caller);
       const rows = await this.db.prepare(`
-        SELECT caller, callee, file, line, confidence, resolution_kind
+        SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
         FROM call_edges
         WHERE snapshot_id = ? AND caller LIKE ? ESCAPE '\\'
-        ORDER BY confidence DESC, line
+          AND signal_tier IN ('primary', 'provider')
+        ORDER BY ${callSignalOrder()}, confidence DESC, line
         LIMIT 25
       `).all(snapshotId, `%${escapeLike(current.caller)}%`) as CallEdgeRow[];
       for (const row of rows) {
@@ -2973,6 +2986,7 @@ export class V2QueryService {
           FROM call_edges
           WHERE snapshot_id = ?
             AND file_role IN ('test_source', 'mock_source')
+            AND signal_tier IN ('primary', 'provider')
             AND (caller IN (${placeholders}) OR callee IN (${placeholders}))
           LIMIT 100
         `).all(snapshotId, ...callTerms, ...callTerms) as Array<{ file: string }>;
@@ -3264,6 +3278,8 @@ interface CallEdgeRow {
   line: number;
   confidence: number;
   resolution_kind: string;
+  signal_tier?: string;
+  signal_reasons_json?: string;
 }
 
 interface EndpointRow {
@@ -3455,6 +3471,10 @@ function referenceDto(row: Record<string, unknown>): Record<string, unknown> {
     callee: row.callee,
     confidence: row.confidence,
     resolutionKind: row.resolution_kind,
+    signalTier: row.signal_tier,
+    signalReasons: typeof row.signal_reasons_json === 'string'
+      ? parseJson<string[]>(row.signal_reasons_json, [])
+      : undefined,
     fileRole: row.file_role,
   };
 }
@@ -4365,6 +4385,17 @@ function uniqueCallEdges(rows: CallEdgeRow[]): CallEdgeRow[] {
   return uniqueRecordsBy(rows, row => `${row.caller}:${row.callee}:${row.file}:${row.line}`);
 }
 
+function callSignalFilter(args: Record<string, unknown>, alias = ''): string {
+  if (args.includeLowSignal === true) return '';
+  const prefix = alias ? `${alias}.` : '';
+  return `AND ${prefix}signal_tier IN ('primary', 'provider')`;
+}
+
+function callSignalOrder(alias = ''): string {
+  const prefix = alias ? `${alias}.` : '';
+  return `CASE ${prefix}signal_tier WHEN 'provider' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END`;
+}
+
 function researchSeedTerms(target: string): string[] {
   const identifierTerms = target.match(/\b[A-Za-z_$][\w$]*(?:(?:::|\.)[A-Za-z_$][\w$]*)+\b/g) ?? [];
   const explicitIdentifierTerms = target.match(/\b[A-Za-z_$][A-Za-z0-9_$]*(?:_[A-Za-z0-9_$]+)+\b/g) ?? [];
@@ -4410,6 +4441,8 @@ function compactCallEdge(edge: CallEdgeRow): Record<string, unknown> {
     line: edge.line,
     confidence: edge.confidence,
     resolutionKind: edge.resolution_kind,
+    signalTier: edge.signal_tier,
+    signalReasons: edge.signal_reasons_json ? parseJson<string[]>(edge.signal_reasons_json, []) : undefined,
   };
 }
 
@@ -4480,6 +4513,7 @@ function researchFlowSteps(input: {
       line: edge.line,
       confidence: edge.confidence,
       resolutionKind: edge.resolution_kind,
+      signalTier: edge.signal_tier,
     });
   }
   return steps.slice(0, 10);
@@ -5851,17 +5885,21 @@ function referenceFiltersFor(args: Record<string, unknown>, query: string): {
   const includeSynthetic = typeof args.includeSynthetic === 'boolean' ? args.includeSynthetic : hasSyntheticIntent(query);
   const symbolSql = [...fileFilters.sql];
   const symbolParams = [...fileFilters.params];
+  const includeLowSignal = args.includeLowSignal === true;
+  const callSql = [...fileFilters.sql];
+  if (!includeLowSignal) callSql.push("signal_tier IN ('primary', 'provider')");
   if (!includeSynthetic) symbolSql.push("COALESCE(framework_meta_json, '') NOT LIKE '%\"synthetic\":\"true\"%'");
   return {
     symbolSql,
     symbolParams,
     importSql: [...fileFilters.sql],
     importParams: [...fileFilters.params],
-    callSql: [...fileFilters.sql],
+    callSql,
     callParams: [...fileFilters.params],
     effective: {
       ...fileFilters.effective,
       includeSynthetic,
+      includeLowSignal,
     },
   };
 }

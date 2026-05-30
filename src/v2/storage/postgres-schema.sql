@@ -140,8 +140,13 @@ CREATE TABLE IF NOT EXISTS call_edges (
   line INTEGER NOT NULL,
   confidence DOUBLE PRECISION NOT NULL,
   resolution_kind TEXT NOT NULL,
-  file_role TEXT NOT NULL
+  file_role TEXT NOT NULL,
+  signal_tier TEXT NOT NULL DEFAULT 'primary',
+  signal_reasons_json TEXT NOT NULL DEFAULT '[]'
 );
+
+ALTER TABLE call_edges ADD COLUMN IF NOT EXISTS signal_tier TEXT NOT NULL DEFAULT 'primary';
+ALTER TABLE call_edges ADD COLUMN IF NOT EXISTS signal_reasons_json TEXT NOT NULL DEFAULT '[]';
 
 CREATE TABLE IF NOT EXISTS dependency_edges (
   id BIGSERIAL PRIMARY KEY,
@@ -214,7 +219,10 @@ CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(snapshot_id, file);
 CREATE INDEX IF NOT EXISTS idx_type_refs_type ON type_refs(snapshot_id, referenced_type);
 DROP INDEX IF EXISTS idx_call_edges_caller;
 DROP INDEX IF EXISTS idx_call_edges_callee;
+DROP INDEX IF EXISTS idx_call_edges_caller_trgm;
+DROP INDEX IF EXISTS idx_call_edges_callee_trgm;
 CREATE INDEX IF NOT EXISTS idx_call_edges_file ON call_edges(snapshot_id, file);
+CREATE INDEX IF NOT EXISTS idx_call_edges_signal_file ON call_edges(snapshot_id, signal_tier, file);
 CREATE INDEX IF NOT EXISTS idx_dependency_from ON dependency_edges(snapshot_id, from_file);
 CREATE INDEX IF NOT EXISTS idx_dependency_to ON dependency_edges(snapshot_id, to_file);
 CREATE INDEX IF NOT EXISTS idx_annotations_annotation ON annotations(snapshot_id, annotation);
@@ -226,8 +234,10 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE INDEX IF NOT EXISTS idx_symbols_simple_name_trgm ON symbols USING gin (simple_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_symbols_fq_name_trgm ON symbols USING gin (fq_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_symbols_file_trgm ON symbols USING gin (file gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_call_edges_caller_trgm ON call_edges USING gin (caller gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_call_edges_callee_trgm ON call_edges USING gin (callee gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_call_edges_caller_signal_trgm ON call_edges USING gin (caller gin_trgm_ops)
+  WHERE signal_tier IN ('primary', 'provider');
+CREATE INDEX IF NOT EXISTS idx_call_edges_callee_signal_trgm ON call_edges USING gin (callee gin_trgm_ops)
+  WHERE signal_tier IN ('primary', 'provider');
 CREATE INDEX IF NOT EXISTS idx_files_path_trgm ON files USING gin (path gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_endpoints_path_trgm ON endpoints USING gin (path gin_trgm_ops);
 
@@ -237,4 +247,8 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO codegraph_schema(version, applied_at)
 VALUES (2, NOW()::TEXT)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO codegraph_schema(version, applied_at)
+VALUES (3, NOW()::TEXT)
 ON CONFLICT (version) DO NOTHING;

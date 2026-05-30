@@ -62,6 +62,81 @@ describe('v2 Postgres index and query service', () => {
     expect(callers.callers.some(call => call.resolution_kind === 'receiver-field' && call.confidence === 0.8)).toBe(true);
   });
 
+  it('keeps low-signal call edges in the raw index but hides them by default', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-call-signal-');
+    writeFile(repo, 'src/main/java/com/example/PaymentGateway.java', `package com.example;
+
+public class PaymentGateway {
+    public boolean processPayment() {
+        return true;
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/NoiseService.java', `package com.example;
+
+public class NoiseService {
+    public void execute(PaymentGateway gateway) {
+        gateway.processPayment();
+        assertThat(gateway);
+        mock();
+        when(gateway.processPayment());
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const lowSignalRows = await db.prepare(`
+      SELECT callee, signal_tier, signal_reasons_json, confidence
+      FROM call_edges
+      WHERE snapshot_id = ? AND callee IN ('assertThat', 'mock', 'when')
+      ORDER BY callee
+    `).all(result.snapshotId) as Array<{ callee: string; signal_tier: string; signal_reasons_json: string; confidence: number }>;
+    expect(lowSignalRows.map(row => row.callee)).toEqual(['assertThat', 'mock', 'when']);
+    expect(lowSignalRows.every(row => row.signal_tier === 'low_signal')).toBe(true);
+    expect(lowSignalRows.every(row => row.signal_reasons_json.includes('low-signal unqualified helper call'))).toBe(true);
+    expect(lowSignalRows.every(row => row.confidence <= 0.25)).toBe(true);
+
+    const defaultCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'assertThat' },
+    }) as { callers: Array<{ callee: string }> };
+    expect(defaultCallers.callers).toHaveLength(0);
+
+    const deepCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'assertThat', includeLowSignal: true },
+    }) as { callers: Array<{ callee: string; signal_tier: string }> };
+    expect(deepCallers.callers).toContainEqual(expect.objectContaining({
+      callee: 'assertThat',
+      signal_tier: 'low_signal',
+    }));
+
+    const primaryCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'PaymentGateway.processPayment' },
+    }) as { callers: Array<{ callee: string; signal_tier: string }> };
+    expect(primaryCallers.callers).toContainEqual(expect.objectContaining({
+      callee: 'PaymentGateway.processPayment',
+      signal_tier: 'primary',
+    }));
+
+    const stats = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_index_stats',
+      args: { warnStale: false },
+    }) as { counts: { callEdgesRaw: number; callEdgesPrimary: number; callEdgesLowSignal: number } };
+    expect(stats.counts.callEdgesLowSignal).toBe(3);
+    expect(stats.counts.callEdgesRaw).toBeGreaterThan(stats.counts.callEdgesPrimary);
+  });
+
   it('ranks multi-token natural-language symbol searches', async () => {
     const home = tempDir('codegraph-home-');
     const { db } = await openDb(home);
