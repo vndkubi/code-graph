@@ -84,7 +84,10 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     if (!grammar) return emptyResult;
 
     this.parser.setLanguage(grammar as Parameters<typeof this.parser.setLanguage>[0]);
-    const tree = this.parser.parse(content);
+    const parseOptions = treeSitterParseOptions(content.length);
+    const tree = parseOptions
+      ? this.parser.parse(content, undefined, parseOptions)
+      : this.parser.parse(content);
 
     const hasParseErrors = tree.rootNode.hasError;
     // Penalise confidence for parse errors; also slightly reduce for very large files
@@ -1119,7 +1122,29 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     receiverTypes?: Map<string, string>,
   ): void {
     // Java: method invocation — obj.method(args)
-    if (node.type === 'method_invocation' || node.type === 'object_creation_expression') {
+    if (node.type === 'object_creation_expression') {
+      const typeNode = node.childForFieldName('type')
+        ?? node.namedChildren.find(child =>
+          child.type === 'type_identifier'
+          || child.type === 'generic_type'
+          || child.type === 'scoped_type_identifier'
+        );
+      const typeName = this.extractJavaTypeName(typeNode) ?? typeNode?.text;
+      if (typeName) {
+        const calleeName = `${typeName}.new`;
+        calls.push({ caller: callerName, callee: calleeName, file, line: node.startPosition.row + 1 });
+        references.push({
+          file,
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column + 1,
+          kind: 'call',
+          context: this.getContextLines(lines, node.startPosition.row, 0),
+          symbolName: calleeName,
+        });
+      }
+    }
+
+    if (node.type === 'method_invocation') {
       const funcNode = node.childForFieldName('name') ?? node.children[0];
       if (funcNode) {
         let calleeName = '';
@@ -1235,4 +1260,11 @@ function resolveReceiverType(receiver: string, receiverTypes?: Map<string, strin
   if (receiverTypes.has(receiver)) return receiverTypes.get(receiver);
   const lastSegment = receiver.split('.').pop();
   return lastSegment ? receiverTypes.get(lastSegment) : undefined;
+}
+
+function treeSitterParseOptions(contentLength: number): { bufferSize: number } | undefined {
+  if (contentLength <= 32 * 1024) return undefined;
+  return {
+    bufferSize: Math.min(Math.max(contentLength + 1024, 128 * 1024), 8 * 1024 * 1024),
+  };
 }

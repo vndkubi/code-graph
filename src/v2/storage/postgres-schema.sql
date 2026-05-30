@@ -28,7 +28,10 @@ CREATE TABLE IF NOT EXISTS snapshots (
   index_time_ms INTEGER NOT NULL DEFAULT 0,
   files_total INTEGER NOT NULL DEFAULT 0,
   files_parsed INTEGER NOT NULL DEFAULT 0,
-  parse_cache_hits INTEGER NOT NULL DEFAULT 0
+  parse_cache_hits INTEGER NOT NULL DEFAULT 0,
+  index_provider_ids TEXT NOT NULL DEFAULT 'tree-sitter',
+  index_provider_versions_json TEXT NOT NULL DEFAULT '{}',
+  index_provider_config_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -44,13 +47,46 @@ CREATE TABLE IF NOT EXISTS files (
 );
 
 CREATE TABLE IF NOT EXISTS parse_cache (
-  blob_hash TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL DEFAULT 'tree-sitter',
+  provider_version TEXT NOT NULL DEFAULT 'tree-sitter-analyzer-v1',
+  blob_hash TEXT NOT NULL,
   language TEXT NOT NULL,
   parse_json TEXT NOT NULL,
   has_parse_errors INTEGER NOT NULL,
   parse_confidence DOUBLE PRECISION NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  CONSTRAINT parse_cache_provider_pkey PRIMARY KEY (provider_id, provider_version, blob_hash)
 );
+
+ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS index_provider_ids TEXT NOT NULL DEFAULT 'tree-sitter';
+ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS index_provider_versions_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS index_provider_config_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE parse_cache ADD COLUMN IF NOT EXISTS provider_id TEXT NOT NULL DEFAULT 'tree-sitter';
+ALTER TABLE parse_cache ADD COLUMN IF NOT EXISTS provider_version TEXT NOT NULL DEFAULT 'tree-sitter-analyzer-v1';
+
+DO $$
+DECLARE
+  existing_primary_key TEXT;
+BEGIN
+  SELECT conname INTO existing_primary_key
+  FROM pg_constraint
+  WHERE conrelid = 'parse_cache'::regclass
+    AND contype = 'p';
+
+  IF existing_primary_key IS NOT NULL AND existing_primary_key <> 'parse_cache_provider_pkey' THEN
+    EXECUTE format('ALTER TABLE parse_cache DROP CONSTRAINT %I', existing_primary_key);
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'parse_cache'::regclass
+      AND conname = 'parse_cache_provider_pkey'
+  ) THEN
+    ALTER TABLE parse_cache
+      ADD CONSTRAINT parse_cache_provider_pkey PRIMARY KEY (provider_id, provider_version, blob_hash);
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS symbols (
   snapshot_id TEXT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
@@ -172,13 +208,16 @@ CREATE INDEX IF NOT EXISTS idx_files_snapshot_hash ON files(snapshot_id, blob_ha
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(snapshot_id, simple_name, kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(snapshot_id, file);
 CREATE INDEX IF NOT EXISTS idx_symbols_fq ON symbols(snapshot_id, fq_name);
+CREATE INDEX IF NOT EXISTS idx_symbols_framework_role ON symbols(snapshot_id, framework_role);
 CREATE INDEX IF NOT EXISTS idx_imports_source ON imports(snapshot_id, source);
 CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(snapshot_id, file);
 CREATE INDEX IF NOT EXISTS idx_type_refs_type ON type_refs(snapshot_id, referenced_type);
-CREATE INDEX IF NOT EXISTS idx_call_edges_caller ON call_edges(snapshot_id, caller);
-CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(snapshot_id, callee);
+DROP INDEX IF EXISTS idx_call_edges_caller;
+DROP INDEX IF EXISTS idx_call_edges_callee;
+CREATE INDEX IF NOT EXISTS idx_call_edges_file ON call_edges(snapshot_id, file);
 CREATE INDEX IF NOT EXISTS idx_dependency_from ON dependency_edges(snapshot_id, from_file);
 CREATE INDEX IF NOT EXISTS idx_dependency_to ON dependency_edges(snapshot_id, to_file);
+CREATE INDEX IF NOT EXISTS idx_annotations_annotation ON annotations(snapshot_id, annotation);
 CREATE INDEX IF NOT EXISTS idx_endpoints_path ON endpoints(snapshot_id, method, path);
 CREATE INDEX IF NOT EXISTS idx_beans_type ON beans(snapshot_id, bean_type);
 CREATE INDEX IF NOT EXISTS idx_inheritance_parent ON inheritance(snapshot_id, parent_type);
@@ -187,9 +226,15 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE INDEX IF NOT EXISTS idx_symbols_simple_name_trgm ON symbols USING gin (simple_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_symbols_fq_name_trgm ON symbols USING gin (fq_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_symbols_file_trgm ON symbols USING gin (file gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_call_edges_caller_trgm ON call_edges USING gin (caller gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_call_edges_callee_trgm ON call_edges USING gin (callee gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_files_path_trgm ON files USING gin (path gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_endpoints_path_trgm ON endpoints USING gin (path gin_trgm_ops);
 
 INSERT INTO codegraph_schema(version, applied_at)
 VALUES (1, NOW()::TEXT)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO codegraph_schema(version, applied_at)
+VALUES (2, NOW()::TEXT)
 ON CONFLICT (version) DO NOTHING;

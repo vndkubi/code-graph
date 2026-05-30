@@ -14,17 +14,23 @@ export interface RunMcpProxyOptions {
   watch?: boolean;
   warnStale?: boolean;
   toolAllowlist?: string;
+  indexProviders?: string[] | string;
+  scipIndexPath?: string;
 }
 
 export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
   const daemon = await DaemonClient.ensure(options.homeDir);
-  const registerOptions = { watch: options.watch === true };
+  const providerOptions = {
+    indexProviders: options.indexProviders,
+    scipIndexPath: options.scipIndexPath,
+  };
+  const registerOptions = { watch: options.watch === true, ...providerOptions };
   let workspace = await daemon.registerWorkspace(options.root, options.workspaceKey, registerOptions);
   if (options.prewarm !== false && !workspace.currentSnapshotId) {
-    await daemon.refreshWorkspace(workspace.root, options.workspaceKey);
+    await daemon.refreshWorkspace(workspace.root, options.workspaceKey, providerOptions);
     workspace = await daemon.registerWorkspace(workspace.root, options.workspaceKey, registerOptions);
   } else if (options.refreshOnStart) {
-    await daemon.refreshWorkspace(workspace.root, options.workspaceKey, { background: true });
+    await daemon.refreshWorkspace(workspace.root, options.workspaceKey, { background: true, ...providerOptions });
   }
 
   const allowedTools = parseToolAllowlist(options.toolAllowlist ?? process.env.CODEGRAPH_MCP_TOOLS);

@@ -18,6 +18,8 @@ export interface TypeRefInfo {
 }
 
 export interface SymbolInfo {
+  /** Optional fully-qualified/indexer-native name. Defaults to package.parent.name when omitted. */
+  fqName?: string;
   name: string;
   kind: SymbolKind;
   file: string;
@@ -65,6 +67,8 @@ export interface CallInfo {
   callee: string;          // Target symbol being called
   file: string;
   line: number;
+  confidence?: number;
+  resolutionKind?: string;
 }
 
 export interface ParseResult {

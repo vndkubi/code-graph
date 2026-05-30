@@ -86,6 +86,44 @@ describe('v2 Postgres index and query service', () => {
     expect(search.symbols[0]?.matchReason).toContain('match');
   });
 
+  it('indexes large Java source files without parser buffer failures', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-large-java-');
+    const padding = `/*
+${'large java source padding\n'.repeat(6000)}
+*/`;
+    writeFile(repo, 'src/main/java/com/example/LargeService.java', `package com.example;
+
+${padding}
+public class LargeService {
+    public void execute() {
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const fileRow = await db.prepare(`
+      SELECT parse_status
+      FROM files
+      WHERE snapshot_id = ? AND path = ?
+    `).get(result.snapshotId, 'src/main/java/com/example/LargeService.java') as { parse_status?: string } | undefined;
+    expect(fileRow?.parse_status).toBe('ok');
+
+    const search = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'LargeService', kind: 'class', limit: 5 },
+    }) as { symbols: Array<{ name: string; file: string }> };
+    expect(search.symbols).toContainEqual(expect.objectContaining({
+      name: 'LargeService',
+      file: 'src/main/java/com/example/LargeService.java',
+    }));
+  });
+
   it('uses entry-point intent ranking and hides lombok synthetic symbols by default', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-intent-');
@@ -1605,6 +1643,127 @@ public class FeatureBranchMarker {
     expect(second.filesHashed).toBe(0);
     expect(second.hashCacheHits).toBe(second.filesTotal);
     expect(second.skippedUnchanged).toBe(true);
+  });
+
+  it('imports SCIP provider facts and scopes parse cache by provider metadata', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-scip-provider-');
+    const javaFile = 'src/main/java/com/example/Placeholder.java';
+    writeFile(repo, javaFile, `package com.example;
+
+public class Placeholder {
+    public void realMethod() {
+    }
+}
+`);
+    writeFile(repo, 'index.scip.json', JSON.stringify({
+      documents: [{
+        relativePath: javaFile,
+        language: 'java',
+        symbols: [
+          {
+            symbol: 'com.example.ScipOnlyFeature',
+            displayName: 'ScipOnlyFeature',
+            kind: 'Class',
+            signatureDocumentation: { text: 'public class ScipOnlyFeature' },
+          },
+          {
+            symbol: 'com.example.ScipOnlyFeature#indexedAction().',
+            displayName: 'indexedAction',
+            kind: 'Method',
+            enclosingSymbol: 'com.example.ScipOnlyFeature',
+            signatureDocumentation: { text: 'public void indexedAction()' },
+          },
+        ],
+        occurrences: [
+          {
+            symbol: 'com.example.ScipOnlyFeature',
+            symbolRoles: 1,
+            range: [2, 13, 24],
+            enclosingRange: [2, 0, 5, 1],
+          },
+          {
+            symbol: 'com.example.ScipOnlyFeature#indexedAction().',
+            symbolRoles: 1,
+            range: [3, 16, 26],
+            enclosingRange: [3, 4, 4, 5],
+          },
+          {
+            symbol: 'com.example.ExternalDependency#externalWork().',
+            symbolRoles: 0,
+            range: [3, 28, 40],
+            enclosingRange: [3, 4, 4, 5],
+          },
+        ],
+      }],
+    }, null, 2));
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({
+      root: repo,
+      indexProviders: 'tree-sitter,scip',
+      scipIndexPath: 'index.scip.json',
+    });
+
+    expect(result.indexProviderIds).toEqual(['tree-sitter', 'scip']);
+
+    const queries = new V2QueryService(db);
+    const stats = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_index_stats',
+      args: {},
+    }) as { snapshot: { index_provider_ids: string; index_provider_versions_json: string } };
+    expect(stats.snapshot.index_provider_ids).toBe('tree-sitter,scip');
+    expect(JSON.parse(stats.snapshot.index_provider_versions_json)).toHaveProperty('scip');
+
+    const scipSymbol = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'ScipOnlyFeature', kind: 'class', limit: 10 },
+    }) as { symbols: Array<{ name: string; fqName: string }> };
+    expect(scipSymbol.symbols).toContainEqual(expect.objectContaining({
+      name: 'ScipOnlyFeature',
+      fqName: 'ScipOnlyFeature',
+    }));
+
+    const scipReferences = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'find_references',
+      args: { symbol: 'externalWork', kind: 'call', limit: 10 },
+    }) as { references: Array<{ kind: string; resolutionKind?: string; confidence?: number }> };
+    expect(scipReferences.references).toContainEqual(expect.objectContaining({
+      kind: 'call',
+      resolutionKind: 'scip-reference',
+      confidence: 0.9,
+    }));
+
+    const cacheRows = await db.prepare(`
+      SELECT provider_id, COUNT(*) AS count
+      FROM parse_cache
+      GROUP BY provider_id
+    `).all() as Array<{ provider_id: string; count: string }>;
+    expect(Number(cacheRows.find(row => row.provider_id === 'tree-sitter+scip')?.count ?? 0)).toBeGreaterThan(0);
+
+    const warm = await indexer.indexWorkspace({
+      root: repo,
+      indexProviders: ['tree-sitter', 'scip'],
+      scipIndexPath: 'index.scip.json',
+    });
+    expect(warm.skippedUnchanged).toBe(true);
+    expect(warm.parseCacheHits).toBe(warm.filesTotal);
+
+    const treeOnly = await indexer.indexWorkspace({ root: repo, indexProviders: 'tree-sitter' });
+    expect(treeOnly.indexProviderIds).toEqual(['tree-sitter']);
+    expect(treeOnly.skippedUnchanged).toBe(false);
+    expect(treeOnly.filesParsed).toBeGreaterThan(0);
+
+    const treeOnlySearch = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'ScipOnlyFeature', kind: 'class', limit: 10 },
+    }) as { symbols: Array<{ name: string }> };
+    expect(treeOnlySearch.symbols.some(symbol => symbol.name === 'ScipOnlyFeature')).toBe(false);
   });
 
   it('updates small changed-file indexes in place', async () => {

@@ -2,11 +2,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { openCodeGraphDb } from '../storage/database.js';
-import { V2Indexer } from '../index/indexer.js';
+import { V2Indexer, type IndexWorkspaceOptions } from '../index/indexer.js';
 import { V2QueryService } from '../query/service.js';
 import { ensureCodeGraphDirs, getCodeGraphPaths } from '../paths.js';
 import type { DaemonInfo, DaemonStartOptions } from './types.js';
 import { watchWorkspace, type WorkspaceWatchHandle } from '../index/watcher.js';
+
+type IndexProviderRefreshOptions = Pick<IndexWorkspaceOptions, 'indexProviders' | 'scipIndexPath'>;
 
 export async function runDaemon(options: DaemonStartOptions = {}): Promise<void> {
   const paths = getCodeGraphPaths(options.homeDir);
@@ -17,9 +19,12 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
   const token = crypto.randomBytes(24).toString('hex');
   const watchers = new Map<string, WorkspaceWatchHandle>();
   const workspaceKeysByRoot = new Map<string, Set<string>>();
+  const providerOptionsByWorkspace = new Map<string, IndexProviderRefreshOptions>();
   const refreshJobs = new Map<string, {
     root: string;
     workspaceKey?: string;
+    indexProviders?: string[] | string;
+    scipIndexPath?: string;
     running: boolean;
     pending: boolean;
     reason: string;
@@ -28,13 +33,20 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
   }>();
   const refreshDelayMs = refreshDebounceMs();
 
-  const scheduleWorkspaceRefresh = (root: string, workspaceKey: string | undefined, reason: string, changedPaths: string[] = []) => {
+  const scheduleWorkspaceRefresh = (
+    root: string,
+    workspaceKey: string | undefined,
+    reason: string,
+    changedPaths: string[] = [],
+    providerOptions: IndexProviderRefreshOptions = {},
+  ) => {
     const key = refreshJobKey(root, workspaceKey);
     let job = refreshJobs.get(key);
     if (!job) {
       job = {
         root,
         workspaceKey,
+        ...providerOptions,
         running: false,
         pending: false,
         reason,
@@ -44,6 +56,8 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
     }
     job.pending = true;
     job.reason = reason;
+    job.indexProviders = providerOptions.indexProviders;
+    job.scipIndexPath = providerOptions.scipIndexPath;
     for (const changedPath of changedPaths) job.changedPaths.add(changedPath);
     if (job.running) return;
     if (job.timer) clearTimeout(job.timer);
@@ -56,6 +70,8 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
   const runScheduledRefresh = async (job: {
     root: string;
     workspaceKey?: string;
+    indexProviders?: string[] | string;
+    scipIndexPath?: string;
     running: boolean;
     pending: boolean;
     reason: string;
@@ -76,8 +92,15 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
           workspaceKey: job.workspaceKey,
           changedPaths,
           incrementalFileLimit: pathDeltaRefreshFileLimit(),
+          indexProviders: job.indexProviders,
+          scipIndexPath: job.scipIndexPath,
         })
-        : await indexer.indexWorkspace({ root: job.root, workspaceKey: job.workspaceKey });
+        : await indexer.indexWorkspace({
+          root: job.root,
+          workspaceKey: job.workspaceKey,
+          indexProviders: job.indexProviders,
+          scipIndexPath: job.scipIndexPath,
+        });
       logEvent(paths.daemonLogPath, {
         event: 'workspace.refresh',
         mode: result.pathDeltaUpdated ? 'path-delta' : 'background',
@@ -143,7 +166,12 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         const root = requireString(body.root, 'root');
         const workspaceKey = optionalString(body.workspaceKey);
         const watch = body.watch === true;
+        const providerOptions = indexProviderOptions(body);
         const workspace = await indexer.registerWorkspace(root, workspaceKey);
+        const providerKey = refreshJobKey(workspace.root, workspaceKey);
+        if (hasIndexProviderOptions(providerOptions)) {
+          providerOptionsByWorkspace.set(providerKey, providerOptions);
+        }
         const rootKeys = workspaceKeysByRoot.get(workspace.root) ?? new Set<string>();
         rootKeys.add(workspaceKeyValue(workspaceKey));
         workspaceKeysByRoot.set(workspace.root, rootKeys);
@@ -152,7 +180,14 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
             watchers.set(workspace.root, watchWorkspace(workspace.root, (changedPaths) => {
               const keys = workspaceKeysByRoot.get(workspace.root) ?? new Set([workspaceKeyValue(workspaceKey)]);
               for (const key of keys) {
-                scheduleWorkspaceRefresh(workspace.root, workspaceKeyFromValue(key), 'watch', changedPaths);
+                const watcherWorkspaceKey = workspaceKeyFromValue(key);
+                scheduleWorkspaceRefresh(
+                  workspace.root,
+                  watcherWorkspaceKey,
+                  'watch',
+                  changedPaths,
+                  providerOptionsByWorkspace.get(refreshJobKey(workspace.root, watcherWorkspaceKey)) ?? {},
+                );
               }
             }));
           } catch (error) {
@@ -173,6 +208,8 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
           workspaceId: workspace.workspaceId,
           hasSnapshot: Boolean(workspace.currentSnapshotId),
           watch,
+          indexProviders: providerOptions.indexProviders,
+          scipIndexPath: providerOptions.scipIndexPath,
           durationMs: Date.now() - startedAt,
         });
         sendJson(res, 200, workspace);
@@ -185,14 +222,35 @@ export async function runDaemon(options: DaemonStartOptions = {}): Promise<void>
         const root = requireString(body.root, 'root');
         const workspaceKey = optionalString(body.workspaceKey);
         const changedPaths = Array.isArray(body.changedPaths) ? body.changedPaths.map(String) : [];
+        const explicitProviderOptions = indexProviderOptions(body);
+        const storedProviderOptions = providerOptionsByWorkspace.get(refreshJobKey(root, workspaceKey)) ?? {};
+        const providerOptions = {
+          ...storedProviderOptions,
+          ...explicitProviderOptions,
+        };
+        if (hasIndexProviderOptions(providerOptions)) {
+          providerOptionsByWorkspace.set(refreshJobKey(root, workspaceKey), providerOptions);
+        }
         if (body.background === true) {
-          scheduleWorkspaceRefresh(root, workspaceKey, changedPaths.length > 0 ? 'watch' : 'startup', changedPaths);
+          scheduleWorkspaceRefresh(root, workspaceKey, changedPaths.length > 0 ? 'watch' : 'startup', changedPaths, providerOptions);
           sendJson(res, 202, { queued: true, root, workspaceKey, changedPathCount: changedPaths.length });
           return;
         }
         const result = changedPaths.length > 0
-          ? await indexer.refreshWorkspacePaths({ root, workspaceKey, changedPaths, incrementalFileLimit: pathDeltaRefreshFileLimit() })
-          : await indexer.indexWorkspace({ root, workspaceKey });
+          ? await indexer.refreshWorkspacePaths({
+            root,
+            workspaceKey,
+            changedPaths,
+            incrementalFileLimit: pathDeltaRefreshFileLimit(),
+            indexProviders: providerOptions.indexProviders,
+            scipIndexPath: providerOptions.scipIndexPath,
+          })
+          : await indexer.indexWorkspace({
+            root,
+            workspaceKey,
+            indexProviders: providerOptions.indexProviders,
+            scipIndexPath: providerOptions.scipIndexPath,
+          });
         logEvent(paths.daemonLogPath, {
           event: 'workspace.refresh',
           mode: result.pathDeltaUpdated ? 'path-delta' : 'foreground',
@@ -303,6 +361,26 @@ function requireString(value: unknown, name: string): string {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function indexProviderOptions(body: Record<string, unknown>): IndexProviderRefreshOptions {
+  const options: IndexProviderRefreshOptions = {};
+  const providers = optionalStringOrStringArray(body.indexProviders);
+  const scipIndexPath = optionalString(body.scipIndexPath);
+  if (providers !== undefined) options.indexProviders = providers;
+  if (scipIndexPath !== undefined) options.scipIndexPath = scipIndexPath;
+  return options;
+}
+
+function optionalStringOrStringArray(value: unknown): string[] | string | undefined {
+  if (typeof value === 'string' && value.length > 0) return value;
+  if (!Array.isArray(value)) return undefined;
+  const items = value.filter((item): item is string => typeof item === 'string' && item.length > 0);
+  return items.length > 0 ? items : undefined;
+}
+
+function hasIndexProviderOptions(options: IndexProviderRefreshOptions): boolean {
+  return options.indexProviders !== undefined || options.scipIndexPath !== undefined;
 }
 
 function refreshJobKey(root: string, workspaceKey: string | undefined): string {

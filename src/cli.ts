@@ -37,6 +37,8 @@ async function main(): Promise<void> {
         watch: parsed.flags.get('watch') === true || envFlag('CODEGRAPH_WATCH'),
         warnStale: parsed.flags.get('warn-stale') === true || envFlag('CODEGRAPH_WARN_STALE'),
         toolAllowlist: getFlag(parsed, 'mcp-tools') ?? process.env.CODEGRAPH_MCP_TOOLS,
+        indexProviders: indexProvidersFlag(parsed),
+        scipIndexPath: scipIndexFlag(parsed),
       });
       return;
     case 'daemon':
@@ -74,7 +76,10 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     }
     case 'index': {
       const root = getFlag(parsed, 'root') ?? process.cwd();
-      console.log(JSON.stringify(await runIndexBenchmark(root, getFlag(parsed, 'home')), null, 2));
+      console.log(JSON.stringify(await runIndexBenchmark(root, getFlag(parsed, 'home'), {
+        indexProviders: indexProvidersFlag(parsed),
+        scipIndexPath: scipIndexFlag(parsed),
+      }), null, 2));
       return;
     }
     case 'eval': {
@@ -217,6 +222,8 @@ async function runIndexCommand(parsed: ParsedArgs): Promise<void> {
       parseWorkers: getNumberFlag(parsed, 'parse-workers'),
       incremental: parsed.flags.get('no-incremental') === true ? false : undefined,
       incrementalFileLimit: getNumberFlag(parsed, 'incremental-file-limit'),
+      indexProviders: indexProvidersFlag(parsed),
+      scipIndexPath: scipIndexFlag(parsed),
       progress,
     });
     console.log(JSON.stringify({ ...result, backend: 'postgres', databaseUrl: redactDatabaseUrl(connectionString) }, null, 2));
@@ -291,6 +298,14 @@ function getNumberFlag(args: ParsedArgs, name: string): number | undefined {
   return value ? Number(value) : undefined;
 }
 
+function indexProvidersFlag(args: ParsedArgs): string | undefined {
+  return getFlag(args, 'index-providers') ?? process.env.CODEGRAPH_INDEX_PROVIDERS;
+}
+
+function scipIndexFlag(args: ParsedArgs): string | undefined {
+  return getFlag(args, 'scip-index') ?? process.env.CODEGRAPH_SCIP_INDEX;
+}
+
 function shouldUseAutoTasks(args: ParsedArgs): boolean {
   return args.flags.get('auto-tasks') === true || getFlag(args, 'tasks') === 'auto';
 }
@@ -321,6 +336,8 @@ Options:
   --task-count <number>                  Number of auto-derived proof/review tasks
   --no-index                             Reuse the current proof/review snapshot instead of refreshing first
   --parse-workers <number>               Worker threads for cold/cache-miss parsing during index
+  --index-providers <a,b>                Index providers: tree-sitter, scip
+  --scip-index <path>                    SCIP JSON or .scip index path for the scip provider
   --no-incremental                       Force changed-file index runs through full snapshot rebuild
   --incremental-file-limit <number>      Max changed/deleted files for incremental index path
   --workspace-key <key>                  Stable workspace identity key, useful when Docker always mounts roots at /workspace

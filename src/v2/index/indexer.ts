@@ -1,11 +1,13 @@
 import path from 'node:path';
+import os from 'node:os';
 import type { CodeGraphDb } from '../storage/database.js';
 import type { ParseResult, SymbolInfo } from '../../analyzers/base-analyzer.js';
 import { getGitInfo, type GitInfo } from '../git.js';
 import { sha256Json, stableId } from '../hash.js';
 import { scanManifest, scanManifestPaths, type ManifestFile, type ManifestPreviousFile } from './manifest.js';
-import { parseFilesBatch, symbolFqName, type ParseWorkItem } from './parse.js';
+import { symbolFqName, type ParseWorkItem } from './parse.js';
 import { roleRank } from './file-role.js';
+import { buildIndexProviderSet, type IndexProviderSet } from './providers.js';
 
 export interface IndexWorkspaceOptions {
   root: string;
@@ -16,6 +18,8 @@ export interface IndexWorkspaceOptions {
   incremental?: boolean;
   incrementalFileLimit?: number;
   incrementalFileRatio?: number;
+  indexProviders?: string[] | string;
+  scipIndexPath?: string;
   progress?: (event: IndexProgressEvent) => void;
 }
 
@@ -26,6 +30,8 @@ export interface RefreshWorkspacePathsOptions {
   maxFileSizeBytes?: number;
   parseWorkers?: number;
   incrementalFileLimit?: number;
+  indexProviders?: string[] | string;
+  scipIndexPath?: string;
   progress?: (event: IndexProgressEvent) => void;
 }
 
@@ -44,6 +50,8 @@ export interface IndexWorkspaceResult {
   parseWorkers: number;
   manifestScanMs: number;
   indexTimeMs: number;
+  indexProviderIds: string[];
+  indexProviderVersions: Record<string, string>;
   pathDeltaUpdated?: boolean;
   pathDeltaFallback?: string;
 }
@@ -67,6 +75,8 @@ interface WorkspaceRow {
 }
 
 interface ParseCacheRow {
+  provider_id: string;
+  provider_version: string;
   blob_hash: string;
   parse_json: string;
 }
@@ -74,6 +84,9 @@ interface ParseCacheRow {
 interface SnapshotSummaryRow {
   head_commit?: string | null;
   dirty_hash: string;
+  index_provider_ids?: string;
+  index_provider_versions_json?: string;
+  index_provider_config_json?: string;
 }
 
 interface ManifestChangeSet {
@@ -120,7 +133,46 @@ interface ParseResultForFile {
 
 const MAX_QUERY_BATCH_PARAMS = 10_000;
 const MAX_WRITE_BATCH_PARAMS = boundedInt(process.env.CODEGRAPH_WRITE_BATCH_PARAMS, 50_000, 1_000, 60_000);
-const WRITE_FILE_BATCH_SIZE = 250;
+const WRITE_FILE_BATCH_SIZE = boundedInt(process.env.CODEGRAPH_WRITE_FILE_BATCH_SIZE, 750, 100, 2_000);
+const MAX_CALL_ENDPOINT_LENGTH = 512;
+const CALL_ENDPOINT_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$/;
+const LOW_SIGNAL_UNQUALIFIED_CALLS = new Set([
+  'assertArrayEquals',
+  'assertEquals',
+  'assertFalse',
+  'assertNotEquals',
+  'assertNotNull',
+  'assertNull',
+  'assertSame',
+  'assertThat',
+  'assertThrows',
+  'assertTrue',
+  'containsString',
+  'empty',
+  'equalTo',
+  'expectThrows',
+  'fail',
+  'greaterThan',
+  'greaterThanOrEqualTo',
+  'hasSize',
+  'instanceOf',
+  'is',
+  'lessThan',
+  'lessThanOrEqualTo',
+  'mock',
+  'never',
+  'not',
+  'notNullValue',
+  'nullValue',
+  'randomAlphaOfLength',
+  'randomBoolean',
+  'randomFrom',
+  'randomInt',
+  'randomIntBetween',
+  'sameInstance',
+  'verify',
+  'when',
+]);
 
 const HTTP_METHOD_ANNOTATIONS = new Map([
   ['GET', 'GET'],
@@ -200,12 +252,21 @@ export class V2Indexer {
   async indexWorkspace(options: IndexWorkspaceOptions): Promise<IndexWorkspaceResult> {
     const start = Date.now();
     const realRoot = path.resolve(options.root);
+    const providerSet = buildIndexProviderSet({
+      root: realRoot,
+      indexProviders: options.indexProviders,
+      scipIndexPath: options.scipIndexPath,
+    });
     options.progress?.({
       phase: 'start',
       status: 'start',
       message: `indexing ${realRoot}`,
       elapsedMs: 0,
-      details: { root: realRoot, workspaceKey: options.workspaceKey ?? process.env.CODEGRAPH_WORKSPACE_KEY },
+      details: {
+        root: realRoot,
+        workspaceKey: options.workspaceKey ?? process.env.CODEGRAPH_WORKSPACE_KEY,
+        indexProviders: providerSet.providerIds.join(','),
+      },
     });
     const git = getGitInfo(realRoot);
     const workspace = await this.registerWorkspaceWithGit(realRoot, options.workspaceKey, git);
@@ -238,9 +299,11 @@ export class V2Indexer {
       }),
     });
     const latestSnapshot = latestSnapshotId ? await this.snapshotSummary(latestSnapshotId) : undefined;
+    const providerMatchesLatest = snapshotProviderMatches(latestSnapshot, providerSet);
     if (!options.force
       && latestSnapshotId
       && latestSnapshot
+      && providerMatchesLatest
       && optionalStringsEqual(latestSnapshot.head_commit, git.headCommit)
       && latestSnapshot.dirty_hash === git.dirtyHash
       && previousFiles
@@ -275,10 +338,13 @@ export class V2Indexer {
         parseWorkers: 0,
         manifestScanMs: manifest.scanTimeMs,
         indexTimeMs: Date.now() - start,
+        indexProviderIds: providerSet.providerIds,
+        indexProviderVersions: providerSet.providerVersions,
       };
     }
 
-    const changes = diffManifestFiles(manifest.files, previousFiles ?? []);
+    const reusablePreviousFiles = providerMatchesLatest ? previousFiles : undefined;
+    const changes = diffManifestFiles(manifest.files, reusablePreviousFiles ?? []);
     options.progress?.({
       phase: 'diff',
       status: 'complete',
@@ -292,8 +358,8 @@ export class V2Indexer {
         unchangedFiles: changes.unchangedFiles.length,
       },
     });
-    if (latestSnapshotId && shouldUseIncrementalUpdate(changes, manifest.files.length, options)) {
-      const prepared = await this.prepareParseBatch(workspace.root, changes.changedFiles, options.parseWorkers, options.progress);
+    if (latestSnapshotId && providerMatchesLatest && shouldUseIncrementalUpdate(changes, manifest.files.length, options)) {
+      const prepared = await this.prepareParseBatch(workspace.root, changes.changedFiles, providerSet, options.parseWorkers, options.progress);
       return this.updateSnapshotIncrementally({
         start,
         workspaceId: workspace.workspaceId,
@@ -306,6 +372,7 @@ export class V2Indexer {
         hashCacheHits: manifest.hashCacheHits,
         changes,
         prepared,
+        providerSet,
         progress: options.progress,
       });
     }
@@ -316,14 +383,16 @@ export class V2Indexer {
       git.treeHash,
       git.dirtyHash,
       sha256Json(manifest.files.map(f => [f.relPath, f.blobHash])),
+      providerSet.id,
+      providerSet.version,
       String(Date.now()),
     ]);
     const now = new Date().toISOString();
 
     let filesParsed = 0;
     let parseCacheHits = 0;
-    const previousByPath = new Map((previousFiles ?? []).map(file => [file.path, file]));
-    const prepared = await this.prepareParseBatch(workspace.root, changes.changedFiles, options.parseWorkers, options.progress);
+    const previousByPath = new Map((reusablePreviousFiles ?? []).map(file => [file.path, file]));
+    const prepared = await this.prepareParseBatch(workspace.root, changes.changedFiles, providerSet, options.parseWorkers, options.progress);
     const parsePlanByPath = new Map(prepared.plans.map(plan => [plan.file.relPath, plan]));
     filesParsed = prepared.filesParsed;
     parseCacheHits = changes.unchangedFiles.length + prepared.parseCacheHits;
@@ -340,9 +409,10 @@ export class V2Indexer {
       await this.db.prepare(`
         INSERT INTO snapshots (
           id, workspace_id, branch, head_commit, tree_hash, dirty_hash, created_at, status,
-          manifest_scan_ms, files_total
+          manifest_scan_ms, files_total,
+          index_provider_ids, index_provider_versions_json, index_provider_config_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'indexing', ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'indexing', ?, ?, ?, ?, ?)
       `).run(
         snapshotId,
         workspace.workspaceId,
@@ -353,6 +423,9 @@ export class V2Indexer {
         now,
         manifest.scanTimeMs,
         manifest.files.length,
+        providerIdsText(providerSet),
+        JSON.stringify(providerSet.providerVersions),
+        JSON.stringify(providerSet.config),
       );
 
       const parseStatusByPath = new Map<string, string>();
@@ -382,7 +455,7 @@ export class V2Indexer {
           materializeItems.push({ file, result: plan.result });
           if (plan.cacheInsert) parseCacheItems.push({ file, result: plan.result });
         }
-        await this.insertParseCaches(parseCacheItems, now);
+        await this.insertParseCaches(parseCacheItems, now, providerSet);
         await this.materializeParseResults(snapshotId, materializeItems);
 
         filesWritten += fileBatch.length;
@@ -397,7 +470,7 @@ export class V2Indexer {
         });
       }
 
-      if (latestSnapshotId) {
+      if (latestSnapshotId && providerMatchesLatest) {
         options.progress?.({
           phase: 'edges',
           status: 'start',
@@ -462,12 +535,19 @@ export class V2Indexer {
       parseWorkers: prepared.parseWorkers,
       manifestScanMs: manifest.scanTimeMs,
       indexTimeMs: Date.now() - start,
+      indexProviderIds: providerSet.providerIds,
+      indexProviderVersions: providerSet.providerVersions,
     };
   }
 
   async refreshWorkspacePaths(options: RefreshWorkspacePathsOptions): Promise<IndexWorkspaceResult> {
     const start = Date.now();
     const realRoot = path.resolve(options.root);
+    const providerSet = buildIndexProviderSet({
+      root: realRoot,
+      indexProviders: options.indexProviders,
+      scipIndexPath: options.scipIndexPath,
+    });
     const normalizedChangedPaths = uniqueStrings(options.changedPaths
       .map(file => normalizeRefreshPath(realRoot, file))
       .filter(Boolean));
@@ -486,7 +566,11 @@ export class V2Indexer {
       status: 'start',
       message: `path-delta refresh ${realRoot}`,
       elapsedMs: 0,
-      details: { changedPaths: normalizedChangedPaths.length, workspaceKey: options.workspaceKey ?? process.env.CODEGRAPH_WORKSPACE_KEY },
+      details: {
+        changedPaths: normalizedChangedPaths.length,
+        workspaceKey: options.workspaceKey ?? process.env.CODEGRAPH_WORKSPACE_KEY,
+        indexProviders: providerSet.providerIds.join(','),
+      },
     });
     const git = getGitInfo(realRoot);
     const workspace = await this.registerWorkspaceWithGit(realRoot, options.workspaceKey, git);
@@ -494,6 +578,11 @@ export class V2Indexer {
     if (!latestSnapshotId) {
       const result = await this.indexWorkspace({ ...options, root: realRoot });
       return { ...result, pathDeltaUpdated: false, pathDeltaFallback: 'no-current-snapshot' };
+    }
+    const latestSnapshot = await this.snapshotSummary(latestSnapshotId);
+    if (!snapshotProviderMatches(latestSnapshot, providerSet)) {
+      const result = await this.indexWorkspace({ ...options, root: realRoot });
+      return { ...result, pathDeltaUpdated: false, pathDeltaFallback: 'index-provider-changed' };
     }
     const previousFiles = await this.previousFilesForSnapshot(latestSnapshotId);
     const previousByPath = new Map(previousFiles.map(file => [file.path, file]));
@@ -537,11 +626,13 @@ export class V2Indexer {
         parseWorkers: 0,
         manifestScanMs: pathManifest.scanTimeMs,
         indexTimeMs: Date.now() - start,
+        indexProviderIds: providerSet.providerIds,
+        indexProviderVersions: providerSet.providerVersions,
         pathDeltaUpdated: true,
       };
     }
 
-    const prepared = await this.prepareParseBatch(realRoot, changedFiles, options.parseWorkers, options.progress);
+    const prepared = await this.prepareParseBatch(realRoot, changedFiles, providerSet, options.parseWorkers, options.progress);
     const addedCount = changedFiles.filter(file => !previousByPath.has(file.relPath)).length;
     const filesTotal = Math.max(0, previousFiles.length + addedCount - deletedPaths.length);
     const result = await this.updateSnapshotIncrementally({
@@ -560,6 +651,7 @@ export class V2Indexer {
         unchangedFiles: [],
       },
       prepared,
+      providerSet,
       progress: options.progress,
     });
     return { ...result, pathDeltaUpdated: true };
@@ -594,7 +686,11 @@ export class V2Indexer {
   }
 
   private async snapshotSummary(snapshotId: string): Promise<SnapshotSummaryRow | undefined> {
-    return await this.db.prepare('SELECT head_commit, dirty_hash FROM snapshots WHERE id = ?')
+    return await this.db.prepare(`
+      SELECT head_commit, dirty_hash, index_provider_ids, index_provider_versions_json, index_provider_config_json
+      FROM snapshots
+      WHERE id = ?
+    `)
       .get(snapshotId) as SnapshotSummaryRow | undefined;
   }
 
@@ -616,6 +712,7 @@ export class V2Indexer {
   private async prepareParseBatch(
     root: string,
     files: ManifestFile[],
+    providerSet: IndexProviderSet,
     requestedWorkers: number | undefined,
     progress?: (event: IndexProgressEvent) => void,
   ): Promise<PreparedParseBatch> {
@@ -641,7 +738,7 @@ export class V2Indexer {
     });
     const cachedByBlobHash = await this.parseCacheByBlobHash(files
       .filter(file => file.parseable && file.language)
-      .map(file => file.blobHash));
+      .map(file => file.blobHash), providerSet);
 
     for (const file of files) {
       if (!file.parseable || !file.language) {
@@ -716,7 +813,7 @@ export class V2Indexer {
       details: { parseCacheHits, queuedForParse: workItems.length },
     });
 
-    const parsed = parseFilesBatch(workItems, {
+    const parsed = providerSet.parseFiles(workItems, {
       workers: requestedWorkers,
       progress: event => progress?.({
         phase: 'parse',
@@ -753,7 +850,7 @@ export class V2Indexer {
     };
   }
 
-  private async parseCacheByBlobHash(blobHashes: string[]): Promise<Map<string, string>> {
+  private async parseCacheByBlobHash(blobHashes: string[], providerSet: IndexProviderSet): Promise<Map<string, string>> {
     const unique = [...new Set(blobHashes)];
     const cached = new Map<string, string>();
     for (const batch of chunkArray(unique, MAX_QUERY_BATCH_PARAMS)) {
@@ -761,20 +858,24 @@ export class V2Indexer {
       const rows = await this.db.prepare(`
         SELECT blob_hash, parse_json
         FROM parse_cache
-        WHERE blob_hash IN (${placeholders})
-      `).all(...batch) as ParseCacheRow[];
+        WHERE provider_id = ?
+          AND provider_version = ?
+          AND blob_hash IN (${placeholders})
+      `).all(providerSet.id, providerSet.version, ...batch) as ParseCacheRow[];
       for (const row of rows) cached.set(row.blob_hash, row.parse_json);
     }
     return cached;
   }
 
-  private async insertParseCaches(items: ParseResultForFile[], now: string): Promise<void> {
+  private async insertParseCaches(items: ParseResultForFile[], now: string, providerSet: IndexProviderSet): Promise<void> {
     await this.insertRows(
       'parse_cache',
-      ['blob_hash', 'language', 'parse_json', 'has_parse_errors', 'parse_confidence', 'created_at'],
+      ['provider_id', 'provider_version', 'blob_hash', 'language', 'parse_json', 'has_parse_errors', 'parse_confidence', 'created_at'],
       items
         .filter(item => item.file.language)
         .map(item => [
+          providerSet.id,
+          providerSet.version,
           item.file.blobHash,
           item.file.language,
           JSON.stringify(item.result),
@@ -798,6 +899,7 @@ export class V2Indexer {
     hashCacheHits: number;
     changes: ManifestChangeSet;
     prepared: PreparedParseBatch;
+    providerSet: IndexProviderSet;
     progress?: (event: IndexProgressEvent) => void;
   }): Promise<IndexWorkspaceResult> {
     const now = new Date().toISOString();
@@ -831,7 +933,10 @@ export class V2Indexer {
             tree_hash = ?,
             dirty_hash = ?,
             manifest_scan_ms = ?,
-            files_total = ?
+            files_total = ?,
+            index_provider_ids = ?,
+            index_provider_versions_json = ?,
+            index_provider_config_json = ?
         WHERE id = ?
       `).run(
         args.git.branch,
@@ -840,6 +945,9 @@ export class V2Indexer {
         args.git.dirtyHash,
         args.manifestScanMs,
         args.manifestFilesTotal,
+        providerIdsText(args.providerSet),
+        JSON.stringify(args.providerSet.providerVersions),
+        JSON.stringify(args.providerSet.config),
         args.snapshotId,
       );
 
@@ -865,7 +973,7 @@ export class V2Indexer {
           materializeItems.push({ file, result: plan.result });
           if (plan.cacheInsert) parseCacheItems.push({ file, result: plan.result });
         }
-        await this.insertParseCaches(parseCacheItems, now);
+        await this.insertParseCaches(parseCacheItems, now, args.providerSet);
         await this.materializeParseResults(args.snapshotId, materializeItems);
 
         filesWritten += fileBatch.length;
@@ -936,6 +1044,8 @@ export class V2Indexer {
       parseWorkers: args.prepared.parseWorkers,
       manifestScanMs: args.manifestScanMs,
       indexTimeMs: Date.now() - args.start,
+      indexProviderIds: args.providerSet.providerIds,
+      indexProviderVersions: args.providerSet.providerVersions,
     };
   }
 
@@ -1110,7 +1220,18 @@ export class V2Indexer {
       }
 
       for (const call of result.calls) {
-        callRows.push([snapshotId, call.caller, call.callee, file.relPath, call.line, 0.4, 'name-only', file.role]);
+        const normalizedCall = normalizedCallEndpoints(call);
+        if (!normalizedCall) continue;
+        callRows.push([
+          snapshotId,
+          normalizedCall.caller,
+          normalizedCall.callee,
+          file.relPath,
+          call.line,
+          call.confidence ?? 0.4,
+          call.resolutionKind ?? 'name-only',
+          file.role,
+        ]);
       }
     }
 
@@ -1213,7 +1334,9 @@ export class V2Indexer {
     const rows = await this.db.prepare(`
       SELECT rowid AS row_id, caller, callee, file, line, file_role
       FROM call_edges
-      WHERE snapshot_id = ? AND resolution_kind = 'name-only' AND callee LIKE '%.%'
+      WHERE snapshot_id = ?
+        AND resolution_kind = 'name-only'
+        AND callee ~ '^(this[.])?[A-Za-z_$][A-Za-z0-9_$]*[.][A-Za-z_$][A-Za-z0-9_$]*$'
       ${fileFilter ? `AND file IN (${filePlaceholders})` : ''}
     `).all(...(fileFilter ? [snapshotId, ...fileFilter] : [snapshotId])) as Array<{
       row_id: number;
@@ -1632,6 +1755,17 @@ function normalizeWorkspaceKey(value: string | undefined): string | undefined {
   return trimmed ? trimmed.toLowerCase().replace(/\\/g, '/') : undefined;
 }
 
+function snapshotProviderMatches(snapshot: SnapshotSummaryRow | undefined, providerSet: IndexProviderSet): boolean {
+  if (!snapshot) return false;
+  return (snapshot.index_provider_ids ?? '') === providerIdsText(providerSet)
+    && (snapshot.index_provider_versions_json ?? '') === JSON.stringify(providerSet.providerVersions)
+    && (snapshot.index_provider_config_json ?? '') === JSON.stringify(providerSet.config);
+}
+
+function providerIdsText(providerSet: IndexProviderSet): string {
+  return providerSet.providerIds.join(',');
+}
+
 function workspaceKeyRegisterGitInfo(root: string): GitInfo {
   return {
     root,
@@ -1697,11 +1831,42 @@ function parseFilesBatchWorkerCount(itemCount: number, requested: number | undef
   if (requested !== undefined && Number.isFinite(requested)) {
     return Math.max(1, Math.min(Math.floor(requested), 16, itemCount));
   }
-  return Math.min(4, itemCount);
+  return Math.min(defaultParseWorkerLimit(), itemCount);
 }
 
 function optionalStringsEqual(left: string | null | undefined, right: string | null | undefined): boolean {
   return (left ?? undefined) === (right ?? undefined);
+}
+
+function normalizedCallEndpoints(call: {
+  caller: string;
+  callee: string;
+  resolutionKind?: string;
+}): { caller: string; callee: string } | undefined {
+  const semanticProviderCall = call.resolutionKind === 'scip-reference';
+  const caller = normalizedCallEndpoint(call.caller, semanticProviderCall);
+  const callee = normalizedCallEndpoint(call.callee, semanticProviderCall);
+  if (!caller || !callee) return undefined;
+  if (!semanticProviderCall && !callee.includes('.') && LOW_SIGNAL_UNQUALIFIED_CALLS.has(callee)) return undefined;
+  return { caller, callee };
+}
+
+function normalizedCallEndpoint(value: string, allowProviderSymbol: boolean): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > MAX_CALL_ENDPOINT_LENGTH) return undefined;
+  if (allowProviderSymbol) return /[\r\n]/.test(trimmed) ? undefined : trimmed;
+  return CALL_ENDPOINT_PATTERN.test(trimmed) ? trimmed : undefined;
+}
+
+function defaultParseWorkerLimit(): number {
+  const configured = Number(process.env.CODEGRAPH_PARSE_WORKERS);
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.max(1, Math.min(Math.floor(configured), 16));
+  }
+  const cpuCount = typeof os.availableParallelism === 'function'
+    ? os.availableParallelism()
+    : os.cpus().length;
+  return Math.max(1, Math.min(8, cpuCount - 1));
 }
 
 function workspaceIdentityParts(realRoot: string, git: GitInfo, workspaceKey: string | undefined): Array<string | undefined> {

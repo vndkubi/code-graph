@@ -321,7 +321,11 @@ function parseWorkerCount(itemCount: number, requested: number | undefined): num
   const cpuCount = typeof os.availableParallelism === 'function'
     ? os.availableParallelism()
     : os.cpus().length;
-  const defaultWorkers = Math.max(1, Math.min(4, cpuCount - 1, itemCount));
+  const configuredDefault = Number(process.env.CODEGRAPH_PARSE_WORKERS);
+  const defaultWorkerLimit = Number.isFinite(configuredDefault) && configuredDefault > 0
+    ? Math.floor(configuredDefault)
+    : 8;
+  const defaultWorkers = Math.max(1, Math.min(defaultWorkerLimit, cpuCount - 1, itemCount));
   if (requested === undefined || !Number.isFinite(requested)) return defaultWorkers;
   return Math.max(1, Math.min(Math.floor(requested), 16, itemCount));
 }
@@ -342,12 +346,14 @@ function chunkWorkItems(items: ParseWorkItem[], chunkCount: number): ParseWorkIt
 }
 
 export function symbolFqName(symbol: {
+  fqName?: string;
   packageName?: string;
   parent?: string;
   name: string;
   kind: string;
   parameterTypes?: string[];
 }): string {
+  if (symbol.fqName) return symbol.fqName;
   const owner = symbol.parent ? `${symbol.parent}.` : '';
   const params = symbol.kind === 'method' || symbol.kind === 'function'
     ? `(${(symbol.parameterTypes ?? []).join(',')})`

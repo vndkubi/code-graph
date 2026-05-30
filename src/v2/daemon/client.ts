@@ -3,6 +3,11 @@ import { spawn } from 'node:child_process';
 import { getCodeGraphPaths } from '../paths.js';
 import type { DaemonInfo } from './types.js';
 
+export interface DaemonIndexProviderOptions {
+  indexProviders?: string[] | string;
+  scipIndexPath?: string;
+}
+
 export class DaemonClient {
   constructor(private readonly info: DaemonInfo) {}
 
@@ -47,12 +52,14 @@ export class DaemonClient {
   async registerWorkspace(
     root: string,
     workspaceKey?: string,
-    options: { watch?: boolean } = {},
+    options: { watch?: boolean } & DaemonIndexProviderOptions = {},
   ): Promise<{ workspaceId: string; root: string; workspaceKey?: string; currentSnapshotId?: string }> {
     return this.request('/workspaces/register', 'POST', {
       root,
       workspaceKey,
       watch: options.watch === true,
+      indexProviders: options.indexProviders,
+      scipIndexPath: options.scipIndexPath,
     }) as Promise<{
       workspaceId: string;
       root: string;
@@ -61,11 +68,17 @@ export class DaemonClient {
     }>;
   }
 
-  async refreshWorkspace(root: string, workspaceKey?: string, options: { background?: boolean } = {}): Promise<unknown> {
+  async refreshWorkspace(
+    root: string,
+    workspaceKey?: string,
+    options: { background?: boolean } & DaemonIndexProviderOptions = {},
+  ): Promise<unknown> {
     return this.request('/workspaces/refresh', 'POST', {
       root,
       workspaceKey,
       background: options.background === true,
+      indexProviders: options.indexProviders,
+      scipIndexPath: options.scipIndexPath,
     });
   }
 

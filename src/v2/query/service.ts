@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { CodeGraphDb } from '../storage/database.js';
-import { V2Indexer } from '../index/indexer.js';
+import { V2Indexer, type IndexWorkspaceOptions } from '../index/indexer.js';
 import { roleRank, type FileRole } from '../index/file-role.js';
 import { scanManifest } from '../index/manifest.js';
 import { getGitInfo } from '../git.js';
@@ -149,16 +149,31 @@ export class V2QueryService {
   }
 
   private async refreshWorkspaceOnce(workspaceId: string, root: string, workspaceKey?: string): Promise<string> {
-    const key = `${workspaceId}:${root}:${workspaceKey ?? ''}`;
+    const providerOptions = await this.indexProviderOptionsForWorkspace(workspaceId);
+    const key = `${workspaceId}:${root}:${workspaceKey ?? ''}:${JSON.stringify(providerOptions)}`;
     const existing = this.inFlightRefreshes.get(key);
     if (existing) return existing;
-    const refresh = this.indexer.indexWorkspace({ root, workspaceKey })
+    const refresh = this.indexer.indexWorkspace({ root, workspaceKey, ...providerOptions })
       .then(result => result.snapshotId)
       .finally(() => {
         this.inFlightRefreshes.delete(key);
       });
     this.inFlightRefreshes.set(key, refresh);
     return refresh;
+  }
+
+  private async indexProviderOptionsForWorkspace(workspaceId: string): Promise<Pick<IndexWorkspaceOptions, 'indexProviders' | 'scipIndexPath'>> {
+    const row = await this.db.prepare(`
+      SELECT s.index_provider_config_json
+      FROM workspaces w
+      JOIN snapshots s ON s.id = w.current_snapshot_id
+      WHERE w.id = ?
+    `).get(workspaceId) as { index_provider_config_json?: string } | undefined;
+    const config = parseJson<{ indexProviders?: string[]; scipIndexPath?: string }>(row?.index_provider_config_json, {});
+    return {
+      indexProviders: config.indexProviders,
+      scipIndexPath: config.scipIndexPath,
+    };
   }
 
   private async indexedFileCount(snapshotId: string): Promise<number> {
