@@ -22,6 +22,8 @@ Prerequisites:
 - npm.
 - Docker for the local Postgres service, unless you already run Postgres.
 
+The examples use `<hadoop-project>` as a placeholder for the local Hadoop project root.
+
 Start Postgres:
 
 ```powershell
@@ -38,16 +40,16 @@ npm run build
 Prewarm a workspace:
 
 ```powershell
-node dist/cli.js index --root "D:\Personal\Projects\hadoop" --parse-workers 8
+node dist/cli.js index --root "<hadoop-project>" --parse-workers 8
 ```
 
 Run the MCP server:
 
 ```powershell
-node dist/cli.js mcp --root "D:\Personal\Projects\hadoop"
+node dist/cli.js mcp --root "<hadoop-project>"
 ```
 
-For Docker and MCP client configuration, see [MCP Setup And Usage](docs/mcp-setup-and-usage.md).
+For Docker and MCP client configuration, see [MCP Setup And Usage](docs/mcp-setup-and-usage.md). For task prompts, see [CodeGraph Prompt Guide](docs/prompt-guide.md).
 
 ## Why Use CodeGraph Instead Of Baseline File Search
 
@@ -60,11 +62,11 @@ Benchmark numbers below are produced from a fresh local run and internal determi
 Environment:
 
 - Date: 2026-05-31
-- Repository: `D:/Personal/Projects/hadoop`
+- Repository: the Hadoop project
 - Hadoop branch and commit: `trunk` at `135e36a1fdb`
 - Database: isolated Postgres `codegraph-docbench-postgres` on port `54330`
 - Workspace key: `docs-hadoop-fresh`
-- Command: `npx tsx src/cli.ts index --root D:/Personal/Projects/hadoop --workspace-key docs-hadoop-fresh --parse-workers 8`
+- Command: `npx tsx src/cli.ts index --root <hadoop-project> --workspace-key docs-hadoop-fresh --parse-workers 8`
 
 | Metric | Fresh run |
 | --- | ---: |
@@ -115,7 +117,7 @@ CodeGraph keeps correctness by snapshotting each workspace:
 - Two branches at once: use `git worktree` or separate clones, each with a different root or `CODEGRAPH_WORKSPACE_KEY`.
 - Docker: always set `CODEGRAPH_WORKSPACE_KEY`, because every repository is mounted as `/workspace` inside the container.
 
-See [MCP Setup And Usage](docs/mcp-setup-and-usage.md) for detailed setup, client config, branch workflows, and troubleshooting.
+See [MCP Setup And Usage](docs/mcp-setup-and-usage.md) for detailed setup, client config, branch workflows, and troubleshooting. See [CodeGraph Prompt Guide](docs/prompt-guide.md) for copy-paste prompts by task type.
 
 ## CLI Reference
 

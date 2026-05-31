@@ -25,6 +25,8 @@ Use local Node when you want the fastest experience on a normal workstation, esp
 - Docker only for the local Postgres service, unless you already run Postgres elsewhere.
 - A source repository to index.
 
+The examples use `<hadoop-project>` as a placeholder for the local Hadoop project root.
+
 ### 1. Start Postgres
 
 ```powershell
@@ -47,22 +49,22 @@ npm run build
 ### 3. Cold Index A Workspace
 
 ```powershell
-node dist/cli.js index --root "D:\Personal\Projects\hadoop" --parse-workers 8
+node dist/cli.js index --root "<hadoop-project>" --parse-workers 8
 ```
 
 Use `--workspace-key` when the same repository can appear under different container paths or when you want a stable explicit identity:
 
 ```powershell
 node dist/cli.js index `
-  --root "D:\Personal\Projects\hadoop" `
-  --workspace-key "D:/Personal/Projects/hadoop" `
+  --root "<hadoop-project>" `
+  --workspace-key "hadoop-project" `
   --parse-workers 8
 ```
 
 ### 4. Run The MCP Server
 
 ```powershell
-node dist/cli.js mcp --root "D:\Personal\Projects\hadoop"
+node dist/cli.js mcp --root "<hadoop-project>"
 ```
 
 This command is an MCP stdio server. It normally stays running and waits for an MCP client instead of printing a success message and exiting.
@@ -92,9 +94,9 @@ docker --context desktop-linux volume create codegraph-cache
 
 ```powershell
 docker --context desktop-linux run --rm `
-  -v "D:/Personal/Projects/hadoop:/workspace:ro" `
+  -v "<hadoop-project>:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
-  -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop" `
+  -e "CODEGRAPH_WORKSPACE_KEY=hadoop-project" `
   -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
   -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
@@ -107,9 +109,9 @@ Every Docker run sees the source repository as `/workspace`, so set `CODEGRAPH_W
 
 ```powershell
 docker --context desktop-linux run --rm -i `
-  -v "D:/Personal/Projects/hadoop:/workspace:ro" `
+  -v "<hadoop-project>:/workspace:ro" `
   -v "codegraph-cache:/codegraph-home" `
-  -e "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/hadoop" `
+  -e "CODEGRAPH_WORKSPACE_KEY=hadoop-project" `
   -e "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph" `
   -e "CODEGRAPH_PG_POOL_MAX=10" `
   mcp-code-graph:latest `
@@ -191,9 +193,9 @@ Create or edit `~/.copilot/mcp-config.json`:
         "D:/Personal/Projects/code-graph/dist/cli.js",
         "mcp",
         "--root",
-        "D:/Personal/Projects/hadoop",
+        "<hadoop-project>",
         "--workspace-key",
-        "D:/Personal/Projects/hadoop"
+        "hadoop-project"
       ]
     }
   }
@@ -213,9 +215,9 @@ args = [
   "D:/Personal/Projects/code-graph/dist/cli.js",
   "mcp",
   "--root",
-  "D:/Personal/Projects/hadoop",
+  "<hadoop-project>",
   "--workspace-key",
-  "D:/Personal/Projects/hadoop"
+  "hadoop-project"
 ]
 ```
 
@@ -228,7 +230,7 @@ For two branches open at the same time, create two entries that point at two dif
 Run an explicit index before connecting the MCP client:
 
 ```powershell
-node dist/cli.js index --root "D:\Personal\Projects\hadoop" --parse-workers 8
+node dist/cli.js index --root "<hadoop-project>" --parse-workers 8
 ```
 
 This builds a full snapshot and writes parse cache, symbols, imports, call edges, endpoints, dependencies, and snapshot stats to Postgres.
@@ -242,7 +244,7 @@ Run the same index command again. CodeGraph should reuse file hashes, parse cach
 Recommended setup:
 
 ```powershell
-node dist/cli.js mcp --root "D:\Personal\Projects\hadoop" --watch
+node dist/cli.js mcp --root "<hadoop-project>" --watch
 ```
 
 With `--watch`, filesystem changes are batched and refreshed with path-delta indexing. Small edits update only the changed paths and deletions instead of rebuilding the whole workspace.
@@ -250,7 +252,7 @@ With `--watch`, filesystem changes are batched and refreshed with path-delta ind
 If you do not use `--watch`, ask the tool with `autoRefresh: true` or run:
 
 ```powershell
-node dist/cli.js index --root "D:\Personal\Projects\hadoop"
+node dist/cli.js index --root "<hadoop-project>"
 ```
 
 ### Delete Or Rename Files
@@ -260,7 +262,7 @@ Use `--watch` for normal local edits. The watcher sends changed and deleted path
 For large rename waves or generated-file churn, run an explicit full refresh:
 
 ```powershell
-node dist/cli.js index --root "D:\Personal\Projects\hadoop"
+node dist/cli.js index --root "<hadoop-project>"
 ```
 
 ### Checkout A New Branch In The Same Folder
@@ -268,8 +270,8 @@ node dist/cli.js index --root "D:\Personal\Projects\hadoop"
 After a branch checkout, the filesystem may change too much for inline refresh. For correctness on large repositories, prewarm manually:
 
 ```powershell
-git -C "D:\Personal\Projects\hadoop" checkout feature/my-branch
-node dist/cli.js index --root "D:\Personal\Projects\hadoop" --parse-workers 8
+git -C "<hadoop-project>" checkout feature/my-branch
+node dist/cli.js index --root "<hadoop-project>" --parse-workers 8
 ```
 
 If MCP is already running with the same workspace key, later tool calls read the new completed snapshot from Postgres. Restarting the MCP client is usually not required.
@@ -279,8 +281,8 @@ If MCP is already running with the same workspace key, later tool calls read the
 Run an explicit index after the operation:
 
 ```powershell
-git -C "D:\Personal\Projects\hadoop" pull --rebase
-node dist/cli.js index --root "D:\Personal\Projects\hadoop" --parse-workers 8
+git -C "<hadoop-project>" pull --rebase
+node dist/cli.js index --root "<hadoop-project>" --parse-workers 8
 ```
 
 This avoids stale answers and avoids paying a large refresh cost inside the first MCP query.
@@ -290,10 +292,10 @@ This avoids stale answers and avoids paying a large refresh cost inside the firs
 Use `git worktree` or separate clones. Do not open two branches from one filesystem folder at the same time.
 
 ```powershell
-git -C "D:\Personal\Projects\hadoop" worktree add "D:\Personal\Projects\hadoop-feature" feature/my-branch
+git -C "<hadoop-project>" worktree add "<hadoop-feature-worktree>" feature/my-branch
 
-node dist/cli.js index --root "D:\Personal\Projects\hadoop" --workspace-key "hadoop-main"
-node dist/cli.js index --root "D:\Personal\Projects\hadoop-feature" --workspace-key "hadoop-feature"
+node dist/cli.js index --root "<hadoop-project>" --workspace-key "hadoop-main"
+node dist/cli.js index --root "<hadoop-feature-worktree>" --workspace-key "hadoop-feature"
 ```
 
 Configure one MCP server per worktree. Each worktree gets its own current snapshot while sharing the same Postgres database and parse cache.
@@ -303,7 +305,7 @@ Configure one MCP server per worktree. Each worktree gets its own current snapsh
 Use one Postgres service and one daemon per machine. Give each repository a unique root or workspace key:
 
 ```powershell
-node dist/cli.js index --root "D:\Personal\Projects\hadoop" --workspace-key "D:/Personal/Projects/hadoop"
+node dist/cli.js index --root "<hadoop-project>" --workspace-key "hadoop-project"
 node dist/cli.js index --root "D:\Personal\Projects\elasticsearch" --workspace-key "D:/Personal/Projects/elasticsearch"
 ```
 
@@ -321,6 +323,8 @@ node dist/cli.js index --root "D:\Personal\Projects\elasticsearch" --workspace-k
 `--auto-refresh` checks freshness before tool calls and can refresh stale snapshots inline. It skips inline refresh when the indexed file count exceeds `CODEGRAPH_AUTO_REFRESH_FILE_LIMIT` and returns a warning instead. Raise that limit only if you accept slower first-query latency.
 
 ## Tool Selection
+
+If you do not want to remember tool names, use natural prompts such as "Use CodeGraph MCP. Trace the full flow for this API" or "Use CodeGraph MCP. Review this diff." For copy-paste prompt templates by task type, see [CodeGraph Prompt Guide](prompt-guide.md).
 
 | Task | First tool |
 | --- | --- |
@@ -365,4 +369,3 @@ If the log contains an event with `toolName`, the MCP tool was called.
 | Docker cold index is very slow on Windows | Docker Desktop bind mount overhead | Prefer local Node, WSL/ext4, or Linux-native source paths for large repositories. |
 | MCP starts but the agent does not use it | Client config points to the wrong command or server | Ask for `get_index_stats`, then check `node dist/cli.js logs --tail 50`. |
 | `autoRefresh=true` does not build the first snapshot | Auto-refresh is for existing snapshots, not empty first-time indexes | Run explicit `index --root ...` once before using MCP. |
-
