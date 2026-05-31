@@ -11,10 +11,12 @@ const { Pool } = pg;
 type PgRow = pg.QueryResultRow;
 type PgQueryable = pg.PoolClient;
 const transactionClient = new AsyncLocalStorage<PgQueryable>();
+const COPY_STREAM_BUFFER_BYTES = positiveInt(process.env.CODEGRAPH_COPY_STREAM_BUFFER_BYTES, 1024 * 1024);
 
 export interface CopyFromRowsOptions {
   ignoreConflicts?: boolean;
   suffix?: string;
+  synchronousCommit?: 'off' | 'on' | 'local';
 }
 
 export interface PostgresOpenResult {
@@ -89,6 +91,32 @@ export class PostgresCodeGraphDb {
     }
   }
 
+  async copyFromTextFiles(
+    table: string,
+    columns: string[],
+    filePaths: string[],
+    options: CopyFromRowsOptions = {},
+  ): Promise<boolean> {
+    if (filePaths.length === 0) return true;
+    const activeClient = transactionClient.getStore();
+    const client = activeClient ?? await this.pool.connect();
+    const savepoint = activeClient ? `codegraph_copy_${Date.now().toString(36)}` : undefined;
+    try {
+      if (savepoint) await client.query(`SAVEPOINT ${savepoint}`);
+      await this.copyFromTextFilesUnsafe(client, table, columns, filePaths, options);
+      if (savepoint) await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+      return true;
+    } catch (error) {
+      if (savepoint) {
+        await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+      }
+      throw error;
+    } finally {
+      if (!activeClient) client.release();
+    }
+  }
+
   transaction<T>(fn: () => T | Promise<T>): () => Promise<T> {
     return () => this.runTransaction(fn);
   }
@@ -124,24 +152,84 @@ export class PostgresCodeGraphDb {
     rows: unknown[][],
     options: CopyFromRowsOptions,
   ): Promise<void> {
-    if (options.ignoreConflicts || options.suffix) {
-      const tempTable = `__codegraph_copy_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
-      await client.query(`CREATE TEMP TABLE ${quoteIdentifier(tempTable)} (LIKE ${quoteIdentifier(table)} INCLUDING DEFAULTS) ON COMMIT DROP`);
-      await copyRowsInto(client, tempTable, columns, rows);
-      const columnList = columns.map(quoteIdentifier).join(', ');
-      const selectList = columns.map(quoteIdentifier).join(', ');
-      const suffix = options.suffix ?? 'ON CONFLICT DO NOTHING';
-      await client.query(`
-        INSERT INTO ${quoteIdentifier(table)} (${columnList})
-        SELECT ${selectList}
-        FROM ${quoteIdentifier(tempTable)}
-        ${suffix}
-      `);
-      await client.query(`DROP TABLE ${quoteIdentifier(tempTable)}`);
-      return;
+    const previousSynchronousCommit = options.synchronousCommit
+      ? await currentSetting(client, 'synchronous_commit')
+      : undefined;
+    if (options.synchronousCommit) {
+      await client.query(`SET synchronous_commit = ${quoteLiteral(options.synchronousCommit)}`);
     }
+    try {
+      if (options.ignoreConflicts || options.suffix) {
+        const tempTable = `__codegraph_copy_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+        try {
+          await client.query(`CREATE TEMP TABLE ${quoteIdentifier(tempTable)} (LIKE ${quoteIdentifier(table)} INCLUDING DEFAULTS) ON COMMIT PRESERVE ROWS`);
+          await copyRowsInto(client, tempTable, columns, rows);
+          const columnList = columns.map(quoteIdentifier).join(', ');
+          const selectList = columns.map(quoteIdentifier).join(', ');
+          const suffix = options.suffix ?? 'ON CONFLICT DO NOTHING';
+          await client.query(`
+            INSERT INTO ${quoteIdentifier(table)} (${columnList})
+            SELECT ${selectList}
+            FROM ${quoteIdentifier(tempTable)}
+            ${suffix}
+          `);
+        } finally {
+          await client.query(`DROP TABLE IF EXISTS ${quoteIdentifier(tempTable)}`).catch(() => undefined);
+        }
+        return;
+      }
 
-    await copyRowsInto(client, table, columns, rows);
+      await copyRowsInto(client, table, columns, rows);
+    } finally {
+      if (previousSynchronousCommit !== undefined) {
+        await client.query(`SET synchronous_commit = ${quoteLiteral(previousSynchronousCommit)}`).catch(() => undefined);
+      }
+    }
+  }
+
+  private async copyFromTextFilesUnsafe(
+    client: pg.PoolClient,
+    table: string,
+    columns: string[],
+    filePaths: string[],
+    options: CopyFromRowsOptions,
+  ): Promise<void> {
+    const previousStatementTimeout = await currentSetting(client, 'statement_timeout');
+    const previousSynchronousCommit = options.synchronousCommit
+      ? await currentSetting(client, 'synchronous_commit')
+      : undefined;
+    await client.query('SET statement_timeout = 0');
+    if (options.synchronousCommit) {
+      await client.query(`SET synchronous_commit = ${quoteLiteral(options.synchronousCommit)}`);
+    }
+    try {
+      if (options.ignoreConflicts || options.suffix) {
+        const tempTable = `__codegraph_copy_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+        try {
+          await client.query(`CREATE TEMP TABLE ${quoteIdentifier(tempTable)} (LIKE ${quoteIdentifier(table)} INCLUDING DEFAULTS) ON COMMIT PRESERVE ROWS`);
+          await copyTextFilesInto(client, tempTable, columns, filePaths);
+          const columnList = columns.map(quoteIdentifier).join(', ');
+          const selectList = columns.map(quoteIdentifier).join(', ');
+          const suffix = options.suffix ?? 'ON CONFLICT DO NOTHING';
+          await client.query(`
+            INSERT INTO ${quoteIdentifier(table)} (${columnList})
+            SELECT ${selectList}
+            FROM ${quoteIdentifier(tempTable)}
+            ${suffix}
+          `);
+        } finally {
+          await client.query(`DROP TABLE IF EXISTS ${quoteIdentifier(tempTable)}`).catch(() => undefined);
+        }
+        return;
+      }
+
+      await copyTextFilesInto(client, table, columns, filePaths);
+    } finally {
+      if (previousSynchronousCommit !== undefined) {
+        await client.query(`SET synchronous_commit = ${quoteLiteral(previousSynchronousCommit)}`).catch(() => undefined);
+      }
+      await client.query(`SET statement_timeout = ${quoteLiteral(previousStatementTimeout)}`).catch(() => undefined);
+    }
   }
 }
 
@@ -200,9 +288,40 @@ async function copyRowsInto(client: pg.PoolClient, table: string, columns: strin
     stream.once('finish', resolve);
     stream.once('error', reject);
   });
+  let buffered = '';
   for (const row of rows) {
     const line = `${row.map(copyTextValue).join('\t')}\n`;
-    if (!stream.write(line)) await once(stream, 'drain');
+    if (buffered.length > 0 && buffered.length + line.length > COPY_STREAM_BUFFER_BYTES) {
+      if (!stream.write(buffered)) await once(stream, 'drain');
+      buffered = '';
+    }
+    if (line.length >= COPY_STREAM_BUFFER_BYTES) {
+      if (!stream.write(line)) await once(stream, 'drain');
+    } else {
+      buffered += line;
+    }
+  }
+  if (buffered.length > 0) {
+    if (!stream.write(buffered)) await once(stream, 'drain');
+  }
+  stream.end();
+  await finished;
+}
+
+async function copyTextFilesInto(client: pg.PoolClient, table: string, columns: string[], filePaths: string[]): Promise<void> {
+  const columnList = columns.map(quoteIdentifier).join(', ');
+  const stream = client.query(copyFrom(
+    `COPY ${quoteIdentifier(table)} (${columnList}) FROM STDIN WITH (FORMAT text)`,
+  ) as never) as Writable;
+  const finished = new Promise<void>((resolve, reject) => {
+    stream.once('finish', resolve);
+    stream.once('error', reject);
+  });
+  for (const filePath of filePaths) {
+    const input = fs.createReadStream(filePath);
+    for await (const chunk of input) {
+      if (!stream.write(chunk)) await Promise.race([once(stream, 'drain'), finished]);
+    }
   }
   stream.end();
   await finished;
@@ -219,6 +338,16 @@ function copyTextValue(value: unknown): string {
 
 function quoteIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
+}
+
+function quoteLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+async function currentSetting(client: pg.PoolClient, name: string): Promise<string> {
+  const result = await client.query(`SHOW ${quoteIdentifier(name)}`);
+  const row = result.rows[0] as Record<string, string> | undefined;
+  return row?.[name] ?? '0';
 }
 
 export function convertSql(sql: string): string {

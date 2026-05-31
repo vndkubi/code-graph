@@ -5,8 +5,9 @@ import { execFileSync } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CodeGraphDb } from '../../src/v2/storage/database.js';
 import { openCodeGraphDb } from '../../src/v2/storage/database.js';
-import { V2Indexer } from '../../src/v2/index/indexer.js';
+import { V2Indexer, type IndexProgressEvent } from '../../src/v2/index/indexer.js';
 import { V2QueryService } from '../../src/v2/query/service.js';
+import { parseFilesBatchToSpool, readParseContextItemsJsonl, type ParseWorkItem } from '../../src/v2/index/parse.js';
 import { generateSyntheticJavaRepo } from '../../src/v2/benchmark/synthetic-java.js';
 import { runContextProofEval } from '../../src/v2/benchmark/context-proof.js';
 import { runReviewProofEval } from '../../src/v2/benchmark/review-proof.js';
@@ -135,6 +136,46 @@ public class NoiseService {
     }) as { counts: { callEdgesRaw: number; callEdgesPrimary: number; callEdgesLowSignal: number } };
     expect(stats.counts.callEdgesLowSignal).toBe(3);
     expect(stats.counts.callEdgesRaw).toBeGreaterThan(stats.counts.callEdgesPrimary);
+  });
+
+  it('reports unresolved imports without loading all symbol/import rows in the query process', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-unresolved-imports-');
+    writeFile(repo, 'src/main/java/com/example/KnownType.java', `package com.example;
+
+public class KnownType {
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/UsesImports.java', `package com.example;
+
+import com.example.KnownType;
+import com.example.DoesNotExist;
+import java.util.List;
+import org.springframework.stereotype.Service;
+
+public class UsesImports {
+    private KnownType known;
+    private DoesNotExist missing;
+    private List<String> values;
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const stats = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_index_stats',
+      args: { warnStale: false },
+    }) as { diagnostics: { topUnresolvedImports: Array<{ source: string; count: number }> } };
+    const sources = stats.diagnostics.topUnresolvedImports.map(row => row.source);
+
+    expect(stats.diagnostics.topUnresolvedImports).toContainEqual({ source: 'com.example.DoesNotExist', count: 1 });
+    expect(sources).not.toContain('com.example.KnownType');
+    expect(sources).not.toContain('java.util.List');
+    expect(sources).not.toContain('org.springframework.stereotype.Service');
   });
 
   it('ranks multi-token natural-language symbol searches', async () => {
@@ -1415,7 +1456,7 @@ public class NoisyOrder${i} {
     expect(proof.tasks[0]?.mcp.changedFiles.some(file => file.endsWith('OrderService.java'))).toBe(true);
   });
 
-  it('resolves Java parameter and local-variable receiver calls', async () => {
+  it('resolves Java parameter and local-variable receiver calls through sharded full indexing', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-receiver-types-');
     writeFile(repo, 'src/main/java/com/example/LocalCallService.java', `package com.example;
@@ -1425,6 +1466,7 @@ public class LocalCallService {
         gateway.processPayment(paymentInfo.getAmount());
         PaymentGateway localGateway = gateway;
         localGateway.processRefund("tx-1");
+        assertThat(gateway);
     }
 }
 `);
@@ -1453,11 +1495,47 @@ public class PaymentInfo {
     }
 }
 `);
+    writeFile(repo, 'src/main/java/com/example/PaymentInfoCopy.java', `package com.example;
+
+public class PaymentInfo {
+    public double getAmount() {
+        return 10.0;
+    }
+}
+`);
 
     const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = await indexer.indexWorkspace({ root: repo });
+    const progressEvents: IndexProgressEvent[] = [];
+    const previousSharded = process.env.CODEGRAPH_ENABLE_SHARDED_FULL_INDEX;
+    process.env.CODEGRAPH_ENABLE_SHARDED_FULL_INDEX = '1';
+    let result: Awaited<ReturnType<V2Indexer['indexWorkspace']>>;
+    try {
+      result = await indexer.indexWorkspace({ root: repo, progress: event => progressEvents.push(event) });
+    } finally {
+      if (previousSharded === undefined) {
+        delete process.env.CODEGRAPH_ENABLE_SHARDED_FULL_INDEX;
+      } else {
+        process.env.CODEGRAPH_ENABLE_SHARDED_FULL_INDEX = previousSharded;
+      }
+    }
     const queries = new V2QueryService(db);
+
+    expect(progressEvents.some(event => event.details?.sharded === true)).toBe(true);
+    expect(progressEvents.some(event => event.message === 'call fact shard resolved')).toBe(true);
+    expect(progressEvents.at(-1)?.details?.copyFallbacks).toBe(0);
+
+    const parseCacheCount = await db.scalar('SELECT COUNT(*) FROM parse_cache');
+    expect(parseCacheCount).toBeGreaterThan(0);
+    expect(parseCacheCount).toBeLessThan(result.filesParsed);
+    const stats = await db.prepare(`
+      SELECT files, symbols, call_edges, call_edges_low_signal
+      FROM snapshot_stats
+      WHERE snapshot_id = ?
+    `).get(result.snapshotId) as { files: number | string; symbols: number | string; call_edges: number | string; call_edges_low_signal: number | string } | undefined;
+    expect(Number(stats?.files ?? 0)).toBe(result.filesTotal);
+    expect(Number(stats?.symbols ?? 0)).toBeGreaterThan(0);
+    expect(Number(stats?.call_edges ?? 0)).toBeGreaterThan(0);
 
     const paymentCallers = await queries.query({
       workspaceId: result.workspaceId,
@@ -1502,6 +1580,82 @@ public class PaymentInfo {
       callee: 'InMemoryPaymentGateway.processPayment',
       resolution_kind: 'interface-implementation',
     }));
+
+    const lowSignalRows = await db.prepare(`
+      SELECT callee, signal_tier
+      FROM call_edges
+      WHERE snapshot_id = ? AND callee = 'assertThat'
+    `).all(result.snapshotId) as Array<{ callee: string; signal_tier: string }>;
+    expect(lowSignalRows).toContainEqual(expect.objectContaining({
+      callee: 'assertThat',
+      signal_tier: 'low_signal',
+    }));
+
+    const warm = await indexer.indexWorkspace({ root: repo });
+    expect(warm.skippedUnchanged).toBe(true);
+    expect(warm.parseCacheHits).toBe(warm.filesTotal);
+  });
+
+  it('writes parse context and empty-safe fact shards when result spooling is disabled', () => {
+    const repo = tempDir('codegraph-shard-files-');
+    writeFile(repo, 'src/main/java/com/example/One.java', `package com.example;
+
+public class One {
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/Two.java', `package com.example;
+
+public class Two {
+}
+`);
+    const workItems: ParseWorkItem[] = [
+      {
+        key: 'src/main/java/com/example/One.java',
+        absPath: path.join(repo, 'src/main/java/com/example/One.java'),
+        rootDir: repo,
+        size: 32,
+        blobHash: 'one-hash',
+        language: 'java',
+        role: 'main_source',
+      },
+      {
+        key: 'src/main/java/com/example/Two.java',
+        absPath: path.join(repo, 'src/main/java/com/example/Two.java'),
+        rootDir: repo,
+        size: 32,
+        blobHash: 'two-hash',
+        language: 'java',
+        role: 'main_source',
+      },
+    ];
+
+    const spool = parseFilesBatchToSpool(workItems, {
+      workers: 1,
+      spoolResults: false,
+      factShard: {
+        snapshotId: 'snapshot-test',
+        providerId: 'tree-sitter',
+        providerVersion: 'test',
+        createdAt: new Date(0).toISOString(),
+      },
+    });
+
+    try {
+      expect(spool.shardPaths).toEqual([]);
+      expect(spool.contextShardPaths).toHaveLength(1);
+      expect(fs.existsSync(spool.contextShardPaths[0]!)).toBe(true);
+      expect([...readParseContextItemsJsonl(spool.contextShardPaths[0]!)]).toHaveLength(2);
+      expect(spool.factShardPaths).toHaveLength(1);
+      for (const filePath of Object.values(spool.factShardPaths[0]!)) {
+        expect(fs.existsSync(filePath)).toBe(true);
+      }
+      expect(spool.factStatsByShard).toHaveLength(1);
+      expect(spool.factStats.parseCache).toBe(2);
+      expect(() => [...readParseContextItemsJsonl(path.join(repo, 'missing.context.json'))])
+        .toThrow(/Missing parse context shard/);
+    } finally {
+      spool.close();
+    }
   });
 
   it('warns about stale snapshots and can auto-refresh on query', async () => {
@@ -1893,6 +2047,7 @@ public class ChangedFeature {
     expect(third.snapshotId).toBe(first.snapshotId);
     expect(third.incrementalUpdated).toBe(true);
     expect(third.filesDeleted).toBe(1);
+    expect(await db.scalar('SELECT files FROM snapshot_stats WHERE snapshot_id = ?', third.snapshotId)).toBe(1);
 
     const deletedSearch = await queries.query({
       workspaceId: third.workspaceId,
@@ -1998,6 +2153,7 @@ async function resetDb(db: CodeGraphDb): Promise<void> {
     TRUNCATE TABLE
       workspaces,
       snapshots,
+      snapshot_stats,
       files,
       parse_cache,
       symbols,

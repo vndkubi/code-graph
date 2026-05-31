@@ -769,7 +769,23 @@ foreach ($model in $modelsToRun) {
       $workspaceInfo = $null
       try {
         $workspaceInfo = Initialize-Workspace $task $taskRunDir $suiteDir $CodeGraphRoot
-        $workspaceKey = "$($workspaceInfo.workspace)#codegraph-e2e#$($task.id)#$($model.id)#$mode#$(Get-Date -Format 'yyyyMMddHHmmss')"
+        $mcpWorkspace = if ($task.mcpRoot) {
+          Resolve-BenchPath ([string]$task.mcpRoot) $suiteDir $CodeGraphRoot
+        } else {
+          $workspaceInfo.workspace
+        }
+        $workspaceKey = if ($task.mcpWorkspaceKey) {
+          Expand-BenchTemplate ([string]$task.mcpWorkspaceKey) @{
+            workspace = $workspaceInfo.workspace
+            sourceRoot = $workspaceInfo.sourceRoot
+            mcpWorkspace = $mcpWorkspace
+            taskId = $task.id
+            model = $model.id
+            mode = $mode
+          }
+        } else {
+          "$($workspaceInfo.workspace)#codegraph-e2e#$($task.id)#$($model.id)#$mode#$(Get-Date -Format 'yyyyMMddHHmmss')"
+        }
         $homeDir = Join-Path $taskRunDir 'codegraph-home'
         $mcpConfigPath = Join-Path $taskRunDir 'mcp-config.json'
 
@@ -781,13 +797,13 @@ foreach ($model in $modelsToRun) {
 
         if ($mode -eq 'codegraph') {
           if (-not $SkipIndex) {
-            $indexRun = Invoke-CodeGraphIndex $workspaceInfo.workspace $workspaceKey $homeDir $taskRunDir $CodeGraphRoot $DatabaseUrl $ParseWorkers
+            $indexRun = Invoke-CodeGraphIndex $mcpWorkspace $workspaceKey $homeDir $taskRunDir $CodeGraphRoot $DatabaseUrl $ParseWorkers
             if ($indexRun.exitCode -ne 0) {
               throw "CodeGraph index failed for $($task.id) $($model.id) $mode with exit $($indexRun.exitCode)"
             }
           }
           $taskMcpTools = Get-TaskStringArray $task 'mcpTools'
-          Write-McpConfig $mcpConfigPath $workspaceInfo.workspace $workspaceKey $homeDir $CodeGraphRoot $DatabaseUrl $taskMcpTools
+          Write-McpConfig $mcpConfigPath $mcpWorkspace $workspaceKey $homeDir $CodeGraphRoot $DatabaseUrl $taskMcpTools
         }
 
         $copilot = Invoke-CopilotTask $task $model $mode $workspaceInfo.workspace $mcpConfigPath $taskRunDir $DisabledMcpServers $CopilotTimeoutSeconds
@@ -809,6 +825,8 @@ foreach ($model in $modelsToRun) {
           mode = $mode
           model = $model.id
           workspace = $workspaceInfo.workspace
+          mcpWorkspace = if ($mode -eq 'codegraph') { $mcpWorkspace } else { $null }
+          mcpWorkspaceKey = if ($mode -eq 'codegraph') { $workspaceKey } else { $null }
           baselineCommit = $workspaceInfo.baselineCommit
           sessionId = $copilot.sessionId
           exitCode = $copilot.exitCode

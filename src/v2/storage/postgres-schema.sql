@@ -34,6 +34,27 @@ CREATE TABLE IF NOT EXISTS snapshots (
   index_provider_config_json TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS snapshot_stats (
+  snapshot_id TEXT PRIMARY KEY REFERENCES snapshots(id) ON DELETE CASCADE,
+  files INTEGER NOT NULL DEFAULT 0,
+  symbols INTEGER NOT NULL DEFAULT 0,
+  imports INTEGER NOT NULL DEFAULT 0,
+  call_edges INTEGER NOT NULL DEFAULT 0,
+  call_edges_primary INTEGER NOT NULL DEFAULT 0,
+  call_edges_low_signal INTEGER NOT NULL DEFAULT 0,
+  call_edges_provider INTEGER NOT NULL DEFAULT 0,
+  dependency_edges INTEGER NOT NULL DEFAULT 0,
+  endpoints INTEGER NOT NULL DEFAULT 0,
+  beans INTEGER NOT NULL DEFAULT 0,
+  endpoint_path_unresolved INTEGER NOT NULL DEFAULT 0,
+  file_roles_json TEXT NOT NULL DEFAULT '[]',
+  parse_failures_json TEXT,
+  endpoint_warnings_json TEXT,
+  top_unresolved_imports_json TEXT,
+  top_unresolved_calls_json TEXT,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS files (
   snapshot_id TEXT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
   path TEXT NOT NULL,
@@ -63,6 +84,10 @@ ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS index_provider_versions_json TEXT
 ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS index_provider_config_json TEXT NOT NULL DEFAULT '{}';
 ALTER TABLE parse_cache ADD COLUMN IF NOT EXISTS provider_id TEXT NOT NULL DEFAULT 'tree-sitter';
 ALTER TABLE parse_cache ADD COLUMN IF NOT EXISTS provider_version TEXT NOT NULL DEFAULT 'tree-sitter-analyzer-v1';
+ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS parse_failures_json TEXT;
+ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS endpoint_warnings_json TEXT;
+ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS top_unresolved_imports_json TEXT;
+ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS top_unresolved_calls_json TEXT;
 
 DO $$
 DECLARE

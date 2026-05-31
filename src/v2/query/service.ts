@@ -4,7 +4,7 @@ import type { CodeGraphDb } from '../storage/database.js';
 import { V2Indexer, type IndexWorkspaceOptions } from '../index/indexer.js';
 import { roleRank, type FileRole } from '../index/file-role.js';
 import { scanManifest } from '../index/manifest.js';
-import { getGitInfo } from '../git.js';
+import { getGitDirtyFiles, getGitFreshnessInfo } from '../git.js';
 
 export interface QueryEnvelope {
   workspaceId: string;
@@ -16,6 +16,8 @@ export class V2QueryService {
   private readonly indexer: V2Indexer;
   private readonly inFlightBatchSliceKeys = new Map<string, number>();
   private readonly inFlightRefreshes = new Map<string, Promise<string>>();
+  private readonly freshnessCache = new Map<string, { expiresAt: number; value: Record<string, unknown> | undefined }>();
+  private readonly relevantTestCache = new Map<string, Promise<Array<Record<string, unknown>>>>();
 
   constructor(private readonly db: CodeGraphDb) {
     this.indexer = new V2Indexer(db);
@@ -36,12 +38,15 @@ export class V2QueryService {
     let freshnessBeforeRefresh: Record<string, unknown> | undefined;
     let snapshotRefreshed = false;
     if (envelope.args.autoRefresh === true) {
-      freshnessBeforeRefresh = await this.indexFreshness(snapshotId);
+      freshnessBeforeRefresh = await this.indexFreshness(snapshotId, { bypassCache: true });
       const workspace = await this.workspaceInfo(envelope.workspaceId);
       const indexedFileCount = await this.indexedFileCount(snapshotId);
       const refreshLimit = autoRefreshFileLimit();
       if (freshnessBeforeRefresh?.isStale && workspace?.root && indexedFileCount > 0 && indexedFileCount <= refreshLimit) {
+        const staleSnapshotId = snapshotId;
         snapshotId = await this.refreshWorkspaceOnce(envelope.workspaceId, workspace.root, workspace.workspaceKey);
+        this.freshnessCache.delete(staleSnapshotId);
+        this.freshnessCache.delete(snapshotId);
         snapshotRefreshed = true;
       } else if (freshnessBeforeRefresh?.isStale && workspace?.root && indexedFileCount > refreshLimit) {
         autoRefreshSkipped = {
@@ -210,7 +215,15 @@ export class V2QueryService {
     return row?.root;
   }
 
-  private async indexFreshness(snapshotId: string): Promise<Record<string, unknown> | undefined> {
+  private async indexFreshness(
+    snapshotId: string,
+    options: { bypassCache?: boolean } = {},
+  ): Promise<Record<string, unknown> | undefined> {
+    const cacheMs = freshnessCacheMs();
+    const cached = options.bypassCache || cacheMs <= 0 ? undefined : this.freshnessCache.get(snapshotId);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    if (cached) this.freshnessCache.delete(snapshotId);
+
     const row = await this.db.prepare(`
       SELECT s.created_at, s.head_commit, s.dirty_hash, w.root
       FROM snapshots s
@@ -222,9 +235,12 @@ export class V2QueryService {
       dirty_hash?: string;
       root?: string;
     } | undefined;
-    if (!row?.root) return undefined;
+    if (!row?.root) {
+      this.cacheFreshness(snapshotId, undefined, cacheMs, options);
+      return undefined;
+    }
 
-    const git = getGitInfo(row.root);
+    const git = getGitFreshnessInfo(row.root);
     const gitDirty = git.available
       ? git.headCommit !== row.head_commit || git.dirtyHash !== row.dirty_hash
       : false;
@@ -239,7 +255,7 @@ export class V2QueryService {
       || Number(dirtyCounts.deletedCount ?? 0) > 0;
     const isStale = fileDirty || gitDirty;
 
-    return {
+    const freshness = {
       isStale,
       snapshotCreatedAt: row.created_at,
       snapshotHeadCommit: row.head_commit,
@@ -251,6 +267,19 @@ export class V2QueryService {
         ? 'Index may be stale. Pass autoRefresh=true on the query or run codegraph index --root <workspace>.'
         : undefined,
     };
+    this.cacheFreshness(snapshotId, freshness, cacheMs, options);
+    return freshness;
+  }
+
+  private cacheFreshness(
+    snapshotId: string,
+    value: Record<string, unknown> | undefined,
+    cacheMs: number,
+    options: { bypassCache?: boolean },
+  ): void {
+    if (options.bypassCache || cacheMs <= 0) return;
+    if (value?.isStale !== true) return;
+    this.freshnessCache.set(snapshotId, { expiresAt: Date.now() + cacheMs, value });
   }
 
   private async snippetOptions(snapshotId: string, args: Record<string, unknown>): Promise<SnippetOptions | undefined> {
@@ -2648,42 +2677,65 @@ export class V2QueryService {
       JOIN workspaces w ON w.id = s.workspace_id
       WHERE s.id = ?
     `).get(snapshotId);
-    const counts = {
-      files: await scalar(this.db, 'SELECT COUNT(*) FROM files WHERE snapshot_id = ?', snapshotId),
-      symbols: await scalar(this.db, 'SELECT COUNT(*) FROM symbols WHERE snapshot_id = ?', snapshotId),
-      imports: await scalar(this.db, 'SELECT COUNT(*) FROM imports WHERE snapshot_id = ?', snapshotId),
-      callEdges: await scalar(this.db, 'SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ?', snapshotId),
-      callEdgesRaw: await scalar(this.db, 'SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ?', snapshotId),
-      callEdgesPrimary: await scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier IN ('primary', 'provider')", snapshotId),
-      callEdgesLowSignal: await scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'low_signal'", snapshotId),
-      callEdgesProvider: await scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'provider'", snapshotId),
-      dependencyEdges: await scalar(this.db, 'SELECT COUNT(*) FROM dependency_edges WHERE snapshot_id = ?', snapshotId),
-      endpoints: await scalar(this.db, 'SELECT COUNT(*) FROM endpoints WHERE snapshot_id = ?', snapshotId),
-      beans: await scalar(this.db, 'SELECT COUNT(*) FROM beans WHERE snapshot_id = ?', snapshotId),
-    };
-    const fileRoles = await this.db.prepare(`
-      SELECT file_role, COUNT(*) AS count FROM files WHERE snapshot_id = ? GROUP BY file_role
-    `).all(snapshotId);
-    const parseFailures = await this.db.prepare(`
+    const snapshotStats = await this.snapshotStats(snapshotId);
+    const [
+      counts,
+      fileRoles,
+      parseFailures,
+      endpointWarnings,
+      staleFiles,
+      topUnresolvedImports,
+      topUnresolvedCalls,
+      endpointPathUnresolvedCount,
+    ] = await Promise.all([
+      snapshotStats
+        ? Promise.resolve(countsFromSnapshotStats(snapshotStats))
+        : this.liveIndexCounts(snapshotId),
+      snapshotStats
+        ? Promise.resolve(fileRolesFromSnapshotStats(snapshotStats))
+        : this.liveFileRoles(snapshotId),
+      snapshotStats?.parse_failures_json != null
+        ? Promise.resolve(parseJson<Array<Record<string, unknown>>>(snapshotStats.parse_failures_json, []))
+        : this.db.prepare(`
       SELECT path, language, parse_status FROM files
       WHERE snapshot_id = ? AND parse_status = 'error'
       ORDER BY path
       LIMIT 50
-    `).all(snapshotId);
-    const endpointWarnings = await this.db.prepare(`
+    `).all(snapshotId),
+      snapshotStats?.endpoint_warnings_json != null
+        ? Promise.resolve(parseJson<Array<Record<string, unknown>>>(snapshotStats.endpoint_warnings_json, []))
+        : this.db.prepare(`
       SELECT method, path, path_resolution, path_resolution_reason, handler_symbol, file, line
       FROM endpoints
       WHERE snapshot_id = ? AND path_resolution != 'exact'
       ORDER BY file, line
       LIMIT 50
-    `).all(snapshotId);
-
-    const staleFiles = args.warnStale === false
+    `).all(snapshotId),
+      args.warnStale === false
       ? {
         skipped: true,
         reason: 'warnStale=false skips filesystem dirty-file scan for fast stats.',
       }
-      : await this.computeDirtyFiles(snapshotId);
+      : this.computeDirtyFiles(snapshotId),
+      snapshotStats?.top_unresolved_imports_json != null
+        ? Promise.resolve(parseJson<Array<Record<string, unknown>>>(snapshotStats.top_unresolved_imports_json, []))
+        : this.topUnresolvedImports(snapshotId),
+      snapshotStats?.top_unresolved_calls_json != null
+        ? Promise.resolve(parseJson<Array<Record<string, unknown>>>(snapshotStats.top_unresolved_calls_json, []))
+        : this.db.prepare(`
+        SELECT callee, COUNT(*) AS count, MAX(confidence) AS maxConfidence
+        FROM call_edges
+        WHERE snapshot_id = ? AND resolution_kind = 'name-only' AND signal_tier IN ('primary', 'provider')
+        GROUP BY callee
+        ORDER BY count DESC, callee
+        LIMIT 20
+      `).all(snapshotId),
+      snapshotStats
+        ? Promise.resolve(Number(snapshotStats.endpoint_path_unresolved ?? 0))
+        : scalar(this.db, `
+          SELECT COUNT(*) FROM endpoints WHERE snapshot_id = ? AND path_resolution != 'exact'
+        `, snapshotId),
+    ]);
 
     return {
       snapshot,
@@ -2692,23 +2744,67 @@ export class V2QueryService {
       diagnostics: {
         parseFailures,
         staleFiles,
-        topUnresolvedImports: await this.topUnresolvedImports(snapshotId),
-        topUnresolvedCalls: await this.db.prepare(`
-          SELECT callee, COUNT(*) AS count, MAX(confidence) AS maxConfidence
-          FROM call_edges
-          WHERE snapshot_id = ? AND resolution_kind = 'name-only' AND signal_tier IN ('primary', 'provider')
-          GROUP BY callee
-          ORDER BY count DESC, callee
-          LIMIT 20
-        `).all(snapshotId),
+        topUnresolvedImports,
+        topUnresolvedCalls,
         frameworkWarnings: {
           endpointPathUnresolved: endpointWarnings,
-          endpointPathUnresolvedCount: await scalar(this.db, `
-            SELECT COUNT(*) FROM endpoints WHERE snapshot_id = ? AND path_resolution != 'exact'
-          `, snapshotId),
+          endpointPathUnresolvedCount,
         },
       },
     };
+  }
+
+  private async snapshotStats(snapshotId: string): Promise<SnapshotStatsRow | undefined> {
+    return await this.db.prepare(`
+      SELECT *
+      FROM snapshot_stats
+      WHERE snapshot_id = ?
+    `).get(snapshotId) as SnapshotStatsRow | undefined;
+  }
+
+  private async liveIndexCounts(snapshotId: string): Promise<IndexCountSummary> {
+    const [
+      files,
+      symbols,
+      imports,
+      callEdges,
+      callEdgesPrimary,
+      callEdgesLowSignal,
+      callEdgesProvider,
+      dependencyEdges,
+      endpoints,
+      beans,
+    ] = await Promise.all([
+      scalar(this.db, 'SELECT COUNT(*) FROM files WHERE snapshot_id = ?', snapshotId),
+      scalar(this.db, 'SELECT COUNT(*) FROM symbols WHERE snapshot_id = ?', snapshotId),
+      scalar(this.db, 'SELECT COUNT(*) FROM imports WHERE snapshot_id = ?', snapshotId),
+      scalar(this.db, 'SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ?', snapshotId),
+      scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier IN ('primary', 'provider')", snapshotId),
+      scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'low_signal'", snapshotId),
+      scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'provider'", snapshotId),
+      scalar(this.db, 'SELECT COUNT(*) FROM dependency_edges WHERE snapshot_id = ?', snapshotId),
+      scalar(this.db, 'SELECT COUNT(*) FROM endpoints WHERE snapshot_id = ?', snapshotId),
+      scalar(this.db, 'SELECT COUNT(*) FROM beans WHERE snapshot_id = ?', snapshotId),
+    ]);
+    return {
+      files,
+      symbols,
+      imports,
+      callEdges,
+      callEdgesRaw: callEdges,
+      callEdgesPrimary,
+      callEdgesLowSignal,
+      callEdgesProvider,
+      dependencyEdges,
+      endpoints,
+      beans,
+    };
+  }
+
+  private async liveFileRoles(snapshotId: string): Promise<FileRoleCountRow[]> {
+    return await this.db.prepare(`
+      SELECT file_role, COUNT(*) AS count FROM files WHERE snapshot_id = ? GROUP BY file_role
+    `).all(snapshotId) as FileRoleCountRow[];
   }
 
   private async dependencyRows(snapshotId: string, file: string, direction: 'from_file' | 'to_file') {
@@ -2945,6 +3041,35 @@ export class V2QueryService {
   }
 
   private async findRelevantTests(snapshotId: string, target: string, limit: number): Promise<Array<Record<string, unknown>>> {
+    const normalizedTarget = target.trim();
+    const normalizedLimit = clampInt(Math.floor(limit), 1, 200);
+    const cacheKey = `${snapshotId}\0${normalizedTarget}\0${normalizedLimit}`;
+    const cached = this.relevantTestCache.get(cacheKey);
+    if (cached) return cached;
+
+    const lookup = this.findRelevantTestsUncached(snapshotId, normalizedTarget, normalizedLimit)
+      .catch(error => {
+        this.relevantTestCache.delete(cacheKey);
+        throw error;
+      });
+    this.rememberRelevantTestLookup(cacheKey, lookup);
+    return lookup;
+  }
+
+  private rememberRelevantTestLookup(
+    key: string,
+    value: Promise<Array<Record<string, unknown>>>,
+  ) {
+    const limit = relevantTestCacheLimit();
+    if (limit <= 0) return;
+    if (!this.relevantTestCache.has(key) && this.relevantTestCache.size >= limit) {
+      const oldest = this.relevantTestCache.keys().next().value as string | undefined;
+      if (oldest) this.relevantTestCache.delete(oldest);
+    }
+    this.relevantTestCache.set(key, value);
+  }
+
+  private async findRelevantTestsUncached(snapshotId: string, target: string, limit: number): Promise<Array<Record<string, unknown>>> {
     const terms = searchTermsForTarget(target);
     if (terms.length === 0) return [];
     const candidates = new Map<string, { file: string; score: number; reasons: Set<string> }>();
@@ -3074,8 +3199,13 @@ export class V2QueryService {
 
   private async findRelevantTestsForSeeds(snapshotId: string, seeds: string[], limit: number): Promise<Array<Record<string, unknown>>> {
     const merged = new Map<string, { file: string; score: number; reasons: Set<string> }>();
-    for (const seed of [...new Set(seeds.map(item => item.trim()).filter(Boolean))].slice(0, 16)) {
-      for (const test of await this.findRelevantTests(snapshotId, seed, limit)) {
+    const seedLookups = await mapWithConcurrency(
+      [...new Set(seeds.map(item => item.trim()).filter(Boolean))].slice(0, 16),
+      relevantTestLookupConcurrency(),
+      seed => this.findRelevantTests(snapshotId, seed, limit),
+    );
+    for (const tests of seedLookups) {
+      for (const test of tests) {
         const file = String(test.file ?? '');
         if (!file) continue;
         const existing = merged.get(file) ?? { file, score: 0, reasons: new Set<string>() };
@@ -3170,14 +3300,31 @@ export class V2QueryService {
 
   private async computeDirtyFiles(snapshotId: string): Promise<Record<string, unknown>> {
     const snapshot = await this.db.prepare(`
-      SELECT w.root AS root
+      SELECT w.root AS root, s.head_commit AS head_commit
       FROM snapshots s
       JOIN workspaces w ON w.id = s.workspace_id
       WHERE s.id = ?
-    `).get(snapshotId) as { root?: string } | undefined;
+    `).get(snapshotId) as { root?: string; head_commit?: string } | undefined;
     if (!snapshot?.root) return { error: 'Workspace root not found for snapshot.' };
 
     try {
+      if (snapshot.head_commit) {
+        const gitDirty = getGitDirtyFiles(snapshot.root);
+        if (gitDirty.available) {
+          return {
+            addedCount: gitDirty.added.length,
+            modifiedCount: gitDirty.modified.length,
+            deletedCount: gitDirty.deleted.length,
+            scanTimeMs: gitDirty.scanTimeMs,
+            source: 'git-status',
+            samples: {
+              added: gitDirty.added.slice(0, 20),
+              modified: gitDirty.modified.slice(0, 20),
+              deleted: gitDirty.deleted.slice(0, 20),
+            },
+          };
+        }
+      }
       const manifest = scanManifest(snapshot.root);
       const current = new Map(manifest.files.map(file => [file.relPath, file.blobHash]));
       const indexedRows = await this.db.prepare(`
@@ -3212,28 +3359,35 @@ export class V2QueryService {
   }
 
   private async topUnresolvedImports(snapshotId: string): Promise<Array<Record<string, unknown>>> {
-    const symbols = await this.db.prepare(`
-      SELECT fq_name, simple_name FROM symbols WHERE snapshot_id = ? AND kind IN ('class', 'interface', 'enum', 'type')
-    `).all(snapshotId) as Array<{ fq_name: string; simple_name: string }>;
-    const known = new Set<string>();
-    for (const symbol of symbols) {
-      known.add(symbol.fq_name);
-      known.add(symbol.simple_name);
-    }
-    const imports = await this.db.prepare(`
-      SELECT source FROM imports WHERE snapshot_id = ?
-    `).all(snapshotId) as Array<{ source: string }>;
-    const counts = new Map<string, number>();
-    for (const imp of imports) {
-      if (isCommonExternalImport(imp.source)) continue;
-      const simple = imp.source.substring(imp.source.lastIndexOf('.') + 1);
-      if (known.has(imp.source) || known.has(simple)) continue;
-      counts.set(imp.source, (counts.get(imp.source) ?? 0) + 1);
-    }
-    return [...counts.entries()]
-      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-      .slice(0, 20)
-      .map(([source, count]) => ({ source, count }));
+    const rows = await this.db.prepare(`
+      WITH import_counts AS (
+        SELECT source, substring(source FROM '[^.]+$') AS simple_name, COUNT(*) AS count
+        FROM imports
+        WHERE snapshot_id = ? AND ${COMMON_EXTERNAL_IMPORT_SQL}
+        GROUP BY source
+      )
+      SELECT i.source, i.count
+      FROM import_counts i
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM symbols s
+        WHERE s.snapshot_id = ?
+          AND s.kind IN ('class', 'interface', 'enum', 'type')
+          AND s.fq_name = i.source
+        LIMIT 1
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM symbols s
+        WHERE s.snapshot_id = ?
+          AND s.kind IN ('class', 'interface', 'enum', 'type')
+          AND s.simple_name = i.simple_name
+        LIMIT 1
+      )
+      ORDER BY i.count DESC, i.source
+      LIMIT 20
+    `).all(snapshotId, snapshotId, snapshotId) as Array<{ source: string; count: number | string }>;
+    return rows.map(row => ({ source: row.source, count: Number(row.count) }));
   }
 
   private async impactedEndpoints(snapshotId: string, files: string[]): Promise<Array<Record<string, unknown>>> {
@@ -3294,6 +3448,44 @@ interface EndpointRow {
   framework: string;
   confidence: number;
   file_role: string;
+}
+
+interface IndexCountSummary {
+  files: number;
+  symbols: number;
+  imports: number;
+  callEdges: number;
+  callEdgesRaw: number;
+  callEdgesPrimary: number;
+  callEdgesLowSignal: number;
+  callEdgesProvider: number;
+  dependencyEdges: number;
+  endpoints: number;
+  beans: number;
+}
+
+interface SnapshotStatsRow {
+  files: number | string;
+  symbols: number | string;
+  imports: number | string;
+  call_edges: number | string;
+  call_edges_primary: number | string;
+  call_edges_low_signal: number | string;
+  call_edges_provider: number | string;
+  dependency_edges: number | string;
+  endpoints: number | string;
+  beans: number | string;
+  endpoint_path_unresolved: number | string;
+  file_roles_json?: string;
+  parse_failures_json?: string | null;
+  endpoint_warnings_json?: string | null;
+  top_unresolved_imports_json?: string | null;
+  top_unresolved_calls_json?: string | null;
+}
+
+interface FileRoleCountRow {
+  file_role: string;
+  count: number | string;
 }
 
 interface FileRow {
@@ -6341,14 +6533,76 @@ function parseJson<T>(value: string | undefined, fallback: T): T {
   }
 }
 
+function countsFromSnapshotStats(row: SnapshotStatsRow): IndexCountSummary {
+  const callEdges = Number(row.call_edges ?? 0);
+  return {
+    files: Number(row.files ?? 0),
+    symbols: Number(row.symbols ?? 0),
+    imports: Number(row.imports ?? 0),
+    callEdges,
+    callEdgesRaw: callEdges,
+    callEdgesPrimary: Number(row.call_edges_primary ?? 0),
+    callEdgesLowSignal: Number(row.call_edges_low_signal ?? 0),
+    callEdgesProvider: Number(row.call_edges_provider ?? 0),
+    dependencyEdges: Number(row.dependency_edges ?? 0),
+    endpoints: Number(row.endpoints ?? 0),
+    beans: Number(row.beans ?? 0),
+  };
+}
+
+function fileRolesFromSnapshotStats(row: SnapshotStatsRow): FileRoleCountRow[] {
+  return parseJson<Array<{ file_role?: unknown; count?: unknown }>>(row.file_roles_json, [])
+    .map(item => ({
+      file_role: String(item.file_role ?? ''),
+      count: Number(item.count ?? 0),
+    }))
+    .filter(item => item.file_role.length > 0);
+}
+
 async function scalar(db: CodeGraphDb, sql: string, ...args: unknown[]): Promise<number> {
   const row = await db.prepare(sql).get(...args) as Record<string, number> | undefined;
   return row ? Number(Object.values(row)[0] ?? 0) : 0;
 }
 
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workerCount = Math.min(Math.max(1, Math.floor(concurrency)), items.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index] as T);
+    }
+  }));
+  return results;
+}
+
+function relevantTestLookupConcurrency(): number {
+  const raw = Number(process.env.CODEGRAPH_RELEVANT_TEST_LOOKUP_CONCURRENCY ?? 6);
+  if (!Number.isFinite(raw)) return 6;
+  return clampInt(Math.floor(raw), 1, 16);
+}
+
+function relevantTestCacheLimit(): number {
+  const raw = Number(process.env.CODEGRAPH_RELEVANT_TEST_CACHE_LIMIT ?? 512);
+  if (!Number.isFinite(raw)) return 512;
+  return clampInt(Math.floor(raw), 0, 10_000);
+}
+
 function autoRefreshFileLimit(): number {
   const raw = Number(process.env.CODEGRAPH_AUTO_REFRESH_FILE_LIMIT ?? 10_000);
   if (!Number.isFinite(raw) || raw < 0) return 10_000;
+  return Math.floor(raw);
+}
+
+function freshnessCacheMs(): number {
+  const raw = Number(process.env.CODEGRAPH_QUERY_FRESHNESS_CACHE_MS ?? 0);
+  if (!Number.isFinite(raw) || raw < 0) return 0;
   return Math.floor(raw);
 }
 
@@ -6441,8 +6695,22 @@ function isDtoLike(symbol: Record<string, unknown>): boolean {
   return /(Dto|DTO|Request|Response|Command|Payload)$/.test(name);
 }
 
+const COMMON_EXTERNAL_IMPORT_PATTERN = '^(java|javax|jakarta|org\\.springframework|lombok|org\\.junit|org\\.mockito|com\\.fasterxml|org\\.slf4j)\\.';
+const COMMON_EXTERNAL_IMPORT_RE = new RegExp(COMMON_EXTERNAL_IMPORT_PATTERN);
+const COMMON_EXTERNAL_IMPORT_SQL = [
+  "source NOT LIKE 'java.%'",
+  "source NOT LIKE 'javax.%'",
+  "source NOT LIKE 'jakarta.%'",
+  "source NOT LIKE 'org.springframework.%'",
+  "source NOT LIKE 'lombok.%'",
+  "source NOT LIKE 'org.junit.%'",
+  "source NOT LIKE 'org.mockito.%'",
+  "source NOT LIKE 'com.fasterxml.%'",
+  "source NOT LIKE 'org.slf4j.%'",
+].join(' AND ');
+
 function isCommonExternalImport(source: string): boolean {
-  return /^(java|javax|jakarta|org\.springframework|lombok|org\.junit|org\.mockito|com\.fasterxml|org\.slf4j)\./.test(source);
+  return COMMON_EXTERNAL_IMPORT_RE.test(source);
 }
 
 function rankFiles(files: string[]): string[] {

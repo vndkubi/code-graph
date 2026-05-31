@@ -9,6 +9,7 @@ param(
   [string[]]$TaskIds = @(),
   [int]$ParseWorkers = 8,
   [int]$CopilotTimeoutSeconds = 900,
+  [int]$ExternalIndexTimeoutSeconds = 3600,
   [switch]$SkipInternalIndex,
   [switch]$SkipExternalIndex,
   [switch]$DryRun,
@@ -32,6 +33,14 @@ function Expand-ListParameter([string[]]$Values) {
 $Models = Expand-ListParameter $Models
 $Modes = Expand-ListParameter $Modes
 $TaskIds = Expand-ListParameter $TaskIds
+
+function Stop-ProcessTree([int]$ProcessId) {
+  $children = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ParentProcessId -eq $ProcessId })
+  foreach ($child in $children) {
+    Stop-ProcessTree ([int]$child.ProcessId)
+  }
+  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
 
 function New-SafeName([string]$Value) {
   return ($Value -replace '[^A-Za-z0-9_.-]', '_')
@@ -130,7 +139,7 @@ function Invoke-CheckedNative(
   if ($TimeoutSeconds -gt 0) {
     $completed = $process.WaitForExit($TimeoutSeconds * 1000)
     if (-not $completed) {
-      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+      Stop-ProcessTree $process.Id
       $stdoutTask.Wait(1000) | Out-Null
       $stderrTask.Wait(1000) | Out-Null
       [System.IO.File]::WriteAllText($StdoutPath, $stdoutTask.Result, [System.Text.UTF8Encoding]::new($false))
@@ -181,6 +190,7 @@ function Get-ChangedFilesSinceBaseline([string]$Workspace, [string]$BaselineRef,
     foreach ($line in (Get-Content -LiteralPath $statusPath | Where-Object { $_ })) {
       $path = if ($line.Length -gt 3) { $line.Substring(3) } else { $line.Trim() }
       if ($path -match ' -> ') { $path = ($path -split ' -> ')[-1] }
+      if ((Normalize-RepoPath $path) -like '.codegraph*') { continue }
       if ($path) { [void]$changed.Add((Normalize-RepoPath $path)) }
     }
   }
@@ -188,6 +198,39 @@ function Get-ChangedFilesSinceBaseline([string]$Workspace, [string]$BaselineRef,
   $result = @()
   foreach ($item in $changed) { $result += $item }
   return @($result | Sort-Object)
+}
+
+function Clear-BenchmarkWorkspaceArtifacts([string]$Workspace, [string]$TaskRunDir, [string]$Label) {
+  $statusPath = Join-Path $TaskRunDir "git-status-cleanup-$Label.txt"
+  Invoke-Git $Workspace @('status', '--porcelain') $statusPath | Out-Null
+  if (-not (Test-Path $statusPath)) { return }
+
+  $workspaceRoot = [System.IO.Path]::GetFullPath($Workspace).TrimEnd('\', '/')
+  $dirtyTracked = [System.Collections.Generic.List[string]]::new()
+  foreach ($line in (Get-Content -LiteralPath $statusPath | Where-Object { $_ })) {
+    if ($line.Length -lt 4) { continue }
+    $status = $line.Substring(0, 2)
+    $path = $line.Substring(3)
+    if ($path -match ' -> ') { $path = ($path -split ' -> ')[-1] }
+    $repoPath = Normalize-RepoPath $path
+    if ($repoPath -like '.codegraph*') { continue }
+
+    if ($status -eq '??') {
+      $target = [System.IO.Path]::GetFullPath((Join-Path $Workspace $path))
+      if (-not ($target -eq $workspaceRoot -or $target.StartsWith($workspaceRoot + [System.IO.Path]::DirectorySeparatorChar))) {
+        throw "Refusing to remove artifact outside workspace: $target"
+      }
+      if (Test-Path -LiteralPath $target) {
+        Remove-Item -LiteralPath $target -Recurse -Force
+      }
+    } else {
+      [void]$dirtyTracked.Add($repoPath)
+    }
+  }
+
+  if ($dirtyTracked.Count -gt 0) {
+    Write-Warning "Workspace has tracked changes after $Label; leaving them in place: $($dirtyTracked -join ', ')"
+  }
 }
 
 function Get-FinalAssistantContent([string]$JsonlPath) {
@@ -278,6 +321,25 @@ function Get-ToolCallSummary([string]$JsonlPath) {
     mcpToolCalls = $mcpTotal
     toolCallNames = [pscustomobject]$names
     mcpToolCallNames = [pscustomobject]$mcpNames
+  }
+}
+
+function Get-CopilotResultEvent([string]$JsonlPath) {
+  $result = $null
+  foreach ($line in (Get-Content -LiteralPath $JsonlPath -ErrorAction SilentlyContinue)) {
+    if (-not $line.Trim()) { continue }
+    if ($line -notlike '*"type":"result"*') { continue }
+    try { $event = $line | ConvertFrom-Json } catch { continue }
+    if ($event.type -eq 'result') { $result = $event }
+  }
+  if (-not $result) {
+    return [pscustomobject]@{ found = $false }
+  }
+  return [pscustomobject]@{
+    found = $true
+    sessionId = [string]$result.sessionId
+    exitCode = if ($null -ne $result.exitCode) { [int]$result.exitCode } else { 0 }
+    latencyMs = if ($result.usage -and $null -ne $result.usage.sessionDurationMs) { [int]$result.usage.sessionDurationMs } else { 0 }
   }
 }
 
@@ -426,11 +488,27 @@ function Invoke-ExternalCodeGraphIndex(
   [string]$Workspace,
   [string]$ExternalCliPath,
   [string]$RunDir,
-  [string]$ExternalCodeGraphRoot
+  [string]$ExternalCodeGraphRoot,
+  [int]$TimeoutSeconds
 ) {
   $stdout = Join-Path $RunDir 'external-index.stdout.log'
   $stderr = Join-Path $RunDir 'external-index.stderr.log'
-  return Invoke-CheckedNative 'node' @($ExternalCliPath, 'init', $Workspace) $ExternalCodeGraphRoot $stdout $stderr 0
+  $statusStdout = Join-Path $RunDir 'external-status.stdout.log'
+  $statusStderr = Join-Path $RunDir 'external-status.stderr.log'
+  if (Test-Path (Join-Path $Workspace '.codegraph\codegraph.db')) {
+    $status = Invoke-CheckedNative 'node' @($ExternalCliPath, 'status', $Workspace) $ExternalCodeGraphRoot $statusStdout $statusStderr 120
+    if ($status.exitCode -eq 0) {
+      return [pscustomobject]@{ exitCode = 0; timedOut = $false; skipped = $true; statusVerified = $true }
+    }
+  }
+  $run = Invoke-CheckedNative 'node' @($ExternalCliPath, 'init', $Workspace) $ExternalCodeGraphRoot $stdout $stderr $TimeoutSeconds
+  if ($run.exitCode -eq 0) { return $run }
+
+  $status = Invoke-CheckedNative 'node' @($ExternalCliPath, 'status', $Workspace) $ExternalCodeGraphRoot $statusStdout $statusStderr 120
+  if ($status.exitCode -eq 0) {
+    return [pscustomobject]@{ exitCode = 0; timedOut = $run.timedOut; skipped = $false; statusVerified = $true; recoveredAfterInitFailure = $true }
+  }
+  return $run
 }
 
 function New-RepoWorktree(
@@ -442,7 +520,11 @@ function New-RepoWorktree(
   $key = "$(New-SafeName $repoLeaf)-$(Get-ShortHash $SourceRoot)"
   $workspace = Join-Path $RunDir "worktrees\$key"
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $workspace) | Out-Null
-  Invoke-Git $SourceRoot @('worktree', 'add', '--detach', $workspace, 'HEAD') (Join-Path $RunDir "worktree-add-$key.out") | Out-Null
+  if (Test-Path (Join-Path $workspace '.git')) {
+    Write-Host "Reusing existing worktree for $SourceRoot"
+  } else {
+    Invoke-Git $SourceRoot @('worktree', 'add', '--detach', $workspace, 'HEAD') (Join-Path $RunDir "worktree-add-$key.out") | Out-Null
+  }
   $baselineCommit = (Invoke-Git $workspace @('rev-parse', 'HEAD') (Join-Path $RunDir "worktree-rev-$key.out")).Trim()
   return [pscustomobject]@{
     key = $key
@@ -483,6 +565,32 @@ function Invoke-CopilotTask(
     }).Replace("`r", ' ').Replace("`n", ' ')
   [System.IO.File]::WriteAllText((Join-Path $TaskRunDir 'prompt.txt'), $prompt, [System.Text.UTF8Encoding]::new($false))
 
+  $finalOutputPath = Join-Path $TaskRunDir 'final-output.txt'
+  if ((Test-Path $stdout) -and (Test-Path $finalOutputPath)) {
+    $existing = Get-CopilotResultEvent $stdout
+    if ($existing.found -and $existing.sessionId) {
+      $final = Get-Content -LiteralPath $finalOutputPath -Raw
+      $toolSummary = Get-ToolCallSummary $stdout
+      return [pscustomobject]@{
+        sessionId = $existing.sessionId
+        exitCode = $existing.exitCode
+        timedOut = $false
+        latencyMs = $existing.latencyMs
+        stdoutPath = $stdout
+        stderrPath = $stderr
+        logDir = $logDir
+        promptPath = Join-Path $TaskRunDir 'prompt.txt'
+        finalAnswerPath = $finalOutputPath
+        finalAnswer = $final
+        totalToolCalls = $toolSummary.totalToolCalls
+        mcpToolCalls = $toolSummary.mcpToolCalls
+        toolCallNames = $toolSummary.toolCallNames
+        mcpToolCallNames = $toolSummary.mcpToolCallNames
+        reused = $true
+      }
+    }
+  }
+
   $copilotArgs = @(
     'copilot',
     '--',
@@ -516,7 +624,7 @@ function Invoke-CopilotTask(
   $run = Invoke-CheckedNative 'gh' $copilotArgs $WorkspaceInfo.workspace $stdout $stderr $TimeoutSeconds
   $ended = Get-Date
   $final = Get-FinalAssistantContent $stdout
-  [System.IO.File]::WriteAllText((Join-Path $TaskRunDir 'final-output.txt'), $final, [System.Text.UTF8Encoding]::new($false))
+  [System.IO.File]::WriteAllText($finalOutputPath, $final, [System.Text.UTF8Encoding]::new($false))
   $toolSummary = Get-ToolCallSummary $stdout
 
   return [pscustomobject]@{
@@ -528,19 +636,47 @@ function Invoke-CopilotTask(
     stderrPath = $stderr
     logDir = $logDir
     promptPath = Join-Path $TaskRunDir 'prompt.txt'
-    finalAnswerPath = Join-Path $TaskRunDir 'final-output.txt'
+    finalAnswerPath = $finalOutputPath
     finalAnswer = $final
     totalToolCalls = $toolSummary.totalToolCalls
     mcpToolCalls = $toolSummary.mcpToolCalls
     toolCallNames = $toolSummary.toolCallNames
     mcpToolCallNames = $toolSummary.mcpToolCallNames
+    reused = $false
   }
+}
+
+function Convert-CountObject([object]$Value) {
+  $hash = [ordered]@{}
+  if ($null -eq $Value) { return [pscustomobject]$hash }
+  foreach ($prop in $Value.PSObject.Properties) {
+    $hash[[string]$prop.Name] = [int]$prop.Value
+  }
+  return [pscustomobject]$hash
+}
+
+function Convert-FailedChecks([object[]]$Checks) {
+  $items = [System.Collections.Generic.List[object]]::new()
+  foreach ($check in @($Checks)) {
+    if ($null -eq $check) { continue }
+    $items.Add([pscustomobject]@{
+      name = [string]$check.name
+      expected = if ($null -ne $check.expected) { [string]$check.expected } else { '' }
+      pattern = if ($null -ne $check.pattern) { [string]$check.pattern } else { '' }
+      actual = if ($null -ne $check.actual) { [string]$check.actual } else { '' }
+      expectedMax = if ($null -ne $check.expectedMax) { [string]$check.expectedMax } else { '' }
+      passed = if ($null -ne $check.passed) { [bool]$check.passed } else { $false }
+    })
+  }
+  return @($items.ToArray())
 }
 
 function Write-ReportFiles([object[]]$Results, [string]$RunDir, [pscustomobject]$Suite) {
   $finalPath = Join-Path $RunDir 'quality-report.real-repo-comparison.json'
-  $resultsPath = Join-Path $RunDir 'results.json'
-  [System.IO.File]::WriteAllText($resultsPath, ($Results | ConvertTo-Json -Depth 80), [System.Text.UTF8Encoding]::new($false))
+  $resultsPath = Join-Path $RunDir 'results.csv'
+  $Results |
+    Select-Object taskId, repoName, model, mode, runIndex, quality, qualityScore, validatorPassed, latencyMs, inputTokens, outputTokens, totalTokens, cachedInputTokens, reasoningTokens, credit, totalToolCalls, mcpToolCalls, reused, promptPath, finalAnswerPath, stdoutPath, stderrPath |
+    Export-Csv -NoTypeInformation -Encoding UTF8 -Path $resultsPath
 
   $groups = @(
     $Results |
@@ -568,9 +704,10 @@ function Write-ReportFiles([object[]]$Results, [string]$RunDir, [pscustomobject]
     suite = $Suite.name
     runDir = $RunDir
     summary = @($groups | Sort-Object model, mode)
-    results = @($Results)
+    resultsCsv = $resultsPath
+    note = 'Per-run prompts and outputs are stored in promptPath and finalAnswerPath from results.csv.'
   }
-  [System.IO.File]::WriteAllText($finalPath, ($report | ConvertTo-Json -Depth 100), [System.Text.UTF8Encoding]::new($false))
+  [System.IO.File]::WriteAllText($finalPath, ($report | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
 
   $csvPath = Join-Path $RunDir 'quality-report.real-repo-comparison.csv'
   $Results |
@@ -596,6 +733,17 @@ function Write-ReportFiles([object[]]$Results, [string]$RunDir, [pscustomobject]
     json = $finalPath
     csv = $csvPath
     markdown = $summaryMdPath
+  }
+}
+
+function Write-ProgressCsvRow([pscustomobject]$Result, [string]$RunDir) {
+  $path = Join-Path $RunDir 'results.partial.csv'
+  $row = $Result |
+    Select-Object taskId, repoName, model, mode, runIndex, quality, qualityScore, validatorPassed, latencyMs, inputTokens, outputTokens, totalTokens, cachedInputTokens, reasoningTokens, credit, totalToolCalls, mcpToolCalls, reused, promptPath, finalAnswerPath, stdoutPath, stderrPath
+  if (Test-Path $path) {
+    $row | Export-Csv -NoTypeInformation -Encoding UTF8 -Append -Path $path
+  } else {
+    $row | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $path
   }
 }
 
@@ -643,15 +791,29 @@ foreach ($repoRoot in $workspaceByRepo.Keys) {
   $workspaceInfo = $workspaceByRepo[$repoRoot]
   New-Item -ItemType Directory -Force -Path $workspaceInfo.indexDir | Out-Null
   if (($Modes -contains 'internal') -and -not $SkipInternalIndex) {
-    Write-Host "Indexing internal CodeGraph: $($workspaceInfo.key)"
-    $run = Invoke-CodeGraphIndex $workspaceInfo.workspace $workspaceInfo.workspaceKey $workspaceInfo.internalHome $workspaceInfo.indexDir $CodeGraphRoot $DatabaseUrl $ParseWorkers
-    if ($run.exitCode -ne 0) {
-      throw "Internal CodeGraph index failed for $($workspaceInfo.workspace). See $($workspaceInfo.indexDir)."
+    $internalStdout = Join-Path $workspaceInfo.indexDir 'internal-index.stdout.log'
+    $internalComplete = $false
+    if (Test-Path $internalStdout) {
+      try {
+        $existingIndex = Get-Content -LiteralPath $internalStdout -Raw | ConvertFrom-Json
+        $internalComplete = [bool]$existingIndex.snapshotId
+      } catch {
+        $internalComplete = $false
+      }
+    }
+    if ($internalComplete) {
+      Write-Host "Reusing internal CodeGraph index: $($workspaceInfo.key)"
+    } else {
+      Write-Host "Indexing internal CodeGraph: $($workspaceInfo.key)"
+      $run = Invoke-CodeGraphIndex $workspaceInfo.workspace $workspaceInfo.workspaceKey $workspaceInfo.internalHome $workspaceInfo.indexDir $CodeGraphRoot $DatabaseUrl $ParseWorkers
+      if ($run.exitCode -ne 0) {
+        throw "Internal CodeGraph index failed for $($workspaceInfo.workspace). See $($workspaceInfo.indexDir)."
+      }
     }
   }
   if (($Modes -contains 'external') -and -not $SkipExternalIndex) {
     Write-Host "Indexing external CodeGraph: $($workspaceInfo.key)"
-    $run = Invoke-ExternalCodeGraphIndex $workspaceInfo.workspace $externalCli $workspaceInfo.indexDir $ExternalCodeGraphRoot
+    $run = Invoke-ExternalCodeGraphIndex $workspaceInfo.workspace $externalCli $workspaceInfo.indexDir $ExternalCodeGraphRoot $ExternalIndexTimeoutSeconds
     if ($run.exitCode -ne 0) {
       throw "External CodeGraph index failed for $($workspaceInfo.workspace). See $($workspaceInfo.indexDir)."
     }
@@ -685,9 +847,11 @@ try {
         }
 
         Write-Host "[$runIndex] task=$($task.id) model=$model mode=$mode"
+        Clear-BenchmarkWorkspaceArtifacts $workspaceInfo.workspace $taskRunDir 'before-run'
         $copilot = Invoke-CopilotTask $task $model $mode $workspaceInfo $mcpConfigPath $taskRunDir $CopilotTimeoutSeconds
         $usage = Get-CopilotShutdownUsage $copilot.sessionId
         $quality = Test-TaskQuality $task $workspaceInfo.workspace $workspaceInfo.baselineCommit $taskRunDir $copilot.finalAnswer $copilot.exitCode
+        Clear-BenchmarkWorkspaceArtifacts $workspaceInfo.workspace $taskRunDir 'after-run'
         $promptText = Get-Content -LiteralPath $copilot.promptPath -Raw
 
         $result = [pscustomobject]@{
@@ -710,8 +874,8 @@ try {
           tokenSource = if ($usage.found) { $usage.eventsPath } else { $usage.reason }
           totalToolCalls = $copilot.totalToolCalls
           mcpToolCalls = $copilot.mcpToolCalls
-          toolCallNames = $copilot.toolCallNames
-          mcpToolCallNames = $copilot.mcpToolCallNames
+          toolCallNames = Convert-CountObject $copilot.toolCallNames
+          mcpToolCallNames = Convert-CountObject $copilot.mcpToolCallNames
           latencyMs = $copilot.latencyMs
           exitCode = $copilot.exitCode
           timedOut = $copilot.timedOut
@@ -724,11 +888,12 @@ try {
           stderrPath = $copilot.stderrPath
           prompt = $promptText
           finalAnswer = $copilot.finalAnswer
-          changedFiles = $quality.changedFiles
-          failedChecks = @($quality.failedChecks)
+          changedFiles = @($quality.changedFiles | ForEach-Object { [string]$_ })
+          failedChecks = Convert-FailedChecks @($quality.failedChecks)
+          reused = [bool]$copilot.reused
         }
         $results.Add($result)
-        [System.IO.File]::WriteAllText((Join-Path $RunDir 'results.partial.json'), ($results.ToArray() | ConvertTo-Json -Depth 40), [System.Text.UTF8Encoding]::new($false))
+        Write-ProgressCsvRow $result $RunDir
       }
     }
   }
