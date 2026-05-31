@@ -11,6 +11,7 @@ import { parseFilesBatchToSpool, readParseContextItemsJsonl, type ParseWorkItem 
 import { generateSyntheticJavaRepo } from '../../src/v2/benchmark/synthetic-java.js';
 import { runContextProofEval } from '../../src/v2/benchmark/context-proof.js';
 import { runReviewProofEval } from '../../src/v2/benchmark/review-proof.js';
+import { buildGraphExport, renderGraphHtml } from '../../src/v2/graph/export.js';
 
 const tempDirs: string[] = [];
 const dbs: CodeGraphDb[] = [];
@@ -200,6 +201,87 @@ public class UsesImports {
     expect(search.symbols[0]?.matchedTokens).toContain('gateway');
     expect(search.symbols[0]?.searchScore).toBeGreaterThan(80);
     expect(search.symbols[0]?.matchReason).toContain('match');
+  });
+
+  it('rescues exact test symbols from broad search windows and links receiver-field calls', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-exact-test-symbol-');
+    const noiseMethods = Array.from({ length: 650 }, (_, i) => `
+    public void federationInterceptorRESTNoise${i}() {
+    }
+`).join('');
+    writeFile(repo, 'src/main/java/org/apache/hadoop/yarn/server/router/webapp/FederationRESTNoise.java', `package org.apache.hadoop.yarn.server.router.webapp;
+
+public class FederationRESTNoise {
+${noiseMethods}
+}
+`);
+    writeFile(repo, 'src/main/java/org/apache/hadoop/yarn/server/router/webapp/FederationInterceptorREST.java', `package org.apache.hadoop.yarn.server.router.webapp;
+
+public class FederationInterceptorREST {
+}
+`);
+    writeFile(repo, 'src/test/java/org/apache/hadoop/yarn/server/router/webapp/TestableFederationInterceptorREST.java', `package org.apache.hadoop.yarn.server.router.webapp;
+
+public class TestableFederationInterceptorREST extends FederationInterceptorREST {
+    public void setupResourceManager() {
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/org/apache/hadoop/yarn/server/router/webapp/TestFederationInterceptorREST.java', `package org.apache.hadoop.yarn.server.router.webapp;
+
+public class TestFederationInterceptorREST {
+    private TestableFederationInterceptorREST interceptor;
+
+    public void setUp() {
+        interceptor = new TestableFederationInterceptorREST();
+        interceptor.setupResourceManager();
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const search = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'TestableFederationInterceptorREST', kind: 'class', limit: 5, explainRank: true },
+    }) as {
+      filters: { includeTests?: boolean };
+      symbols: Array<{
+        name: string;
+        file: string;
+        fileRole: string;
+        matchReason: string;
+        rankExplanation: string[];
+      }>;
+    };
+
+    expect(search.filters.includeTests).toBe(true);
+    expect(search.symbols[0]).toMatchObject({
+      name: 'TestableFederationInterceptorREST',
+      fileRole: 'test_source',
+      file: 'src/test/java/org/apache/hadoop/yarn/server/router/webapp/TestableFederationInterceptorREST.java',
+      matchReason: 'exact symbol/FQCN match',
+    });
+    expect(search.symbols[0]?.rankExplanation).toContain('exact symbol or FQCN equals query');
+
+    const callers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'TestableFederationInterceptorREST.setupResourceManager', limit: 10 },
+    }) as {
+      callers: Array<{ caller: string; callee: string; file: string; resolution_kind: string }>;
+    };
+    expect(callers.callers).toContainEqual(expect.objectContaining({
+      caller: 'TestFederationInterceptorREST.setUp',
+      callee: 'TestableFederationInterceptorREST.setupResourceManager',
+      file: 'src/test/java/org/apache/hadoop/yarn/server/router/webapp/TestFederationInterceptorREST.java',
+      resolution_kind: 'receiver-field',
+    }));
   });
 
   it('indexes large Java source files without parser buffer failures', async () => {
@@ -396,6 +478,64 @@ public class PartialController {
       args: {},
     }) as { diagnostics: { frameworkWarnings: { endpointPathUnresolvedCount: number } } };
     expect(stats.diagnostics.frameworkWarnings.endpointPathUnresolvedCount).toBeGreaterThan(0);
+  });
+
+  it('resolves JAX-RS endpoint paths from sibling Java constants', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-jaxrs-constant-endpoints-');
+    writeFile(repo, 'src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWSConsts.java', `package org.apache.hadoop.yarn.server.resourcemanager.webapp;
+
+public final class RMWSConsts {
+    public static final String RM_WEB_SERVICE_PATH = "/ws/v1/cluster";
+    public static final String APPS = "/apps";
+}
+`);
+    writeFile(repo, 'src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java', `package org.apache.hadoop.yarn.server.resourcemanager.webapp;
+
+import javax.ws.rs.GET;
+import javax.ws.rs.Path;
+
+@Path(RMWSConsts.RM_WEB_SERVICE_PATH)
+public class RMWebServices {
+    @GET
+    @Path(RMWSConsts.APPS)
+    public AppsInfo getApps() {
+        return new AppsInfo();
+    }
+}
+
+class AppsInfo {
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const endpoints = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'find_endpoints',
+      args: { method: 'GET', path: '/ws/v1/cluster/apps', explainRank: true },
+    }) as { endpoints: Array<{ path: string; pathResolution: string; handlerSymbol: string }> };
+
+    expect(endpoints.endpoints[0]).toMatchObject({
+      path: '/ws/v1/cluster/apps',
+      pathResolution: 'exact',
+      handlerSymbol: 'org.apache.hadoop.yarn.server.resourcemanager.webapp.RMWebServices.getApps()',
+    });
+
+    const explanation = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'explain_endpoint',
+      args: { method: 'GET', path: '/ws/v1/cluster/apps' },
+    }) as { endpoint?: { path: string; pathResolution: string }; error?: string };
+
+    expect(explanation.error).toBeUndefined();
+    expect(explanation.endpoint).toMatchObject({
+      path: '/ws/v1/cluster/apps',
+      pathResolution: 'exact',
+    });
   });
 
   it('classifies Jakarta EE 8+ annotations across javax and jakarta namespaces', async () => {
@@ -883,6 +1023,105 @@ public class PaymentService {
     expect(flowPack.evidenceSlices.some(slice => slice.text.includes('processRefund'))).toBe(true);
   });
 
+  it('promotes endpoint targets into flow pack handler evidence and callees', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-endpoint-flow-pack-');
+    writeFile(repo, 'src/main/java/com/example/api/OrderResource.java', `package com.example.api;
+
+import javax.ws.rs.GET;
+import javax.ws.rs.Path;
+
+@Path("/api")
+public class OrderResource {
+    private final OrderService service = new OrderService();
+
+    @GET
+    @Path("/orders")
+    public String listOrders() {
+        return service.listOrders();
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/api/OrderService.java', `package com.example.api;
+
+public class OrderService {
+    public String listOrders() {
+        return "ok";
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const flowPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_flow_pack',
+      args: {
+        target: 'For API GET /api/orders, what logic and method does it call?',
+        profile: 'full',
+        tokenBudget: 6000,
+        includeLowSignal: true,
+      },
+    }) as {
+      definitionCandidates: Array<{ symbol: string; frameworkRole?: string }>;
+      impactedEndpoints: Array<{ method: string; path: string; handlerSymbol: string }>;
+      evidenceSlices: Array<{ file: string; text: string }>;
+      callees: Array<{ callee: string }>;
+      routing: { answerDirectly: boolean };
+    };
+
+    expect(flowPack.routing.answerDirectly).toBe(true);
+    expect(flowPack.impactedEndpoints).toContainEqual(expect.objectContaining({
+      method: 'GET',
+      path: '/api/orders',
+      handlerSymbol: expect.stringContaining('OrderResource.listOrders'),
+    }));
+    expect(flowPack.definitionCandidates[0]).toEqual(expect.objectContaining({
+      symbol: expect.stringContaining('OrderResource.listOrders'),
+      frameworkRole: 'endpoint:handler',
+    }));
+    expect(flowPack.evidenceSlices.some(slice => slice.file.endsWith('OrderResource.java') && slice.text.includes('service.listOrders()'))).toBe(true);
+    expect(flowPack.callees.some(edge => edge.callee.includes('OrderService.listOrders'))).toBe(true);
+
+    const rootedPromptPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_flow_pack',
+      args: {
+        target: 'Apache Hadoop at D:/Personal/Projects/hadoop GET /api/orders request flow',
+        profile: 'full',
+        tokenBudget: 6000,
+      },
+    }) as {
+      definitionCandidates: Array<{ symbol: string; frameworkRole?: string }>;
+      impactedEndpoints: Array<{ method: string; path: string; handlerSymbol: string }>;
+      routing: { answerDirectly: boolean };
+    };
+    expect(rootedPromptPack.routing.answerDirectly).toBe(true);
+    expect(rootedPromptPack.impactedEndpoints).toContainEqual(expect.objectContaining({
+      method: 'GET',
+      path: '/api/orders',
+      handlerSymbol: expect.stringContaining('OrderResource.listOrders'),
+    }));
+    expect(rootedPromptPack.definitionCandidates[0]).toEqual(expect.objectContaining({
+      symbol: expect.stringContaining('OrderResource.listOrders'),
+      frameworkRole: 'endpoint:handler',
+    }));
+
+    const directCallees = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callees',
+      args: {
+        symbol: flowPack.impactedEndpoints[0].handlerSymbol,
+        limit: 10,
+        includeLowSignal: true,
+      },
+    }) as { callees: Array<{ callee: string }> };
+    expect(directCallees.callees.some(edge => edge.callee.includes('OrderService.listOrders'))).toBe(true);
+  });
+
   it('prioritizes exact TypeScript tool symbols in research packs', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-ts-tool-research-');
@@ -1305,6 +1544,173 @@ server:
       toFile: expect.stringContaining('OrderMapper.xml'),
       resolutionKind: 'mybatis-namespace',
     }));
+  });
+
+  it('exports a static graph with inferred services, endpoint links, and caps', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-static-graph-');
+    writeFile(repo, 'order-service/pom.xml', `<project>
+  <artifactId>order-service</artifactId>
+</project>
+`);
+    writeFile(repo, 'payment-service/pom.xml', `<project>
+  <artifactId>payment-service</artifactId>
+</project>
+`);
+    writeFile(repo, 'docker-compose.yml', `services:
+  order-service:
+    image: example/order-service:latest
+  payment-service:
+    image: example/payment-service:latest
+`);
+    writeFile(repo, 'order-service/src/main/java/com/example/order/OrderController.java', `package com.example.order;
+
+import com.example.payment.PaymentClient;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/orders")
+public class OrderController {
+    private final PaymentClient paymentClient;
+
+    public OrderController(PaymentClient paymentClient) {
+        this.paymentClient = paymentClient;
+    }
+
+    @GetMapping("/{id}")
+    public String getOrder(String id) {
+        paymentClient.authorize(id);
+        return id;
+    }
+}
+`);
+    writeFile(repo, 'order-service/src/test/java/com/example/order/OrderControllerTest.java', `package com.example.order;
+
+public class OrderControllerTest {
+}
+`);
+    writeFile(repo, 'payment-service/src/main/java/com/example/payment/PaymentClient.java', `package com.example.payment;
+
+public class PaymentClient {
+    public boolean authorize(String orderId) {
+        return true;
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const graph = await buildGraphExport(db, {
+      workspaceId: result.workspaceId,
+      snapshotId: result.snapshotId,
+      root: repo,
+      maxNodes: 200,
+      maxEdges: 400,
+    });
+    const nodeById = new Map(graph.nodes.map(node => [node.id, node]));
+    const groupLabels = graph.groups.map(group => group.label);
+
+    expect(groupLabels).toContain('order-service');
+    expect(groupLabels).toContain('payment-service');
+    expect(graph.nodes).toContainEqual(expect.objectContaining({
+      kind: 'endpoint',
+      label: 'GET /orders/{id}',
+    }));
+    expect(graph.edges.some(edge => edge.kind === 'endpoint_handler')).toBe(true);
+    expect(graph.edges.some(edge => edge.kind === 'call')).toBe(true);
+    expect(graph.edges.some(edge => {
+      const from = nodeById.get(edge.from);
+      const to = nodeById.get(edge.to);
+      return edge.kind === 'dependency'
+        && from?.file?.endsWith('OrderController.java')
+        && to?.file?.endsWith('PaymentClient.java');
+    })).toBe(true);
+    expect(graph.edges.some(edge => edge.kind === 'cross_service')).toBe(true);
+
+    const defaultFiles = graph.nodes.filter(node => node.kind === 'file').map(node => node.file);
+    expect(defaultFiles.some(file => file?.endsWith('OrderControllerTest.java'))).toBe(false);
+    const withTests = await buildGraphExport(db, {
+      workspaceId: result.workspaceId,
+      snapshotId: result.snapshotId,
+      root: repo,
+      maxNodes: 200,
+      maxEdges: 400,
+      includeTests: true,
+    });
+    expect(withTests.nodes.some(node => node.file?.endsWith('OrderControllerTest.java'))).toBe(true);
+
+    const capped = await buildGraphExport(db, {
+      workspaceId: result.workspaceId,
+      snapshotId: result.snapshotId,
+      root: repo,
+      maxNodes: 3,
+      maxEdges: 1,
+    });
+    expect(capped.metadata.truncated).toBe(true);
+    expect(capped.stats.hiddenNodes).toBeGreaterThan(0);
+
+    const html = renderGraphHtml(graph);
+    expect(html).toContain('CodeGraph Static View');
+    expect(html).toContain('Under Nodes / Related Calls');
+    expect(html).toContain('<svg id="graph"');
+    expect(html).toContain('id="graph-data"');
+    expect(html).not.toMatch(/<script[^>]+src=/i);
+    expect(html).not.toMatch(/<link[^>]+href=/i);
+  });
+
+  it('exports graph HTML from the CLI and reports missing snapshots for --no-index', () => {
+    const repo = tempDir('codegraph-cli-graph-');
+    const outDir = tempDir('codegraph-cli-graph-out-');
+    const out = path.join(outDir, 'graph.html');
+    writeFile(repo, 'src/main/java/com/example/Demo.java', `package com.example;
+
+public class Demo {
+}
+`);
+
+    const output = execFileSync(process.execPath, tsxArgs([
+      'src/cli.ts',
+      'graph',
+      '--root',
+      repo,
+      '--out',
+      out,
+      '--workspace-key',
+      'cli-graph-test',
+      '--quiet',
+    ]), { cwd: path.resolve('.'), encoding: 'utf-8' });
+    const parsed = JSON.parse(output) as { out: string; nodes: number; edges: number };
+
+    expect(parsed.out).toBe(path.resolve(out));
+    expect(parsed.nodes).toBeGreaterThan(0);
+    expect(fs.existsSync(out)).toBe(true);
+    expect(fs.readFileSync(out, 'utf-8')).toContain('CodeGraph Static View');
+
+    const freshRepo = tempDir('codegraph-cli-graph-missing-');
+    writeFile(freshRepo, 'src/main/java/com/example/Missing.java', `package com.example;
+
+public class Missing {
+}
+`);
+    let stderr = '';
+    try {
+      execFileSync(process.execPath, tsxArgs([
+        'src/cli.ts',
+        'graph',
+        '--root',
+        freshRepo,
+        '--out',
+        path.join(outDir, 'missing.html'),
+        '--no-index',
+        '--quiet',
+      ]), { cwd: path.resolve('.'), stdio: 'pipe' });
+    } catch (error) {
+      stderr = String((error as { stderr?: Buffer }).stderr ?? '');
+    }
+    expect(stderr).toContain('No current CodeGraph snapshot found');
   });
 
   it('runs a context proof benchmark comparing baseline file reads to MCP slices', async () => {
@@ -2190,4 +2596,8 @@ function runGit(cwd: string, ...args: string[]): void {
 
 function gitOutput(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf-8' }).trim();
+}
+
+function tsxArgs(args: string[]): string[] {
+  return [path.resolve('node_modules', 'tsx', 'dist', 'cli.mjs'), ...args];
 }

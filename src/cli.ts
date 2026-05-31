@@ -15,6 +15,7 @@ import { runIndexBenchmark } from './v2/benchmark/run.js';
 import { loadGoldenEvalTasks, runGoldenEval } from './v2/benchmark/golden-eval.js';
 import { deriveContextProofTasks, loadContextProofTasks, runContextProofEval } from './v2/benchmark/context-proof.js';
 import { deriveReviewProofTasks, loadReviewProofTasks, runReviewProofEval } from './v2/benchmark/review-proof.js';
+import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 
 interface ParsedArgs {
   command: string[];
@@ -46,6 +47,9 @@ async function main(): Promise<void> {
       return;
     case 'index':
       await runIndexCommand(parsed);
+      return;
+    case 'graph':
+      await runGraphCommand(parsed);
       return;
     case 'doctor':
       await runDoctorCommand(parsed);
@@ -232,6 +236,63 @@ async function runIndexCommand(parsed: ParsedArgs): Promise<void> {
   }
 }
 
+async function runGraphCommand(parsed: ParsedArgs): Promise<void> {
+  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const out = getFlag(parsed, 'out');
+  if (!out) throw new Error('Usage: codegraph graph --root <workspace> --out <graph.html>');
+
+  const { db, connectionString } = await openCodeGraphDb(getFlag(parsed, 'home'));
+  const indexer = new V2Indexer(db);
+  const workspaceKey = getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY;
+  const progress = parsed.flags.get('quiet') === true
+    ? undefined
+    : createIndexProgressReporter(connectionString);
+  try {
+    const snapshot = parsed.flags.get('no-index') === true
+      ? await resolveCurrentGraphSnapshot(db, root, workspaceKey)
+      : await indexer.indexWorkspace({
+        root,
+        workspaceKey,
+        parseWorkers: getNumberFlag(parsed, 'parse-workers'),
+        indexProviders: indexProvidersFlag(parsed),
+        scipIndexPath: scipIndexFlag(parsed),
+        skipSnapshotStats: true,
+        progress,
+      });
+    if (!snapshot) {
+      throw new Error('No current CodeGraph snapshot found for this workspace. Run codegraph index --root <workspace>, or omit --no-index.');
+    }
+
+    const graph = await buildGraphExport(db, {
+      workspaceId: snapshot.workspaceId,
+      snapshotId: snapshot.snapshotId,
+      root,
+      maxNodes: getNumberFlag(parsed, 'max-nodes'),
+      maxEdges: getNumberFlag(parsed, 'max-edges'),
+      includeTests: parsed.flags.get('include-tests') === true,
+      includeGenerated: parsed.flags.get('include-generated') === true,
+    });
+    const outputPath = path.resolve(out);
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, renderGraphHtml(graph), 'utf-8');
+    console.log(JSON.stringify({
+      out: outputPath,
+      workspaceId: graph.metadata.workspaceId,
+      snapshotId: graph.metadata.snapshotId,
+      nodes: graph.nodes.length,
+      edges: graph.edges.length,
+      groups: graph.groups.length,
+      truncated: graph.metadata.truncated,
+      hiddenNodes: graph.stats.hiddenNodes,
+      hiddenEdges: graph.stats.hiddenEdges,
+      backend: 'postgres',
+      databaseUrl: redactDatabaseUrl(connectionString),
+    }, null, 2));
+  } finally {
+    await db.close();
+  }
+}
+
 async function runDoctorCommand(parsed: ParsedArgs): Promise<void> {
   const paths = getCodeGraphPaths(getFlag(parsed, 'home'));
   const databaseUrl = process.env.CODEGRAPH_DATABASE_URL ?? defaultPostgresUrl();
@@ -322,6 +383,8 @@ Usage:
   codegraph mcp --root <workspace>       Run MCP stdio proxy and auto-start daemon
   codegraph daemon start|stop|status     Manage local daemon
   codegraph index --root <workspace>     Prewarm persistent index
+  codegraph graph --root <workspace> --out <graph.html>
+                                             Export a self-contained static HTML graph viewer
   codegraph doctor                       Inspect local configuration
   codegraph logs --tail <number>         Print recent daemon query/index events
   codegraph benchmark generate|index|eval|proof|review|copilot-e2e
@@ -334,7 +397,12 @@ Options:
   --tasks <path>                         Golden eval task JSON file
   --tasks auto                           Derive proof/review tasks from indexed-looking source files
   --task-count <number>                  Number of auto-derived proof/review tasks
-  --no-index                             Reuse the current proof/review snapshot instead of refreshing first
+  --no-index                             Reuse the current proof/review/graph snapshot instead of refreshing first
+  --out <path>                           Output path for graph HTML export
+  --max-nodes <number>                   Maximum graph nodes for static export (default: 800)
+  --max-edges <number>                   Maximum graph edges for static export (default: 2000)
+  --include-tests                        Include test and mock files in graph export
+  --include-generated                    Include generated files in graph export
   --parse-workers <number>               Worker threads for cold/cache-miss parsing during index
   --index-providers <a,b>                Index providers: tree-sitter, scip
   --scip-index <path>                    SCIP JSON or .scip index path for the scip provider

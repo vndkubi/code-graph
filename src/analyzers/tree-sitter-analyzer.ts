@@ -1,5 +1,6 @@
 import Parser from 'tree-sitter';
 import type { SyntaxNode } from 'tree-sitter';
+import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import type {
@@ -38,6 +39,7 @@ const grammarLoaders: Partial<Record<SupportedLanguage, () => unknown>> = {
 };
 
 const loadedGrammars = new Map<SupportedLanguage, unknown>();
+const EXTERNAL_JAVA_ANNOTATION_CONSTANT_PATTERN = /@\w+(?:\s*\([\s\S]{0,300}\b[A-Z][A-Za-z0-9_]*\s*\.\s*[A-Z][A-Za-z0-9_]*\b)/;
 
 function getGrammar(lang: SupportedLanguage): unknown | undefined {
   if (loadedGrammars.has(lang)) return loadedGrammars.get(lang);
@@ -63,6 +65,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   private parseTypeRefs: TypeRefInfo[] = [];
   private parsePackageName: string | undefined;
   private javaStringConstants = new Map<string, string>();
+  private externalJavaConstantCache = new Map<string, Map<string, string> | undefined>();
 
   parse(filePath: string, content: string, rootDir: string): ParseResult {
     const lang = detectLanguage(filePath);
@@ -102,6 +105,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     this.javaStringConstants = new Map();
     if (lang === 'java') {
       this.javaStringConstants = this.collectJavaStringConstants(tree.rootNode);
+      if (EXTERNAL_JAVA_ANNOTATION_CONSTANT_PATTERN.test(content)) {
+        this.mergeExternalJavaStringConstants(tree.rootNode, filePath, rootDir, this.javaStringConstants);
+      }
     }
 
     const symbols: SymbolInfo[] = [];
@@ -539,6 +545,130 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       }
       if (!changed) break;
     }
+    return constants;
+  }
+
+  private mergeExternalJavaStringConstants(
+    root: SyntaxNode,
+    filePath: string,
+    rootDir: string,
+    constants: Map<string, string>,
+  ): void {
+    const classNames = this.collectJavaAnnotationConstantClassNames(root);
+    if (classNames.size === 0) return;
+
+    const imports = this.collectJavaImportPaths(root);
+    const currentDir = path.dirname(filePath);
+    const sourceRoots = this.javaSourceRootsFor(filePath, rootDir);
+
+    for (const className of classNames) {
+      for (const candidatePath of this.javaConstantCandidatePaths(className, currentDir, sourceRoots, imports)) {
+        if (path.resolve(candidatePath) === path.resolve(filePath)) continue;
+        const externalConstants = this.readJavaStringConstantsFromFile(candidatePath);
+        if (!externalConstants) continue;
+        for (const [name, value] of externalConstants) {
+          constants.set(`${className}.${name}`, value);
+          if (!constants.has(name)) constants.set(name, value);
+        }
+        break;
+      }
+    }
+  }
+
+  private collectJavaAnnotationConstantClassNames(root: SyntaxNode): Set<string> {
+    const classNames = new Set<string>();
+    const visit = (node: SyntaxNode): void => {
+      if (node.type === 'annotation') {
+        const argsNode = node.childForFieldName('arguments');
+        if (argsNode) {
+          const regex = /\b([A-Z][A-Za-z0-9_]*)\s*\.\s*[A-Z][A-Za-z0-9_]*\b/g;
+          let match: RegExpExecArray | null;
+          while ((match = regex.exec(argsNode.text)) !== null) {
+            if (match[1]) classNames.add(match[1]);
+          }
+        }
+      }
+      for (const child of node.children) visit(child);
+    };
+    visit(root);
+    return classNames;
+  }
+
+  private collectJavaImportPaths(root: SyntaxNode): string[] {
+    const imports: string[] = [];
+    const visit = (node: SyntaxNode): void => {
+      if (node.type === 'import_declaration') {
+        const match = node.text.match(/^import\s+(?:static\s+)?([\w.*]+)\s*;/);
+        if (match?.[1]) imports.push(match[1]);
+      }
+      for (const child of node.children) visit(child);
+    };
+    visit(root);
+    return imports;
+  }
+
+  private javaSourceRootsFor(filePath: string, rootDir: string): string[] {
+    const roots = new Set<string>();
+    const normalized = filePath.replace(/\\/g, '/');
+    for (const marker of [
+      '/src/main/java/',
+      '/src/test/java/',
+      '/src/integration-test/java/',
+      '/src/java/',
+    ]) {
+      const index = normalized.indexOf(marker);
+      if (index >= 0) {
+        roots.add(filePath.slice(0, index + marker.length));
+      }
+    }
+    roots.add(rootDir);
+    return [...roots];
+  }
+
+  private javaConstantCandidatePaths(
+    className: string,
+    currentDir: string,
+    sourceRoots: string[],
+    imports: string[],
+  ): string[] {
+    const candidates = new Set<string>();
+    candidates.add(path.join(currentDir, `${className}.java`));
+
+    for (const importPath of imports) {
+      const parts = importPath.split('.').filter(Boolean);
+      if (parts[parts.length - 1] === className) {
+        for (const sourceRoot of sourceRoots) {
+          candidates.add(path.join(sourceRoot, ...parts) + '.java');
+        }
+      }
+      if (parts.length >= 2 && parts[parts.length - 2] === className) {
+        const classParts = parts.slice(0, -1);
+        for (const sourceRoot of sourceRoots) {
+          candidates.add(path.join(sourceRoot, ...classParts) + '.java');
+        }
+      }
+    }
+
+    return [...candidates];
+  }
+
+  private readJavaStringConstantsFromFile(filePath: string): Map<string, string> | undefined {
+    const absolute = path.resolve(filePath);
+    if (this.externalJavaConstantCache.has(absolute)) return this.externalJavaConstantCache.get(absolute);
+
+    let constants: Map<string, string> | undefined;
+    try {
+      const stat = fs.statSync(absolute);
+      if (stat.isFile() && stat.size <= 512 * 1024) {
+        const content = fs.readFileSync(absolute, 'utf8');
+        const tree = this.parser.parse(content, undefined, treeSitterParseOptions(content.length));
+        constants = this.collectJavaStringConstants(tree.rootNode);
+      }
+    } catch {
+      constants = undefined;
+    }
+
+    this.externalJavaConstantCache.set(absolute, constants);
     return constants;
   }
 

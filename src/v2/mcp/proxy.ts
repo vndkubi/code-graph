@@ -87,7 +87,14 @@ request-flow, or codebase-research questions, use CodeGraph directly and answer
 from its returned evidence instead of starting a grep/read exploration loop.
 
 Primary flow:
-- Call get_research_pack or get_flow_pack first.
+- Endpoint/API/request-flow/investigation questions: call get_flow_pack first.
+- Spec, implementation-plan, debug, refactor, or "what should I change" tasks:
+  call get_change_pack first, even when the user asks for read-only planning.
+- Code review tasks with a unified diff: call review_patch first. Code review
+  tasks without a concrete diff should use get_flow_pack or get_change_pack
+  for the mentioned endpoint/symbol before answering.
+- Use the user's full task text as the pack target/task. Do not strip HTTP
+  methods or endpoint paths such as "GET /ws/v1/cluster/apps".
 - Do not set autoRefresh=true for these pack tools unless the user explicitly
   asks for a fresh index; they are optimized for a prewarmed index.
 - Do not set warnStale=true for these pack tools during exploration benchmarks;

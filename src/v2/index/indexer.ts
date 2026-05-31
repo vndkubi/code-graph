@@ -39,6 +39,7 @@ export interface IndexWorkspaceOptions {
   indexProviders?: string[] | string;
   scipIndexPath?: string;
   progress?: (event: IndexProgressEvent) => void;
+  skipSnapshotStats?: boolean;
 }
 
 export interface RefreshWorkspacePathsOptions {
@@ -51,6 +52,7 @@ export interface RefreshWorkspacePathsOptions {
   indexProviders?: string[] | string;
   scipIndexPath?: string;
   progress?: (event: IndexProgressEvent) => void;
+  skipSnapshotStats?: boolean;
 }
 
 export interface IndexWorkspaceResult {
@@ -571,6 +573,7 @@ export class V2Indexer {
             changes,
             prepared: shardedPrepared,
             providerSet,
+            skipSnapshotStats: options.skipSnapshotStats,
             progress: options.progress,
           });
         } finally {
@@ -600,6 +603,7 @@ export class V2Indexer {
             changes,
             prepared: streamingPrepared,
             providerSet,
+            skipSnapshotStats: options.skipSnapshotStats,
             progress: options.progress,
           });
         } finally {
@@ -779,7 +783,9 @@ export class V2Indexer {
         elapsedMs: Date.now() - start,
         details: { phaseElapsedMs: Date.now() - dependencyRebuildStart },
       });
-      await this.refreshSnapshotStats(snapshotId);
+      if (!options.skipSnapshotStats) {
+        await this.refreshSnapshotStats(snapshotId);
+      }
       await this.db.prepare(`
         UPDATE snapshots
         SET status = 'ready',
@@ -941,6 +947,7 @@ export class V2Indexer {
       },
       prepared,
       providerSet,
+      skipSnapshotStats: options.skipSnapshotStats,
       progress: options.progress,
     });
     return { ...result, pathDeltaUpdated: true };
@@ -1038,11 +1045,17 @@ export class V2Indexer {
               AND source NOT LIKE 'com.fasterxml.%'
               AND source NOT LIKE 'org.slf4j.%'
             GROUP BY source
+          ),
+          ranked_import_counts AS (
+            SELECT source, simple_name, count
+            FROM import_counts
+            ORDER BY count DESC, source
+            LIMIT 200
           )
           SELECT json_agg(json_build_object('source', i.source, 'count', i.count) ORDER BY i.count DESC, i.source)::text
           FROM (
             SELECT source, count
-            FROM import_counts i
+            FROM ranked_import_counts i
             WHERE NOT EXISTS (
               SELECT 1
               FROM symbols s
@@ -1674,6 +1687,7 @@ export class V2Indexer {
     changes: ManifestChangeSet;
     prepared: PreparedShardedFullParseBatch;
     providerSet: IndexProviderSet;
+    skipSnapshotStats?: boolean;
     progress?: (event: IndexProgressEvent) => void;
   }): Promise<IndexWorkspaceResult> {
     const fileByPath = new Map(args.manifest.files.map(file => [file.relPath, file]));
@@ -1896,7 +1910,9 @@ export class V2Indexer {
           });
         }
 
-        await this.refreshSnapshotStats(args.snapshotId);
+        if (!args.skipSnapshotStats) {
+          await this.refreshSnapshotStats(args.snapshotId);
+        }
         await this.db.prepare(`
           UPDATE snapshots
           SET status = 'ready',
@@ -1960,6 +1976,7 @@ export class V2Indexer {
     changes: ManifestChangeSet;
     prepared: PreparedStreamingParseBatch;
     providerSet: IndexProviderSet;
+    skipSnapshotStats?: boolean;
     progress?: (event: IndexProgressEvent) => void;
   }): Promise<IndexWorkspaceResult> {
     const fileByPath = new Map(args.manifest.files.map(file => [file.relPath, file]));
@@ -2118,7 +2135,9 @@ export class V2Indexer {
         elapsedMs: Date.now() - args.start,
         details: { phaseElapsedMs: Date.now() - dependencyRebuildStart, streaming: true },
       });
-      await this.refreshSnapshotStats(args.snapshotId);
+      if (!args.skipSnapshotStats) {
+        await this.refreshSnapshotStats(args.snapshotId);
+      }
       await this.db.prepare(`
         UPDATE snapshots
         SET status = 'ready',
@@ -2180,6 +2199,7 @@ export class V2Indexer {
     changes: ManifestChangeSet;
     prepared: PreparedParseBatch;
     providerSet: IndexProviderSet;
+    skipSnapshotStats?: boolean;
     progress?: (event: IndexProgressEvent) => void;
   }): Promise<IndexWorkspaceResult> {
     const now = new Date().toISOString();
@@ -2309,7 +2329,9 @@ export class V2Indexer {
         details: { phaseElapsedMs: Date.now() - dependencyRebuildStart },
       });
 
-      await this.refreshSnapshotStats(args.snapshotId);
+      if (!args.skipSnapshotStats) {
+        await this.refreshSnapshotStats(args.snapshotId);
+      }
       await this.db.prepare(`
         UPDATE snapshots
         SET status = 'ready',

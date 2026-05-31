@@ -390,7 +390,51 @@ export class V2QueryService {
     }
     const candidateLimit = Math.min(Math.max((cursorOffset + limit) * 50, 500), 5000);
 
-    const rows = await this.db.prepare(`
+    const exactRows = await this.db.prepare(`
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+             package_name, return_type, parameter_types_json, annotations_json,
+             framework_role, framework_meta_json, file_role
+      FROM symbols
+      WHERE ${baseWhere}
+        AND (
+          LOWER(simple_name) = LOWER(?)
+          OR LOWER(fq_name) = LOWER(?)
+          OR simple_name LIKE ? ESCAPE '\\'
+          OR fq_name LIKE ? ESCAPE '\\'
+        )
+      ORDER BY
+        CASE
+          WHEN LOWER(simple_name) = LOWER(?) THEN 0
+          WHEN LOWER(fq_name) = LOWER(?) THEN 1
+          WHEN simple_name LIKE ? ESCAPE '\\' THEN 2
+          WHEN fq_name LIKE ? ESCAPE '\\' THEN 3
+          ELSE 4
+        END,
+        CASE file_role
+          WHEN 'main_source' THEN 0
+          WHEN 'resource_config' THEN 1
+          WHEN 'build_config' THEN 2
+          WHEN 'test_source' THEN 3
+          WHEN 'mock_source' THEN 4
+          WHEN 'generated' THEN 5
+          ELSE 6
+        END,
+        simple_name
+      LIMIT ?
+    `).all(
+      ...baseParams,
+      query,
+      query,
+      phrasePattern,
+      phrasePattern,
+      query,
+      query,
+      phrasePattern,
+      phrasePattern,
+      100,
+    ) as SymbolRow[];
+
+    const broadRows = await this.db.prepare(`
       SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
              package_name, return_type, parameter_types_json, annotations_json,
              framework_role, framework_meta_json, file_role
@@ -399,6 +443,7 @@ export class V2QueryService {
         AND (${matchClauses.map(clause => `(${clause})`).join(' OR ')})
       LIMIT ?
     `).all(...baseParams, ...matchParams, candidateLimit) as SymbolRow[];
+    const rows = mergeSymbolRows(exactRows, broadRows);
 
     const ranked = rows
       .map(row => ({ row, score: scoreSymbolSearch(row, query, compactQuery, tokens, intent) }))
@@ -429,7 +474,7 @@ export class V2QueryService {
       searchMode: intent.kind !== 'none' ? 'intent-ranked' : tokens.length > 1 ? 'multi-token-ranked' : 'token-ranked',
       ...(explainRank ? { debug: rankDebug('search_symbol', [
         'Ranking order: exact/phrase/camel-case matches, intent boosts, file-role boost, synthetic/test/generated penalties from default filters.',
-        `Candidate window: ${rows.length}; returned page offset ${cursorOffset}.`,
+        `Candidate window: ${rows.length}; exact prepass: ${exactRows.length}; broad prepass: ${broadRows.length}; returned page offset ${cursorOffset}.`,
       ]) } : {}),
       confidence: ranked.some(candidate => candidate.score.score >= 90) ? 0.85 : 0.65,
       confidenceNotes: [
@@ -776,6 +821,7 @@ export class V2QueryService {
     const resolved = await this.resolveFile(snapshotId, file);
     if (!resolved) return { error: `File "${file}" not found in index.` };
     const snippets = await this.snippetOptions(snapshotId, args);
+    const limit = clampInt(Number(args.limit ?? 80), 10, 500);
 
     const symbols = await this.db.prepare(`
       SELECT * FROM symbols WHERE snapshot_id = ? AND file = ? ORDER BY line
@@ -789,23 +835,32 @@ export class V2QueryService {
 
     return {
       file: resolved,
-      classes: symbols.filter(s => s.kind === 'class' || s.kind === 'interface').map(row => symbolDto(row, snippets)),
-      methods: symbols.filter(s => s.kind === 'method' || s.kind === 'function').map(row => symbolDto(row, snippets)),
-      fields: symbols.filter(s => s.kind === 'field' || s.kind === 'variable').map(row => symbolDto(row, snippets)),
+      classes: symbols.filter(s => s.kind === 'class' || s.kind === 'interface').slice(0, limit).map(row => symbolDto(row, snippets)),
+      methods: symbols.filter(s => s.kind === 'method' || s.kind === 'function').slice(0, limit).map(row => symbolDto(row, snippets)),
+      fields: symbols.filter(s => s.kind === 'field' || s.kind === 'variable').slice(0, limit).map(row => symbolDto(row, snippets)),
       imports: imports.map(row => ({
         source: row.source,
         symbols: parseJson<string[]>(row.imported_symbols_json, []),
         isExternal: Boolean(row.is_external),
         line: row.line,
-      })),
-      dependencies: deps,
-      dependents,
+      })).slice(0, limit),
+      dependencies: deps.slice(0, limit),
+      dependents: dependents.slice(0, limit),
       stats: {
         symbolCount: symbols.length,
         importCount: imports.length,
         dependencyCount: deps.length,
         dependentCount: dependents.length,
       },
+      truncated: {
+        classes: symbols.filter(s => s.kind === 'class' || s.kind === 'interface').length > limit,
+        methods: symbols.filter(s => s.kind === 'method' || s.kind === 'function').length > limit,
+        fields: symbols.filter(s => s.kind === 'field' || s.kind === 'variable').length > limit,
+        imports: imports.length > limit,
+        dependencies: deps.length > limit,
+        dependents: dependents.length > limit,
+      },
+      limit,
     };
   }
 
@@ -947,28 +1002,34 @@ export class V2QueryService {
   private async getCallers(snapshotId: string, args: Record<string, unknown>) {
     const symbol = String(args.symbol ?? args.target ?? '');
     const signalFilter = callSignalFilter(args);
+    const terms = callEdgeLookupTerms(symbol);
+    if (terms.length === 0) return { symbol, callers: [], totalCount: 0 };
+    const clauses = terms.map(() => "callee LIKE ? ESCAPE '\\'").join(' OR ');
     const rows = await this.db.prepare(`
       SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
       FROM call_edges
-      WHERE snapshot_id = ? AND callee LIKE ? ESCAPE '\\'
+      WHERE snapshot_id = ? AND (${clauses})
         ${signalFilter}
       ORDER BY ${callSignalOrder()}, confidence DESC, file, line
       LIMIT ?
-    `).all(snapshotId, `%${escapeLike(symbol)}%`, Number(args.limit ?? 100)) as CallEdgeRow[];
+    `).all(snapshotId, ...terms.map(term => `%${escapeLike(term)}%`), Number(args.limit ?? 100)) as CallEdgeRow[];
     return { symbol, callers: rows, totalCount: rows.length };
   }
 
   private async getCallees(snapshotId: string, args: Record<string, unknown>) {
     const symbol = String(args.symbol ?? args.source ?? '');
     const signalFilter = callSignalFilter(args);
+    const terms = callEdgeLookupTerms(symbol);
+    if (terms.length === 0) return { symbol, callees: [], totalCount: 0 };
+    const clauses = terms.map(() => "caller LIKE ? ESCAPE '\\'").join(' OR ');
     const rows = await this.db.prepare(`
       SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
       FROM call_edges
-      WHERE snapshot_id = ? AND caller LIKE ? ESCAPE '\\'
+      WHERE snapshot_id = ? AND (${clauses})
         ${signalFilter}
       ORDER BY ${callSignalOrder()}, confidence DESC, file, line
       LIMIT ?
-    `).all(snapshotId, `%${escapeLike(symbol)}%`, Number(args.limit ?? 100)) as CallEdgeRow[];
+    `).all(snapshotId, ...terms.map(term => `%${escapeLike(term)}%`), Number(args.limit ?? 100)) as CallEdgeRow[];
     return { symbol, callees: rows, totalCount: rows.length };
   }
 
@@ -1636,6 +1697,40 @@ export class V2QueryService {
     const preferredFileRole = String(args.fileRole ?? 'main_source');
     const preferredLanguage = args.language ? String(args.language) : await this.dominantResearchLanguage(snapshotId);
     const seedTerms = researchSeedTerms(target);
+    const endpointNeedle = endpointNeedleForResearch(target);
+    const endpointMethod = endpointMethodForResearch(target, args.method);
+    const endpointSearch = endpointNeedle
+      ? await this.findEndpoints(snapshotId, {
+        ...args,
+        path: endpointNeedle,
+        method: endpointMethod,
+        limit: packProfileValue(profile, 4, 6, 8),
+        includeSnippets: false,
+        explainRank: true,
+      }) as { endpoints: Array<Record<string, unknown>>; totalCount?: number }
+      : { endpoints: [], totalCount: 0 };
+    const endpointCandidates = compactEndpointCandidates(endpointSearch.endpoints);
+    const exactEndpointCandidates = endpointNeedle
+      ? endpointCandidates.filter(endpoint =>
+        endpoint.path === endpointNeedle
+        && (endpointMethod === 'all' || endpoint.method.toUpperCase() === endpointMethod))
+      : [];
+    const handlerSeedEndpoints = exactEndpointCandidates.length > 0 ? exactEndpointCandidates : endpointCandidates;
+    const impactedEndpoints = uniqueEndpointCandidates([
+      ...exactEndpointCandidates,
+      ...endpointCandidates,
+    ]).slice(0, packProfileValue(profile, 4, 5, 6));
+    const endpointSymbolCandidates = handlerSeedEndpoints.map(endpointHandlerSymbolCandidate);
+    const hasEndpointSeed = endpointSymbolCandidates.length > 0;
+    const endpointFileCandidates = handlerSeedEndpoints.map(endpoint => ({
+      file: endpoint.file,
+      lines: endpoint.lines,
+      whyRelevant: endpoint.whyRelevant,
+      confidence: Math.min(0.95, endpoint.confidence + 0.1),
+      matchedTokens: [endpoint.method, endpoint.path].filter(Boolean),
+      topSymbols: [endpointHandlerSymbolCandidate(endpoint) as unknown as Record<string, unknown>],
+      endpoints: [endpoint as unknown as Record<string, unknown>],
+    }));
     const explicitSymbols = await this.explicitResearchSymbols(
       snapshotId,
       target,
@@ -1653,7 +1748,7 @@ export class V2QueryService {
     const explicitMemberTarget = explicitSymbolRefs(target).some(ref => Boolean(ref.member));
     const explicitFastPath = explicitFiles.length >= 3 || (explicitMemberTarget && explicitFiles.length > 0);
     const symbolRows: Array<Record<string, unknown>> = [];
-    if (!explicitFastPath) {
+    if (!explicitFastPath && !hasEndpointSeed) {
       for (const query of researchSymbolQueries(target, seedTerms)) {
         const result = await this.searchSymbol(snapshotId, {
           ...args,
@@ -1673,19 +1768,21 @@ export class V2QueryService {
     }
 
     const symbolCandidates = uniqueSymbolCandidates([
+      ...endpointSymbolCandidates,
       ...explicitSymbols,
       ...symbolRows.map(row => compactSymbolCandidate(row)),
     ]);
+    const endpointSymbolKeys = new Set(endpointSymbolCandidates.map(symbol => `${symbol.symbol}\0${symbol.file}`));
     const explicitFileSet = new Set(explicitFiles.map(file => file.file));
     const scopedSymbolCandidates = explicitFiles.length > 0
-      ? symbolCandidates.filter(symbol => explicitFileSet.has(symbol.file))
+      ? symbolCandidates.filter(symbol => explicitFileSet.has(symbol.file) || endpointSymbolKeys.has(`${symbol.symbol}\0${symbol.file}`))
       : symbolCandidates;
     const relevantSymbols = (scopedSymbolCandidates.length > 0
       ? scopedSymbolCandidates
       : explicitFastPath
         ? []
         : symbolCandidates).slice(0, packProfileValue(profile, 4, 5, 6));
-    const fileResults = explicitFastPath
+    const fileResults = explicitFastPath || hasEndpointSeed
       ? { files: [] as Array<Record<string, unknown>>, totalFound: explicitFiles.length }
       : await this.searchFiles(snapshotId, {
         ...args,
@@ -1702,6 +1799,7 @@ export class V2QueryService {
         explainRank: true,
       }) as { files: Array<Record<string, unknown>>; totalFound?: number };
     const candidateFiles = uniqueFileCandidates([
+      ...endpointFileCandidates,
       ...explicitFiles,
       ...relevantSymbols.map(symbol => ({
         file: symbol.file,
@@ -1715,28 +1813,22 @@ export class V2QueryService {
       ...(explicitFiles.length >= 3 ? [] : fileResults.files.map(row => compactFileCandidate(row))),
     ]).slice(0, packProfileValue(profile, 4, 5, 6));
 
-    const edgeSeeds = explicitFastPath ? [] : relevantSymbols.slice(0, packProfileValue(profile, 3, 4, 4));
+    const edgeSeeds = endpointSymbolCandidates.length > 0
+      ? endpointSymbolCandidates.slice(0, packProfileValue(profile, 2, 3, 4))
+      : explicitFastPath
+        ? []
+        : relevantSymbols.slice(0, packProfileValue(profile, 3, 4, 4));
     const candidateFileSet = new Set(candidateFiles.map(file => file.file));
     const includeLowSignal = args.includeLowSignal === true;
-    const callersRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callers', packProfileValue(profile, 6, 8, 8), includeLowSignal) : [];
-    const calleesRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callees', packProfileValue(profile, 6, 8, 8), includeLowSignal) : [];
-    const callers = explicitFiles.length > 0
+    const callersRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callers', packProfileValue(profile, 6, 8, 12), includeLowSignal) : [];
+    const calleesRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callees', packProfileValue(profile, 10, 16, 24), includeLowSignal) : [];
+    const restrictEdgesToCandidateFiles = explicitFiles.length > 0 && endpointSymbolCandidates.length === 0;
+    const callers = restrictEdgesToCandidateFiles
       ? callersRaw.filter(edge => candidateFileSet.has(edge.file)).slice(0, 8)
       : callersRaw;
-    const callees = explicitFiles.length > 0
+    const callees = restrictEdgesToCandidateFiles
       ? calleesRaw.filter(edge => candidateFileSet.has(edge.file)).slice(0, 8)
       : calleesRaw;
-    const endpointNeedle = endpointNeedleForResearch(target);
-    const endpointSearch = endpointNeedle
-      ? await this.findEndpoints(snapshotId, {
-        ...args,
-        path: endpointNeedle,
-        method: args.method ?? 'all',
-        limit: packProfileValue(profile, 4, 6, 8),
-        includeSnippets: false,
-      }) as { endpoints: Array<Record<string, unknown>>; totalCount?: number }
-      : { endpoints: [], totalCount: 0 };
-    const impactedEndpoints = compactEndpointCandidates(endpointSearch.endpoints).slice(0, packProfileValue(profile, 4, 5, 6));
     const topFiles = uniqueFilesInOrder([
       ...candidateFiles.map(file => file.file),
       ...relevantSymbols.map(symbol => symbol.file),
@@ -1768,8 +1860,8 @@ export class V2QueryService {
     const sufficientForAnswer = missingFacts.length === 0;
     const returnedFlowSteps = flowSteps.slice(0, packProfileValue(profile, 5, 6, 8));
     const returnedDefinitions = relevantSymbols.slice(0, packProfileValue(profile, 3, 4, 4));
-    const returnedCallers = callers.slice(0, packProfileValue(profile, 3, 4, 4)).map(compactCallEdge);
-    const returnedCallees = callees.slice(0, packProfileValue(profile, 3, 4, 4)).map(compactCallEdge);
+    const returnedCallers = callers.slice(0, packProfileValue(profile, 3, 5, 8)).map(compactCallEdge);
+    const returnedCallees = callees.slice(0, packProfileValue(profile, 6, 10, 14)).map(compactCallEdge);
     const returnedEndpoints = impactedEndpoints.slice(0, packProfileValue(profile, 3, 4, 4));
     const returnedTopFiles = topFiles.slice(0, packProfileValue(profile, 5, 6, 6));
     const returnedSeedTerms = seedTerms.slice(0, packProfileValue(profile, 8, 10, 10));
@@ -2059,7 +2151,8 @@ export class V2QueryService {
     const needles = researchEdgeNeedles(symbols).slice(0, 8);
     if (needles.length === 0) return [];
     const clauses = needles.map(() => `${column} LIKE ? ESCAPE '\\'`).join(' OR ');
-    const params = [snapshotId, ...needles.map(needle => `%${escapeLike(needle)}%`), limit];
+    const dbLimit = Math.min(Math.max(limit * 4, 40), 120);
+    const params = [snapshotId, ...needles.map(needle => `%${escapeLike(needle)}%`), dbLimit];
     const rows = await this.db.prepare(`
       SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
       FROM call_edges
@@ -2070,7 +2163,9 @@ export class V2QueryService {
       ORDER BY ${callSignalOrder()}, confidence DESC, file, line
       LIMIT ?
     `).all(...params) as CallEdgeRow[];
-    return uniqueCallEdges(rows);
+    return uniqueCallEdges(rows)
+      .sort((a, b) => researchCallEdgeScore(b) - researchCallEdgeScore(a) || a.line - b.line || a.callee.localeCompare(b.callee))
+      .slice(0, limit);
   }
 
   private async researchEvidenceSlices(
@@ -2082,6 +2177,15 @@ export class V2QueryService {
   ): Promise<Array<Record<string, unknown>>> {
     const seeds: Array<{ file: string; lines?: string; symbol?: string; why: string }> = [];
     const root = await this.workspaceRootForSnapshot(snapshotId);
+    for (const symbol of symbols) {
+      if (!symbol.file || !symbol.lines) continue;
+      seeds.push({
+        file: symbol.file,
+        lines: symbol.lines,
+        symbol: symbol.symbol,
+        why: `definition/source evidence for ${symbol.name}`,
+      });
+    }
     for (const file of files) {
       const lines = file.lines || bestSourceRange(root, file.file, seedTerms);
       if (lines) {
@@ -2105,16 +2209,6 @@ export class V2QueryService {
         }
       }
     }
-    for (const symbol of symbols) {
-      if (!symbol.file || !symbol.lines) continue;
-      seeds.push({
-        file: symbol.file,
-        lines: symbol.lines,
-        symbol: symbol.symbol,
-        why: `definition/source evidence for ${symbol.name}`,
-      });
-    }
-
     const slices: Array<Record<string, unknown>> = [];
     const seen = new Set<string>();
     let usedChars = 0;
@@ -2125,12 +2219,13 @@ export class V2QueryService {
       seen.add(key);
       const remaining = budgetChars - usedChars;
       if (remaining < 500) break;
-      const slice = await this.getFileSlice(snapshotId, {
+      const sliceArgs: Record<string, unknown> = {
         file: seed.file,
-        lines: seed.lines,
         symbol: seed.symbol,
-        maxChars: Math.min(900, remaining),
-      }) as Record<string, unknown>;
+        maxChars: Math.min(seed.symbol ? 3200 : 900, remaining),
+      };
+      if (!seed.symbol) sliceArgs.lines = seed.lines;
+      const slice = await this.getFileSlice(snapshotId, sliceArgs) as Record<string, unknown>;
       const text = typeof slice.text === 'string' ? slice.text : '';
       if (!text) continue;
       usedChars += text.length;
@@ -2179,8 +2274,46 @@ export class V2QueryService {
     );
     const query = [domain, task].filter(Boolean).join(' ');
     const explicitContext = await this.explicitContextMatches(snapshotId, task, domain, maxFiles);
+    const exactDomainContext = explicitContext.candidateFiles.length > 0
+      && Boolean(domain && (domain.includes('/') || path.extname(domain)));
+    const endpointNeedle = endpointNeedleForTask(task, domain);
+    const endpointMethod = endpointMethodForResearch(query, args.method);
+    const endpointSearch = endpointNeedle
+      ? await this.findEndpoints(snapshotId, {
+        ...args,
+        path: endpointNeedle,
+        method: endpointMethod,
+        limit: Math.min(maxFiles, 10),
+        explainRank: true,
+        includeSnippets: false,
+      }) as { endpoints: Array<Record<string, unknown>>; totalCount?: number }
+      : { endpoints: [], totalCount: 0 };
+    const allEndpointCandidates = compactEndpointCandidates(endpointSearch.endpoints);
+    const exactEndpointCandidates = endpointNeedle
+      ? allEndpointCandidates.filter(endpoint =>
+        endpoint.path === endpointNeedle
+        && (endpointMethod === 'all' || endpoint.method.toUpperCase() === endpointMethod))
+      : [];
+    const directEndpointCandidates = exactEndpointCandidates.length > 0 ? exactEndpointCandidates : allEndpointCandidates;
+    const endpointFileCandidates = directEndpointCandidates.map(endpoint => ({
+      file: endpoint.file,
+      language: undefined,
+      fileRole: undefined,
+      lines: endpoint.lines,
+      whyRelevant: endpoint.whyRelevant,
+      confidence: endpoint.confidence,
+      matchedTokens: [endpoint.method, endpoint.path],
+      snippet: undefined,
+      topSymbols: [endpointHandlerSymbolCandidate(endpoint) as unknown as Record<string, unknown>],
+      endpoints: [endpoint],
+    }));
+    const endpointSymbolCandidates = directEndpointCandidates.map(endpointHandlerSymbolCandidate);
+    const endpointFileSet = new Set(endpointFileCandidates.map(file => file.file));
+    const hasEndpointContext = directEndpointCandidates.length > 0;
 
-    const files = await this.searchFiles(snapshotId, {
+    const files = exactDomainContext || hasEndpointContext
+      ? { files: [] as Array<Record<string, unknown>>, totalFound: explicitContext.candidateFiles.length }
+      : await this.searchFiles(snapshotId, {
       ...args,
       query,
       limit: maxFiles,
@@ -2192,7 +2325,9 @@ export class V2QueryService {
       snippetLines,
       snippetTokenBudget,
     }) as { files: Array<Record<string, unknown>>; totalFound?: number };
-    const symbols = await this.searchSymbol(snapshotId, {
+    const symbols = hasEndpointContext
+      ? { symbols: [] as Array<Record<string, unknown>>, totalFound: 0 }
+      : await this.searchSymbol(snapshotId, {
       ...args,
       query,
       limit: maxSymbols,
@@ -2203,46 +2338,29 @@ export class V2QueryService {
       explainRank: true,
       includeSnippets: false,
     }) as { symbols: Array<Record<string, unknown>>; totalFound?: number };
-    const endpointNeedle = endpointNeedleForTask(task, domain);
-    const endpointSearch = endpointNeedle
-      ? await this.findEndpoints(snapshotId, {
-        ...args,
-        path: endpointNeedle,
-        method: 'all',
-        limit: Math.min(maxFiles, 10),
-        explainRank: true,
-        includeSnippets: false,
-      }) as { endpoints: Array<Record<string, unknown>>; totalCount?: number }
-      : { endpoints: [], totalCount: 0 };
     const myBatisContext = isMyBatisIntent(query)
       ? await this.myBatisContext(snapshotId, query, maxFiles, maxSymbols)
       : { candidateFiles: [], relevantSymbols: [], topFiles: [] };
-    const directEndpointCandidates = compactEndpointCandidates(endpointSearch.endpoints);
-    const endpointFileCandidates = directEndpointCandidates.map(endpoint => ({
-      file: endpoint.file,
-      language: undefined,
-      fileRole: undefined,
-      lines: endpoint.lines,
-      whyRelevant: endpoint.whyRelevant,
-      confidence: endpoint.confidence,
-      matchedTokens: [],
-      snippet: undefined,
-      topSymbols: [],
-      endpoints: [endpoint],
-    }));
 
     const fuzzyFileCandidates = files.files
       .map(row => compactFileCandidate(row))
       .filter(candidate => explicitContext.topFiles.length === 0
         || isCompatibleExplicitFileCandidate(candidate.file, explicitContext.topFiles));
+    const explicitCandidateFiles = hasEndpointContext
+      ? explicitContext.candidateFiles.filter(candidate => endpointFileSet.has(candidate.file))
+      : explicitContext.candidateFiles;
+    const explicitRelevantSymbols = hasEndpointContext
+      ? explicitContext.relevantSymbols.filter(symbol => endpointFileSet.has(symbol.file))
+      : explicitContext.relevantSymbols;
     const candidateFiles = uniqueFileCandidates([
-      ...explicitContext.candidateFiles,
-      ...myBatisContext.candidateFiles,
       ...endpointFileCandidates,
+      ...explicitCandidateFiles,
+      ...myBatisContext.candidateFiles,
       ...fuzzyFileCandidates,
     ]).slice(0, maxFiles);
     const relevantSymbols = uniqueSymbolCandidates([
-      ...explicitContext.relevantSymbols,
+      ...endpointSymbolCandidates,
+      ...explicitRelevantSymbols,
       ...myBatisContext.relevantSymbols,
       ...symbols.symbols.map(row => compactSymbolCandidate(row)),
     ]).slice(0, maxSymbols);
@@ -2251,9 +2369,9 @@ export class V2QueryService {
       ...files.files.flatMap(row => Array.isArray(row.endpoints) ? row.endpoints as Array<Record<string, unknown>> : []),
     ]).slice(0, Math.min(maxFiles, 10));
     const topFiles = uniqueFilesInOrder([
-      ...explicitContext.topFiles,
-      ...candidateFiles.map(row => row.file),
       ...endpointCandidates.map(row => row.file),
+      ...candidateFiles.map(row => row.file),
+      ...(hasEndpointContext ? [] : explicitContext.topFiles),
       ...relevantSymbols.map(row => row.file),
       ...myBatisContext.topFiles,
     ].filter(Boolean)).slice(0, maxFiles);
@@ -2274,6 +2392,11 @@ export class V2QueryService {
     const testSeeds = [
       task,
       domain ?? '',
+      ...directEndpointCandidates.flatMap(endpoint => [
+        endpoint.path,
+        endpoint.handlerSymbol,
+        String((endpoint as unknown as Record<string, unknown>).controller ?? ''),
+      ]),
       ...relevantSymbols.slice(0, 8).flatMap(symbol => [symbol.symbol, symbol.name]),
       ...topFiles.slice(0, 5).map(file => path.basename(file, path.extname(file))),
     ].filter(seed => seed.length > 0);
@@ -2605,23 +2728,33 @@ export class V2QueryService {
 
   private async searchCode(snapshotId: string, args: Record<string, unknown>) {
     const query = String(args.query ?? '').trim();
-    const limit = Math.min(Number(args.limit ?? 10), 50);
+    const outputMode = String(args.outputMode ?? 'compact');
+    const compact = outputMode !== 'full';
+    const limit = Math.min(Number(args.limit ?? 10), compact ? 8 : 50);
     const includeReferences = Boolean(args.includeReferences ?? true);
     const includeDependencies = Boolean(args.includeDependencies ?? true);
+    const downstreamArgs = compact
+      ? {
+        ...args,
+        includeSnippets: false,
+        snippetLines: Math.min(Number(args.snippetLines ?? 6), 6),
+        snippetTokenBudget: Math.min(Number(args.snippetTokenBudget ?? 800), 800),
+      }
+      : args;
     const symbolResults = await this.searchSymbol(snapshotId, {
-      ...args,
+      ...downstreamArgs,
       query,
       limit,
       explainRank: Boolean(args.explainRank ?? false),
     }) as Record<string, unknown>;
     const fileResults = await this.searchFiles(snapshotId, {
-      ...args,
+      ...downstreamArgs,
       query,
       limit,
       explainRank: Boolean(args.explainRank ?? false),
     }) as Record<string, unknown>;
     const endpointResults = await this.findEndpoints(snapshotId, {
-      ...args,
+      ...downstreamArgs,
       path: query,
       method: args.method ?? 'all',
       limit,
@@ -2629,7 +2762,7 @@ export class V2QueryService {
     }) as Record<string, unknown>;
     const references = includeReferences && query
       ? await this.findReferences(snapshotId, {
-        ...args,
+        ...downstreamArgs,
         symbol: query,
         limit,
         groupBy: args.groupBy ?? 'file',
@@ -2637,22 +2770,26 @@ export class V2QueryService {
       : undefined;
     const dependencies = includeDependencies && query
       ? await this.traceDependencies(snapshotId, {
-        ...args,
+        ...downstreamArgs,
         target: query,
         depth: args.depth ?? 1,
         limit: Math.max(limit * 5, 50),
       }) as Record<string, unknown>
       : undefined;
-
-    return {
-      query,
-      sections: {
+    const sections = compact
+      ? compactSearchCodeSections(fileResults, symbolResults, endpointResults, references, dependencies, limit)
+      : {
         files: fileResults,
         symbols: symbolResults,
         endpoints: endpointResults,
         references,
         dependencies,
-      },
+      };
+
+    return {
+      query,
+      outputMode: compact ? 'compact' : 'full',
+      sections,
       summary: {
         fileMatches: Number(fileResults.totalFound ?? 0),
         symbolMatches: Number(symbolResults.totalFound ?? 0),
@@ -2665,7 +2802,9 @@ export class V2QueryService {
         'Use the section-specific nextCursor values when one result type needs deeper pagination.',
       ]) } : {}),
       confidenceNotes: [
-        'search_code is a mixed retrieval view; use the section-specific tools when you need deeper pagination or fewer result types.',
+        compact
+          ? 'search_code returns compact sections by default; call a pack tool or get_file_slice for exact source text, or set outputMode=full for expanded retrieval.'
+          : 'search_code is a mixed retrieval view; use the section-specific tools when you need deeper pagination or fewer result types.',
       ],
     };
   }
@@ -3200,7 +3339,7 @@ export class V2QueryService {
   private async findRelevantTestsForSeeds(snapshotId: string, seeds: string[], limit: number): Promise<Array<Record<string, unknown>>> {
     const merged = new Map<string, { file: string; score: number; reasons: Set<string> }>();
     const seedLookups = await mapWithConcurrency(
-      [...new Set(seeds.map(item => item.trim()).filter(Boolean))].slice(0, 16),
+      [...new Set(seeds.map(item => item.trim()).filter(Boolean))].slice(0, 8),
       relevantTestLookupConcurrency(),
       seed => this.findRelevantTests(snapshotId, seed, limit),
     );
@@ -3365,9 +3504,15 @@ export class V2QueryService {
         FROM imports
         WHERE snapshot_id = ? AND ${COMMON_EXTERNAL_IMPORT_SQL}
         GROUP BY source
+      ),
+      ranked_import_counts AS (
+        SELECT source, simple_name, count
+        FROM import_counts
+        ORDER BY count DESC, source
+        LIMIT 200
       )
       SELECT i.source, i.count
-      FROM import_counts i
+      FROM ranked_import_counts i
       WHERE NOT EXISTS (
         SELECT 1
         FROM symbols s
@@ -3560,6 +3705,89 @@ interface SnippetOptions {
   budgetChars: number;
   usedChars: number;
   fileCache: Map<string, string>;
+}
+
+function compactSearchCodeSections(
+  fileResults: Record<string, unknown>,
+  symbolResults: Record<string, unknown>,
+  endpointResults: Record<string, unknown>,
+  references: Record<string, unknown> | undefined,
+  dependencies: Record<string, unknown> | undefined,
+  limit: number,
+): Record<string, unknown> {
+  return {
+    files: {
+      totalFound: Number(fileResults.totalFound ?? 0),
+      nextCursor: fileResults.nextCursor,
+      files: arrayRecords(fileResults.files).slice(0, limit).map(slimSearchCodeFile),
+    },
+    symbols: {
+      totalFound: Number(symbolResults.totalFound ?? 0),
+      nextCursor: symbolResults.nextCursor,
+      symbols: arrayRecords(symbolResults.symbols).slice(0, limit).map(slimSearchCodeSymbol),
+    },
+    endpoints: {
+      totalCount: Number(endpointResults.totalCount ?? 0),
+      endpoints: compactEndpointCandidates(arrayRecords(endpointResults.endpoints)).slice(0, limit),
+    },
+    references: references ? {
+      totalCount: Number(references.totalCount ?? 0),
+      truncated: Boolean(references.truncated),
+      nextCursor: references.nextCursor,
+      references: arrayRecords(references.references).slice(0, limit).map(row => compactReviewObject(row, 8, 2)),
+      groups: arrayRecords(references.groups).slice(0, Math.min(limit, 5)).map(row => compactReviewObject(row, 8, 2)),
+    } : undefined,
+    dependencies: dependencies ? {
+      seedFiles: stringArray(dependencies.seedFiles).slice(0, limit),
+      transitiveFiles: stringArray(dependencies.transitiveFiles).slice(0, limit * 2),
+      edges: arrayRecords(dependencies.edges).slice(0, limit * 3).map(row => compactReviewObject(row, 8, 2)),
+    } : undefined,
+  };
+}
+
+function slimSearchCodeFile(row: Record<string, unknown>): Record<string, unknown> {
+  return {
+    path: String(row.path ?? row.file ?? ''),
+    language: stringOrUndefined(row.language),
+    fileRole: stringOrUndefined(row.fileRole ?? row.file_role),
+    parseStatus: stringOrUndefined(row.parseStatus ?? row.parse_status),
+    searchScore: Number(row.searchScore ?? 0),
+    matchedTokens: stringArray(row.matchedTokens),
+    matchReason: stringOrUndefined(row.matchReason),
+    topSymbols: arrayRecords(row.topSymbols).slice(0, 3).map(slimSearchCodeSymbol),
+    endpoints: compactEndpointCandidates(arrayRecords(row.endpoints)).slice(0, 3),
+  };
+}
+
+function slimSearchCodeSymbol(row: Record<string, unknown>): Record<string, unknown> {
+  return {
+    name: String(row.name ?? row.simple_name ?? ''),
+    fqName: String(row.fqName ?? row.fq_name ?? row.symbol ?? ''),
+    kind: stringOrUndefined(row.kind),
+    file: String(row.file ?? ''),
+    line: Number(row.line ?? 0),
+    lines: stringOrUndefined(row.lines),
+    signature: stringOrUndefined(row.signature),
+    frameworkRole: stringOrUndefined(row.frameworkRole ?? row.framework_role),
+    fileRole: stringOrUndefined(row.fileRole ?? row.file_role),
+    searchScore: Number(row.searchScore ?? 0),
+    matchedTokens: stringArray(row.matchedTokens),
+    matchReason: stringOrUndefined(row.matchReason),
+  };
+}
+
+function mergeSymbolRows(...groups: SymbolRow[][]): SymbolRow[] {
+  const merged: SymbolRow[] = [];
+  const seen = new Set<string>();
+  for (const group of groups) {
+    for (const row of group) {
+      const key = `${row.fq_name}\0${row.kind}\0${row.file}\0${row.line}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(row);
+    }
+  }
+  return merged;
 }
 
 function symbolDto(row: SymbolRow, snippets?: SnippetOptions): Record<string, unknown> {
@@ -3969,11 +4197,48 @@ function compactEndpointCandidates(rows: Array<Record<string, unknown>>): Array<
   return result;
 }
 
+function uniqueEndpointCandidates<T extends { method: string; path: string; handlerSymbol: string; file: string; line: number }>(candidates: T[]): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const candidate of candidates) {
+    const key = `${candidate.method}\0${candidate.path}\0${candidate.handlerSymbol}\0${candidate.file}\0${candidate.line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(candidate);
+  }
+  return result;
+}
+
+function endpointNeedleFromText(text: string): string {
+  const candidates: Array<{ path: string; index: number; score: number }> = [];
+  const endpointIntent = /\b(api|endpoint|route|rest|http|handler|controller|request|response)\b/i.test(text);
+  for (const match of text.matchAll(/\/[A-Za-z0-9_{}:$.-][A-Za-z0-9_{}:$/.-]*/g)) {
+    const raw = match[0] ?? '';
+    const value = raw.replace(/[),.;]+$/g, '');
+    if (!value || value === '/' || value.length < 2) continue;
+    const index = match.index ?? 0;
+    const before = text.slice(Math.max(0, index - 24), index);
+    const segments = value.split('/').filter(Boolean);
+    const first = segments[0]?.toLowerCase() ?? '';
+    let score = 0;
+    if (/\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s*$/i.test(before)) score += 120;
+    if (/^\/(?:api|apis|ws|rest|v\d+|actuator|health|metrics|graphql)(?:\/|$)/i.test(value)) score += 80;
+    if (/[{}]/.test(value)) score += 35;
+    if (segments.length >= 2) score += 20;
+    if (endpointIntent) score += 15;
+    if (/\.(?:java|kt|scala|ts|tsx|js|jsx|py|xml|json|ya?ml|md|txt|class)$/i.test(value)) score -= 120;
+    if (/^(?:users?|home|personal|projects?|workspace|workspaces|src|main|test|tests|java|com|org|net|io|d)$/i.test(first)) score -= 90;
+    if (/^[A-Z]:\//.test(text.slice(Math.max(0, index - 2), index + value.length))) score -= 70;
+    candidates.push({ path: value, index, score });
+  }
+  candidates.sort((a, b) => b.score - a.score || b.path.length - a.path.length || a.index - b.index);
+  const best = candidates[0];
+  if (!best || best.score < 15) return '';
+  return best.path;
+}
+
 function endpointNeedleForTask(task: string, domain?: string): string {
-  const explicitPath = task.match(/\/[A-Za-z0-9_{}:$.-][A-Za-z0-9_{}:$/.-]*/);
-  if (explicitPath) return explicitPath[0];
-  if (domain?.includes('/')) return domain;
-  return '';
+  return endpointNeedleFromText([task, domain ?? ''].join(' '));
 }
 
 function explicitSymbolRefs(task: string, domain?: string): Array<{ className: string; member?: string }> {
@@ -4066,6 +4331,9 @@ function sharedPrefixSegments(left: string, right: string): number {
 
 const EXPLICIT_FILENAME_STOP_WORDS = new Set([
   'Find',
+  'Task',
+  'Question',
+  'Feature',
   'Implementation',
   'Context',
   'Callers',
@@ -4076,6 +4344,18 @@ const EXPLICIT_FILENAME_STOP_WORDS = new Set([
   'This',
   'That',
   'With',
+  'Read',
+  'Only',
+  'Return',
+  'Current',
+  'Behavior',
+  'Proposed',
+  'Acceptance',
+  'Criteria',
+  'Edge',
+  'Cases',
+  'Validation',
+  'Commands',
 ]);
 
 function inferDomain(task: string, files: string[]): string {
@@ -4620,9 +4900,31 @@ function snakeToLowerCamel(value: string): string {
 }
 
 function endpointNeedleForResearch(target: string): string {
-  const explicitPath = target.match(/\/[A-Za-z0-9_{}:$.-][A-Za-z0-9_{}:$/.-]*/);
-  if (explicitPath) return explicitPath[0];
-  return '';
+  return endpointNeedleFromText(target);
+}
+
+function endpointMethodForResearch(target: string, explicitMethod?: unknown): string {
+  const provided = typeof explicitMethod === 'string' ? explicitMethod.toUpperCase() : '';
+  if (/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|ALL)$/.test(provided)) return provided;
+  const match = target.match(/\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/i);
+  return match ? (match[1] ?? 'all').toUpperCase() : 'all';
+}
+
+function endpointHandlerSymbolCandidate(endpoint: ReturnType<typeof compactEndpointCandidates>[number]): ResearchSymbolCandidate {
+  const symbol = endpoint.handlerSymbol;
+  const nameMatch = symbol.match(/\.([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/);
+  const fallbackName = symbol.split(/[.#]/).pop()?.replace(/\([^)]*\)$/, '') ?? symbol;
+  return {
+    symbol,
+    name: nameMatch?.[1] ?? fallbackName,
+    kind: 'method',
+    file: endpoint.file,
+    lines: endpoint.lines,
+    frameworkRole: 'endpoint:handler',
+    whyRelevant: `handler for indexed endpoint ${endpoint.method} ${endpoint.path}`,
+    confidence: Math.min(0.95, endpoint.confidence + 0.15),
+    matchedTokens: [endpoint.method, endpoint.path, endpoint.framework ?? 'endpoint'].filter(Boolean),
+  };
 }
 
 function compactCallEdge(edge: CallEdgeRow): Record<string, unknown> {
@@ -4638,13 +4940,30 @@ function compactCallEdge(edge: CallEdgeRow): Record<string, unknown> {
   };
 }
 
+function researchCallEdgeScore(edge: CallEdgeRow): number {
+  const callee = edge.callee;
+  let score = edge.confidence * 100;
+  if (edge.signal_tier === 'provider') score += 30;
+  else if (edge.signal_tier === 'primary') score += 20;
+  else score += 5;
+  if (edge.resolution_kind === 'receiver-field' || edge.resolution_kind === 'interface-implementation') score += 8;
+  if (/\b(Service|Client|Manager|Context|Store|Repository|Dao|Request|Response|Builder|Info|Entity|Controller)\b/.test(callee)) score += 18;
+  if (/\b(Logger|String|HashSet|ArrayList|List|Set|Map|ConcurrentMap|AtomicLong|Objects|Optional)\./.test(callee)) score -= 24;
+  if (/\.new$/.test(callee) && !/\b(Request|Response|Info|Entity|Builder|Service|Client)\.new$/.test(callee)) score -= 8;
+  return score;
+}
+
 function researchEdgeNeedles(symbols: ResearchSymbolCandidate[]): string[] {
   const values: string[] = [];
   for (const symbol of symbols) {
-    values.push(symbol.name, symbol.symbol);
-    const parts = symbol.symbol.split(/[.#]/g).filter(Boolean);
-    if (parts.length >= 2) values.push(`${parts[parts.length - 2]}.${parts[parts.length - 1]}`);
-    if (parts.length > 0) values.push(parts[parts.length - 1] ?? '');
+    const withoutParams = symbol.symbol.replace(/\([^)]*\)$/, '').trim();
+    const parts = withoutParams.split(/[.#]/g).filter(Boolean);
+    const compact = parts.length >= 2 ? `${parts[parts.length - 2]}.${parts[parts.length - 1]}` : '';
+    if (symbol.kind === 'method' || symbol.kind === 'function') {
+      values.push(symbol.symbol, withoutParams, compact);
+    } else {
+      values.push(symbol.name, symbol.symbol, withoutParams, compact, parts[parts.length - 1] ?? '');
+    }
   }
   return uniqueStrings(values
     .map(value => value.replace(/\([^)]*\)$/, '').trim())
@@ -6230,7 +6549,10 @@ function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined, query
 }
 
 function hasTestIntent(query: string): boolean {
-  return /\b(test|tests|spec|behavior|behaviour|should|fixture|fixtures|mock|mocks)\b/i.test(query);
+  const expanded = query
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
+  return /\b(test|tests|testable|spec|behavior|behaviour|should|fixture|fixtures|mock|mocks)\b/i.test(expanded);
 }
 
 function hasGeneratedIntent(query: string): boolean {
@@ -6636,6 +6958,17 @@ function exactCallEdgeTestTerms(term: string): string[] {
     compact,
     parts.length >= 2 ? `${parts[parts.length - 2]}.${parts[parts.length - 1]}` : '',
   ].filter(value => value.length >= 4 && !isBroadSearchTerm(value)));
+}
+
+function callEdgeLookupTerms(symbol: string): string[] {
+  const raw = symbol.trim();
+  const withoutParams = raw.replace(/\([^)]*\)$/, '').trim();
+  return uniqueStrings([
+    ...exactCallEdgeTestTerms(raw),
+    callGraphName(raw),
+    withoutParams,
+    raw,
+  ].filter(value => value.length >= 3 && !isBroadSearchTerm(value))).slice(0, 6);
 }
 
 function isServiceLike(symbol: Record<string, unknown>): boolean {

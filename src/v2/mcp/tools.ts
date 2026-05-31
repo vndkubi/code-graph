@@ -11,7 +11,7 @@ const SnippetOptions = {
   // value per tool, so keep the MCP schema permissive enough to avoid a hard
   // parse failure before the service can apply its own budget.
   snippetLines: z.number().min(1).max(240).optional(),
-  snippetTokenBudget: z.number().min(100).max(12000).optional(),
+  snippetTokenBudget: z.number().min(100).max(30000).optional(),
 };
 
 const PackProfileOption = {
@@ -66,6 +66,7 @@ export const V2ToolSchemas = {
   }),
   get_file_summary: z.object({
     file: z.string(),
+    limit: z.number().min(10).max(500).default(80),
     ...SnippetOptions,
     ...FreshnessOptions,
   }),
@@ -171,7 +172,7 @@ export const V2ToolSchemas = {
   get_flow_pack: z.object({
     target: z.string(),
     taskType: z.string().default('architecture'),
-    tokenBudget: z.number().min(1000).max(12000).default(8000),
+    tokenBudget: z.number().min(1000).max(30000).default(8000),
     ...CallSignalOption,
     ...PackProfileOption,
     ...SnippetOptions,
@@ -180,7 +181,7 @@ export const V2ToolSchemas = {
   get_research_pack: z.object({
     target: z.string(),
     taskType: z.string().default('research'),
-    tokenBudget: z.number().min(1000).max(12000).default(8000),
+    tokenBudget: z.number().min(1000).max(30000).default(8000),
     ...CallSignalOption,
     ...PackProfileOption,
     ...SnippetOptions,
@@ -216,6 +217,7 @@ export const V2ToolSchemas = {
   search_code: z.object({
     query: z.string(),
     limit: z.number().min(1).max(50).default(10),
+    outputMode: z.enum(['compact', 'full']).default('compact'),
     includeReferences: z.boolean().default(true),
     includeDependencies: z.boolean().default(true),
     includeSynthetic: z.boolean().optional(),
@@ -252,15 +254,15 @@ export function parseToolArgs(name: string, args: unknown): Record<string, unkno
 function descriptionFor(name: V2ToolName): string {
   switch (name) {
     case 'get_flow_pack':
-      return 'Read-only architecture flow pack: ordered steps, ranked files/symbols, call evidence, and capped slices. For implementation/debug/refactor, use get_change_pack instead.';
+      return 'PRIMARY endpoint/API/investigation/request-flow tool. Returns ordered steps, ranked files/symbols, endpoint handlers, call evidence, tests, and capped slices. Call once and answer directly when routing.answerDirectly is true. For implementation/debug/refactor/spec planning, use get_change_pack instead.';
     case 'get_research_pack':
-      return 'Read-only research/architecture pack with ranked definitions, flow steps, related edges, top files, and bounded evidence. Do not use for edit/debug tasks; use get_change_pack.';
+      return 'PRIMARY broad architecture/research tool when no concrete endpoint/API path is named. Returns ranked definitions, flow steps, related edges, top files, and bounded evidence. Do not use for edit/debug/spec tasks; use get_change_pack.';
     case 'get_context_packet':
       return 'Compact implementation/debug router. Returns ranked files/symbols, slice/tool hints, likely tests, validation, and next action. For edits, prefer get_change_pack first.';
     case 'get_change_pack':
-      return 'PRIMARY edit/debug/refactor tool. Returns scoped files/symbols, exact edit ranges, invariants, likely tests, validation commands, and optional patch impact before editing.';
+      return 'PRIMARY spec/implementation-plan/edit/debug/refactor tool, including read-only planning. Returns scoped files/symbols, exact edit ranges, invariants, likely tests, validation commands, and optional patch impact before editing. Call once before using search_symbol/search_code.';
     case 'search_symbol':
-      return 'Search indexed symbols with intent-aware ranking, pagination, facets, and optional rank explanations. Hides Lombok synthetic symbols, tests, generated files, and fixtures by default unless requested or implied by the query.';
+      return 'Targeted fallback symbol lookup after a pack names a missing symbol. Do not use as the first tool for endpoint/API/spec/implementation/review prompts. Supports intent-aware ranking, pagination, facets, and optional rank explanations.';
     case 'search_files':
       return 'Find relevant files by path, symbols, endpoints, imports, dependency signal, and file role. Returns top symbols/endpoints per file, facets, pagination, and optional rank explanations.';
     case 'find_references':
@@ -294,7 +296,7 @@ function descriptionFor(name: V2ToolName): string {
     case 'find_tests_for':
       return 'Find tests likely relevant to a symbol using test file names, test symbols, and indexed call edges.';
     case 'search_code':
-      return 'Fallback mixed retrieval search for when get_research_pack/get_flow_pack reports low confidence or missing facts. Returns file, symbol, endpoint, reference, and dependency sections; avoid using it as a first step for architecture questions.';
+      return 'Targeted fallback mixed retrieval for a specific missing fact after get_flow_pack/get_research_pack/get_change_pack. Returns file, symbol, endpoint, reference, and dependency sections; avoid using it as a first step for architecture, spec, implementation, or review prompts.';
     case 'get_index_stats':
       return 'Return persistent index and graph statistics plus health diagnostics such as parse failures, stale files, unresolved calls/imports, and framework warnings.';
   }
