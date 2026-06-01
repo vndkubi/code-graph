@@ -203,6 +203,54 @@ Expected output:
 - Identifies missing test coverage.
 - Produces traceability from acceptance criteria to files and tests.
 
+## PR Review Variant
+
+Use this when the task is to review an existing PR, diff, or patch instead of implementing the ticket. In this mode, the PR diff is the primary artifact. Jira and Confluence provide the review rubric.
+
+The ordering changes:
+
+1. Identify the PR diff and linked Jira or Confluence evidence.
+2. Extract acceptance criteria, constraints, non-goals, and risky requirements.
+3. Use CodeGraph MCP `review_patch` on the PR diff.
+4. Inspect only required follow-up slices for risky changed hunks.
+5. Return findings first, then traceability.
+
+Do not run the implementation phases unless the user explicitly asks the agent to fix the PR.
+
+```text
+Use Jira MCP and Confluence MCP to understand the linked ticket/spec for PR <PR_URL>.
+Then use CodeGraph MCP review_patch to review the PR diff against:
+- ticket acceptance criteria
+- linked docs
+- existing code behavior
+- correctness, compatibility, security, performance, and missing tests
+
+Start with findings ordered by severity.
+Each finding must include:
+- severity
+- violated requirement or risk
+- affected file/method
+- concrete failure mode
+- required fix
+- required test
+
+Also return:
+- AC -> changed code -> tests traceability
+- residual risks
+- areas not reviewed due to missing evidence
+
+Do not suggest unrelated refactors.
+Use shell only if CodeGraph evidence is missing.
+```
+
+Expected output:
+
+- Findings lead the answer.
+- Findings are tied to changed code and concrete failure modes.
+- Ticket acceptance criteria are mapped to changed files and tests.
+- Missing tests are reported as specific validation gaps.
+- Non-findings and residual risks are separated from blocking issues.
+
 ## Prompt Templates By Task Type
 
 ### Full Ticket Implementation
