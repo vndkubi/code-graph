@@ -5,6 +5,7 @@
 export type SymbolKind = 'class' | 'interface' | 'function' | 'method' | 'variable' | 'enum' | 'type' | 'field';
 export type Visibility = 'public' | 'private' | 'protected' | 'internal';
 export type ReferenceKind = 'call' | 'import' | 'definition' | 'type';
+export type FieldAccessKind = 'read' | 'write' | 'read_write' | 'init' | 'unknown';
 
 /**
  * A reference to a type used in field/parameter/return position.
@@ -71,12 +72,29 @@ export interface CallInfo {
   resolutionKind?: string;
 }
 
+export interface FieldUsageInfo {
+  fieldName: string;
+  fieldFqName?: string;
+  ownerClass?: string;
+  file: string;
+  line: number;
+  column: number;
+  enclosingClass?: string;
+  enclosingSymbol?: string;
+  accessKind: FieldAccessKind;
+  receiverText?: string;
+  context: string;
+  confidence: number;
+  resolutionKind: string;
+}
+
 export interface ParseResult {
   file: string;
   symbols: SymbolInfo[];
   imports: ImportInfo[];
   calls: CallInfo[];
   references: ReferenceInfo[];
+  fieldUsages?: FieldUsageInfo[];
   /** Whether tree-sitter detected syntax errors in this file */
   hasParseErrors: boolean;
   /** 0.0–1.0: how reliable this parse result is likely to be */

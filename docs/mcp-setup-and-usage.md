@@ -324,7 +324,7 @@ node dist/cli.js index --root "D:\Personal\Projects\elasticsearch" --workspace-k
 
 ## Tool Selection
 
-If you do not want to remember tool names, use natural prompts such as "Use CodeGraph MCP. Trace the full flow for this API" or "Use CodeGraph MCP. Review this diff." For copy-paste prompt templates by task type, see [CodeGraph Prompt Guide](prompt-guide.md).
+If you do not want to remember tool names, use natural prompts such as "Use CodeGraph MCP. Trace the full flow for this API" or "Use CodeGraph MCP. Review this diff." For MCP-first workflow rules, see [Using CodeGraph MCP Correctly](using-codegraph-mcp-correctly.md). For copy-paste prompt templates by task type, see [CodeGraph Prompt Guide](prompt-guide.md).
 
 | Task | First tool |
 | --- | --- |

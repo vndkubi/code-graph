@@ -53,10 +53,11 @@ export const V2ToolSchemas = {
   }),
   find_references: z.object({
     symbol: z.string(),
-    kind: z.enum(['call', 'import', 'definition', 'all']).default('all'),
+    kind: z.enum(['call', 'import', 'definition', 'field_usage', 'all']).default('all'),
+    fieldAccess: z.enum(['all', 'read', 'write', 'read_write', 'init', 'unknown']).default('all'),
     limit: z.number().min(1).max(500).default(100),
     cursor: z.string().optional(),
-    groupBy: z.enum(['none', 'file', 'kind', 'caller']).default('none'),
+    groupBy: z.enum(['none', 'file', 'kind', 'caller', 'method', 'class']).default('none'),
     includeSynthetic: z.boolean().optional(),
     includeTests: z.boolean().optional(),
     includeGenerated: z.boolean().optional(),
@@ -266,7 +267,7 @@ function descriptionFor(name: V2ToolName): string {
     case 'search_files':
       return 'Find relevant files by path, symbols, endpoints, imports, dependency signal, and file role. Returns top symbols/endpoints per file, facets, pagination, and optional rank explanations.';
     case 'find_references':
-      return 'Find definitions, imports, and call references for a symbol with filters, pagination, and optional grouping by file, kind, or caller.';
+      return 'Find definitions, imports, call references, and Java field usages for a symbol with filters, pagination, and optional grouping by file, kind, caller, method, or class.';
     case 'get_file_summary':
       return 'Summarize a file using persistent symbols, imports, dependencies, and dependents.';
     case 'get_file_slice':

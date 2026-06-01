@@ -49,7 +49,7 @@ Run the MCP server:
 node dist/cli.js mcp --root "<hadoop-project>"
 ```
 
-For Docker and MCP client configuration, see [MCP Setup And Usage](docs/mcp-setup-and-usage.md). For task prompts, see [CodeGraph Prompt Guide](docs/prompt-guide.md).
+For Docker and MCP client configuration, see [MCP Setup And Usage](docs/mcp-setup-and-usage.md). For correct MCP-first workflows, see [Using CodeGraph MCP Correctly](docs/using-codegraph-mcp-correctly.md). For task prompts, see [CodeGraph Prompt Guide](docs/prompt-guide.md).
 
 ## Why Use CodeGraph Instead Of Baseline File Search
 
@@ -102,7 +102,7 @@ The baseline proof scans and opens matching files directly. The CodeGraph proof 
 | Review a patch | `review_patch` | Risk-focused packet with findings, changed hunks, required follow-up slices, and validation gaps. |
 | Find a symbol | `search_symbol` | Intent-aware symbol ranking with filters for kind, annotations, framework role, tests, and generated files. |
 | Find files | `search_files` | Ranks paths by symbols, endpoints, imports, dependencies, and file role. |
-| Find references or calls | `find_references`, `get_callers`, `get_callees` | Uses indexed definitions, imports, and call edges. |
+| Find references, calls, or field usage | `find_references`, `get_callers`, `get_callees` | Uses indexed definitions, imports, call edges, and opt-in Java field usages. |
 | Trace dependencies | `trace_dependencies` | Walks dependency or dependent edges with depth and file-role filters. |
 | Check index health | `get_index_stats` | Shows snapshot counts, diagnostics, stale status, and framework warnings. |
 
@@ -117,7 +117,7 @@ CodeGraph keeps correctness by snapshotting each workspace:
 - Two branches at once: use `git worktree` or separate clones, each with a different root or `CODEGRAPH_WORKSPACE_KEY`.
 - Docker: always set `CODEGRAPH_WORKSPACE_KEY`, because every repository is mounted as `/workspace` inside the container.
 
-See [MCP Setup And Usage](docs/mcp-setup-and-usage.md) for detailed setup, client config, branch workflows, and troubleshooting. See [CodeGraph Prompt Guide](docs/prompt-guide.md) for copy-paste prompts by task type.
+See [MCP Setup And Usage](docs/mcp-setup-and-usage.md) for detailed setup, client config, branch workflows, and troubleshooting. See [Using CodeGraph MCP Correctly](docs/using-codegraph-mcp-correctly.md) for MCP-first workflow rules and [CodeGraph Prompt Guide](docs/prompt-guide.md) for copy-paste prompts by task type.
 
 ## CLI Reference
 

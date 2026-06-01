@@ -723,6 +723,7 @@ export class V2QueryService {
     const cursorOffset = parseCursor(args.cursor);
     const groupBy = String(args.groupBy ?? 'none');
     const like = `%${escapeLike(symbol)}%`;
+    const fieldAccess = String(args.fieldAccess ?? 'all');
     const filters = referenceFiltersFor(args, symbol);
     const branches: string[] = [];
     const params: unknown[] = [];
@@ -737,7 +738,9 @@ export class V2QueryService {
       branches.push(`
         SELECT file, line, column, 'definition' AS kind, simple_name AS symbol_name,
                fq_name AS source, NULL::text AS caller, NULL::text AS callee, NULL::double precision AS confidence,
-               NULL::text AS resolution_kind, NULL::text AS signal_tier, NULL::text AS signal_reasons_json, file_role
+               NULL::text AS resolution_kind, NULL::text AS signal_tier, NULL::text AS signal_reasons_json, file_role,
+               NULL::text AS field_access, NULL::text AS enclosing_class, NULL::text AS enclosing_symbol,
+               NULL::text AS owner_class, NULL::text AS receiver_text, NULL::text AS context
         FROM symbols
         WHERE ${where}
       `);
@@ -754,7 +757,9 @@ export class V2QueryService {
       branches.push(`
         SELECT file, line, 1 AS column, 'import' AS kind, source AS symbol_name,
                source, NULL::text AS caller, NULL::text AS callee, NULL::double precision AS confidence,
-               NULL::text AS resolution_kind, NULL::text AS signal_tier, NULL::text AS signal_reasons_json, file_role
+               NULL::text AS resolution_kind, NULL::text AS signal_tier, NULL::text AS signal_reasons_json, file_role,
+               NULL::text AS field_access, NULL::text AS enclosing_class, NULL::text AS enclosing_symbol,
+               NULL::text AS owner_class, NULL::text AS receiver_text, NULL::text AS context
         FROM imports
         WHERE ${where}
       `);
@@ -771,11 +776,39 @@ export class V2QueryService {
       branches.push(`
         SELECT file, line, 1 AS column, 'call' AS kind, callee AS symbol_name,
                callee AS source, caller, callee, confidence, resolution_kind, signal_tier, signal_reasons_json, file_role
+               , NULL::text AS field_access, NULL::text AS enclosing_class, NULL::text AS enclosing_symbol,
+               NULL::text AS owner_class, NULL::text AS receiver_text, NULL::text AS context
         FROM call_edges
         WHERE ${where}
       `);
       params.push(snapshotId, like, ...filters.callParams);
       countQueries.push({ sql: `SELECT COUNT(*) AS count FROM call_edges WHERE ${where}`, params: [snapshotId, like, ...filters.callParams] });
+    }
+
+    if (kind === 'all' || kind === 'field_usage') {
+      const fieldWhereParts = [
+        'snapshot_id = ?',
+        "(field_name LIKE ? ESCAPE '\\' OR field_fq_name LIKE ? ESCAPE '\\' OR (COALESCE(owner_class, '') || '.' || field_name) LIKE ? ESCAPE '\\')",
+        ...filters.fieldSql,
+      ];
+      const fieldParams = [snapshotId, like, like, like, ...filters.fieldParams];
+      if (fieldAccess !== 'all') {
+        fieldWhereParts.push('access_kind = ?');
+        fieldParams.push(fieldAccess);
+      }
+      const where = fieldWhereParts.join(' AND ');
+      branches.push(`
+        SELECT file, line, column AS column, 'field_usage' AS kind, field_name AS symbol_name,
+               COALESCE(field_fq_name, field_name) AS source, enclosing_symbol AS caller, NULL::text AS callee,
+               confidence, resolution_kind,
+               CASE WHEN confidence < 0.5 THEN 'low_signal' ELSE 'primary' END AS signal_tier,
+               '[]'::text AS signal_reasons_json, file_role,
+               access_kind AS field_access, enclosing_class, enclosing_symbol, owner_class, receiver_text, context
+        FROM field_usages
+        WHERE ${where}
+      `);
+      params.push(...fieldParams);
+      countQueries.push({ sql: `SELECT COUNT(*) AS count FROM field_usages WHERE ${where}`, params: fieldParams });
     }
 
     if (branches.length === 0) {
@@ -812,6 +845,7 @@ export class V2QueryService {
       truncated: cursorOffset + references.length < totalCount,
       nextCursor: cursorOffset + references.length < totalCount ? String(cursorOffset + references.length) : undefined,
       filters: filters.effective,
+      fieldAccess,
       confidence: 0.75,
     };
   }
@@ -1310,9 +1344,16 @@ export class V2QueryService {
     const callees = uniqueCallEdges(
       (await Promise.all(callSeeds.map(async symbol => ((await this.getCallees(snapshotId, { symbol, limit: 25 })) as { callees: CallEdgeRow[] }).callees))).flat(),
     ).slice(0, limit * 2);
+    const fieldImpact = await this.fieldImpactForInputs(snapshotId, {
+      ...args,
+      symbols: requestedSymbols,
+      files: changedFiles,
+    }, limit);
+    const fieldImpactFiles = fieldImpact ? stringArray(fieldImpact.files) : [];
 
     const impactedFiles = rankFiles([
       ...changedFiles,
+      ...fieldImpactFiles,
       ...dependentRows.map(row => String(row.file ?? row.modulePath ?? '')),
       ...dependencyRows.map(row => String(row.file ?? row.modulePath ?? '')),
       ...callers.map(call => call.file),
@@ -1372,6 +1413,7 @@ export class V2QueryService {
         callerCount: callers.length,
         calleeCount: callees.length,
       },
+      fieldImpact,
       impactedFiles,
       impactedEndpoints,
       testsLikelyRelevant: tests,
@@ -1383,6 +1425,7 @@ export class V2QueryService {
         touchedSymbolCount: touchedSymbols.length,
         directDependentCount: dependentRows.length,
         callerCount: callers.length,
+        fieldUsageCount: fieldImpact ? Number(fieldImpact.usageCount ?? 0) : 0,
         impactedEndpointCount: impactedEndpoints.length,
         likelyTestCount: tests.length,
         unresolvedInputCount: unresolvedFiles.length + unresolvedSymbols.length,
@@ -1394,6 +1437,150 @@ export class V2QueryService {
         'Dependency impact follows indexed file dependency edges; call impact follows indexed call edges and may include lower-confidence name-only matches.',
       ],
     };
+  }
+
+  private async fieldImpactForInputs(
+    snapshotId: string,
+    args: Record<string, unknown>,
+    limit: number,
+  ): Promise<Record<string, unknown> | undefined> {
+    const seeds = fieldImpactSeeds(args).slice(0, 40);
+    if (seeds.length === 0) return undefined;
+    const hasFieldUsageRows = await scalar(this.db, `
+      SELECT COUNT(*) FROM (
+        SELECT 1 FROM field_usages WHERE snapshot_id = ? LIMIT 1
+      ) field_usage_probe
+    `, snapshotId);
+    if (hasFieldUsageRows === 0) return undefined;
+    const definitions = await this.fieldDefinitionsForSeeds(snapshotId, seeds, Math.min(limit, 50));
+    const definitionNames = definitions.map(row => row.simple_name);
+    const definitionFqNames = definitions.map(row => row.fq_name);
+    const fieldNames = uniqueStrings([
+      ...definitionNames,
+      ...seeds.filter(seed => !seed.includes('.')),
+      ...seeds.map(seed => seed.split('.').pop() ?? '').filter(Boolean),
+    ]).slice(0, 50);
+    const fieldFqNames = uniqueStrings([
+      ...definitionFqNames,
+      ...seeds.filter(seed => seed.includes('.')),
+    ]).slice(0, 50);
+    const usages = await this.fieldUsagesForTargets(snapshotId, fieldNames, fieldFqNames, limit * 4);
+    if (definitions.length === 0 && usages.length === 0) return undefined;
+
+    const usageDtos = usages.map(fieldUsageDto);
+    const usageFiles = rankFiles(usageDtos.map(row => String(row.file ?? ''))).slice(0, limit);
+    const enclosingSymbols = uniqueStrings(usageDtos.map(row => String(row.enclosingSymbol ?? '')).filter(Boolean)).slice(0, 50);
+    const relatedCalls = enclosingSymbols.length > 0
+      ? await this.callEdgesForCallers(snapshotId, enclosingSymbols, Math.min(limit * 2, 100))
+      : [];
+    const endpoints = compactEndpointCandidates(await this.impactedEndpoints(snapshotId, usageFiles)).slice(0, Math.min(limit, 50));
+    const tests = await this.findRelevantTestsForSeeds(snapshotId, uniqueStrings([
+      ...fieldNames,
+      ...fieldFqNames,
+      ...enclosingSymbols,
+    ]).slice(0, 32), Math.min(limit, 30));
+
+    return {
+      seeds,
+      definitions: definitions.map(row => compactSymbolCandidate(symbolDto(row), 'field definition matched field impact seed')),
+      usages: usageDtos.slice(0, limit),
+      usageCount: usages.length,
+      groups: {
+        byAccess: groupFieldUsages(usageDtos, 'fieldAccess'),
+        byMethod: groupFieldUsages(usageDtos, 'enclosingSymbol'),
+        byClass: groupFieldUsages(usageDtos, 'enclosingClass'),
+      },
+      relatedCalls: relatedCalls.map(compactCallEdge),
+      candidateEndpoints: endpoints,
+      testsLikelyRelevant: tests,
+      files: rankFiles([
+        ...definitions.map(row => row.file),
+        ...usageFiles,
+        ...relatedCalls.map(edge => edge.file),
+        ...endpoints.map(endpoint => String(endpoint.file ?? '')),
+      ]).slice(0, limit),
+      confidence: fieldImpactConfidence(definitions.length, usages.length),
+    };
+  }
+
+  private async fieldDefinitionsForSeeds(snapshotId: string, seeds: string[], limit: number): Promise<SymbolRow[]> {
+    const rows: SymbolRow[] = [];
+    for (const seed of seeds.slice(0, 20)) {
+      const like = `%${escapeLike(seed)}%`;
+      const simple = seed.split('.').pop() ?? seed;
+      rows.push(...await this.db.prepare(`
+        SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+               package_name, return_type, parameter_types_json, annotations_json,
+               framework_role, framework_meta_json, file_role
+        FROM symbols
+        WHERE snapshot_id = ? AND kind = 'field'
+          AND (
+            LOWER(simple_name) = LOWER(?)
+            OR LOWER(fq_name) = LOWER(?)
+            OR simple_name LIKE ? ESCAPE '\\'
+            OR fq_name LIKE ? ESCAPE '\\'
+          )
+        ORDER BY
+          CASE
+            WHEN LOWER(fq_name) = LOWER(?) THEN 0
+            WHEN LOWER(simple_name) = LOWER(?) THEN 1
+            WHEN fq_name LIKE ? ESCAPE '\\' THEN 2
+            ELSE 3
+          END,
+          file_role,
+          file,
+          line
+        LIMIT ?
+      `).all(snapshotId, simple, seed, `%${escapeLike(simple)}%`, like, seed, simple, like, limit) as SymbolRow[]);
+      if (rows.length >= limit) break;
+    }
+    return uniqueRecordsBy(rows, row => `${row.fq_name}\0${row.file}\0${row.line}`).slice(0, limit);
+  }
+
+  private async fieldUsagesForTargets(
+    snapshotId: string,
+    fieldNames: string[],
+    fieldFqNames: string[],
+    limit: number,
+  ): Promise<FieldUsageRow[]> {
+    const clauses: string[] = [];
+    const params: unknown[] = [snapshotId];
+    if (fieldNames.length > 0) {
+      clauses.push(`field_name IN (${fieldNames.map(() => '?').join(', ')})`);
+      params.push(...fieldNames);
+    }
+    if (fieldFqNames.length > 0) {
+      clauses.push(`field_fq_name IN (${fieldFqNames.map(() => '?').join(', ')})`);
+      params.push(...fieldFqNames);
+      clauses.push(`field_fq_name LIKE ANY(ARRAY[${fieldFqNames.map(() => '?').join(', ')}])`);
+      params.push(...fieldFqNames.map(name => `%${escapeLike(name)}%`));
+    }
+    if (clauses.length === 0) return [];
+    return await this.db.prepare(`
+      SELECT field_name, field_fq_name, owner_class, file, line, column,
+             enclosing_class, enclosing_symbol, access_kind, receiver_text,
+             context, confidence, resolution_kind, file_role
+      FROM field_usages
+      WHERE snapshot_id = ?
+        AND (${clauses.join(' OR ')})
+        AND confidence >= 0.5
+      ORDER BY confidence DESC, file, line, field_name
+      LIMIT ?
+    `).all(...params, limit) as FieldUsageRow[];
+  }
+
+  private async callEdgesForCallers(snapshotId: string, callers: string[], limit: number): Promise<CallEdgeRow[]> {
+    if (callers.length === 0) return [];
+    const placeholders = callers.map(() => '?').join(', ');
+    return await this.db.prepare(`
+      SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
+      FROM call_edges
+      WHERE snapshot_id = ?
+        AND caller IN (${placeholders})
+        AND signal_tier IN ('primary', 'provider')
+      ORDER BY confidence DESC, file, line
+      LIMIT ?
+    `).all(snapshotId, ...callers, limit) as CallEdgeRow[];
   }
 
   private async reviewPatch(snapshotId: string, args: Record<string, unknown>) {
@@ -1413,6 +1600,7 @@ export class V2QueryService {
     const hunks = rankPatchHunks(allHunks).slice(0, Math.max(budget.maxLineFocus, budget.maxFindings));
     const lineMapping = await this.patchLineMappings(snapshotId, hunks);
     const changedFiles = stringArray(impact.changedFiles);
+    const fieldImpact = isPlainObject(impact.fieldImpact) ? impact.fieldImpact : undefined;
     const tests = arrayRecords(impact.testsLikelyRelevant);
     const validation = isPlainObject(impact.validation) ? impact.validation : {};
     const riskFlags = arrayRecords(impact.riskFlags);
@@ -1453,6 +1641,7 @@ export class V2QueryService {
       reviewStatus: reviewStatusFor(findings, changedFiles),
       impactSummary: impact.summary,
       changedFiles,
+      fieldImpact: fieldImpact ? compactReviewObject(fieldImpact, budget.maxEvidencePerFinding, 2) : undefined,
       diffStats,
       reviewPlan: reviewPlanForPatch(diffStats, findings, impact),
       seededRiskCategories: seededRiskCategoriesForReview(focus, findings, riskFlags, diffStats),
@@ -2597,6 +2786,12 @@ export class V2QueryService {
         limit: Math.max(20, Number(args.maxFiles ?? 8) * 4),
       }) as Record<string, unknown>
       : undefined;
+    const fieldImpact = await this.fieldImpactForInputs(snapshotId, {
+      ...args,
+      task,
+      symbols: requestedSymbols,
+      diff,
+    }, Math.max(20, Number(args.maxFiles ?? 8) * 4));
     const commands = stringArray(validation.suggestedCommands);
     const editRanges = sliceHints
       .slice(0, packProfileValue(profile, 4, 6, 8))
@@ -2632,6 +2827,7 @@ export class V2QueryService {
       commands,
       taskOracle: slimTaskOracleForPack(taskOracle, profile),
       patchImpact: patchImpact ? compactReviewObject(patchImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined,
+      fieldImpact: fieldImpact ? compactReviewObject(fieldImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined,
       topFiles,
       nextAction: editRanges.length > 0
         ? 'Call get_file_slice once with routing.firstToolCall.args, then make the smallest scoped edit.'
@@ -2906,6 +3102,7 @@ export class V2QueryService {
       files,
       symbols,
       imports,
+      fieldUsages,
       callEdges,
       callEdgesPrimary,
       callEdgesLowSignal,
@@ -2917,6 +3114,7 @@ export class V2QueryService {
       scalar(this.db, 'SELECT COUNT(*) FROM files WHERE snapshot_id = ?', snapshotId),
       scalar(this.db, 'SELECT COUNT(*) FROM symbols WHERE snapshot_id = ?', snapshotId),
       scalar(this.db, 'SELECT COUNT(*) FROM imports WHERE snapshot_id = ?', snapshotId),
+      scalar(this.db, 'SELECT COUNT(*) FROM field_usages WHERE snapshot_id = ?', snapshotId),
       scalar(this.db, 'SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ?', snapshotId),
       scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier IN ('primary', 'provider')", snapshotId),
       scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'low_signal'", snapshotId),
@@ -2929,6 +3127,7 @@ export class V2QueryService {
       files,
       symbols,
       imports,
+      fieldUsages,
       callEdges,
       callEdgesRaw: callEdges,
       callEdgesPrimary,
@@ -3581,6 +3780,23 @@ interface CallEdgeRow {
   signal_reasons_json?: string;
 }
 
+interface FieldUsageRow {
+  field_name: string;
+  field_fq_name?: string;
+  owner_class?: string;
+  file: string;
+  line: number;
+  column: number;
+  enclosing_class?: string;
+  enclosing_symbol?: string;
+  access_kind: string;
+  receiver_text?: string;
+  context: string;
+  confidence: number;
+  resolution_kind: string;
+  file_role: FileRole;
+}
+
 interface EndpointRow {
   method: string;
   path: string;
@@ -3599,6 +3815,7 @@ interface IndexCountSummary {
   files: number;
   symbols: number;
   imports: number;
+  fieldUsages: number;
   callEdges: number;
   callEdgesRaw: number;
   callEdgesPrimary: number;
@@ -3613,6 +3830,7 @@ interface SnapshotStatsRow {
   files: number | string;
   symbols: number | string;
   imports: number | string;
+  field_usages: number | string;
   call_edges: number | string;
   call_edges_primary: number | string;
   call_edges_low_signal: number | string;
@@ -3895,6 +4113,31 @@ function referenceDto(row: Record<string, unknown>): Record<string, unknown> {
     signalReasons: typeof row.signal_reasons_json === 'string'
       ? parseJson<string[]>(row.signal_reasons_json, [])
       : undefined,
+    fieldAccess: row.field_access,
+    enclosingClass: row.enclosing_class,
+    enclosingSymbol: row.enclosing_symbol,
+    ownerClass: row.owner_class,
+    receiverText: row.receiver_text,
+    context: row.context,
+    fileRole: row.file_role,
+  };
+}
+
+function fieldUsageDto(row: FieldUsageRow): Record<string, unknown> {
+  return {
+    fieldName: row.field_name,
+    fieldFqName: row.field_fq_name,
+    ownerClass: row.owner_class,
+    file: row.file,
+    line: row.line,
+    column: row.column,
+    enclosingClass: row.enclosing_class,
+    enclosingSymbol: row.enclosing_symbol,
+    fieldAccess: row.access_kind,
+    receiverText: row.receiver_text,
+    context: row.context,
+    confidence: row.confidence,
+    resolutionKind: row.resolution_kind,
     fileRole: row.file_role,
   };
 }
@@ -6390,6 +6633,8 @@ function referenceFiltersFor(args: Record<string, unknown>, query: string): {
   importParams: unknown[];
   callSql: string[];
   callParams: unknown[];
+  fieldSql: string[];
+  fieldParams: unknown[];
   effective: Record<string, unknown>;
 } {
   const fileFilters = fileFiltersFor(args, query);
@@ -6398,7 +6643,9 @@ function referenceFiltersFor(args: Record<string, unknown>, query: string): {
   const symbolParams = [...fileFilters.params];
   const includeLowSignal = args.includeLowSignal === true;
   const callSql = [...fileFilters.sql];
+  const fieldSql = [...fileFilters.sql];
   if (!includeLowSignal) callSql.push("signal_tier IN ('primary', 'provider')");
+  if (!includeLowSignal) fieldSql.push('confidence >= 0.5');
   if (!includeSynthetic) symbolSql.push("COALESCE(framework_meta_json, '') NOT LIKE '%\"synthetic\":\"true\"%'");
   return {
     symbolSql,
@@ -6407,10 +6654,13 @@ function referenceFiltersFor(args: Record<string, unknown>, query: string): {
     importParams: [...fileFilters.params],
     callSql,
     callParams: [...fileFilters.params],
+    fieldSql,
+    fieldParams: [...fileFilters.params],
     effective: {
       ...fileFilters.effective,
       includeSynthetic,
       includeLowSignal,
+      fieldAccess: typeof args.fieldAccess === 'string' ? args.fieldAccess : 'all',
     },
   };
 }
@@ -6650,6 +6900,25 @@ function groupReferences(references: Array<Record<string, unknown>>, groupBy: st
     .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
 }
 
+function groupFieldUsages(usages: Array<Record<string, unknown>>, keyName: string): Array<Record<string, unknown>> {
+  const groups = new Map<string, Array<Record<string, unknown>>>();
+  for (const usage of usages) {
+    const key = String(usage[keyName] ?? 'unknown');
+    const bucket = groups.get(key) ?? [];
+    bucket.push(usage);
+    groups.set(key, bucket);
+  }
+  return [...groups.entries()]
+    .map(([key, rows]) => ({
+      key,
+      count: rows.length,
+      accessKinds: [...new Set(rows.map(row => String(row.fieldAccess ?? 'unknown')))],
+      files: rankFiles(rows.map(row => String(row.file ?? ''))).slice(0, 8),
+      usages: rows.slice(0, 8),
+    }))
+    .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
+}
+
 function referenceGroupKey(reference: Record<string, unknown>, groupBy: string): string {
   switch (groupBy) {
     case 'file':
@@ -6658,6 +6927,10 @@ function referenceGroupKey(reference: Record<string, unknown>, groupBy: string):
       return String(reference.kind ?? 'unknown');
     case 'caller':
       return String(reference.caller ?? reference.file ?? 'unknown');
+    case 'method':
+      return String(reference.enclosingSymbol ?? reference.caller ?? reference.file ?? 'unknown');
+    case 'class':
+      return String(reference.enclosingClass ?? reference.ownerClass ?? reference.file ?? 'unknown');
     default:
       return 'all';
   }
@@ -6846,6 +7119,41 @@ function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, ch => `\\${ch}`);
 }
 
+function fieldImpactSeeds(args: Record<string, unknown>): string[] {
+  const values = [
+    ...stringArray(args.symbols),
+    stringOrUndefined(args.symbol),
+    stringOrUndefined(args.target),
+    stringOrUndefined(args.task),
+    stringOrUndefined(args.diff),
+  ].filter((value): value is string => Boolean(value));
+  const seeds: string[] = [];
+  const keyword = new Set([
+    'class', 'interface', 'enum', 'public', 'private', 'protected', 'static', 'final',
+    'return', 'new', 'void', 'int', 'long', 'double', 'float', 'boolean', 'char',
+    'byte', 'short', 'if', 'else', 'for', 'while', 'switch', 'case', 'try', 'catch',
+    'true', 'false', 'null', 'this', 'super', 'package', 'import',
+  ]);
+  for (const value of values) {
+    for (const match of value.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)?\b/g)) {
+      const token = match[0] ?? '';
+      const simple = token.split('.').pop() ?? token;
+      if (simple.length < 2 || keyword.has(simple)) continue;
+      if (/^[A-Z0-9_]+$/.test(simple) && !token.includes('.')) continue;
+      seeds.push(token);
+      if (token.includes('.')) seeds.push(simple);
+    }
+  }
+  return uniqueStrings(seeds).slice(0, 80);
+}
+
+function fieldImpactConfidence(definitionCount: number, usageCount: number): number {
+  if (definitionCount > 0 && usageCount > 0) return 0.82;
+  if (usageCount > 0) return 0.68;
+  if (definitionCount > 0) return 0.55;
+  return 0.3;
+}
+
 function parseJson<T>(value: string | undefined, fallback: T): T {
   if (!value) return fallback;
   try {
@@ -6861,6 +7169,7 @@ function countsFromSnapshotStats(row: SnapshotStatsRow): IndexCountSummary {
     files: Number(row.files ?? 0),
     symbols: Number(row.symbols ?? 0),
     imports: Number(row.imports ?? 0),
+    fieldUsages: Number(row.field_usages ?? 0),
     callEdges,
     callEdgesRaw: callEdges,
     callEdgesPrimary: Number(row.call_edges_primary ?? 0),

@@ -1,0 +1,273 @@
+# Using CodeGraph MCP Correctly
+
+This guide explains how to get reliable answers from CodeGraph MCP during real coding work. It focuses on how to prompt the agent, when to trust the index, when to refresh it, and when to allow shell fallback.
+
+## The Short Version
+
+Use CodeGraph MCP as the first source of repository context, then open exact source slices only when the graph packet says more evidence is needed.
+
+```text
+Use CodeGraph MCP first. Use shell only if CodeGraph evidence is missing.
+Trace <target API/method/field/change>.
+Include handlers, service calls, callers/callees, dependencies, tests, and risks.
+Cite repository-relative files and methods.
+```
+
+For benchmark or audit runs, remove fallback:
+
+```text
+Use CodeGraph MCP only. Do not use shell/read/write/edit.
+Return evidence-backed JSON with keyFiles, keySymbols, flow, risks, tests, and confidence.
+```
+
+## Before You Ask Questions
+
+Prewarm the repository once:
+
+```powershell
+node dist/cli.js index --root "<project>" --workspace-key "<project-key>" --parse-workers 8
+```
+
+Run the MCP server with the same root and workspace key:
+
+```powershell
+node dist/cli.js mcp --root "<project>" --workspace-key "<project-key>"
+```
+
+If you need Java field impact answers such as "where is `fieldA` read or written?", enable field usage indexing before indexing:
+
+```powershell
+$env:CODEGRAPH_ENABLE_FIELD_USAGES="1"
+node dist/cli.js index --root "<project>" --workspace-key "<project-key>" --parse-workers 8
+node dist/cli.js mcp --root "<project>" --workspace-key "<project-key>"
+```
+
+Field usage indexing is opt-in because it adds cold-index cost on large Java repositories. Without it, CodeGraph can still find text references, symbols, and calls, but it cannot reliably classify field reads, writes, or initialization.
+
+## Prompt Contract
+
+Good prompts tell the agent four things:
+
+| Part | What to include | Example |
+| --- | --- | --- |
+| Intent | The job you want done | `Trace the full API flow`, `Investigate impact`, `Review this diff` |
+| Target | The exact route, class, method, field, file, error, or diff | `GET /ws/v1/cluster/apps`, `BlockReceiver.datanode` |
+| Evidence | What must be included | `handler, request builder, service filtering, tests, risks` |
+| Output | The shape of the answer | `Mermaid + bullets`, `findings first`, `compact JSON` |
+
+Avoid vague prompts such as:
+
+```text
+Use MCP and explain this code.
+```
+
+Prefer:
+
+```text
+Use CodeGraph MCP first. Trace GET /ws/v1/cluster/apps from REST handler to request builder to service filtering.
+Include applicationTags behavior, cache key, likely tests, and risks. Cite files/methods.
+```
+
+## Tool Choice
+
+You usually do not need to remember tool names. Ask for the task, and let the agent choose. Mention a first tool only when you want repeatable behavior.
+
+| Task | Best first tool | Why |
+| --- | --- | --- |
+| API, RPC, handler, or method flow | `get_flow_pack` | Returns entry point, flow steps, callers/callees, tests, and risk hints. |
+| Broad investigation or architecture | `get_research_pack` | Finds ranked symbols, files, evidence slices, and follow-up hints. |
+| Implementation planning | `get_change_pack` | Produces target files, symbols, tests, edit plan, and validation hints. |
+| Code review | `review_patch` | Builds findings, risky hunks, impacted tests, and follow-up slices from a diff. |
+| Field, method, or constant impact | `find_references` | Finds definitions, calls, imports, and field usages when enabled. |
+| Exact source evidence | `get_file_slice` | Opens bounded file ranges after a pack has narrowed the context. |
+| Dependency or dependent analysis | `trace_dependencies` | Walks graph edges instead of broad text search. |
+| Index health | `get_index_stats` | Confirms counts, snapshot state, warnings, and freshness. |
+
+Recommended pattern:
+
+```text
+Use CodeGraph MCP. Start with the best pack tool for this task.
+Use granular tools only for missing facts or exact source slices.
+Do not open broad files until the pack identifies target files.
+```
+
+## Correct Workflows
+
+### API Flow
+
+```text
+Use CodeGraph MCP first. Trace the full flow for <METHOD /path>.
+Include the route/handler, request parsing, validation, service calls, downstream dependencies, response construction, tests, and risks.
+Return a Mermaid flowchart plus key files/methods.
+```
+
+Expected quality:
+
+- Names the endpoint handler and file.
+- Shows ordered flow from entry point to service/dependency.
+- Includes tests or test gaps.
+- Separates confirmed evidence from assumptions.
+
+### Field Impact
+
+Use this only after indexing with `CODEGRAPH_ENABLE_FIELD_USAGES=1`.
+
+```text
+Use CodeGraph MCP first. Analyze impact of changing field <Class.field>.
+Find definition, initialization, reads, writes, read-write updates, enclosing methods/classes, related calls, tests, and review risks.
+Group usages by method and cite files.
+```
+
+Expected quality:
+
+- Separates declaration, constructor/init writes, reads, and read-write updates.
+- Groups usages by method or class.
+- Identifies nearby call flow and likely tests.
+- Hides low-confidence matches unless you ask for low-signal evidence.
+
+### Bug Investigation
+
+```text
+Use CodeGraph MCP first. Investigate why <symptom> happens in <area/API/method>.
+Trace the relevant flow, list evidence, identify likely root cause, affected tests, and safest fix.
+Do not edit files yet.
+```
+
+Expected quality:
+
+- Starts from likely entry points rather than broad search.
+- Explains why each file matters.
+- Gives a fix strategy with validation commands.
+
+### Implementation
+
+```text
+Use CodeGraph MCP first to identify files and tests. Then implement <change>.
+Keep the change minimal. Preserve existing behavior except for <desired behavior>.
+Run focused tests or explain why they could not run.
+```
+
+Expected quality:
+
+- Uses `get_change_pack` or equivalent before editing.
+- Touches only relevant files.
+- Adds or updates focused tests when behavior changes.
+- Reports validation results.
+
+### Code Review
+
+```text
+Use CodeGraph MCP. Review this diff for correctness, security, performance, compatibility, and missing tests.
+Start with review_patch, then inspect only required follow-up slices.
+Findings first. Each finding must include severity, failure mode, affected file/method, and required test.
+
+<diff>
+```
+
+Expected quality:
+
+- Findings lead the answer.
+- No unsupported claims.
+- Maps the diff to impacted flow and tests.
+- Calls out missing tests as a concrete risk.
+
+## Freshness Rules
+
+CodeGraph queries read completed snapshots. That is good for consistency, but it means the snapshot must match the checkout you are asking about.
+
+| Situation | Correct action |
+| --- | --- |
+| First time indexing a repo | Run explicit `index --root ...`. |
+| Small local edit | Run MCP with `--watch`, or ask with `autoRefresh: true`. |
+| Single file delete | Use `--watch` or run `index --root ...`; path-delta refresh removes deleted rows. |
+| Large branch checkout | Run explicit `index --root ...` after checkout. |
+| Pull, rebase, generated-file burst | Run explicit `index --root ...` before relying on answers. |
+| Two branches at once | Use two worktrees or clones with different workspace keys. |
+| Docker `/workspace` mount | Always set a stable `CODEGRAPH_WORKSPACE_KEY`. |
+
+Good prompt after a checkout:
+
+```text
+I just checked out a new branch. Use CodeGraph MCP only after confirming the index snapshot is fresh.
+If it is stale, tell me to run a full index instead of answering from stale evidence.
+```
+
+## MCP Vs Shell
+
+Use MCP-first for large repositories. Shell fallback is still useful, but only after MCP narrows the search.
+
+| Mode | Use when | Prompt prefix |
+| --- | --- | --- |
+| MCP only | Benchmarking, auditing tool quality, avoiding token-heavy raw file reads | `Use CodeGraph MCP only. Do not use shell/read/write/edit.` |
+| MCP first with shell fallback | Normal engineering work | `Use CodeGraph MCP first. Use shell only if CodeGraph evidence is missing.` |
+| Shell only | Testing baseline behavior or when no index exists | `Do not use CodeGraph MCP. Use shell/search/read commands only.` |
+
+If the agent opens many files before using a pack tool, the prompt is too loose. Ask it to restart with MCP-first and bounded source slices.
+
+## Verify MCP Was Used
+
+Ask a direct check:
+
+```text
+Use CodeGraph MCP get_index_stats and tell me the indexed file count.
+```
+
+Then inspect logs:
+
+```powershell
+node dist/cli.js logs --tail 50
+```
+
+A successful MCP query writes log entries with `toolName`, `durationMs`, and response-size telemetry.
+
+## Quality Checklist
+
+A good CodeGraph-assisted answer should include:
+
+- Repository-relative files and method/class names.
+- A clear flow or dependency path, not just a list of files.
+- Tests or test gaps.
+- Risks and confidence.
+- Follow-up tool calls only when evidence is missing.
+- A note when the index is stale or field usage indexing was not enabled.
+
+A weak answer usually has one of these problems:
+
+- It uses broad shell search first on a large repo.
+- It cites files without explaining why they matter.
+- It answers a field-impact question without read/write/init classification.
+- It gives conclusions without tests or validation hints.
+- It ignores branch checkout or local edit freshness.
+
+## Troubleshooting Bad Answers
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Agent does not call MCP | Prompt did not require MCP, or MCP client is not configured | Ask for `get_index_stats`; check daemon logs. |
+| Answer references old branch | Snapshot is stale | Run explicit `index --root ...` with the same workspace key. |
+| Field impact lacks read/write/init | Field usage indexing was not enabled before indexing | Re-index with `CODEGRAPH_ENABLE_FIELD_USAGES=1`. |
+| Too many tokens | Agent opened broad files or used large dependency output | Ask for one pack tool first and bounded `get_file_slice` calls only. |
+| Review answer is slower than shell | Agent used MCP and then unnecessary shell fallback | Use `MCP only` for review benchmarks, or require `review_patch` plus bounded slices. |
+| Docker repo has no files | Bind mount is wrong | Check `/workspace` in the container and rerun index. |
+
+## Copy-Paste Starters
+
+```text
+Use CodeGraph MCP first. Trace full flow for <API>. Include handler, service, dependencies, tests, risks, and Mermaid.
+```
+
+```text
+Use CodeGraph MCP first. Analyze impact of changing <Class.field>. Include definition, reads, writes, init, enclosing methods, related calls, tests, and risks.
+```
+
+```text
+Use CodeGraph MCP first. Investigate <symptom>. Return evidence, likely root cause, affected tests, and safest fix strategy.
+```
+
+```text
+Use CodeGraph MCP. Review this diff. Findings first with severity, failure mode, impacted flow, affected tests, and fix.
+```
+
+```text
+Use CodeGraph MCP first to identify target files and tests. Then implement <change>. Keep the change minimal and run focused tests.
+```

@@ -1,6 +1,6 @@
 # CodeGraph Prompt Guide
 
-This guide gives copy-paste prompt patterns for using CodeGraph MCP without memorizing every tool name.
+This guide gives copy-paste prompt patterns for using CodeGraph MCP without memorizing every tool name. For workflow rules, freshness behavior, MCP-vs-shell guidance, and quality checks, see [Using CodeGraph MCP Correctly](using-codegraph-mcp-correctly.md).
 
 ## Core Pattern
 

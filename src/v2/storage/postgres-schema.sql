@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS snapshot_stats (
   files INTEGER NOT NULL DEFAULT 0,
   symbols INTEGER NOT NULL DEFAULT 0,
   imports INTEGER NOT NULL DEFAULT 0,
+  field_usages INTEGER NOT NULL DEFAULT 0,
   call_edges INTEGER NOT NULL DEFAULT 0,
   call_edges_primary INTEGER NOT NULL DEFAULT 0,
   call_edges_low_signal INTEGER NOT NULL DEFAULT 0,
@@ -88,6 +89,7 @@ ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS parse_failures_json TEXT;
 ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS endpoint_warnings_json TEXT;
 ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS top_unresolved_imports_json TEXT;
 ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS top_unresolved_calls_json TEXT;
+ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS field_usages INTEGER NOT NULL DEFAULT 0;
 
 DO $$
 DECLARE
@@ -153,6 +155,25 @@ CREATE TABLE IF NOT EXISTS type_refs (
   referenced_type TEXT NOT NULL,
   context TEXT NOT NULL,
   line INTEGER NOT NULL,
+  file_role TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS field_usages (
+  id BIGSERIAL PRIMARY KEY,
+  snapshot_id TEXT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+  field_name TEXT NOT NULL,
+  field_fq_name TEXT,
+  owner_class TEXT,
+  file TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  "column" INTEGER NOT NULL,
+  enclosing_class TEXT,
+  enclosing_symbol TEXT,
+  access_kind TEXT NOT NULL,
+  receiver_text TEXT,
+  context TEXT NOT NULL,
+  confidence DOUBLE PRECISION NOT NULL,
+  resolution_kind TEXT NOT NULL,
   file_role TEXT NOT NULL
 );
 
@@ -242,6 +263,10 @@ CREATE INDEX IF NOT EXISTS idx_symbols_framework_role ON symbols(snapshot_id, fr
 CREATE INDEX IF NOT EXISTS idx_imports_source ON imports(snapshot_id, source);
 CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(snapshot_id, file);
 CREATE INDEX IF NOT EXISTS idx_type_refs_type ON type_refs(snapshot_id, referenced_type);
+CREATE INDEX IF NOT EXISTS idx_field_usages_name ON field_usages(snapshot_id, field_name);
+CREATE INDEX IF NOT EXISTS idx_field_usages_owner_name ON field_usages(snapshot_id, owner_class, field_name);
+CREATE INDEX IF NOT EXISTS idx_field_usages_file ON field_usages(snapshot_id, file);
+CREATE INDEX IF NOT EXISTS idx_field_usages_enclosing ON field_usages(snapshot_id, enclosing_symbol);
 DROP INDEX IF EXISTS idx_call_edges_caller;
 DROP INDEX IF EXISTS idx_call_edges_callee;
 DROP INDEX IF EXISTS idx_call_edges_caller_trgm;
@@ -259,6 +284,7 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE INDEX IF NOT EXISTS idx_symbols_simple_name_trgm ON symbols USING gin (simple_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_symbols_fq_name_trgm ON symbols USING gin (fq_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_symbols_file_trgm ON symbols USING gin (file gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_field_usages_name_trgm ON field_usages USING gin (field_name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_call_edges_caller_signal_trgm ON call_edges USING gin (caller gin_trgm_ops)
   WHERE signal_tier IN ('primary', 'provider');
 CREATE INDEX IF NOT EXISTS idx_call_edges_callee_signal_trgm ON call_edges USING gin (callee gin_trgm_ops)
@@ -276,4 +302,8 @@ ON CONFLICT (version) DO NOTHING;
 
 INSERT INTO codegraph_schema(version, applied_at)
 VALUES (3, NOW()::TEXT)
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO codegraph_schema(version, applied_at)
+VALUES (4, NOW()::TEXT)
 ON CONFLICT (version) DO NOTHING;

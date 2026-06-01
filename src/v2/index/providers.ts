@@ -80,6 +80,7 @@ interface ScipSymbolInformation {
 
 const TREE_SITTER_PROVIDER_ID = 'tree-sitter';
 const TREE_SITTER_PROVIDER_VERSION = 'tree-sitter-analyzer-v6-endpoint-constant-paths';
+const TREE_SITTER_FIELD_USAGE_PROVIDER_VERSION = 'tree-sitter-analyzer-v9-field-usages';
 const SCIP_PROVIDER_ID = 'scip';
 const SYMBOL_ROLE_DEFINITION = 0x1;
 const SYMBOL_ROLE_IMPORT = 0x2;
@@ -141,7 +142,9 @@ export function normalizeProviderNames(value: string[] | string | undefined): st
 
 class TreeSitterIndexProvider implements IndexProvider {
   readonly id = TREE_SITTER_PROVIDER_ID;
-  readonly version = TREE_SITTER_PROVIDER_VERSION;
+  readonly version = treeSitterFieldUsagesEnabled()
+    ? TREE_SITTER_FIELD_USAGE_PROVIDER_VERSION
+    : TREE_SITTER_PROVIDER_VERSION;
 
   parseFiles(workItems: ParseWorkItem[], options: ParseBatchOptions): ParseWorkResult[] {
     return parseFilesBatch(workItems, options);
@@ -419,6 +422,11 @@ function normalizeScipPath(value: string | undefined): string | undefined {
   return normalized;
 }
 
+function treeSitterFieldUsagesEnabled(): boolean {
+  const value = String(process.env.CODEGRAPH_ENABLE_FIELD_USAGES ?? '').trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+
 function mergeParseResults(left: ParseResult, right: ParseResult): ParseResult {
   return {
     file: left.file,
@@ -427,6 +435,7 @@ function mergeParseResults(left: ParseResult, right: ParseResult): ParseResult {
     calls: uniqueBy([...left.calls, ...right.calls], item => `${item.file}\0${item.caller}\0${item.callee}\0${item.line}`),
     references: uniqueBy([...left.references, ...right.references], item => `${item.file}\0${item.symbolName}\0${item.line}\0${item.column}`),
     typeReferences: uniqueBy([...(left.typeReferences ?? []), ...(right.typeReferences ?? [])], item => `${item.file}\0${item.referencedType}\0${item.context}\0${item.line}`),
+    fieldUsages: uniqueBy([...(left.fieldUsages ?? []), ...(right.fieldUsages ?? [])], item => `${item.file}\0${item.fieldName}\0${item.line}\0${item.column}\0${item.accessKind}`),
     hasParseErrors: left.hasParseErrors || right.hasParseErrors,
     parseConfidence: Math.max(left.parseConfidence, right.parseConfidence),
     packageName: left.packageName ?? right.packageName,

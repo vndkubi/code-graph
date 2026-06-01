@@ -11,6 +11,8 @@ import type {
   CallInfo,
   ReferenceInfo,
   TypeRefInfo,
+  FieldAccessKind,
+  FieldUsageInfo,
   SymbolKind,
   Visibility,
 } from './base-analyzer.js';
@@ -41,6 +43,27 @@ const grammarLoaders: Partial<Record<SupportedLanguage, () => unknown>> = {
 const loadedGrammars = new Map<SupportedLanguage, unknown>();
 const EXTERNAL_JAVA_ANNOTATION_CONSTANT_PATTERN = /@\w+(?:\s*\([\s\S]{0,300}\b[A-Z][A-Za-z0-9_]*\s*\.\s*[A-Z][A-Za-z0-9_]*\b)/;
 
+interface JavaFieldInfo {
+  name: string;
+  ownerClass: string;
+  fieldFqName: string;
+  type?: string;
+}
+
+function javaFieldUsagesEnabled(): boolean {
+  const value = String(process.env.CODEGRAPH_ENABLE_FIELD_USAGES ?? '').trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+
+interface JavaFieldUsageContext {
+  enclosingClass: string;
+  enclosingSymbol: string;
+  isConstructor: boolean;
+  receiverTypes: Map<string, string>;
+  shadowedNames: Set<string>;
+  seen: Set<string>;
+}
+
 function getGrammar(lang: SupportedLanguage): unknown | undefined {
   if (loadedGrammars.has(lang)) return loadedGrammars.get(lang);
   const loader = grammarLoaders[lang];
@@ -63,7 +86,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
 
   // Temporary accumulators reset on each parse() call (Java only)
   private parseTypeRefs: TypeRefInfo[] = [];
+  private parseFieldUsages: FieldUsageInfo[] = [];
   private parsePackageName: string | undefined;
+  private javaFieldsByClass = new Map<string, Map<string, JavaFieldInfo>>();
   private javaStringConstants = new Map<string, string>();
   private externalJavaConstantCache = new Map<string, Map<string, string> | undefined>();
 
@@ -101,7 +126,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
 
     // Reset Java-specific accumulators
     this.parseTypeRefs = [];
+    this.parseFieldUsages = [];
     this.parsePackageName = undefined;
+    this.javaFieldsByClass = new Map();
     this.javaStringConstants = new Map();
     if (lang === 'java') {
       this.javaStringConstants = this.collectJavaStringConstants(tree.rootNode);
@@ -128,6 +155,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       parseConfidence,
       packageName: this.parsePackageName,
       typeReferences: this.parseTypeRefs.length > 0 ? [...this.parseTypeRefs] : undefined,
+      fieldUsages: this.parseFieldUsages.length > 0 ? [...this.parseFieldUsages] : undefined,
     };
   }
 
@@ -251,6 +279,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             // Recurse into body with class context
             const body = child.childForFieldName('body');
             if (body) {
+              this.collectJavaClassFields(body, nameNode.text);
               this.extractJava(body, file, lines, symbols, imports, calls, references, nameNode.text);
             }
           }
@@ -358,8 +387,12 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             const body = child.childForFieldName('body');
             if (body) {
               const receiverTypes = this.extractMethodParamTypeMap(paramsNode);
-              this.collectJavaLocalVariableTypes(body, receiverTypes, file);
-              this.extractCallsFromNode(body, file, lines, calls, references, methodName, receiverTypes);
+              const shadowedNames = this.extractJavaParameterNames(paramsNode);
+              this.collectJavaLocalVariableTypes(body, receiverTypes, file, shadowedNames);
+              const fieldUsageContext = javaFieldUsagesEnabled() && parentClass
+                ? this.javaFieldUsageContext(parentClass, methodName, child.type === 'constructor_declaration', receiverTypes, shadowedNames)
+                : undefined;
+              this.extractCallsFromNode(body, file, lines, calls, references, methodName, receiverTypes, fieldUsageContext);
             }
           }
           break;
@@ -380,6 +413,100 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
    * Handles CDI @Observes, JAX-RS @PathParam/@FormParam/@QueryParam/@BeanParam, etc.
    * These appear inside formal_parameter → modifiers, not on the method itself.
    */
+  private collectJavaClassFields(body: SyntaxNode, className: string): void {
+    const fields = new Map<string, JavaFieldInfo>();
+    const packagePrefix = this.parsePackageName ? `${this.parsePackageName}.` : '';
+    for (const child of body.children) {
+      if (child.type !== 'field_declaration') continue;
+      const fieldType = this.extractJavaTypeName(child.childForFieldName('type')) ?? undefined;
+      for (const declarator of child.children.filter(c => c.type === 'variable_declarator')) {
+        const nameNode = declarator.childForFieldName('name') ?? declarator.children.find(c => c.type === 'identifier');
+        if (!nameNode) continue;
+        fields.set(nameNode.text, {
+          name: nameNode.text,
+          ownerClass: className,
+          fieldFqName: `${packagePrefix}${className}.${nameNode.text}`,
+          type: fieldType,
+        });
+      }
+    }
+    this.javaFieldsByClass.set(className, fields);
+  }
+
+  private extractJavaParameterNames(paramsNode: SyntaxNode | null | undefined): Set<string> {
+    const names = new Set<string>();
+    if (!paramsNode) return names;
+    for (const child of paramsNode.children) {
+      if (child.type !== 'formal_parameter' && child.type !== 'spread_parameter') continue;
+      const nameNode = child.childForFieldName('name')
+        ?? [...child.namedChildren].reverse().find(node => node.type === 'identifier');
+      if (nameNode) names.add(nameNode.text);
+    }
+    return names;
+  }
+
+  private resolveJavaFieldAccess(
+    fieldName: string,
+    receiverText: string | undefined,
+    enclosingClass: string,
+    receiverTypes: Map<string, string>,
+  ): { field?: JavaFieldInfo; confidence: number; resolutionKind: string } {
+    if (receiverText === 'this' || receiverText === 'super') {
+      const field = this.javaFieldsByClass.get(enclosingClass)?.get(fieldName) ?? {
+        name: fieldName,
+        ownerClass: enclosingClass,
+        fieldFqName: `${this.parsePackageName ? `${this.parsePackageName}.` : ''}${enclosingClass}.${fieldName}`,
+      };
+      return { field, confidence: 0.95, resolutionKind: `${receiverText}-field` };
+    }
+
+    const receiverType = receiverText ? resolveReceiverType(receiverText, receiverTypes) : undefined;
+    if (receiverType) {
+      return {
+        field: {
+          name: fieldName,
+          ownerClass: receiverType,
+          fieldFqName: `${receiverType}.${fieldName}`,
+        },
+        confidence: 0.65,
+        resolutionKind: 'receiver-type-field',
+      };
+    }
+
+    if (receiverText && /^[A-Z]/.test(receiverText)) {
+      return {
+        field: {
+          name: fieldName,
+          ownerClass: receiverText,
+          fieldFqName: `${receiverText}.${fieldName}`,
+        },
+        confidence: 0.7,
+        resolutionKind: 'static-or-type-field',
+      };
+    }
+
+    return { confidence: 0.35, resolutionKind: 'receiver-unresolved-field' };
+  }
+
+  private javaFieldUsageContext(
+    enclosingClass: string,
+    enclosingSymbol: string,
+    isConstructor: boolean,
+    receiverTypes: Map<string, string>,
+    shadowedNames: Set<string>,
+  ): JavaFieldUsageContext | undefined {
+    const classFields = this.javaFieldsByClass.get(enclosingClass);
+    if (!classFields || classFields.size === 0) return undefined;
+    return {
+      enclosingClass,
+      enclosingSymbol,
+      isConstructor,
+      receiverTypes,
+      shadowedNames,
+      seen: new Set(),
+    };
+  }
+
   private getJavaParameterAnnotations(paramsNode: SyntaxNode | null | undefined): string[] {
     if (!paramsNode) return [];
     const names: string[] = [];
@@ -872,13 +999,21 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   }
 
   /** Add local Java variable declarations to the receiver type scope. */
-  private collectJavaLocalVariableTypes(node: SyntaxNode, receiverTypes: Map<string, string>, file: string): void {
+  private collectJavaLocalVariableTypes(
+    node: SyntaxNode,
+    receiverTypes: Map<string, string>,
+    file: string,
+    shadowedNames?: Set<string>,
+  ): void {
     if (node.type === 'local_variable_declaration' || node.type === 'resource') {
       const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
       if (typeName) {
         for (const declarator of node.children.filter(child => child.type === 'variable_declarator')) {
           const nameNode = declarator.childForFieldName('name') ?? declarator.children.find(child => child.type === 'identifier');
-          if (nameNode) receiverTypes.set(nameNode.text, typeName);
+          if (nameNode) {
+            receiverTypes.set(nameNode.text, typeName);
+            shadowedNames?.add(nameNode.text);
+          }
         }
         if (this.isReferenceType(typeName)) {
           this.parseTypeRefs.push({
@@ -891,7 +1026,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       }
     }
     for (const child of node.children) {
-      this.collectJavaLocalVariableTypes(child, receiverTypes, file);
+      this.collectJavaLocalVariableTypes(child, receiverTypes, file, shadowedNames);
     }
   }
 
@@ -1242,6 +1377,82 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
 
   // ─── Shared helpers ─────────────────────────────────────
 
+  private maybeExtractJavaFieldUsageFromNode(
+    node: SyntaxNode,
+    file: string,
+    lines: string[],
+    context: JavaFieldUsageContext | undefined,
+  ): boolean {
+    if (!context) return false;
+    const classFields = this.javaFieldsByClass.get(context.enclosingClass);
+    if (!classFields || classFields.size === 0) return false;
+
+    const addUsage = (
+      usageNode: SyntaxNode,
+      fieldName: string,
+      field: JavaFieldInfo | undefined,
+      accessKind: FieldAccessKind,
+      receiverText: string | undefined,
+      confidence: number,
+      resolutionKind: string,
+    ): void => {
+      const key = `${file}\0${usageNode.startIndex}\0${usageNode.endIndex}\0${fieldName}\0${receiverText ?? ''}`;
+      if (context.seen.has(key)) return;
+      context.seen.add(key);
+      const row = usageNode.startPosition.row;
+      this.parseFieldUsages.push({
+        fieldName,
+        fieldFqName: field?.fieldFqName,
+        ownerClass: field?.ownerClass,
+        file,
+        line: row + 1,
+        column: usageNode.startPosition.column + 1,
+        enclosingClass: context.enclosingClass,
+        enclosingSymbol: context.enclosingSymbol,
+        accessKind,
+        receiverText,
+        context: this.getContextLines(lines, row, 0),
+        confidence,
+        resolutionKind,
+      });
+    };
+
+    if (node.type === 'field_access') {
+      const fieldNode = node.childForFieldName('field')
+        ?? [...node.namedChildren].reverse().find(child => child.type === 'identifier' || child.type === 'field_identifier');
+      if (fieldNode) {
+        const receiverText = node.childForFieldName('object')?.text;
+        const resolved = this.resolveJavaFieldAccess(fieldNode.text, receiverText, context.enclosingClass, context.receiverTypes);
+        addUsage(
+          node,
+          fieldNode.text,
+          resolved.field,
+          javaFieldAccessKind(node, context.isConstructor, resolved.field?.ownerClass === context.enclosingClass),
+          receiverText,
+          resolved.confidence,
+          resolved.resolutionKind,
+        );
+      }
+      return false;
+    }
+
+    if (node.type === 'identifier' && isJavaIdentifierReferenceCandidate(node)) {
+      const field = classFields.get(node.text);
+      if (field && !context.shadowedNames.has(node.text)) {
+        addUsage(
+          node,
+          node.text,
+          field,
+          javaFieldAccessKind(node, context.isConstructor, true),
+          undefined,
+          0.85,
+          'class-field',
+        );
+      }
+    }
+    return false;
+  }
+
   private extractCallsFromNode(
     node: SyntaxNode,
     file: string,
@@ -1250,7 +1461,12 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     references: ReferenceInfo[],
     callerName: string,
     receiverTypes?: Map<string, string>,
+    fieldUsageContext?: JavaFieldUsageContext,
   ): void {
+    if (this.maybeExtractJavaFieldUsageFromNode(node, file, lines, fieldUsageContext)) {
+      return;
+    }
+
     // Java: method invocation — obj.method(args)
     if (node.type === 'object_creation_expression') {
       const typeNode = node.childForFieldName('type')
@@ -1358,7 +1574,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     }
 
     for (const child of node.children) {
-      this.extractCallsFromNode(child, file, lines, calls, references, callerName, receiverTypes);
+      this.extractCallsFromNode(child, file, lines, calls, references, callerName, receiverTypes, fieldUsageContext);
     }
   }
 
@@ -1383,6 +1599,49 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     const end = Math.min(lines.length - 1, row + contextSize);
     return lines.slice(start, end + 1).join('\n');
   }
+}
+
+function isJavaIdentifierReferenceCandidate(node: SyntaxNode): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  if (parent.type === 'field_access') return false;
+  if (parent.type === 'method_invocation' && sameSyntaxNode(parent.childForFieldName('name'), node)) return false;
+  if (parent.type === 'variable_declarator' && sameSyntaxNode(parent.childForFieldName('name'), node)) return false;
+  if (parent.type === 'formal_parameter' && sameSyntaxNode(parent.childForFieldName('name'), node)) return false;
+  if (parent.type === 'spread_parameter' && sameSyntaxNode(parent.childForFieldName('name'), node)) return false;
+  if (parent.type === 'class_declaration' && sameSyntaxNode(parent.childForFieldName('name'), node)) return false;
+  if (parent.type === 'interface_declaration' && sameSyntaxNode(parent.childForFieldName('name'), node)) return false;
+  if (parent.type === 'method_declaration' && sameSyntaxNode(parent.childForFieldName('name'), node)) return false;
+  if (parent.type === 'constructor_declaration' && sameSyntaxNode(parent.childForFieldName('name'), node)) return false;
+  if (parent.type === 'package_declaration' || parent.type === 'import_declaration') return false;
+  if (parent.type === 'scoped_identifier' || parent.type === 'scoped_type_identifier') return false;
+  return true;
+}
+
+function javaFieldAccessKind(node: SyntaxNode, isConstructor: boolean, ownClassField: boolean): FieldAccessKind {
+  const parent = node.parent;
+  if (!parent) return 'unknown';
+  if (parent.type === 'update_expression') return 'read_write';
+  if (parent.type === 'assignment_expression' && syntaxNodeContains(parent.childForFieldName('left'), node)) {
+    const operator = parent.childForFieldName('operator')?.text ?? assignmentOperatorFromText(parent.text);
+    if (operator === '=') return isConstructor && ownClassField ? 'init' : 'write';
+    return 'read_write';
+  }
+  return 'read';
+}
+
+function assignmentOperatorFromText(text: string): string | undefined {
+  const match = text.match(/([+\-*/%&|^]?=)/);
+  return match?.[1];
+}
+
+function sameSyntaxNode(left: SyntaxNode | null | undefined, right: SyntaxNode | null | undefined): boolean {
+  return Boolean(left && right && left.startIndex === right.startIndex && left.endIndex === right.endIndex && left.type === right.type);
+}
+
+function syntaxNodeContains(parent: SyntaxNode | null | undefined, child: SyntaxNode): boolean {
+  if (!parent) return false;
+  return child.startIndex >= parent.startIndex && child.endIndex <= parent.endIndex;
 }
 
 function resolveReceiverType(receiver: string, receiverTypes?: Map<string, string>): string | undefined {

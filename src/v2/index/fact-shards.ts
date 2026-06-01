@@ -8,6 +8,7 @@ export interface FactShardPaths {
   symbols: string;
   imports: string;
   typeRefs: string;
+  fieldUsages: string;
   rawCallEdges: string;
   annotations: string;
   endpoints: string;
@@ -20,6 +21,7 @@ export interface FactShardStats {
   symbols: number;
   imports: number;
   typeRefs: number;
+  fieldUsages: number;
   rawCallEdges: number;
   annotations: number;
   endpoints: number;
@@ -158,6 +160,7 @@ export function factShardPathsForWorker(tmpDir: string, index: number): FactShar
     symbols: `${prefix}.symbols.copy`,
     imports: `${prefix}.imports.copy`,
     typeRefs: `${prefix}.type_refs.copy`,
+    fieldUsages: `${prefix}.field_usages.copy`,
     rawCallEdges: `${prefix}.raw_call_edges.copy`,
     annotations: `${prefix}.annotations.copy`,
     endpoints: `${prefix}.endpoints.copy`,
@@ -172,6 +175,7 @@ export function emptyFactShardStats(): FactShardStats {
     symbols: 0,
     imports: 0,
     typeRefs: 0,
+    fieldUsages: 0,
     rawCallEdges: 0,
     annotations: 0,
     endpoints: 0,
@@ -185,6 +189,7 @@ export function addFactShardStats(total: FactShardStats, next: FactShardStats): 
   total.symbols += next.symbols;
   total.imports += next.imports;
   total.typeRefs += next.typeRefs;
+  total.fieldUsages += next.fieldUsages;
   total.rawCallEdges += next.rawCallEdges;
   total.annotations += next.annotations;
   total.endpoints += next.endpoints;
@@ -330,6 +335,26 @@ export function writeParseResultFactRows(
 
   for (const ref of result.typeReferences ?? []) {
     writeRow(writer, 'typeRefs', [config.snapshotId, file.relPath, ref.referencedType, ref.context, ref.line, file.role]);
+  }
+
+  for (const usage of result.fieldUsages ?? []) {
+    writeRow(writer, 'fieldUsages', [
+      config.snapshotId,
+      usage.fieldName,
+      usage.fieldFqName,
+      usage.ownerClass,
+      file.relPath,
+      usage.line,
+      usage.column,
+      usage.enclosingClass,
+      usage.enclosingSymbol,
+      usage.accessKind,
+      usage.receiverText,
+      usage.context,
+      usage.confidence,
+      usage.resolutionKind,
+      file.role,
+    ]);
   }
 
   for (const call of result.calls) {

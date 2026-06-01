@@ -153,6 +153,7 @@ type SqlValue = string | number | null | undefined;
 const POST_INDEX_ANALYZE_TABLES = [
   'files',
   'symbols',
+  'field_usages',
   'call_edges',
   'dependency_edges',
   'imports',
@@ -180,6 +181,7 @@ interface MaterializeStats {
   endpoints: number;
   imports: number;
   typeRefs: number;
+  fieldUsages: number;
   callEdges: number;
 }
 
@@ -252,6 +254,7 @@ const COPY_INSERT_TABLES = new Set([
   'symbols',
   'imports',
   'type_refs',
+  'field_usages',
   'call_edges',
   'dependency_edges',
   'annotations',
@@ -352,6 +355,10 @@ const FULL_BULK_LOAD_INDEXES: BulkLoadIndexSpec[] = [
   { name: 'idx_imports_source', createSql: 'CREATE INDEX IF NOT EXISTS idx_imports_source ON imports(snapshot_id, source)' },
   { name: 'idx_imports_file', createSql: 'CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(snapshot_id, file)' },
   { name: 'idx_type_refs_type', createSql: 'CREATE INDEX IF NOT EXISTS idx_type_refs_type ON type_refs(snapshot_id, referenced_type)' },
+  { name: 'idx_field_usages_name', createSql: 'CREATE INDEX IF NOT EXISTS idx_field_usages_name ON field_usages(snapshot_id, field_name)' },
+  { name: 'idx_field_usages_owner_name', createSql: 'CREATE INDEX IF NOT EXISTS idx_field_usages_owner_name ON field_usages(snapshot_id, owner_class, field_name)' },
+  { name: 'idx_field_usages_file', createSql: 'CREATE INDEX IF NOT EXISTS idx_field_usages_file ON field_usages(snapshot_id, file)' },
+  { name: 'idx_field_usages_enclosing', createSql: 'CREATE INDEX IF NOT EXISTS idx_field_usages_enclosing ON field_usages(snapshot_id, enclosing_symbol)' },
   { name: 'idx_call_edges_file', createSql: 'CREATE INDEX IF NOT EXISTS idx_call_edges_file ON call_edges(snapshot_id, file)' },
   { name: 'idx_call_edges_signal_file', createSql: 'CREATE INDEX IF NOT EXISTS idx_call_edges_signal_file ON call_edges(snapshot_id, signal_tier, file)' },
   { name: 'idx_dependency_from', createSql: 'CREATE INDEX IF NOT EXISTS idx_dependency_from ON dependency_edges(snapshot_id, from_file)' },
@@ -363,6 +370,7 @@ const FULL_BULK_LOAD_INDEXES: BulkLoadIndexSpec[] = [
   { name: 'idx_symbols_simple_name_trgm', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_simple_name_trgm ON symbols USING gin (simple_name gin_trgm_ops)' },
   { name: 'idx_symbols_fq_name_trgm', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_fq_name_trgm ON symbols USING gin (fq_name gin_trgm_ops)' },
   { name: 'idx_symbols_file_trgm', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_file_trgm ON symbols USING gin (file gin_trgm_ops)' },
+  { name: 'idx_field_usages_name_trgm', createSql: 'CREATE INDEX IF NOT EXISTS idx_field_usages_name_trgm ON field_usages USING gin (field_name gin_trgm_ops)' },
   { name: 'idx_call_edges_caller_signal_trgm', createSql: "CREATE INDEX IF NOT EXISTS idx_call_edges_caller_signal_trgm ON call_edges USING gin (caller gin_trgm_ops) WHERE signal_tier IN ('primary', 'provider')" },
   { name: 'idx_call_edges_callee_signal_trgm', createSql: "CREATE INDEX IF NOT EXISTS idx_call_edges_callee_signal_trgm ON call_edges USING gin (callee gin_trgm_ops) WHERE signal_tier IN ('primary', 'provider')" },
   { name: 'idx_files_path_trgm', createSql: 'CREATE INDEX IF NOT EXISTS idx_files_path_trgm ON files USING gin (path gin_trgm_ops)' },
@@ -961,6 +969,7 @@ export class V2Indexer {
         files,
         symbols,
         imports,
+        field_usages,
         call_edges,
         call_edges_primary,
         call_edges_low_signal,
@@ -981,6 +990,7 @@ export class V2Indexer {
         (SELECT COUNT(*)::integer FROM files WHERE snapshot_id = ?),
         (SELECT COUNT(*)::integer FROM symbols WHERE snapshot_id = ?),
         (SELECT COUNT(*)::integer FROM imports WHERE snapshot_id = ?),
+        (SELECT COUNT(*)::integer FROM field_usages WHERE snapshot_id = ?),
         (SELECT COUNT(*)::integer FROM call_edges WHERE snapshot_id = ?),
         (SELECT COUNT(*)::integer FROM call_edges WHERE snapshot_id = ? AND signal_tier IN ('primary', 'provider')),
         (SELECT COUNT(*)::integer FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'low_signal'),
@@ -1096,6 +1106,7 @@ export class V2Indexer {
         files = excluded.files,
         symbols = excluded.symbols,
         imports = excluded.imports,
+        field_usages = excluded.field_usages,
         call_edges = excluded.call_edges,
         call_edges_primary = excluded.call_edges_primary,
         call_edges_low_signal = excluded.call_edges_low_signal,
@@ -1111,6 +1122,7 @@ export class V2Indexer {
         top_unresolved_calls_json = excluded.top_unresolved_calls_json,
         updated_at = excluded.updated_at
     `).run(
+      snapshotId,
       snapshotId,
       snapshotId,
       snapshotId,
@@ -1833,6 +1845,7 @@ export class V2Indexer {
         await this.copyFactShardTable('endpoints', factPaths, 'endpoints', args.prepared.factStats.endpoints);
         await this.copyFactShardTable('imports', factPaths, 'imports', args.prepared.factStats.imports);
         await this.copyFactShardTable('type_refs', factPaths, 'typeRefs', args.prepared.factStats.typeRefs);
+        await this.copyFactShardTable('field_usages', factPaths, 'fieldUsages', args.prepared.factStats.fieldUsages);
         await this.copyTextShards(
           'call_edges',
           copyableColumnsFor('call_edges'),
@@ -1848,6 +1861,7 @@ export class V2Indexer {
           elapsedMs: Date.now() - args.start,
           details: {
             symbols: args.prepared.factStats.symbols,
+            fieldUsages: args.prepared.factStats.fieldUsages,
             callEdges: resolvedCallShard!.rows,
             typeRefs: args.prepared.factStats.typeRefs,
             sharded: true,
@@ -2382,7 +2396,7 @@ export class V2Indexer {
     if (files.size === 0) return;
     const values = [...files];
     const placeholders = values.map(() => '?').join(', ');
-    for (const table of ['symbols', 'imports', 'type_refs', 'call_edges', 'annotations', 'endpoints', 'beans', 'inheritance']) {
+    for (const table of ['symbols', 'imports', 'type_refs', 'field_usages', 'call_edges', 'annotations', 'endpoints', 'beans', 'inheritance']) {
       await this.db.prepare(`
         DELETE FROM ${table}
         WHERE snapshot_id = ? AND file IN (${placeholders})
@@ -2455,7 +2469,7 @@ export class V2Indexer {
   }
 
   private async copyUnchangedRows(fromSnapshotId: string, toSnapshotId: string): Promise<void> {
-    for (const table of ['symbols', 'imports', 'type_refs', 'call_edges', 'annotations', 'endpoints', 'beans', 'inheritance']) {
+    for (const table of ['symbols', 'imports', 'type_refs', 'field_usages', 'call_edges', 'annotations', 'endpoints', 'beans', 'inheritance']) {
       await this.copyRowsForUnchangedFiles(table, fromSnapshotId, toSnapshotId);
     }
   }
@@ -2587,6 +2601,7 @@ export class V2Indexer {
     const endpointRows: SqlValue[][] = [];
     const importRows: SqlValue[][] = [];
     const typeRefRows: SqlValue[][] = [];
+    const fieldUsageRows: SqlValue[][] = [];
     const callRows: SqlValue[][] = [];
     const implementationCallRows: SqlValue[][] = [];
 
@@ -2655,6 +2670,26 @@ export class V2Indexer {
         typeRefRows.push([snapshotId, file.relPath, ref.referencedType, ref.context, ref.line, file.role]);
       }
 
+      for (const usage of result.fieldUsages ?? []) {
+        fieldUsageRows.push([
+          snapshotId,
+          usage.fieldName,
+          usage.fieldFqName,
+          usage.ownerClass,
+          file.relPath,
+          usage.line,
+          usage.column,
+          usage.enclosingClass,
+          usage.enclosingSymbol,
+          usage.accessKind,
+          usage.receiverText,
+          usage.context,
+          usage.confidence,
+          usage.resolutionKind,
+          file.role,
+        ]);
+      }
+
       for (const call of result.calls) {
         const normalizedCall = classifyCallEdge(call);
         if (!normalizedCall) continue;
@@ -2688,6 +2723,7 @@ export class V2Indexer {
     await this.insertRows('endpoints', copyableColumnsFor('endpoints'), endpointRows);
     await this.insertRows('imports', copyableColumnsFor('imports'), importRows);
     await this.insertRows('type_refs', copyableColumnsFor('type_refs'), typeRefRows);
+    await this.insertRows('field_usages', copyableColumnsFor('field_usages'), fieldUsageRows);
     await this.insertRows('call_edges', copyableColumnsFor('call_edges'), callRows);
     await this.insertRows('call_edges', copyableColumnsFor('call_edges'), implementationCallRows);
     return {
@@ -2698,6 +2734,7 @@ export class V2Indexer {
       endpoints: endpointRows.length,
       imports: importRows.length,
       typeRefs: typeRefRows.length,
+      fieldUsages: fieldUsageRows.length,
       callEdges: callRows.length + implementationCallRows.length,
     };
   }
@@ -3447,6 +3484,12 @@ function copyableColumnsFor(table: string): string[] {
       return ['snapshot_id', 'file', 'source', 'imported_symbols_json', 'line', 'is_external', 'file_role'];
     case 'type_refs':
       return ['snapshot_id', 'file', 'referenced_type', 'context', 'line', 'file_role'];
+    case 'field_usages':
+      return [
+        'snapshot_id', 'field_name', 'field_fq_name', 'owner_class', 'file', 'line', 'column',
+        'enclosing_class', 'enclosing_symbol', 'access_kind', 'receiver_text', 'context',
+        'confidence', 'resolution_kind', 'file_role',
+      ];
     case 'call_edges':
       return [
         'snapshot_id', 'caller', 'callee', 'file', 'line', 'confidence', 'resolution_kind', 'file_role',
@@ -3639,6 +3682,7 @@ function emptyMaterializeStats(): MaterializeStats {
     endpoints: 0,
     imports: 0,
     typeRefs: 0,
+    fieldUsages: 0,
     callEdges: 0,
   };
 }
@@ -3651,6 +3695,7 @@ function addMaterializeStats(total: MaterializeStats, batch: MaterializeStats): 
   total.endpoints += batch.endpoints;
   total.imports += batch.imports;
   total.typeRefs += batch.typeRefs;
+  total.fieldUsages += batch.fieldUsages;
   total.callEdges += batch.callEdges;
 }
 

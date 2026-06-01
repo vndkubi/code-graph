@@ -139,6 +139,136 @@ public class NoiseService {
     expect(stats.counts.callEdgesRaw).toBeGreaterThan(stats.counts.callEdgesPrimary);
   });
 
+  it('indexes Java field usages for references, change packs, review packets, and warm cache reuse', async () => {
+    const previousFieldUsageFlag = process.env.CODEGRAPH_ENABLE_FIELD_USAGES;
+    process.env.CODEGRAPH_ENABLE_FIELD_USAGES = '1';
+    try {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-field-usage-');
+    writeFile(repo, 'src/main/java/com/example/FieldImpactSubject.java', `package com.example;
+
+public class FieldImpactSubject {
+    private int fieldA;
+    private Helper helper;
+
+    public FieldImpactSubject(int fieldA, Helper helper) {
+        this.fieldA = fieldA;
+        this.helper = helper;
+    }
+
+    public void update() {
+        fieldA++;
+        this.fieldA += 2;
+        helper.touch();
+    }
+
+    public int read() {
+        return this.fieldA + fieldA;
+    }
+
+    public void shadow(int fieldA) {
+        fieldA = fieldA + 1;
+    }
+
+    public void typed(Holder holder) {
+        holder.fieldA = this.fieldA;
+    }
+}
+
+class Helper {
+    void touch() {}
+}
+
+class Holder {
+    public int fieldA;
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/FieldImpactSubjectTest.java', `package com.example;
+
+public class FieldImpactSubjectTest {
+    public void updateUsesFieldA() {
+        new FieldImpactSubject(1, new Helper()).update();
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const first = await indexer.indexWorkspace({ root: repo, workspaceKey: 'field-impact-first' });
+    const queries = new V2QueryService(db);
+
+    const rows = await db.prepare(`
+      SELECT field_name, owner_class, access_kind, enclosing_symbol, resolution_kind
+      FROM field_usages
+      WHERE snapshot_id = ? AND field_name = 'fieldA'
+      ORDER BY line, access_kind
+    `).all(first.snapshotId) as Array<{
+      field_name: string;
+      owner_class?: string;
+      access_kind: string;
+      enclosing_symbol?: string;
+      resolution_kind: string;
+    }>;
+    expect(rows.some(row => row.access_kind === 'init' && row.resolution_kind === 'this-field')).toBe(true);
+    expect(rows.some(row => row.access_kind === 'read_write' && row.enclosing_symbol === 'FieldImpactSubject.update')).toBe(true);
+    expect(rows.some(row => row.access_kind === 'read' && row.enclosing_symbol === 'FieldImpactSubject.read')).toBe(true);
+    expect(rows.some(row => row.owner_class === 'Holder' && row.resolution_kind === 'receiver-type-field')).toBe(true);
+    expect(rows.some(row => row.enclosing_symbol === 'FieldImpactSubject.shadow')).toBe(false);
+
+    const references = await queries.query({
+      workspaceId: first.workspaceId,
+      toolName: 'find_references',
+      args: { symbol: 'fieldA', kind: 'field_usage', groupBy: 'method', limit: 20 },
+    }) as {
+      references: Array<{ kind: string; fieldAccess: string; enclosingSymbol: string; resolutionKind: string }>;
+      groups: Array<{ key: string; count: number }>;
+    };
+    expect(references.references).toContainEqual(expect.objectContaining({
+      kind: 'field_usage',
+      fieldAccess: 'init',
+      enclosingSymbol: 'FieldImpactSubject.FieldImpactSubject',
+    }));
+    expect(references.references).toContainEqual(expect.objectContaining({
+      fieldAccess: 'read_write',
+      enclosingSymbol: 'FieldImpactSubject.update',
+    }));
+    expect(references.groups.some(group => group.key === 'FieldImpactSubject.update')).toBe(true);
+
+    const changePack = await queries.query({
+      workspaceId: first.workspaceId,
+      toolName: 'get_change_pack',
+      args: { task: 'investigate changing fieldA logic', profile: 'compact' },
+    }) as { fieldImpact?: { usageCount?: number; groups?: { byMethod?: Array<{ key: string }> } } };
+    expect(Number(changePack.fieldImpact?.usageCount ?? 0)).toBeGreaterThan(0);
+    expect(changePack.fieldImpact?.groups?.byMethod?.some(group => group.key === 'FieldImpactSubject.update')).toBe(true);
+
+    const review = await queries.query({
+      workspaceId: first.workspaceId,
+      toolName: 'review_patch',
+      args: {
+        diff: `diff --git a/src/main/java/com/example/FieldImpactSubject.java b/src/main/java/com/example/FieldImpactSubject.java
+@@ -9,7 +9,7 @@ public class FieldImpactSubject {
+-        this.fieldA = fieldA;
++        this.fieldA = fieldA + 1;
+`,
+      },
+    }) as { fieldImpact?: { usageCount?: number } };
+    expect(Number(review.fieldImpact?.usageCount ?? 0)).toBeGreaterThan(0);
+
+    const second = await indexer.indexWorkspace({ root: repo, workspaceKey: 'field-impact-second' });
+    expect(second.parseCacheHits).toBeGreaterThan(0);
+    const warmRows = await db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM field_usages
+      WHERE snapshot_id = ? AND field_name = 'fieldA'
+    `).get(second.snapshotId) as { count: number | string } | undefined;
+    expect(Number(warmRows?.count ?? 0)).toBeGreaterThan(0);
+    } finally {
+      if (previousFieldUsageFlag === undefined) delete process.env.CODEGRAPH_ENABLE_FIELD_USAGES;
+      else process.env.CODEGRAPH_ENABLE_FIELD_USAGES = previousFieldUsageFlag;
+    }
+  });
+
   it('reports unresolved imports without loading all symbol/import rows in the query process', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-unresolved-imports-');
@@ -2565,6 +2695,7 @@ async function resetDb(db: CodeGraphDb): Promise<void> {
       symbols,
       imports,
       type_refs,
+      field_usages,
       call_edges,
       dependency_edges,
       annotations,
