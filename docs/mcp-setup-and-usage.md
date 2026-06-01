@@ -1,6 +1,6 @@
 # CodeGraph MCP Setup and Usage Guide
 
-This guide explains how to run CodeGraph as an MCP server, how to prewarm indexes, and how to keep answers correct when files or branches change.
+This guide explains how to run CodeGraph as an MCP server, how to prewarm indexes, and how to keep answers correct when files or branches change. For the internal architecture and indexing/query flow, see [System Design](system-design.md).
 
 ## Mental Model
 

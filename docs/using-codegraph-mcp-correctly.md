@@ -1,6 +1,6 @@
 # Using CodeGraph MCP Correctly
 
-This guide explains how to get reliable answers from CodeGraph MCP during real coding work. It focuses on how to prompt the agent, when to trust the index, when to refresh it, and when to allow shell fallback.
+This guide explains how to get reliable answers from CodeGraph MCP during real coding work. It focuses on how to prompt the agent, when to trust the index, when to refresh it, and when to allow shell fallback. For the internal architecture, see [System Design](system-design.md).
 
 ## The Short Version
 
