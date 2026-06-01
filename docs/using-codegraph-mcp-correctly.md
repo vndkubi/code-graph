@@ -1,6 +1,6 @@
 # Using CodeGraph MCP Correctly
 
-This guide explains how to get reliable answers from CodeGraph MCP during real coding work. It focuses on how to prompt the agent, when to trust the index, when to refresh it, and when to allow shell fallback. For the internal architecture, see [System Design](system-design.md).
+This guide explains how to get reliable answers from CodeGraph MCP during real coding work. It focuses on how to prompt the agent, when to trust the index, when to refresh it, and when to allow shell fallback. For the internal architecture, see [System Design](system-design.md). For Jira and Confluence ticket workflows, see [Ticket-Driven Agent Workflow](ticket-driven-agent-workflow.md).
 
 ## The Short Version
 
