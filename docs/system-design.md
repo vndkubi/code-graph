@@ -412,3 +412,4 @@ node dist/cli.js logs --tail 50
 - [MCP Setup And Usage](mcp-setup-and-usage.md)
 - [Using CodeGraph MCP Correctly](using-codegraph-mcp-correctly.md)
 - [CodeGraph Prompt Guide](prompt-guide.md)
+- [Benchmark Results](benchmark-results.md)

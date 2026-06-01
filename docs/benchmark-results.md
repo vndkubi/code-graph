@@ -1,0 +1,270 @@
+# CodeGraph Benchmark Results
+
+This document records the latest local benchmark results for CodeGraph indexing and real-agent MCP usage. The goal is to show when CodeGraph MCP improves agent workflow performance, token use, tool calls, and answer quality compared with baseline shell search.
+
+## Summary
+
+The benchmark compared Codex CLI baseline shell/search behavior against Codex CLI with CodeGraph MCP on the Hadoop project copy.
+
+Aggregate result across three representative tasks:
+
+| Metric | Baseline shell/search | CodeGraph MCP-first | Change |
+| --- | ---: | ---: | ---: |
+| Total agent wall time | `444.7s` | `235.8s` | `47.0%` faster |
+| Input tokens | `3,818,267` | `834,162` | `78.2%` lower |
+| Output tokens | `33,492` | `17,370` | `48.1%` lower |
+| MCP tool calls | `0` | `16` | MCP used for graph context |
+| Shell calls | `128` | `10` | `92.2%` lower |
+
+Main conclusion:
+
+- CodeGraph MCP is strongest for investigation and flow tracing in large repositories because it avoids repeated raw file reads.
+- Field usage indexing improves field-impact questions by returning definition, initialization, reads, enclosing methods, related calls, and tests.
+- Review tasks can still fall back to shell if the prompt allows it; `review_patch` quality improved, but total wall time was slower in this run because the agent still made shell calls after MCP.
+
+## Environment
+
+| Item | Value |
+| --- | --- |
+| Date | 2026-06-01 |
+| CodeGraph branch | `codex/answer-ready-flow-pack` |
+| Source repository | Hadoop project copy |
+| Source state | Dirty working tree with `95` deleted files before benchmark |
+| Runtime | Windows, local Node.js, local Postgres |
+| Model | `gpt-5.4-mini` |
+| Reasoning | `medium` |
+| Codex mode | `codex exec --json --ephemeral --ignore-user-config --ignore-rules --dangerously-bypass-approvals-and-sandbox` |
+| Field usage indexing | Enabled with `CODEGRAPH_ENABLE_FIELD_USAGES=1` |
+| Parse workers | `8` |
+| Token source | Actual Codex CLI `turn.completed.usage` event fields |
+| Quality score | Heuristic expected-file and expected-term hit rate in final answer |
+
+The benchmark used a copied Hadoop checkout instead of the clean main Hadoop checkout. Treat these numbers as a local workflow benchmark, not a canonical clean-repository index benchmark.
+
+## Index Benchmark
+
+Command shape:
+
+```powershell
+$env:CODEGRAPH_ENABLE_FIELD_USAGES="1"
+node dist/cli.js index `
+  --root "<hadoop-project-copy>" `
+  --workspace-key hadoop-copy-field-bench `
+  --parse-workers 8
+```
+
+Final index result:
+
+| Metric | Value |
+| --- | ---: |
+| Total index time | `15m57.6s` |
+| Files total | `13,987` |
+| Files parsed | `13,987` |
+| Parse cache hits | `0` |
+| Parse workers | `8` |
+| Provider | `tree-sitter` |
+| Provider version | `tree-sitter-analyzer-v9-field-usages` |
+| Symbols | `323,077` |
+| Type refs | `298,956` |
+| Field usages | `382,483` |
+| Call edges | `1,183,062` |
+| Dependency edges | `66,100` |
+| Endpoints | `279` |
+| COPY fallbacks | `0` |
+| COPY errors | `0` |
+
+Important phases:
+
+| Phase | Time |
+| --- | ---: |
+| Manifest scan | `1.7s` |
+| Parse worker phase | `445.1s` |
+| Parse context build | `0.6s` |
+| Parse cache COPY | `357.0s` |
+| Call edge resolution | `6.8s` |
+| Field usage COPY | `7.9s` |
+| Call edge COPY | `23.2s` |
+| Symbols COPY | `19.1s` |
+| Dependency rebuild | `2.9s` |
+| Full bulk index rebuild | `54.7s` |
+
+Interpretation:
+
+- Field usage COPY itself is not the bottleneck at `7.9s`.
+- The expensive phases remain cold parsing and full `parse_cache.parse_json` COPY.
+- Field usage indexing adds useful query capability but still increases total cold index cost compared with the non-field baseline, so it remains opt-in.
+
+## Real-Agent Task Matrix
+
+Each task ran twice:
+
+- `baseline`: Codex was told not to use CodeGraph MCP and could use shell/search/read commands.
+- `mcp`: Codex was told to use CodeGraph MCP first and use shell only if MCP evidence was missing.
+
+| Task | Purpose | Expected evidence |
+| --- | --- | --- |
+| `api-flow` | Trace `GET /ws/v1/cluster/apps` through Hadoop YARN REST handling. | `RMWebServices`, `ApplicationsRequestBuilder`, `ClientRMService`, `applicationTags`, likely tests. |
+| `field-impact` | Investigate impact of changing `BlockReceiver.datanode`. | Definition, constructor initialization, reads, methods/classes, related calls, likely tests. |
+| `review-diff` | Review a patch that drops `applicationTags` by passing `Collections.emptySet()`. | Correctness finding, impacted flow, missing endpoint-level test. |
+
+## Agent Metrics By Task
+
+| Task | Mode | Time | Input tokens | Cached input | Output tokens | Reasoning tokens | MCP calls | Shell calls | Quality |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `api-flow` | baseline | `265.5s` | `3,018,876` | `2,886,656` | `17,219` | `6,544` | `0` | `85` | `85.7%` |
+| `api-flow` | MCP-first | `69.0s` | `257,738` | `215,936` | `5,860` | `2,720` | `7` | `0` | `85.7%` |
+| `field-impact` | baseline | `107.6s` | `410,118` | `341,376` | `10,281` | `5,877` | `0` | `22` | `100%` |
+| `field-impact` | MCP-first | `74.8s` | `206,461` | `161,792` | `6,722` | `3,494` | `6` | `0` | `100%` |
+| `review-diff` | baseline | `71.5s` | `389,273` | `342,912` | `5,992` | `3,123` | `0` | `21` | `71.4%` |
+| `review-diff` | MCP-first | `92.0s` | `369,963` | `305,792` | `4,788` | `2,693` | `3` | `10` | `85.7%` |
+
+## Per-Task Deltas
+
+| Task | Time change | Input token change | Output token change | Tool-call change | Quality change |
+| --- | ---: | ---: | ---: | --- | ---: |
+| `api-flow` | `74.0%` faster | `91.5%` lower | `66.0%` lower | `85` shell calls to `7` MCP calls | unchanged |
+| `field-impact` | `30.5%` faster | `49.7%` lower | `34.6%` lower | `22` shell calls to `6` MCP calls | unchanged |
+| `review-diff` | `28.6%` slower | `5.0%` lower | `20.1%` lower | `21` shell calls to `3` MCP + `10` shell calls | `14.3pp` higher |
+
+## MCP Tool Usage
+
+| Task | MCP tools used |
+| --- | --- |
+| `api-flow` | `get_flow_pack`, `get_file_slice`, `find_tests_for`, `trace_dependencies`, `search_symbol`, `get_file_slice`, `get_file_slice` |
+| `field-impact` | `get_research_pack`, `find_references`, `get_file_slice`, `get_file_slice`, `find_tests_for`, `find_references` |
+| `review-diff` | `review_patch`, `find_tests_for`, `find_tests_for` |
+
+MCP query latency from daemon telemetry, excluding the smoke-test `get_index_stats` call:
+
+| Metric | Value |
+| --- | ---: |
+| Query count | `16` |
+| Min latency | `7ms` |
+| Average latency | `382.2ms` |
+| p95 latency | `1,919ms` |
+| Max latency | `1,919ms` |
+| Total MCP response chars | `233,673` |
+
+The slowest MCP call in this run was `review_patch` at `1,919ms`. The field reference call for `BlockReceiver.datanode` was approximately `1,003ms`, close to the target for exact field usage queries on a large snapshot.
+
+## Prompts
+
+### API Flow
+
+Baseline prompt:
+
+```text
+Do not use CodeGraph MCP. Use shell/search/read commands only as needed. Do not modify files. Trace the Hadoop YARN REST API GET /ws/v1/cluster/apps. Include handler, query params states/limit/applicationTags, request builder/service filtering, dependencies, and likely tests. Return valid compact JSON only with keys task,keyFiles,methods,flow,dependencies,tests,risks,confidence. Cite repository-relative files.
+```
+
+MCP prompt:
+
+```text
+Use CodeGraph MCP server codegraph_hadoop first. Choose the best CodeGraph MCP tools yourself. Use shell only if MCP evidence is missing. Do not modify files. Trace the Hadoop YARN REST API GET /ws/v1/cluster/apps. Include handler, query params states/limit/applicationTags, request builder/service filtering, dependencies, and likely tests. Return valid compact JSON only with keys task,keyFiles,methods,flow,dependencies,tests,risks,confidence. Cite repository-relative files.
+```
+
+Expected output quality:
+
+- Names `RMWebServices.getApps`.
+- Connects the request builder and service filtering.
+- Includes `applicationTags`.
+- Includes likely tests.
+- Cites repository-relative files.
+
+### Field Impact
+
+Baseline prompt:
+
+```text
+Do not use CodeGraph MCP. Use shell/search/read commands only as needed. Do not modify files. Investigate impact of changing the Java field BlockReceiver.datanode in Hadoop. Where is it initialized, read, or used in methods/classes/flow? Include access kind when known, related calls/dependencies, review risks, and likely tests. Return valid compact JSON only with keys task,field,definitions,usagesByMethod,flow,risks,tests,confidence. Cite repository-relative files.
+```
+
+MCP prompt:
+
+```text
+Use CodeGraph MCP server codegraph_hadoop first. Choose the best CodeGraph MCP tools yourself. Use shell only if MCP evidence is missing. Do not modify files. Investigate impact of changing the Java field BlockReceiver.datanode in Hadoop. Where is it initialized, read, or used in methods/classes/flow? Include access kind when known, related calls/dependencies, review risks, and likely tests. Return valid compact JSON only with keys task,field,definitions,usagesByMethod,flow,risks,tests,confidence. Cite repository-relative files.
+```
+
+Expected output quality:
+
+- Identifies `BlockReceiver.datanode`.
+- Separates field declaration, constructor parameter, and initialization.
+- Groups uses by method.
+- Mentions `getDataNode`, `DataNode`, and metrics/dataset/config interactions.
+- Includes likely tests and review risks.
+
+### Review Diff
+
+Baseline prompt:
+
+```text
+Do not use CodeGraph MCP. Use shell/search/read commands only as needed. Do not modify files. Review this Hadoop patch for correctness and missing tests. Return valid compact JSON only with keys status,topFindings,impactedFlow,tests,confidence. Cite repository-relative files.
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java
+@@
+-                    .withApplicationTags(applicationTags)
++                    .withApplicationTags(java.util.Collections.emptySet())
+                     .build();
+```
+
+MCP prompt:
+
+```text
+Use CodeGraph MCP server codegraph_hadoop first. Choose the best CodeGraph MCP tools yourself. Use shell only if MCP evidence is missing. Do not modify files. Review this Hadoop patch for correctness and missing tests. Return valid compact JSON only with keys status,topFindings,impactedFlow,tests,confidence. Cite repository-relative files.
+
+diff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java
+--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java
++++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java
+@@
+-                    .withApplicationTags(applicationTags)
++                    .withApplicationTags(java.util.Collections.emptySet())
+                     .build();
+```
+
+Expected output quality:
+
+- Flags the dropped `applicationTags` filter.
+- Explains the impacted `/ws/v1/cluster/apps` flow.
+- Points to `RMWebServices.java`.
+- Mentions missing endpoint-level tests.
+
+## Output Quality Observations
+
+### API Flow
+
+Both modes found the main flow. MCP used zero shell calls and still returned the handler, builder, service dependency, and tests. MCP also included `TestRMWebServices.java`, which the baseline final answer did not include in the expected-file hit list.
+
+### Field Impact
+
+Both modes produced high-quality answers, but MCP used half the input tokens and avoided raw shell search. The MCP answer used the new field usage index through `find_references`, returning field declaration, constructor assignment, read usages grouped by method, related calls, and likely tests.
+
+### Review Diff
+
+Both modes found the correctness bug. MCP produced a stronger answer by explicitly tying the change to `GET /ws/v1/cluster/apps`, cache/filter behavior, and missing endpoint-level tests. It was slower because the agent still used 10 shell calls after `review_patch`.
+
+## Limitations
+
+- This is a single-run benchmark, not a statistically repeated suite.
+- The Hadoop project copy had a dirty working tree with deleted files, so counts differ from a clean checkout.
+- The quality score is a deterministic expected-file and expected-term heuristic, not a human review score.
+- Codex model behavior can change over time and may choose different tools on later runs.
+- MCP-first prompts allowed shell fallback; strict MCP-only runs may produce different review timing.
+- Raw event JSONL and final outputs were stored under `.tmp/` locally and are not committed.
+
+## Follow-Up Work
+
+Recommended next measurements:
+
+- Re-run on a clean Hadoop checkout with the same benchmark suite.
+- Add a strict MCP-only review run to isolate `review_patch` quality without shell fallback.
+- Repeat each task at least three times and report median/p95.
+- Tune `review_patch` evidence so the agent does not need extra shell calls.
+- Continue optimizing cold index bottlenecks: parse worker time and full `parse_cache.parse_json` COPY.
+
+## Related Documents
+
+- [System Design](system-design.md)
+- [Using CodeGraph MCP Correctly](using-codegraph-mcp-correctly.md)
+- [CodeGraph Prompt Guide](prompt-guide.md)

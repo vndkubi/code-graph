@@ -49,7 +49,7 @@ Run the MCP server:
 node dist/cli.js mcp --root "<hadoop-project>"
 ```
 
-For architecture details, see [System Design](docs/system-design.md). For Docker and MCP client configuration, see [MCP Setup And Usage](docs/mcp-setup-and-usage.md). For correct MCP-first workflows, see [Using CodeGraph MCP Correctly](docs/using-codegraph-mcp-correctly.md). For task prompts, see [CodeGraph Prompt Guide](docs/prompt-guide.md).
+For architecture details, see [System Design](docs/system-design.md). For measured indexing and real-agent results, see [Benchmark Results](docs/benchmark-results.md). For Docker and MCP client configuration, see [MCP Setup And Usage](docs/mcp-setup-and-usage.md). For correct MCP-first workflows, see [Using CodeGraph MCP Correctly](docs/using-codegraph-mcp-correctly.md). For task prompts, see [CodeGraph Prompt Guide](docs/prompt-guide.md).
 
 ## Why Use CodeGraph Instead Of Baseline File Search
 
@@ -117,7 +117,7 @@ CodeGraph keeps correctness by snapshotting each workspace:
 - Two branches at once: use `git worktree` or separate clones, each with a different root or `CODEGRAPH_WORKSPACE_KEY`.
 - Docker: always set `CODEGRAPH_WORKSPACE_KEY`, because every repository is mounted as `/workspace` inside the container.
 
-See [System Design](docs/system-design.md) for the internal architecture and indexing/query flow. See [MCP Setup And Usage](docs/mcp-setup-and-usage.md) for detailed setup, client config, branch workflows, and troubleshooting. See [Using CodeGraph MCP Correctly](docs/using-codegraph-mcp-correctly.md) for MCP-first workflow rules and [CodeGraph Prompt Guide](docs/prompt-guide.md) for copy-paste prompts by task type.
+See [System Design](docs/system-design.md) for the internal architecture and indexing/query flow. See [Benchmark Results](docs/benchmark-results.md) for local Hadoop indexing and Codex CLI MCP comparisons. See [MCP Setup And Usage](docs/mcp-setup-and-usage.md) for detailed setup, client config, branch workflows, and troubleshooting. See [Using CodeGraph MCP Correctly](docs/using-codegraph-mcp-correctly.md) for MCP-first workflow rules and [CodeGraph Prompt Guide](docs/prompt-guide.md) for copy-paste prompts by task type.
 
 ## CLI Reference
 
