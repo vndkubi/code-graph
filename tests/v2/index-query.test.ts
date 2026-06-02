@@ -11,6 +11,7 @@ import { parseFilesBatchToSpool, readParseContextItemsJsonl, type ParseWorkItem 
 import { generateSyntheticJavaRepo } from '../../src/v2/benchmark/synthetic-java.js';
 import { runContextProofEval } from '../../src/v2/benchmark/context-proof.js';
 import { runReviewProofEval } from '../../src/v2/benchmark/review-proof.js';
+import { parseCodexJsonEvents, scoreCodexOutput } from '../../src/v2/benchmark/codex-e2e.js';
 import { buildGraphExport, renderGraphHtml } from '../../src/v2/graph/export.js';
 
 const tempDirs: string[] = [];
@@ -1732,7 +1733,52 @@ public class PaymentClient {
 
     const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
-    const result = await indexer.indexWorkspace({ root: repo });
+    const previousOverlayFlag = process.env.CODEGRAPH_ENABLE_GRAPH_OVERLAY;
+    process.env.CODEGRAPH_ENABLE_GRAPH_OVERLAY = '1';
+    let result: Awaited<ReturnType<V2Indexer['indexWorkspace']>>;
+    try {
+      result = await indexer.indexWorkspace({ root: repo });
+    } finally {
+      if (previousOverlayFlag === undefined) {
+        delete process.env.CODEGRAPH_ENABLE_GRAPH_OVERLAY;
+      } else {
+        process.env.CODEGRAPH_ENABLE_GRAPH_OVERLAY = previousOverlayFlag;
+      }
+    }
+    const overlayStats = await db.prepare(`
+      SELECT graph_nodes, graph_edges
+      FROM snapshot_stats
+      WHERE snapshot_id = ?
+    `).get(result.snapshotId) as { graph_nodes: number; graph_edges: number } | undefined;
+    expect(overlayStats?.graph_nodes).toBeGreaterThan(0);
+    expect(overlayStats?.graph_edges).toBeGreaterThan(0);
+
+    const overlayModules = await db.prepare(`
+      SELECT label
+      FROM graph_nodes
+      WHERE snapshot_id = ? AND node_type = 'module'
+      ORDER BY label
+    `).all(result.snapshotId) as Array<{ label: string }>;
+    expect(overlayModules.map(module => module.label)).toContain('order-service');
+    expect(overlayModules.map(module => module.label)).toContain('payment-service');
+
+    const overlayCrossEdges = await db.prepare(`
+      SELECT edge_type, edge_count, evidence_json
+      FROM graph_edges
+      WHERE snapshot_id = ? AND edge_type IN ('module_dependency', 'module_call')
+    `).all(result.snapshotId) as Array<{ edge_type: string; edge_count: number; evidence_json: string }>;
+    expect(overlayCrossEdges.some(edge => edge.edge_type === 'module_dependency' && edge.edge_count > 0)).toBe(true);
+    expect(overlayCrossEdges.some(edge => edge.evidence_json.includes('OrderController.java') && edge.evidence_json.includes('PaymentClient.java'))).toBe(true);
+
+    const queries = new V2QueryService(db);
+    const flowPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_flow_pack',
+      args: { target: '/orders/{id}', profile: 'standard' },
+    }) as { architectureContext?: { available?: boolean; modules?: Array<{ label: string }>; moduleEdges?: unknown[] } };
+    expect(flowPack.architectureContext?.available).toBe(true);
+    expect(flowPack.architectureContext?.modules?.some(module => module.label === 'order-service')).toBe(true);
+
     const graph = await buildGraphExport(db, {
       workspaceId: result.workspaceId,
       snapshotId: result.snapshotId,
@@ -1990,6 +2036,76 @@ public class NoisyOrder${i} {
     expect(proof.totals.inputTokenSavingPct).toBeGreaterThan(0);
     expect(proof.tasks[0]?.mcp.findingCount).toBeGreaterThan(0);
     expect(proof.tasks[0]?.mcp.changedFiles.some(file => file.endsWith('OrderService.java'))).toBe(true);
+  });
+
+  it('parses Codex CLI JSON events into tool, token, output, and quality metrics', () => {
+    const jsonl = [
+      JSON.stringify({
+        type: 'mcp_tool_call.started',
+        data: { id: 'call-1', name: 'get_flow_pack' },
+      }),
+      JSON.stringify({
+        type: 'item.started',
+        item: {
+          id: 'call-3',
+          type: 'mcp_tool_call',
+          server: 'codegraph_bench',
+          tool: 'find_references',
+        },
+      }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'call-3',
+          type: 'mcp_tool_call',
+          server: 'codegraph_bench',
+          tool: 'find_references',
+        },
+      }),
+      JSON.stringify({
+        type: 'tool_call.started',
+        item: { id: 'call-2', type: 'tool_call', name: 'shell_command' },
+      }),
+      JSON.stringify({
+        type: 'assistant.message',
+        data: {
+          role: 'assistant',
+          content: '{"task":"api-flow","keyFiles":["RMWebServices.java"],"methods":["getApps"],"flow":["applicationTags"]}',
+        },
+      }),
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 1200,
+          cached_input_tokens: 400,
+          output_tokens: 180,
+          reasoning_tokens: 40,
+        },
+      }),
+    ].join('\n');
+
+    const parsed = parseCodexJsonEvents(jsonl, 'Trace /ws/v1/cluster/apps');
+    expect(parsed.eventCount).toBe(6);
+    expect(parsed.mcpCalls).toBe(2);
+    expect(parsed.shellCalls).toBe(1);
+    expect(parsed.toolCalls).toBe(3);
+    expect(parsed.inputTokens).toBe(1200);
+    expect(parsed.cachedInputTokens).toBe(400);
+    expect(parsed.outputTokens).toBe(180);
+    expect(parsed.reasoningTokens).toBe(40);
+    expect(parsed.tokenSource).toBe('actual');
+    expect(parsed.finalOutput).toContain('RMWebServices.java');
+
+    const quality = scoreCodexOutput({
+      id: 'api-flow',
+      prompt: 'Trace app API',
+      expectedFiles: ['RMWebServices.java'],
+      expectedMethods: ['getApps'],
+      expectedTerms: ['applicationTags'],
+      requiredAnswerFields: ['keyFiles'],
+    }, parsed.finalOutput);
+    expect(quality.score).toBe(1);
+    expect(quality.misses).toHaveLength(0);
   });
 
   it('resolves Java parameter and local-variable receiver calls through sharded full indexing', async () => {
@@ -2410,6 +2526,56 @@ public class FeatureBranchMarker {
     expect(second.skippedUnchanged).toBe(true);
   });
 
+  it('hydrates sharded full facts from parse cache for a new workspace key', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-sharded-cache-hydrate-');
+    writeFile(repo, 'src/main/java/com/example/PaymentGateway.java', `package com.example;
+
+public class PaymentGateway {
+    public void processPayment() {
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/PaymentService.java', `package com.example;
+
+public class PaymentService {
+    private final PaymentGateway gateway = new PaymentGateway();
+
+    public void submit() {
+        gateway.processPayment();
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const first = await indexer.indexWorkspace({ root: repo, workspaceKey: 'cache-hydrate-a' });
+    const second = await indexer.indexWorkspace({ root: repo, workspaceKey: 'cache-hydrate-b' });
+    const queries = new V2QueryService(db);
+
+    expect(first.filesParsed).toBeGreaterThan(0);
+    expect(second.parseCacheHits).toBeGreaterThan(0);
+    expect(second.filesParsed).toBe(0);
+    expect(second.skippedUnchanged).toBe(false);
+
+    const search = await queries.query({
+      workspaceId: second.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'PaymentService', limit: 5 },
+    }) as { symbols: Array<{ name: string }> };
+    expect(search.symbols.some(symbol => symbol.name === 'PaymentService')).toBe(true);
+
+    const callers = await queries.query({
+      workspaceId: second.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'PaymentGateway.processPayment' },
+    }) as { callers: Array<{ caller: string; resolution_kind: string }> };
+    expect(callers.callers).toContainEqual(expect.objectContaining({
+      caller: 'PaymentService.submit',
+      resolution_kind: 'receiver-field',
+    }));
+  });
+
   it('imports SCIP provider facts and scopes parse cache by provider metadata', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-scip-provider-');
@@ -2698,6 +2864,8 @@ async function resetDb(db: CodeGraphDb): Promise<void> {
       field_usages,
       call_edges,
       dependency_edges,
+      graph_edges,
+      graph_nodes,
       annotations,
       endpoints,
       beans,

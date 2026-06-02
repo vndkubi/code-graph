@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS snapshot_stats (
   call_edges_low_signal INTEGER NOT NULL DEFAULT 0,
   call_edges_provider INTEGER NOT NULL DEFAULT 0,
   dependency_edges INTEGER NOT NULL DEFAULT 0,
+  graph_nodes INTEGER NOT NULL DEFAULT 0,
+  graph_edges INTEGER NOT NULL DEFAULT 0,
   endpoints INTEGER NOT NULL DEFAULT 0,
   beans INTEGER NOT NULL DEFAULT 0,
   endpoint_path_unresolved INTEGER NOT NULL DEFAULT 0,
@@ -90,6 +92,8 @@ ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS endpoint_warnings_json TEXT;
 ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS top_unresolved_imports_json TEXT;
 ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS top_unresolved_calls_json TEXT;
 ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS field_usages INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS graph_nodes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE snapshot_stats ADD COLUMN IF NOT EXISTS graph_edges INTEGER NOT NULL DEFAULT 0;
 
 DO $$
 DECLARE
@@ -204,6 +208,34 @@ CREATE TABLE IF NOT EXISTS dependency_edges (
   resolution_kind TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS graph_nodes (
+  snapshot_id TEXT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+  node_id TEXT NOT NULL,
+  node_type TEXT NOT NULL,
+  label TEXT NOT NULL,
+  file TEXT,
+  line INTEGER,
+  role TEXT,
+  language TEXT,
+  file_role TEXT,
+  parent_node_id TEXT,
+  stats_json TEXT NOT NULL DEFAULT '{}',
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  PRIMARY KEY (snapshot_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS graph_edges (
+  id BIGSERIAL PRIMARY KEY,
+  snapshot_id TEXT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+  from_node_id TEXT NOT NULL,
+  to_node_id TEXT NOT NULL,
+  edge_type TEXT NOT NULL,
+  confidence DOUBLE PRECISION NOT NULL,
+  edge_count INTEGER NOT NULL DEFAULT 1,
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  UNIQUE (snapshot_id, from_node_id, to_node_id, edge_type)
+);
+
 CREATE TABLE IF NOT EXISTS annotations (
   id BIGSERIAL PRIMARY KEY,
   snapshot_id TEXT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
@@ -275,6 +307,11 @@ CREATE INDEX IF NOT EXISTS idx_call_edges_file ON call_edges(snapshot_id, file);
 CREATE INDEX IF NOT EXISTS idx_call_edges_signal_file ON call_edges(snapshot_id, signal_tier, file);
 CREATE INDEX IF NOT EXISTS idx_dependency_from ON dependency_edges(snapshot_id, from_file);
 CREATE INDEX IF NOT EXISTS idx_dependency_to ON dependency_edges(snapshot_id, to_file);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_type ON graph_nodes(snapshot_id, node_type);
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_file ON graph_nodes(snapshot_id, file);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_from ON graph_edges(snapshot_id, from_node_id);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_to ON graph_edges(snapshot_id, to_node_id);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_type ON graph_edges(snapshot_id, edge_type);
 CREATE INDEX IF NOT EXISTS idx_annotations_annotation ON annotations(snapshot_id, annotation);
 CREATE INDEX IF NOT EXISTS idx_endpoints_path ON endpoints(snapshot_id, method, path);
 CREATE INDEX IF NOT EXISTS idx_beans_type ON beans(snapshot_id, bean_type);

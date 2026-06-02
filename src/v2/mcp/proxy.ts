@@ -18,20 +18,30 @@ export interface RunMcpProxyOptions {
   scipIndexPath?: string;
 }
 
+type RegisteredWorkspace = Awaited<ReturnType<DaemonClient['registerWorkspace']>>;
+
 export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
-  const daemon = await DaemonClient.ensure(options.homeDir);
   const providerOptions = {
     indexProviders: options.indexProviders,
     scipIndexPath: options.scipIndexPath,
   };
   const registerOptions = { watch: options.watch === true, ...providerOptions };
-  let workspace = await daemon.registerWorkspace(options.root, options.workspaceKey, registerOptions);
-  if (options.prewarm !== false && !workspace.currentSnapshotId) {
-    await daemon.refreshWorkspace(workspace.root, options.workspaceKey, providerOptions);
-    workspace = await daemon.registerWorkspace(workspace.root, options.workspaceKey, registerOptions);
-  } else if (options.refreshOnStart) {
-    await daemon.refreshWorkspace(workspace.root, options.workspaceKey, { background: true, ...providerOptions });
-  }
+  let runtimePromise: Promise<{ daemon: DaemonClient; workspace: RegisteredWorkspace }> | undefined;
+  const runtime = async (): Promise<{ daemon: DaemonClient; workspace: RegisteredWorkspace }> => {
+    runtimePromise ??= initializeRuntime();
+    return runtimePromise;
+  };
+  const initializeRuntime = async (): Promise<{ daemon: DaemonClient; workspace: RegisteredWorkspace }> => {
+    const daemon = await DaemonClient.ensure(options.homeDir);
+    let workspace = await daemon.registerWorkspace(options.root, options.workspaceKey, registerOptions);
+    if (options.prewarm !== false && !workspace.currentSnapshotId) {
+      await daemon.refreshWorkspace(workspace.root, options.workspaceKey, providerOptions);
+      workspace = await daemon.registerWorkspace(workspace.root, options.workspaceKey, registerOptions);
+    } else if (options.refreshOnStart) {
+      await daemon.refreshWorkspace(workspace.root, options.workspaceKey, { background: true, ...providerOptions });
+    }
+    return { daemon, workspace };
+  };
 
   const allowedTools = parseToolAllowlist(options.toolAllowlist ?? process.env.CODEGRAPH_MCP_TOOLS);
   const exposedTools = allowedTools
@@ -64,6 +74,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
       if (options.warnStale !== true && args.warnStale === undefined) {
         args.warnStale = false;
       }
+      const { daemon, workspace } = await runtime();
       const result = await daemon.query(workspace.workspaceId, request.params.name, args);
       return {
         content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
@@ -78,6 +89,11 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  if (options.refreshOnStart) {
+    void runtime().catch(error => {
+      process.stderr.write(`[codegraph] MCP background refresh startup failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+  }
 }
 
 const MCP_SERVER_INSTRUCTIONS = `# CodeGraph usage

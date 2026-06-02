@@ -140,6 +140,15 @@ interface ServiceCandidate {
   };
 }
 
+interface OverlayModuleEdgeRow {
+  from_node_id: string;
+  to_node_id: string;
+  edge_type: string;
+  confidence: number | string;
+  edge_count: number | string;
+  evidence_json?: string;
+}
+
 interface NodeCandidate {
   node: GraphNode;
   score: number;
@@ -251,9 +260,14 @@ export async function buildGraphExport(db: CodeGraphDb, options: GraphExportOpti
     .filter(edge => includedFiles.has(edge.from_file) && includedFiles.has(edge.to_file));
   const filteredCallEdges = callEdges
     .filter(edge => includedFiles.has(edge.file));
+  const overlay = await loadOverlayForGraphExport(db, options.snapshotId);
   const fileDegree = fileDegreeMap(filteredDependencyEdges, filteredCallEdges);
-  const services = inferServices(options.root, files, symbols, endpoints);
-  const fileServiceIds = assignFilesToServices(files, services);
+  const services = overlay.services.size > 0
+    ? overlay.services
+    : inferServices(options.root, files, symbols, endpoints);
+  const fileServiceIds = overlay.fileServiceIds.size > 0
+    ? overlay.fileServiceIds
+    : assignFilesToServices(files, services);
   const symbolServiceIds = new Map(symbols.map(symbol => [symbol.fq_name, fileServiceIds.get(symbol.file) ?? defaultServiceId(options.root)]));
   const endpointServiceIds = new Map(endpoints.map(endpoint => [endpointKey(endpoint), fileServiceIds.get(endpoint.file) ?? defaultServiceId(options.root)]));
   for (const serviceId of symbolServiceIds.values()) {
@@ -374,6 +388,7 @@ export async function buildGraphExport(db: CodeGraphDb, options: GraphExportOpti
     endpoints,
     dependencyEdges: filteredDependencyEdges,
     callEdges: filteredCallEdges,
+    overlayModuleEdges: overlay.moduleEdges,
     fileServiceIds,
     symbolIndex,
   });
@@ -2629,6 +2644,7 @@ function buildEdgeCandidates(input: {
   endpoints: EndpointRow[];
   dependencyEdges: DependencyEdgeRow[];
   callEdges: CallEdgeRow[];
+  overlayModuleEdges: OverlayModuleEdgeRow[];
   fileServiceIds: Map<string, string>;
   symbolIndex: Map<string, SymbolRow>;
 }): EdgeCandidate[] {
@@ -2713,11 +2729,76 @@ function buildEdgeCandidates(input: {
     }, 1400 + numberValue(edge.confidence) * 100);
   }
 
-  for (const aggregate of crossServiceEdges(input)) {
+  const aggregateEdges = input.overlayModuleEdges.length > 0
+    ? overlayCrossServiceEdges(input.overlayModuleEdges)
+    : crossServiceEdges(input);
+  for (const aggregate of aggregateEdges) {
     addEdge(aggregate.edge, aggregate.score);
   }
 
   return dedupeEdges(edgeCandidates);
+}
+
+async function loadOverlayForGraphExport(db: CodeGraphDb, snapshotId: string): Promise<{
+  services: Map<string, ServiceCandidate>;
+  fileServiceIds: Map<string, string>;
+  moduleEdges: OverlayModuleEdgeRow[];
+}> {
+  const [moduleRows, fileRows, moduleEdges] = await Promise.all([
+    db.prepare(`
+      SELECT node_id, label, stats_json, evidence_json
+      FROM graph_nodes
+      WHERE snapshot_id = ? AND node_type = 'module'
+      ORDER BY label
+    `).all(snapshotId) as Promise<Array<{ node_id: string; label: string; stats_json?: string; evidence_json?: string }>>,
+    db.prepare(`
+      SELECT file, parent_node_id
+      FROM graph_nodes
+      WHERE snapshot_id = ? AND node_type = 'file' AND file IS NOT NULL AND parent_node_id IS NOT NULL
+    `).all(snapshotId) as Promise<Array<{ file: string; parent_node_id: string }>>,
+    db.prepare(`
+      SELECT from_node_id, to_node_id, edge_type, confidence, edge_count, evidence_json
+      FROM graph_edges
+      WHERE snapshot_id = ? AND edge_type LIKE 'module_%'
+      ORDER BY edge_count DESC, confidence DESC
+      LIMIT 5000
+    `).all(snapshotId) as Promise<OverlayModuleEdgeRow[]>,
+  ]);
+  const services = new Map<string, ServiceCandidate>();
+  for (const row of moduleRows) {
+    const stats = parseJsonObject(row.stats_json);
+    services.set(row.node_id, {
+      id: row.node_id,
+      label: row.label,
+      evidence: new Set(parseJsonArray(row.evidence_json).map(item => String(item.reason ?? item.rootPrefix ?? '')).filter(Boolean)),
+      stats: {
+        files: Number(stats.files ?? 0),
+        symbols: Number(stats.symbols ?? 0),
+        endpoints: Number(stats.endpoints ?? 0),
+      },
+    });
+  }
+  const fileServiceIds = new Map(fileRows.map(row => [row.file, row.parent_node_id]));
+  return { services, fileServiceIds, moduleEdges };
+}
+
+function overlayCrossServiceEdges(rows: OverlayModuleEdgeRow[]): EdgeCandidate[] {
+  return rows.map(row => ({
+    edge: {
+      id: `cross-service:${row.from_node_id}:${row.to_node_id}:${row.edge_type}`,
+      kind: 'cross_service',
+      from: row.from_node_id,
+      to: row.to_node_id,
+      confidence: numberValue(row.confidence),
+      label: `${numberValue(row.edge_count)} ${row.edge_type.replace(/^module_/, '').replace(/_/g, ' ')}`,
+      meta: {
+        edgeType: row.edge_type,
+        edgeCount: numberValue(row.edge_count),
+        evidence: parseJsonArray(row.evidence_json).slice(0, 4),
+      },
+    },
+    score: 7200 + numberValue(row.edge_count),
+  }));
 }
 
 function crossServiceEdges(input: {
@@ -3098,6 +3179,26 @@ function callGraphName(symbol: string): string {
 function numberValue(value: number | string | undefined): number {
   const parsed = Number(value ?? 0);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function parseJsonObject(value: string | undefined): Record<string, unknown> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseJsonArray(value: string | undefined): Array<Record<string, unknown>> {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>> : [];
+  } catch {
+    return [];
+  }
 }
 
 function clampInt(value: number, min: number, max: number): number {

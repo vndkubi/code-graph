@@ -5,6 +5,7 @@ import { V2Indexer, type IndexWorkspaceOptions } from '../index/indexer.js';
 import { roleRank, type FileRole } from '../index/file-role.js';
 import { scanManifest } from '../index/manifest.js';
 import { getGitDirtyFiles, getGitFreshnessInfo } from '../git.js';
+import { architectureContextForFiles, dependencyTraceDiagnostics } from '../graph/overlay.js';
 
 export interface QueryEnvelope {
   workspaceId: string;
@@ -1178,6 +1179,9 @@ export class V2QueryService {
     const transitiveFiles = [...visited].filter(file => !seedFiles.includes(file));
     const dependencies = edges.filter(edge => seedFiles.includes(edge.fromFile) || direction === 'dependencies');
     const dependents = edges.filter(edge => seedFiles.includes(edge.toFile) || direction === 'dependents');
+    const graphDiagnostics = edges.length === 0
+      ? await dependencyTraceDiagnostics(this.db, snapshotId, seedFiles, 12)
+      : undefined;
 
     return {
       target,
@@ -1195,6 +1199,7 @@ export class V2QueryService {
       ]).slice(0, 50),
       impactedEndpoints: await this.impactedEndpoints(snapshotId, [...seedFiles, ...transitiveFiles]),
       cycleHints,
+      graphDiagnostics,
       truncated: edges.length >= limit,
       filters: filters.effective,
       confidence: seedFiles.length > 0 ? 0.75 : 0.35,
@@ -1386,6 +1391,13 @@ export class V2QueryService {
       testsCount: tests.length,
       riskFlags,
     });
+    const architectureContext = await architectureContextForFiles(
+      this.db,
+      snapshotId,
+      impactedFiles,
+      [...requestedSymbols, ...requestedFiles].join(' '),
+      Math.min(limit, 20),
+    );
 
     return {
       inputs: {
@@ -1414,6 +1426,7 @@ export class V2QueryService {
         calleeCount: callees.length,
       },
       fieldImpact,
+      architectureContext,
       impactedFiles,
       impactedEndpoints,
       testsLikelyRelevant: tests,
@@ -1601,6 +1614,7 @@ export class V2QueryService {
     const lineMapping = await this.patchLineMappings(snapshotId, hunks);
     const changedFiles = stringArray(impact.changedFiles);
     const fieldImpact = isPlainObject(impact.fieldImpact) ? impact.fieldImpact : undefined;
+    const architectureContext = isPlainObject(impact.architectureContext) ? impact.architectureContext : undefined;
     const tests = arrayRecords(impact.testsLikelyRelevant);
     const validation = isPlainObject(impact.validation) ? impact.validation : {};
     const riskFlags = arrayRecords(impact.riskFlags);
@@ -1642,6 +1656,7 @@ export class V2QueryService {
       impactSummary: impact.summary,
       changedFiles,
       fieldImpact: fieldImpact ? compactReviewObject(fieldImpact, budget.maxEvidencePerFinding, 2) : undefined,
+      architectureContext: architectureContext ? compactReviewObject(architectureContext, budget.maxEvidencePerFinding, 2) : undefined,
       diffStats,
       reviewPlan: reviewPlanForPatch(diffStats, findings, impact),
       seededRiskCategories: seededRiskCategoriesForReview(focus, findings, riskFlags, diffStats),
@@ -2081,6 +2096,7 @@ export class V2QueryService {
       evidenceSlices,
       definitions: returnedDefinitions,
     });
+    const architectureContext = await architectureContextForFiles(this.db, snapshotId, returnedTopFiles, target, packProfileValue(profile, 6, 8, 10));
 
     return {
       target,
@@ -2102,6 +2118,7 @@ export class V2QueryService {
       topFiles: returnedTopFiles,
       evidenceSlices: slimEvidenceSlicesForPack(evidenceSlices, profile),
       compressedEvidence,
+      architectureContext,
       taskOracle: slimTaskOracleForPack(taskOracle, profile),
       completeness: {
         sufficientForAnswer,
@@ -2141,6 +2158,7 @@ export class V2QueryService {
           callees: returnedCallees,
           impactedEndpoints: returnedEndpoints,
           topFiles: returnedTopFiles,
+          architectureContext,
           compressedEvidence,
         })),
       },
@@ -2803,6 +2821,11 @@ export class V2QueryService {
         why: 'Open this exact range before editing.',
       }))
       .filter(range => range.file || range.symbol);
+    const patchArchitectureContext = patchImpact && isPlainObject(patchImpact.architectureContext)
+      ? patchImpact.architectureContext
+      : undefined;
+    const architectureContext = patchArchitectureContext
+      ?? await architectureContextForFiles(this.db, snapshotId, topFiles, task, packProfileValue(profile, 6, 8, 10));
 
     return {
       task,
@@ -2828,6 +2851,7 @@ export class V2QueryService {
       taskOracle: slimTaskOracleForPack(taskOracle, profile),
       patchImpact: patchImpact ? compactReviewObject(patchImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined,
       fieldImpact: fieldImpact ? compactReviewObject(fieldImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined,
+      architectureContext: architectureContext ? compactReviewObject(architectureContext, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined,
       topFiles,
       nextAction: editRanges.length > 0
         ? 'Call get_file_slice once with routing.firstToolCall.args, then make the smallest scoped edit.'
@@ -3108,6 +3132,8 @@ export class V2QueryService {
       callEdgesLowSignal,
       callEdgesProvider,
       dependencyEdges,
+      graphNodes,
+      graphEdges,
       endpoints,
       beans,
     ] = await Promise.all([
@@ -3120,6 +3146,8 @@ export class V2QueryService {
       scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'low_signal'", snapshotId),
       scalar(this.db, "SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'provider'", snapshotId),
       scalar(this.db, 'SELECT COUNT(*) FROM dependency_edges WHERE snapshot_id = ?', snapshotId),
+      scalar(this.db, 'SELECT COUNT(*) FROM graph_nodes WHERE snapshot_id = ?', snapshotId),
+      scalar(this.db, 'SELECT COUNT(*) FROM graph_edges WHERE snapshot_id = ?', snapshotId),
       scalar(this.db, 'SELECT COUNT(*) FROM endpoints WHERE snapshot_id = ?', snapshotId),
       scalar(this.db, 'SELECT COUNT(*) FROM beans WHERE snapshot_id = ?', snapshotId),
     ]);
@@ -3134,6 +3162,8 @@ export class V2QueryService {
       callEdgesLowSignal,
       callEdgesProvider,
       dependencyEdges,
+      graphNodes,
+      graphEdges,
       endpoints,
       beans,
     };
@@ -3822,6 +3852,8 @@ interface IndexCountSummary {
   callEdgesLowSignal: number;
   callEdgesProvider: number;
   dependencyEdges: number;
+  graphNodes: number;
+  graphEdges: number;
   endpoints: number;
   beans: number;
 }
@@ -3836,6 +3868,8 @@ interface SnapshotStatsRow {
   call_edges_low_signal: number | string;
   call_edges_provider: number | string;
   dependency_edges: number | string;
+  graph_nodes: number | string;
+  graph_edges: number | string;
   endpoints: number | string;
   beans: number | string;
   endpoint_path_unresolved: number | string;
@@ -7176,6 +7210,8 @@ function countsFromSnapshotStats(row: SnapshotStatsRow): IndexCountSummary {
     callEdgesLowSignal: Number(row.call_edges_low_signal ?? 0),
     callEdgesProvider: Number(row.call_edges_provider ?? 0),
     dependencyEdges: Number(row.dependency_edges ?? 0),
+    graphNodes: Number(row.graph_nodes ?? 0),
+    graphEdges: Number(row.graph_edges ?? 0),
     endpoints: Number(row.endpoints ?? 0),
     beans: Number(row.beans ?? 0),
   };

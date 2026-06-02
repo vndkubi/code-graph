@@ -15,6 +15,7 @@ import { runIndexBenchmark } from './v2/benchmark/run.js';
 import { loadGoldenEvalTasks, runGoldenEval } from './v2/benchmark/golden-eval.js';
 import { deriveContextProofTasks, loadContextProofTasks, runContextProofEval } from './v2/benchmark/context-proof.js';
 import { deriveReviewProofTasks, loadReviewProofTasks, runReviewProofEval } from './v2/benchmark/review-proof.js';
+import { runCodexE2eBenchmark, type CodexBenchmarkMode } from './v2/benchmark/codex-e2e.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 
 interface ParsedArgs {
@@ -130,8 +131,27 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     case 'copilot-e2e':
       runCopilotE2eBenchmark(parsed);
       return;
+    case 'codex-e2e':
+      console.log(JSON.stringify(await runCodexE2eBenchmark({
+        suitePath: getFlag(parsed, 'suite') ?? getFlag(parsed, 'tasks'),
+        root: getFlag(parsed, 'root'),
+        homeDir: getFlag(parsed, 'home'),
+        workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
+        databaseUrl: getFlag(parsed, 'database-url') ?? process.env.CODEGRAPH_DATABASE_URL,
+        runDir: getFlag(parsed, 'run-dir'),
+        models: splitCsv(getFlag(parsed, 'models')),
+        modes: splitCodexModes(getFlag(parsed, 'modes')),
+        taskIds: splitCsv(getFlag(parsed, 'task-ids') ?? getFlag(parsed, 'task')),
+        parseWorkers: getNumberFlag(parsed, 'parse-workers'),
+        codexCommand: getFlag(parsed, 'codex-command'),
+        codexCommandArgs: splitCsv(getFlag(parsed, 'codex-command-args')),
+        timeoutSeconds: getNumberFlag(parsed, 'codex-timeout-seconds'),
+        skipIndex: parsed.flags.get('no-index') === true,
+        dryRun: parsed.flags.get('dry-run') === true,
+      }), null, 2));
+      return;
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|copilot-e2e');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|copilot-e2e|codex-e2e');
   }
 }
 
@@ -359,6 +379,24 @@ function getNumberFlag(args: ParsedArgs, name: string): number | undefined {
   return value ? Number(value) : undefined;
 }
 
+function splitCsv(value: string | undefined): string[] | undefined {
+  if (!value) return undefined;
+  const parts = value.split(',').map(part => part.trim()).filter(Boolean);
+  return parts.length ? parts : undefined;
+}
+
+function splitCodexModes(value: string | undefined): CodexBenchmarkMode[] | undefined {
+  const parts = splitCsv(value);
+  if (!parts) return undefined;
+  const allowed = new Set<CodexBenchmarkMode>(['baseline', 'mcp-first', 'mcp-only']);
+  for (const part of parts) {
+    if (!allowed.has(part as CodexBenchmarkMode)) {
+      throw new Error(`Unknown Codex benchmark mode: ${part}. Use baseline,mcp-first,mcp-only.`);
+    }
+  }
+  return parts as CodexBenchmarkMode[];
+}
+
 function indexProvidersFlag(args: ParsedArgs): string | undefined {
   return getFlag(args, 'index-providers') ?? process.env.CODEGRAPH_INDEX_PROVIDERS;
 }
@@ -387,7 +425,7 @@ Usage:
                                              Export a self-contained static HTML graph viewer
   codegraph doctor                       Inspect local configuration
   codegraph logs --tail <number>         Print recent daemon query/index events
-  codegraph benchmark generate|index|eval|proof|review|copilot-e2e
+  codegraph benchmark generate|index|eval|proof|review|copilot-e2e|codex-e2e
                                              Generate synthetic repos, measure indexing, run evals, or prove context/review savings
 
 Options:
@@ -417,8 +455,14 @@ Options:
   --mcp-tools <a,b,c>                    Comma-separated MCP tool allowlist; also CODEGRAPH_MCP_TOOLS
   --models <a,b,c>                       Copilot E2E model list for benchmark copilot-e2e
   --modes <codegraph,baseline>           Copilot E2E comparison modes
-  --task-ids <a,b,c>                     Copilot E2E task ids
-  --dry-run                              Print benchmark plan without running Copilot
+  --modes <baseline,mcp-first,mcp-only>  Codex E2E comparison modes
+  --task-ids <a,b,c>                     Copilot/Codex E2E task ids
+  --run-dir <path>                       Output directory for E2E benchmark artifacts
+  --database-url <url>                   Postgres URL for isolated benchmark runs
+  --codex-command <path>                 Codex CLI executable for benchmark codex-e2e
+  --codex-command-args <a,b>             Args before "exec", e.g. "-y,@openai/codex" for npx.cmd
+  --codex-timeout-seconds <number>       Timeout per Codex task run
+  --dry-run                              Print benchmark plan without running Copilot/Codex
 `);
 }
 

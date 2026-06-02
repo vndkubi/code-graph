@@ -53,8 +53,9 @@ flowchart LR
 | Daemon | Owns workspace registration, optional file watching, refresh orchestration, and query routing. |
 | Indexer | Builds full snapshots, performs incremental path refreshes, writes graph facts, and updates snapshot stats. |
 | Parser workers | Parse source files with tree-sitter and emit parse results, context shards, and COPY-ready fact shards. |
+| Graph overlay builder | Materializes lightweight module, file, endpoint, and symbol graph rows from completed snapshot facts. |
 | Query service | Implements MCP tool behavior from indexed data and returns bounded agent-ready packets. |
-| Postgres | Stores workspaces, snapshots, parse cache, files, symbols, imports, type refs, field usages, call edges, endpoints, beans, inheritance, dependency edges, and stats. |
+| Postgres | Stores workspaces, snapshots, parse cache, files, symbols, imports, type refs, field usages, call edges, endpoints, beans, inheritance, dependency edges, graph overlay rows, and stats. |
 
 ## Runtime Modes
 
@@ -72,7 +73,9 @@ This command opens Postgres, registers the workspace, creates an indexing snapsh
 node dist/cli.js mcp --root "<project>" --workspace-key "<project-key>"
 ```
 
-The MCP server is a stdio process launched by a client such as Codex CLI, VS Code, GitHub Copilot, or another MCP client. It starts or connects to the daemon, registers the workspace, and serves tools.
+The MCP server is a stdio process launched by a client such as Codex CLI, VS Code, GitHub Copilot, or another MCP client. It exposes tool schemas and completes the stdio handshake before doing daemon or workspace work. The daemon connection and workspace registration are initialized lazily on the first tool call so large repositories do not make MCP startup look like a tool-discovery failure.
+
+For benchmark runs, the Codex E2E runner configures the MCP process with `--no-prewarm`. Indexing is measured as a separate phase, and agent runs do not silently start a full index inside a tool call.
 
 ### Watch And Auto Refresh
 
@@ -140,7 +143,8 @@ sequenceDiagram
   IDX->>SH: build call resolution context from context shards
   IDX->>SH: resolve raw calls into final call_edges
   IDX->>DB: COPY parse_cache and fact shards
-  IDX->>DB: rebuild dependency_edges, indexes, and snapshot_stats
+  IDX->>DB: rebuild dependency_edges and graph overlay
+  IDX->>DB: rebuild indexes and snapshot_stats
   IDX->>DB: mark snapshot complete and set current_snapshot_id
 ```
 
@@ -177,6 +181,29 @@ Workers parse files once and emit COPY-ready shard files:
 - raw call facts
 
 This avoids keeping all parse results as large in-memory arrays in the main process.
+
+### Persistent Architecture Graph Overlay
+
+When `CODEGRAPH_ENABLE_GRAPH_OVERLAY=1` is set, CodeGraph rebuilds `graph_nodes` and `graph_edges` after the full facts are written for the completed snapshot. This overlay is derived data, not a replacement for `symbols`, `call_edges`, `dependency_edges`, `field_usages`, or `endpoints`.
+
+Overlay nodes include:
+
+- Workspace nodes.
+- Module or service nodes inferred from build markers, Spring app roots, endpoint roots, and fallback directory roots.
+- File nodes for indexed files.
+- Important symbol nodes and endpoint nodes.
+
+Overlay edges include:
+
+- Workspace-to-module containment.
+- Module-to-file containment.
+- File-to-symbol and file-to-endpoint definitions.
+- Endpoint-to-handler links.
+- Cross-module aggregate edges from dependency edges, primary/provider call edges, endpoints, and field usages.
+
+The overlay stores bounded evidence samples on aggregate edges instead of duplicating every raw call or reference row. Pack tools use it to add architecture context, bridge modules, and blast-radius summaries without repeatedly scanning large fact tables. For sharded full indexing, cross-file call aggregates are collected while streaming resolved raw call shards, avoiding a post-index scan over the full `call_edges` table. Incremental refresh rebuilds the overlay for the completed snapshot after path-delta facts are copied and refreshed when the overlay flag is enabled.
+
+The overlay is currently opt-in because Hadoop benchmarking showed the full call-edge aggregate can exceed the performance gate on a very large repository. When overlay rows are absent, query tools and graph export keep their existing behavior and fall back to direct fact-table inference.
 
 ### Call Resolution
 
@@ -296,6 +323,8 @@ Core tables:
 | `field_usages` | Opt-in Java field read/write/init facts. |
 | `call_edges` | Caller/callee graph, confidence, resolution kind, and signal tier. |
 | `dependency_edges` | File-level dependencies. |
+| `graph_nodes` | Snapshot-scoped architecture overlay nodes for workspace, modules, files, endpoints, and key symbols. |
+| `graph_edges` | Snapshot-scoped architecture overlay edges with bounded evidence samples. |
 | `endpoints` | Framework endpoints such as REST handlers. |
 | `annotations` | Symbol annotations. |
 | `beans` | Framework bean/interface implementation facts. |
@@ -371,6 +400,7 @@ Important environment variables:
 | `CODEGRAPH_HOME` | Daemon metadata and log directory. |
 | `CODEGRAPH_WORKSPACE_KEY` | Stable workspace key. |
 | `CODEGRAPH_ENABLE_FIELD_USAGES` | Enables opt-in Java field usage indexing. |
+| `CODEGRAPH_ENABLE_GRAPH_OVERLAY` | Enables opt-in persistent architecture overlay rows. |
 | `CODEGRAPH_AUTO_REFRESH` | Enables auto-refresh for MCP. |
 | `CODEGRAPH_WATCH` | Enables watch mode for MCP. |
 | `CODEGRAPH_QUERY_FRESHNESS_CACHE_MS` | Optional cache for query freshness checks. |

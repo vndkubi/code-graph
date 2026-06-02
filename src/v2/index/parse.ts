@@ -56,6 +56,7 @@ export interface ParseContextItem {
   parseStatus: 'ok' | 'error';
   fields: Array<[string, string]>;
   methods: string[];
+  methodFiles?: Array<[string, string]>;
   implementations: Array<[string, string]>;
 }
 
@@ -514,13 +515,16 @@ export function* readParseContextItemsJsonl(filePath: string): Iterable<ParseCon
 export function parseContextForResult(key: string, result: ParseResult): ParseContextItem {
   const fields: Array<[string, string]> = [];
   const methods: string[] = [];
+  const methodFiles: Array<[string, string]> = [];
   const implementations: Array<[string, string]> = [];
   for (const sym of result.symbols) {
     if (sym.kind === 'field' && sym.returnType) {
       fields.push([sym.name, sym.returnType]);
     }
     if (sym.kind === 'method' && sym.parent) {
-      methods.push(`${sym.parent}.${sym.name}`);
+      const method = `${sym.parent}.${sym.name}`;
+      methods.push(method);
+      methodFiles.push([method, key]);
     }
     if ((sym.kind === 'class' || sym.kind === 'interface') && sym.implements?.length) {
       const child = simpleTypeName(symbolFqName(sym).replace(/\([^)]*\)$/, ''));
@@ -534,6 +538,7 @@ export function parseContextForResult(key: string, result: ParseResult): ParseCo
     parseStatus: result.hasParseErrors ? 'error' : 'ok',
     fields,
     methods,
+    methodFiles,
     implementations,
   };
 }

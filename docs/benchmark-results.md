@@ -41,6 +41,112 @@ Main conclusion:
 
 The benchmark used a copied Hadoop checkout instead of the clean main Hadoop checkout. Treat these numbers as a local workflow benchmark, not a canonical clean-repository index benchmark.
 
+## Reproducible Codex E2E Runner
+
+The repository includes a tracked Hadoop task suite at `examples/codex-e2e-quality-suite.example.json` and a CLI runner:
+
+```powershell
+node dist/cli.js benchmark codex-e2e `
+  --suite examples/codex-e2e-quality-suite.example.json `
+  --root "<hadoop-project>" `
+  --workspace-key hadoop-project `
+  --run-dir ".tmp/codex-e2e-hadoop" `
+  --modes baseline,mcp-first,mcp-only `
+  --models gpt-5.4-mini `
+  --parse-workers 8
+```
+
+Runner behavior:
+
+- `baseline`: tells Codex not to use CodeGraph MCP and allows shell/search/read.
+- `mcp-first`: tells Codex to use CodeGraph MCP first and shell only when evidence is missing.
+- `mcp-only`: tells Codex to use CodeGraph MCP only, which isolates MCP answer quality.
+- Captures cold index result, index progress events, raw Codex JSONL, stderr, wall time, MCP calls, shell calls, token usage, final output, and heuristic quality score.
+- Reads actual Codex `usage` events when present and falls back to `ceil(chars / 4)` estimates only when usage is missing.
+
+On the current Windows machine, `codex.exe` was discovered under WindowsApps but returned `Access denied`. The working path is to invoke the published CLI through `npx` via `cmd.exe`, which avoids the WindowsApps policy wrapper.
+
+WindowsApps workaround:
+
+```powershell
+node dist/cli.js benchmark codex-e2e `
+  --suite examples/codex-e2e-quality-suite.example.json `
+  --root "<hadoop-project>" `
+  --workspace-key hadoop-project `
+  --run-dir ".tmp/codex-e2e-hadoop" `
+  --modes baseline,mcp-first,mcp-only `
+  --models gpt-5.4-mini `
+  --codex-command cmd.exe `
+  --codex-command-args "/d,/c,npx.cmd,-y,@openai/codex" `
+  --parse-workers 8
+```
+
+This bypass was smoke-tested with `npx.cmd -y @openai/codex exec --json ... "Return exactly OK."`; Codex returned `OK` and actual usage fields.
+
+The runner now injects CodeGraph MCP config through Codex `--config` overrides, sends the prompt through stdin, and configures the benchmark MCP server with `--no-prewarm`. That keeps indexing as a separate benchmark phase: if a snapshot is missing during `--no-index`, the agent phase fails fast instead of silently starting a full index inside a tool call.
+
+## Architecture Overlay Experiment
+
+A Repowise-inspired persistent architecture overlay was implemented behind `CODEGRAPH_ENABLE_GRAPH_OVERLAY=1`. The overlay materializes `graph_nodes` and `graph_edges` from completed snapshot facts and lets pack tools add optional architecture context.
+
+The first Hadoop overlay benchmark did not meet the performance gate:
+
+| Run | Result |
+| --- | --- |
+| Default overlay attempt | Timed out after `25m`; Postgres was still aggregating `call_edges` to `symbols`. |
+| Deduped aggregate attempt | Timed out after `35m`; Postgres was still grouping primary/provider call edges. |
+
+Decision:
+
+- Do not enable the overlay by default.
+- Keep `CODEGRAPH_ENABLE_GRAPH_OVERLAY=1` as an opt-in experiment.
+- Query tools and graph export fall back to existing behavior when overlay rows are absent.
+- The next optimization was implemented: sharded full indexing now records file-pair call aggregates while streaming resolved raw call shards, and the overlay builder uses those small aggregates instead of scanning persisted `call_edges`.
+- `CODEGRAPH_GRAPH_OVERLAY_DB_CALL_AGGREGATE=1` can still force the old DB aggregate for experiments, but it is not the default.
+
+Follow-up measurement note:
+
+- The post-fix overlay benchmark must use an isolated database to stay truly cold. A warm retry on the previous benchmark DB hit a separate parse-cache fallback memory limit before reaching overlay because the aborted run had already populated `parse_cache`.
+
+Post-fix measurement on the Hadoop project:
+
+| Run | Result |
+| --- | ---: |
+| Sharded full with streaming call aggregates, cold-ish parse cache misses | `17m04s` total; overlay phase `17.1s`; `45,719` graph nodes; `47,967` graph edges |
+| Sharded full from parse cache hits, overlay enabled, full bulk index rebuild disabled to avoid local lock contention | `6m03s` total; overlay phase `13.0s`; `45,719` graph nodes; `47,984` graph edges |
+
+The overlay phase is no longer the `25m+` bottleneck. It remains opt-in until a clean cold run also meets the default full-index gate.
+
+## Full-Mode MCP And Codex Smoke
+
+The original failure mode for Codex full-mode testing was not just model time. The MCP proxy performed daemon startup and workspace prewarm before the stdio handshake, so Codex could fail to see tools or time out while a large repository started indexing. The MCP proxy now handshakes immediately and initializes the daemon/workspace lazily on the first tool call.
+
+Warm full snapshot rebuild used for the smoke test:
+
+| Metric | Value |
+| --- | ---: |
+| Total index time | `6m03s` |
+| Files total | `14,082` |
+| Files parsed | `0` |
+| Parse cache hits | `14,082` |
+| Parse-cache hydrate | `69.6s` |
+| Call edge resolution | `11.2s` |
+| Fact COPY | `203.5s` |
+| Call edge COPY | `97.1s` |
+| Symbols COPY | `76.5s` |
+| Call search index rebuild | `26.9s` |
+| Dependency rebuild | `6.3s` |
+| Graph overlay rebuild | `13.0s` |
+| Call edges | `1,186,425` |
+
+Codex MCP-only smoke after the lazy MCP startup fix:
+
+| Task | Mode | Time | Input tokens | Cached input | Output tokens | Reasoning tokens | MCP calls | Shell calls | Quality |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `api-flow-yarn-apps` | MCP-only | `119.1s` | `212,452` | `172,160` | `5,205` | `2,435` | `5` | `0` | `90.9%` |
+
+Tools used: `get_flow_pack`, `explain_endpoint`, `get_callees` twice, and `find_tests_for`. The answer identified `RMWebServices.getApps`, `ApplicationsRequestBuilder`, `AppsCacheKey`, `LRUCache`, `DeSelectFields`, likely tests, and the `applicationTags` query parameter. The only expected heuristic miss was `withApplicationTags`.
+
 ## Index Benchmark
 
 Command shape:

@@ -9,10 +9,12 @@ import { getGitInfo, type GitInfo } from '../git.js';
 import { sha256Json, stableId } from '../hash.js';
 import { scanManifest, scanManifestPaths, type ManifestFile, type ManifestPreviousFile } from './manifest.js';
 import {
+  parseContextForResult,
   parseFilesBatchToSpool,
   readParseContextItemsJsonl,
   readParseWorkResultsJsonl,
   symbolFqName,
+  writeFactShardResult,
   type ParseContextItem,
   type ParseSpool,
   type ParseWorkItem,
@@ -20,12 +22,19 @@ import {
 import { roleRank } from './file-role.js';
 import { buildIndexProviderSet, type IndexProviderSet } from './providers.js';
 import {
+  addFactShardStats,
   createCopyTextWriter,
+  factShardPathsForWorker,
+  openFactShardWriter,
   readRawCallFacts,
   type FactShardPaths,
   type FactShardStats,
   type RawCallFact,
 } from './fact-shards.js';
+import {
+  rebuildGraphOverlay as rebuildGraphOverlaySnapshot,
+  type GraphOverlayCallFileEdge,
+} from '../graph/overlay.js';
 
 export interface IndexWorkspaceOptions {
   root: string;
@@ -190,6 +199,7 @@ interface ResolvedCallShard {
   rows: number;
   rawRows: number;
   implementationRows: number;
+  callFileEdges: GraphOverlayCallFileEdge[];
 }
 
 interface DedupedParseCacheShard {
@@ -203,6 +213,7 @@ interface CallResolutionContext {
   fieldsByFile: Map<string, Map<string, string>>;
   implementationsByInterface: Map<string, string[]>;
   methodOwners: Set<string>;
+  methodFiles: Map<string, string>;
   insertedImplementationEdges: Set<string>;
 }
 
@@ -241,6 +252,7 @@ interface BulkLoadIndexSpec {
 
 const MAX_QUERY_BATCH_PARAMS = 10_000;
 const MAX_WRITE_BATCH_PARAMS = boundedInt(process.env.CODEGRAPH_WRITE_BATCH_PARAMS, 50_000, 1_000, 60_000);
+const PARSE_CACHE_HYDRATE_BATCH_SIZE = boundedInt(process.env.CODEGRAPH_PARSE_CACHE_HYDRATE_BATCH_SIZE, 100, 10, 1_000);
 const WRITE_FILE_BATCH_SIZE = boundedInt(process.env.CODEGRAPH_WRITE_FILE_BATCH_SIZE, 1_500, 100, 2_000);
 const COPY_INSERT_MIN_ROWS = boundedInt(process.env.CODEGRAPH_COPY_MIN_ROWS, 1_000, 100, 50_000);
 const STREAMING_FULL_INDEX_MIN_FILES = boundedInt(process.env.CODEGRAPH_STREAMING_FULL_INDEX_MIN_FILES, 1, 0, 1_000_000);
@@ -791,6 +803,7 @@ export class V2Indexer {
         elapsedMs: Date.now() - start,
         details: { phaseElapsedMs: Date.now() - dependencyRebuildStart },
       });
+      await this.rebuildGraphOverlay(snapshotId, options.progress, start);
       if (!options.skipSnapshotStats) {
         await this.refreshSnapshotStats(snapshotId);
       }
@@ -975,6 +988,8 @@ export class V2Indexer {
         call_edges_low_signal,
         call_edges_provider,
         dependency_edges,
+        graph_nodes,
+        graph_edges,
         endpoints,
         beans,
         endpoint_path_unresolved,
@@ -996,6 +1011,8 @@ export class V2Indexer {
         (SELECT COUNT(*)::integer FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'low_signal'),
         (SELECT COUNT(*)::integer FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'provider'),
         (SELECT COUNT(*)::integer FROM dependency_edges WHERE snapshot_id = ?),
+        (SELECT COUNT(*)::integer FROM graph_nodes WHERE snapshot_id = ?),
+        (SELECT COUNT(*)::integer FROM graph_edges WHERE snapshot_id = ?),
         (SELECT COUNT(*)::integer FROM endpoints WHERE snapshot_id = ?),
         (SELECT COUNT(*)::integer FROM beans WHERE snapshot_id = ?),
         (SELECT COUNT(*)::integer FROM endpoints WHERE snapshot_id = ? AND path_resolution != 'exact'),
@@ -1112,6 +1129,8 @@ export class V2Indexer {
         call_edges_low_signal = excluded.call_edges_low_signal,
         call_edges_provider = excluded.call_edges_provider,
         dependency_edges = excluded.dependency_edges,
+        graph_nodes = excluded.graph_nodes,
+        graph_edges = excluded.graph_edges,
         endpoints = excluded.endpoints,
         beans = excluded.beans,
         endpoint_path_unresolved = excluded.endpoint_path_unresolved,
@@ -1142,8 +1161,50 @@ export class V2Indexer {
       snapshotId,
       snapshotId,
       snapshotId,
+      snapshotId,
+      snapshotId,
       now,
     );
+  }
+
+  private async rebuildGraphOverlay(
+    snapshotId: string,
+    progress: IndexWorkspaceOptions['progress'],
+    start: number,
+    details: Record<string, string | number | boolean | undefined> = {},
+    callFileEdges?: GraphOverlayCallFileEdge[],
+  ): Promise<void> {
+    if (!shouldBuildGraphOverlay()) {
+      progress?.({
+        phase: 'edges',
+        status: 'skipped',
+        message: 'graph overlay disabled',
+        elapsedMs: Date.now() - start,
+        details: { ...details, graphOverlayEnabled: false },
+      });
+      return;
+    }
+    const overlayStart = Date.now();
+    progress?.({
+      phase: 'edges',
+      status: 'start',
+      message: 'rebuilding graph overlay',
+      elapsedMs: Date.now() - start,
+      details,
+    });
+    const stats = await rebuildGraphOverlaySnapshot(this.db, snapshotId, { callFileEdges });
+    progress?.({
+      phase: 'edges',
+      status: 'complete',
+      message: 'graph overlay rebuilt',
+      elapsedMs: Date.now() - start,
+      details: {
+        ...details,
+        phaseElapsedMs: Date.now() - overlayStart,
+        graphNodes: stats.nodes,
+        graphEdges: stats.edges,
+      },
+    });
   }
 
   private async analyzeQueryTables(progress: IndexWorkspaceOptions['progress'], start: number): Promise<void> {
@@ -1461,24 +1522,17 @@ export class V2Indexer {
       if (cacheHits.has(file.blobHash)) parseCacheHits++;
     }
 
-    if (parseCacheHits > 0) {
-      progress?.({
-        phase: 'parse-cache',
-        status: 'fallback',
-        message: 'sharded full index skipped because parse cache hits require provider merge fallback',
-        current: parseCacheHits,
-        total: files.length,
-        elapsedMs: Date.now() - indexStart,
-        details: { parseCacheHits, phaseElapsedMs: Date.now() - start, sharded: false },
-      });
-      return undefined;
-    }
-
     const cacheInsertBlobHashes = new Set<string>();
-    const workItems: ParseWorkItem[] = parseableFiles.map(file => {
+    const cacheHitFiles: ManifestFile[] = [];
+    const workItems: ParseWorkItem[] = [];
+    for (const file of parseableFiles) {
+      if (cacheHits.has(file.blobHash)) {
+        cacheHitFiles.push(file);
+        continue;
+      }
       const cacheInsert = !cacheInsertBlobHashes.has(file.blobHash);
       cacheInsertBlobHashes.add(file.blobHash);
-      return {
+      workItems.push({
         key: file.relPath,
         absPath: file.absPath,
         rootDir: root,
@@ -1487,8 +1541,8 @@ export class V2Indexer {
         language: file.language,
         role: file.role,
         cacheInsert,
-      };
-    });
+      });
+    }
     progress?.({
       phase: 'parse-cache',
       status: 'complete',
@@ -1518,6 +1572,18 @@ export class V2Indexer {
         details: { workers: event.workers, phaseElapsedMs: event.elapsedMs, sharded: true },
       }),
     });
+    if (cacheHitFiles.length > 0) {
+      await this.appendCachedParseFactsToSpool({
+        root,
+        snapshotId,
+        now,
+        providerSet,
+        files: cacheHitFiles,
+        spool,
+        indexStart,
+        progress,
+      });
+    }
 
     return {
       spool,
@@ -1552,6 +1618,100 @@ export class V2Indexer {
       for (const row of rows) cached.add(row.blob_hash);
     }
     return cached;
+  }
+
+  private async appendCachedParseFactsToSpool(args: {
+    root: string;
+    snapshotId: string;
+    now: string;
+    providerSet: IndexProviderSet;
+    files: ManifestFile[];
+    spool: ParseSpool;
+    indexStart: number;
+    progress?: (event: IndexProgressEvent) => void;
+  }): Promise<void> {
+    const start = Date.now();
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cache-facts-'));
+    const contextPath = path.join(tempDir, 'cached.context.json');
+    const factPaths = factShardPathsForWorker(tempDir, 0);
+    const factStatsPath = path.join(tempDir, 'cached.fact.stats.json');
+    const contextFd = fs.openSync(contextPath, 'w');
+    const factWriter = openFactShardWriter(factPaths);
+    let completed = 0;
+    let lastProgressAt = 0;
+    let failed = false;
+    try {
+      const filesByBlob = new Map<string, ManifestFile[]>();
+      for (const file of args.files) {
+        const files = filesByBlob.get(file.blobHash) ?? [];
+        files.push(file);
+        filesByBlob.set(file.blobHash, files);
+      }
+      for (const blobHashBatch of chunkArray([...filesByBlob.keys()], PARSE_CACHE_HYDRATE_BATCH_SIZE)) {
+        const placeholders = blobHashBatch.map(() => '?').join(', ');
+        const rows = await this.db.prepare(`
+          SELECT blob_hash, parse_json
+          FROM parse_cache
+          WHERE provider_id = ?
+            AND provider_version = ?
+            AND blob_hash IN (${placeholders})
+        `).all(args.providerSet.id, args.providerSet.version, ...blobHashBatch) as ParseCacheRow[];
+        const parseJsonByBlob = new Map(rows.map(row => [row.blob_hash, row.parse_json]));
+        for (const blobHash of blobHashBatch) {
+          const parseJson = parseJsonByBlob.get(blobHash);
+          if (!parseJson) throw new Error(`Missing parse_cache row for cached blob ${blobHash}.`);
+          const result = JSON.parse(parseJson) as ParseResult;
+          for (const file of filesByBlob.get(blobHash) ?? []) {
+            fs.writeSync(contextFd, `${JSON.stringify(parseContextForResult(file.relPath, result))}\n`);
+            writeFactShardResult(factWriter, {
+              snapshotId: args.snapshotId,
+              providerId: args.providerSet.id,
+              providerVersion: args.providerSet.version,
+              createdAt: args.now,
+            }, {
+              key: file.relPath,
+              absPath: file.absPath,
+              rootDir: args.root,
+              size: file.size,
+              blobHash: file.blobHash,
+              language: file.language,
+              role: file.role,
+              cacheInsert: false,
+            }, result);
+            completed++;
+          }
+        }
+        lastProgressAt = reportProgressEvery(args.progress, lastProgressAt, {
+          phase: 'parse-cache',
+          status: completed === args.files.length ? 'complete' : 'progress',
+          message: 'hydrating cached parse facts',
+          current: completed,
+          total: args.files.length,
+          elapsedMs: Date.now() - args.indexStart,
+          details: { phaseElapsedMs: Date.now() - start, sharded: true, cacheHydrate: true },
+        });
+      }
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      fs.closeSync(contextFd);
+      factWriter.close();
+      if (!failed) fs.writeFileSync(factStatsPath, JSON.stringify(factWriter.stats));
+      if (failed) fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+
+    args.spool.contextShardPaths.push(contextPath);
+    args.spool.factShardPaths.push(factPaths);
+    args.spool.factStatsPaths.push(factStatsPath);
+    args.spool.factStatsByShard.push(factWriter.stats);
+    addFactShardStats(args.spool.factStats, factWriter.stats);
+    args.spool.resultCount += args.files.length;
+    const previousClose = args.spool.close;
+    args.spool.close = () => {
+      previousClose();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    };
   }
 
   private async parseCacheByBlobHash(blobHashes: string[], providerSet: IndexProviderSet): Promise<Map<string, string>> {
@@ -1904,6 +2064,7 @@ export class V2Indexer {
           elapsedMs: Date.now() - args.start,
           details: { phaseElapsedMs: Date.now() - dependencyRebuildStart, sharded: true },
         });
+        await this.rebuildGraphOverlay(args.snapshotId, args.progress, args.start, { sharded: true }, resolvedCallShard?.callFileEdges);
 
         if (rebuildFullBulkIndexes) {
           const indexRebuildStart = Date.now();
@@ -2149,6 +2310,7 @@ export class V2Indexer {
         elapsedMs: Date.now() - args.start,
         details: { phaseElapsedMs: Date.now() - dependencyRebuildStart, streaming: true },
       });
+      await this.rebuildGraphOverlay(args.snapshotId, args.progress, args.start, { streaming: true });
       if (!args.skipSnapshotStats) {
         await this.refreshSnapshotStats(args.snapshotId);
       }
@@ -2342,6 +2504,7 @@ export class V2Indexer {
         elapsedMs: Date.now() - args.start,
         details: { phaseElapsedMs: Date.now() - dependencyRebuildStart },
       });
+      await this.rebuildGraphOverlay(args.snapshotId, args.progress, args.start);
 
       if (!args.skipSnapshotStats) {
         await this.refreshSnapshotStats(args.snapshotId);
@@ -2535,6 +2698,7 @@ export class V2Indexer {
     const writer = createCopyTextWriter(outputPath);
     let rawRows = 0;
     let implementationRows = 0;
+    const callFileAggregates = new Map<string, GraphOverlayCallFileEdge>();
     try {
       for (const shardPath of rawCallShardPaths) {
         for (const raw of readRawCallFacts(shardPath)) {
@@ -2550,6 +2714,14 @@ export class V2Indexer {
           };
           if (!shouldAttemptPreResolveRawCall(raw)) {
             writer.writeRawLine(raw.rawLine);
+            recordCallFileAggregate(
+              callFileAggregates,
+              context,
+              raw.file,
+              raw.callee,
+              raw.confidence,
+              raw.signalTier,
+            );
             continue;
           }
           const resolvedCall = preResolveCallEdge(
@@ -2572,8 +2744,24 @@ export class V2Indexer {
             raw.signalTier,
             raw.signalReasonsJson,
           ]);
+          recordCallFileAggregate(
+            callFileAggregates,
+            context,
+            raw.file,
+            resolvedCall?.callee ?? raw.callee,
+            resolvedCall?.confidence ?? raw.confidence,
+            raw.signalTier,
+          );
           for (const row of implementationCallRows) {
             writer.write(row);
+            recordCallFileAggregate(
+              callFileAggregates,
+              context,
+              String(row[3] ?? ''),
+              String(row[2] ?? ''),
+              Number(row[5] ?? 0),
+              row[8] as CallSignalTier,
+            );
             implementationRows++;
           }
         }
@@ -2586,6 +2774,7 @@ export class V2Indexer {
       rows: writer.rows,
       rawRows,
       implementationRows,
+      callFileEdges: [...callFileAggregates.values()],
     };
   }
 
@@ -3579,6 +3768,10 @@ function shouldUseParseCacheDedupCopy(): boolean {
   return envFlag(process.env.CODEGRAPH_ENABLE_PARSE_CACHE_DEDUP_COPY);
 }
 
+function shouldBuildGraphOverlay(): boolean {
+  return envFlag(process.env.CODEGRAPH_ENABLE_GRAPH_OVERLAY);
+}
+
 function parseCacheCopyLineKey(line: string): string {
   const first = line.indexOf('\t');
   const second = first >= 0 ? line.indexOf('\t', first + 1) : -1;
@@ -3712,6 +3905,37 @@ function rawCallInfo(raw: RawCallFact): { caller: string; callee: string; line: 
   };
 }
 
+function recordCallFileAggregate(
+  aggregates: Map<string, GraphOverlayCallFileEdge>,
+  context: CallResolutionContext,
+  fromFile: string,
+  callee: string,
+  confidence: number,
+  signalTier: CallSignalTier,
+): void {
+  if (!fromFile || !callee || !['primary', 'provider'].includes(signalTier)) return;
+  const targetFile = context.methodFiles.get(callee)
+    ?? context.methodFiles.get(stripCallParams(callee));
+  if (!targetFile || targetFile === fromFile) return;
+  const key = `${fromFile}\0${targetFile}`;
+  const existing = aggregates.get(key);
+  if (existing) {
+    existing.edge_count++;
+    existing.confidence = Math.max(existing.confidence, confidence);
+    return;
+  }
+  aggregates.set(key, {
+    from_file: fromFile,
+    to_file: targetFile,
+    edge_count: 1,
+    confidence,
+  });
+}
+
+function stripCallParams(value: string): string {
+  return value.replace(/\([^)]*\)\s*$/, '');
+}
+
 function minimalManifestFile(relPath: string, role: string): ManifestFile {
   return {
     relPath,
@@ -3730,6 +3954,7 @@ function createCallResolutionContext(): CallResolutionContext {
     fieldsByFile: new Map(),
     implementationsByInterface: new Map(),
     methodOwners: new Set(),
+    methodFiles: new Map(),
     insertedImplementationEdges: new Set(),
   };
 }
@@ -3750,7 +3975,9 @@ function addParseResultToCallResolutionContext(
     }
 
     if (sym.kind === 'method' && sym.parent) {
-      context.methodOwners.add(`${sym.parent}.${sym.name}`);
+      const method = `${sym.parent}.${sym.name}`;
+      context.methodOwners.add(method);
+      if (!context.methodFiles.has(method)) context.methodFiles.set(method, file.relPath);
     }
 
     if ((sym.kind === 'class' || sym.kind === 'interface') && sym.implements?.length) {
@@ -3778,6 +4005,9 @@ function addParseContextItemToCallResolutionContext(
   }
   for (const method of item.methods) {
     context.methodOwners.add(method);
+  }
+  for (const [method, file] of item.methodFiles ?? []) {
+    if (!context.methodFiles.has(method)) context.methodFiles.set(method, file);
   }
   for (const [parent, child] of item.implementations) {
     const implementations = context.implementationsByInterface.get(parent) ?? [];

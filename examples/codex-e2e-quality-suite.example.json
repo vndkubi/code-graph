@@ -1,0 +1,77 @@
+{
+  "name": "hadoop-hard-task-suite",
+  "repoRoot": "<hadoop-project>",
+  "workspaceKey": "hadoop-project",
+  "tasks": [
+    {
+      "id": "api-flow-yarn-apps",
+      "type": "api-flow",
+      "prompt": "Trace the Hadoop YARN REST API GET /ws/v1/cluster/apps. Include handler, query parameters states/limit/applicationTags, request builder or service filtering, dependencies, and likely tests. Return compact JSON with keys task,keyFiles,methods,flow,dependencies,tests,risks,confidence.",
+      "expectedFiles": [
+        "RMWebServices.java",
+        "TestRMWebServices.java"
+      ],
+      "expectedMethods": [
+        "getApps",
+        "withApplicationTags"
+      ],
+      "expectedTerms": [
+        "applicationTags",
+        "/ws/v1/cluster/apps"
+      ],
+      "requiredAnswerFields": [
+        "task",
+        "keyFiles",
+        "methods",
+        "flow",
+        "tests"
+      ]
+    },
+    {
+      "id": "field-impact-blockreceiver-datanode",
+      "type": "investigation",
+      "prompt": "Investigate the impact of changing the Java field BlockReceiver.datanode. Where is it initialized, read, or used in methods/classes/flow? Include access kind when known, related calls/dependencies, review risks, and likely tests. Return compact JSON with keys task,field,definitions,usagesByMethod,flow,risks,tests,confidence.",
+      "expectedFiles": [
+        "BlockReceiver.java",
+        "DataNode.java"
+      ],
+      "expectedMethods": [
+        "getDataNode"
+      ],
+      "expectedTerms": [
+        "datanode",
+        "read",
+        "init"
+      ],
+      "requiredAnswerFields": [
+        "field",
+        "definitions",
+        "usagesByMethod",
+        "risks"
+      ]
+    },
+    {
+      "id": "review-application-tags-diff",
+      "type": "code-review",
+      "prompt": "Review this Hadoop patch for correctness and missing tests. Return compact JSON with keys status,topFindings,impactedFlow,tests,confidence. Cite repository-relative files.\n\ndiff --git a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java\n--- a/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java\n+++ b/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java\n@@\n-                    .withApplicationTags(applicationTags)\n+                    .withApplicationTags(java.util.Collections.emptySet())\n                     .build();",
+      "expectedFiles": [
+        "RMWebServices.java"
+      ],
+      "expectedMethods": [
+        "withApplicationTags",
+        "getApps"
+      ],
+      "expectedTerms": [
+        "applicationTags",
+        "GET /ws/v1/cluster/apps",
+        "missing test"
+      ],
+      "requiredAnswerFields": [
+        "status",
+        "topFindings",
+        "impactedFlow",
+        "tests"
+      ]
+    }
+  ]
+}
