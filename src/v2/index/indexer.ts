@@ -976,6 +976,95 @@ export class V2Indexer {
 
   private async refreshSnapshotStats(snapshotId: string): Promise<void> {
     const now = new Date().toISOString();
+    const count = (sql: string, ...params: unknown[]) => this.db.scalar(sql, ...params);
+    const [
+      files,
+      symbols,
+      imports,
+      fieldUsages,
+      callEdges,
+      callEdgesPrimary,
+      callEdgesLowSignal,
+      callEdgesProvider,
+      dependencyEdges,
+      graphNodes,
+      graphEdges,
+      endpoints,
+      beans,
+      endpointPathUnresolved,
+    ] = await Promise.all([
+      count('SELECT COUNT(*) FROM files WHERE snapshot_id = ?', snapshotId),
+      count('SELECT COUNT(*) FROM symbols WHERE snapshot_id = ?', snapshotId),
+      count('SELECT COUNT(*) FROM imports WHERE snapshot_id = ?', snapshotId),
+      count('SELECT COUNT(*) FROM field_usages WHERE snapshot_id = ?', snapshotId),
+      count('SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ?', snapshotId),
+      count("SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier IN ('primary', 'provider')", snapshotId),
+      count("SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'low_signal'", snapshotId),
+      count("SELECT COUNT(*) FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'provider'", snapshotId),
+      count('SELECT COUNT(*) FROM dependency_edges WHERE snapshot_id = ?', snapshotId),
+      count('SELECT COUNT(*) FROM graph_nodes WHERE snapshot_id = ?', snapshotId),
+      count('SELECT COUNT(*) FROM graph_edges WHERE snapshot_id = ?', snapshotId),
+      count('SELECT COUNT(*) FROM endpoints WHERE snapshot_id = ?', snapshotId),
+      count('SELECT COUNT(*) FROM beans WHERE snapshot_id = ?', snapshotId),
+      count("SELECT COUNT(*) FROM endpoints WHERE snapshot_id = ? AND path_resolution != 'exact'", snapshotId),
+    ]);
+    const fileRoles = await this.db.prepare(`
+      SELECT file_role, COUNT(*) AS count
+      FROM files
+      WHERE snapshot_id = ?
+      GROUP BY file_role
+      ORDER BY file_role
+    `).all(snapshotId) as Array<{ file_role: string; count: number | string }>;
+    const parseFailures = await this.db.prepare(`
+      SELECT path, language, parse_status
+      FROM files
+      WHERE snapshot_id = ? AND parse_status = 'error'
+      ORDER BY path
+      LIMIT 50
+    `).all(snapshotId) as Array<{ path: string; language?: string; parse_status: string }>;
+    const endpointWarnings = await this.db.prepare(`
+      SELECT method, path, path_resolution, path_resolution_reason, handler_symbol, file, line
+      FROM endpoints
+      WHERE snapshot_id = ? AND path_resolution != 'exact'
+      ORDER BY file, line
+      LIMIT 50
+    `).all(snapshotId) as Array<Record<string, unknown>>;
+    const importCounts = await this.db.prepare(`
+      SELECT source, COUNT(*) AS count
+      FROM imports
+      WHERE snapshot_id = ?
+        AND source NOT LIKE 'java.%'
+        AND source NOT LIKE 'javax.%'
+        AND source NOT LIKE 'jakarta.%'
+        AND source NOT LIKE 'org.springframework.%'
+        AND source NOT LIKE 'lombok.%'
+        AND source NOT LIKE 'org.junit.%'
+        AND source NOT LIKE 'org.mockito.%'
+        AND source NOT LIKE 'com.fasterxml.%'
+        AND source NOT LIKE 'org.slf4j.%'
+      GROUP BY source
+      ORDER BY count DESC, source
+      LIMIT 200
+    `).all(snapshotId) as Array<{ source: string; count: number | string }>;
+    const knownTypes = new Set((await this.db.prepare(`
+      SELECT fq_name, simple_name
+      FROM symbols
+      WHERE snapshot_id = ? AND kind IN ('class', 'interface', 'enum', 'type')
+    `).all(snapshotId) as Array<{ fq_name: string; simple_name: string }>)
+      .flatMap(row => [row.fq_name, row.simple_name]));
+    const topUnresolvedImports = importCounts
+      .filter(row => !knownTypes.has(row.source) && !knownTypes.has(simpleTypeName(row.source)))
+      .slice(0, 20)
+      .map(row => ({ source: row.source, count: Number(row.count) }));
+    const topUnresolvedCalls = await this.db.prepare(`
+      SELECT callee, COUNT(*) AS count, MAX(confidence) AS max_confidence
+      FROM call_edges
+      WHERE snapshot_id = ? AND resolution_kind = 'name-only' AND signal_tier IN ('primary', 'provider')
+      GROUP BY callee
+      ORDER BY count DESC, callee
+      LIMIT 20
+    `).all(snapshotId) as Array<{ callee: string; count: number | string; max_confidence: number | string }>;
+
     await this.db.prepare(`
       INSERT INTO snapshot_stats (
         snapshot_id,
@@ -1000,125 +1089,7 @@ export class V2Indexer {
         top_unresolved_calls_json,
         updated_at
       )
-      SELECT
-        ?,
-        (SELECT COUNT(*)::integer FROM files WHERE snapshot_id = ?),
-        (SELECT COUNT(*)::integer FROM symbols WHERE snapshot_id = ?),
-        (SELECT COUNT(*)::integer FROM imports WHERE snapshot_id = ?),
-        (SELECT COUNT(*)::integer FROM field_usages WHERE snapshot_id = ?),
-        (SELECT COUNT(*)::integer FROM call_edges WHERE snapshot_id = ?),
-        (SELECT COUNT(*)::integer FROM call_edges WHERE snapshot_id = ? AND signal_tier IN ('primary', 'provider')),
-        (SELECT COUNT(*)::integer FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'low_signal'),
-        (SELECT COUNT(*)::integer FROM call_edges WHERE snapshot_id = ? AND signal_tier = 'provider'),
-        (SELECT COUNT(*)::integer FROM dependency_edges WHERE snapshot_id = ?),
-        (SELECT COUNT(*)::integer FROM graph_nodes WHERE snapshot_id = ?),
-        (SELECT COUNT(*)::integer FROM graph_edges WHERE snapshot_id = ?),
-        (SELECT COUNT(*)::integer FROM endpoints WHERE snapshot_id = ?),
-        (SELECT COUNT(*)::integer FROM beans WHERE snapshot_id = ?),
-        (SELECT COUNT(*)::integer FROM endpoints WHERE snapshot_id = ? AND path_resolution != 'exact'),
-        COALESCE((
-          SELECT json_agg(json_build_object('file_role', file_role, 'count', count) ORDER BY file_role)::text
-          FROM (
-            SELECT file_role, COUNT(*)::integer AS count
-            FROM files
-            WHERE snapshot_id = ?
-            GROUP BY file_role
-          ) roles
-        ), '[]'),
-        COALESCE((
-          SELECT json_agg(json_build_object(
-            'path', path,
-            'language', language,
-            'parse_status', parse_status
-          ) ORDER BY path)::text
-          FROM (
-            SELECT path, language, parse_status
-            FROM files
-            WHERE snapshot_id = ? AND parse_status = 'error'
-            ORDER BY path
-            LIMIT 50
-          ) parse_failures
-        ), '[]'),
-        COALESCE((
-          SELECT json_agg(json_build_object(
-            'method', method,
-            'path', path,
-            'path_resolution', path_resolution,
-            'path_resolution_reason', path_resolution_reason,
-            'handler_symbol', handler_symbol,
-            'file', file,
-            'line', line
-          ) ORDER BY file, line)::text
-          FROM (
-            SELECT method, path, path_resolution, path_resolution_reason, handler_symbol, file, line
-            FROM endpoints
-            WHERE snapshot_id = ? AND path_resolution != 'exact'
-            ORDER BY file, line
-            LIMIT 50
-          ) endpoint_warnings
-        ), '[]'),
-        COALESCE((
-          WITH import_counts AS (
-            SELECT source, substring(source FROM '[^.]+$') AS simple_name, COUNT(*)::integer AS count
-            FROM imports
-            WHERE snapshot_id = ?
-              AND source NOT LIKE 'java.%'
-              AND source NOT LIKE 'javax.%'
-              AND source NOT LIKE 'jakarta.%'
-              AND source NOT LIKE 'org.springframework.%'
-              AND source NOT LIKE 'lombok.%'
-              AND source NOT LIKE 'org.junit.%'
-              AND source NOT LIKE 'org.mockito.%'
-              AND source NOT LIKE 'com.fasterxml.%'
-              AND source NOT LIKE 'org.slf4j.%'
-            GROUP BY source
-          ),
-          ranked_import_counts AS (
-            SELECT source, simple_name, count
-            FROM import_counts
-            ORDER BY count DESC, source
-            LIMIT 200
-          )
-          SELECT json_agg(json_build_object('source', i.source, 'count', i.count) ORDER BY i.count DESC, i.source)::text
-          FROM (
-            SELECT source, count
-            FROM ranked_import_counts i
-            WHERE NOT EXISTS (
-              SELECT 1
-              FROM symbols s
-              WHERE s.snapshot_id = ?
-                AND s.kind IN ('class', 'interface', 'enum', 'type')
-                AND s.fq_name = i.source
-              LIMIT 1
-            )
-            AND NOT EXISTS (
-              SELECT 1
-              FROM symbols s
-              WHERE s.snapshot_id = ?
-                AND s.kind IN ('class', 'interface', 'enum', 'type')
-                AND s.simple_name = i.simple_name
-              LIMIT 1
-            )
-            ORDER BY count DESC, source
-            LIMIT 20
-          ) i
-        ), '[]'),
-        COALESCE((
-          SELECT json_agg(json_build_object(
-            'callee', callee,
-            'count', count,
-            'maxConfidence', max_confidence
-          ) ORDER BY count DESC, callee)::text
-          FROM (
-            SELECT callee, COUNT(*)::integer AS count, MAX(confidence) AS max_confidence
-            FROM call_edges
-            WHERE snapshot_id = ? AND resolution_kind = 'name-only' AND signal_tier IN ('primary', 'provider')
-            GROUP BY callee
-            ORDER BY count DESC, callee
-            LIMIT 20
-          ) unresolved_calls
-        ), '[]'),
-        ?
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(snapshot_id) DO UPDATE SET
         files = excluded.files,
         symbols = excluded.symbols,
@@ -1142,27 +1113,29 @@ export class V2Indexer {
         updated_at = excluded.updated_at
     `).run(
       snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
-      snapshotId,
+      files,
+      symbols,
+      imports,
+      fieldUsages,
+      callEdges,
+      callEdgesPrimary,
+      callEdgesLowSignal,
+      callEdgesProvider,
+      dependencyEdges,
+      graphNodes,
+      graphEdges,
+      endpoints,
+      beans,
+      endpointPathUnresolved,
+      JSON.stringify(fileRoles.map(row => ({ file_role: row.file_role, count: Number(row.count) }))),
+      JSON.stringify(parseFailures),
+      JSON.stringify(endpointWarnings),
+      JSON.stringify(topUnresolvedImports),
+      JSON.stringify(topUnresolvedCalls.map(row => ({
+        callee: row.callee,
+        count: Number(row.count),
+        maxConfidence: Number(row.max_confidence),
+      }))),
       now,
     );
   }
@@ -1203,6 +1176,7 @@ export class V2Indexer {
         phaseElapsedMs: Date.now() - overlayStart,
         graphNodes: stats.nodes,
         graphEdges: stats.edges,
+        fieldUsageEdgesIncluded: stats.fieldUsageEdgesIncluded,
       },
     });
   }
@@ -1211,7 +1185,7 @@ export class V2Indexer {
     progress?.({
       phase: 'analyze',
       status: 'start',
-      message: 'updating Postgres planner statistics',
+      message: 'updating SQLite planner statistics',
       current: 0,
       total: POST_INDEX_ANALYZE_TABLES.length,
       elapsedMs: Date.now() - start,
@@ -3014,13 +2988,13 @@ export class V2Indexer {
     if (files && files.size === 0) return;
     const fileFilter = files ? [...files] : undefined;
     const filePlaceholders = fileFilter?.map(() => '?').join(', ');
-    const rows = await this.db.prepare(`
+    const receiverCallPattern = /^(this[.])?[A-Za-z_$][A-Za-z0-9_$]*[.][A-Za-z_$][A-Za-z0-9_$]*$/;
+    const rows = (await this.db.prepare(`
       SELECT rowid AS row_id, caller, callee, file, line, file_role
       FROM call_edges
       WHERE snapshot_id = ?
         AND resolution_kind = 'name-only'
         AND signal_tier = 'primary'
-        AND callee ~ '^(this[.])?[A-Za-z_$][A-Za-z0-9_$]*[.][A-Za-z_$][A-Za-z0-9_$]*$'
       ${fileFilter ? `AND file IN (${filePlaceholders})` : ''}
     `).all(...(fileFilter ? [snapshotId, ...fileFilter] : [snapshotId])) as Array<{
       row_id: number;
@@ -3029,7 +3003,7 @@ export class V2Indexer {
       file: string;
       line: number;
       file_role: string;
-    }>;
+    }>).filter(row => receiverCallPattern.test(row.callee));
 
     const fieldsByFile = new Map<string, Map<string, string>>();
     const fields = await this.db.prepare(`
@@ -3124,45 +3098,33 @@ export class V2Indexer {
 
   private async updateCallEdges(rows: SqlValue[][]): Promise<void> {
     if (rows.length === 0) return;
-    const columns = ['row_id', 'callee', 'confidence', 'resolution_kind'];
-    const maxRows = Math.max(1, Math.floor(MAX_WRITE_BATCH_PARAMS / columns.length));
-    for (const batch of chunkArray(rows, maxRows)) {
-      const params: SqlValue[] = [];
-      const placeholders = batch.map(row => {
-        if (row.length !== columns.length) {
-          throw new Error(`Expected ${columns.length} values for call_edges update, received ${row.length}.`);
-        }
-        params.push(...row.map(value => value === undefined ? null : value));
-        return `(${columns.map(() => '?').join(', ')})`;
-      }).join(', ');
-      await this.db.prepare(`
-        UPDATE call_edges AS target
-        SET callee = updates.callee::text,
-            confidence = updates.confidence::double precision,
-            resolution_kind = updates.resolution_kind::text
-        FROM (VALUES ${placeholders}) AS updates(row_id, callee, confidence, resolution_kind)
-        WHERE target.id = updates.row_id::bigint
-      `).run(...params);
+    const update = this.db.prepare(`
+      UPDATE call_edges
+      SET callee = ?,
+          confidence = ?,
+          resolution_kind = ?
+      WHERE id = ?
+    `);
+    for (const row of rows) {
+      if (row.length !== 4) {
+        throw new Error(`Expected 4 values for call_edges update, received ${row.length}.`);
+      }
+      await update.run(row[1], row[2], row[3], row[0]);
     }
   }
 
   private async dropCallSearchIndexesForBulkLoad(): Promise<void> {
-    await this.db.prepare('SET LOCAL statement_timeout = 0').run();
     await this.db.prepare('DROP INDEX IF EXISTS idx_call_edges_caller_signal_trgm').run();
     await this.db.prepare('DROP INDEX IF EXISTS idx_call_edges_callee_signal_trgm').run();
   }
 
   private async dropFullBulkLoadIndexes(): Promise<void> {
-    await this.db.prepare('SET LOCAL statement_timeout = 0').run();
     for (const spec of FULL_BULK_LOAD_INDEXES) {
       await this.db.prepare(`DROP INDEX IF EXISTS ${spec.name}`).run();
     }
   }
 
   private async rebuildCallSearchIndexesAfterBulkLoad(): Promise<void> {
-    await this.db.prepare('SET LOCAL statement_timeout = 0').run();
-    await this.db.prepare(`SET LOCAL maintenance_work_mem = '${postgresMemorySetting(process.env.CODEGRAPH_INDEX_MAINTENANCE_WORK_MEM, '1GB')}'`).run();
-    await this.db.prepare(`SET LOCAL max_parallel_maintenance_workers = ${boundedInt(process.env.CODEGRAPH_MAX_PARALLEL_MAINTENANCE_WORKERS, 4, 0, 16)}`).run();
     await this.db.prepare(`
       CREATE INDEX IF NOT EXISTS idx_call_edges_caller_signal_trgm ON call_edges USING gin (caller gin_trgm_ops)
       WHERE signal_tier IN ('primary', 'provider')
@@ -3174,10 +3136,6 @@ export class V2Indexer {
   }
 
   private async rebuildFullBulkLoadIndexes(): Promise<void> {
-    await this.db.prepare('SET LOCAL statement_timeout = 0').run();
-    await this.db.prepare(`SET LOCAL maintenance_work_mem = '${postgresMemorySetting(process.env.CODEGRAPH_INDEX_MAINTENANCE_WORK_MEM, '1GB')}'`).run();
-    await this.db.prepare(`SET LOCAL max_parallel_maintenance_workers = ${boundedInt(process.env.CODEGRAPH_MAX_PARALLEL_MAINTENANCE_WORKERS, 4, 0, 16)}`).run();
-    await this.db.prepare('CREATE EXTENSION IF NOT EXISTS pg_trgm').run();
     for (const spec of FULL_BULK_LOAD_INDEXES) {
       await this.db.prepare(spec.createSql).run();
     }
@@ -3744,11 +3702,6 @@ function boundedInt(value: string | undefined, fallback: number, min: number, ma
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(parsed)));
-}
-
-function postgresMemorySetting(value: string | undefined, fallback: string): string {
-  const candidate = (value ?? fallback).trim();
-  return /^\d+\s*(?:B|kB|MB|GB|TB)?$/i.test(candidate) ? candidate : fallback;
 }
 
 function envFlag(value: string | undefined): boolean {

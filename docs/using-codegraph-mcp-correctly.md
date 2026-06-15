@@ -4,33 +4,47 @@ This guide explains how to get reliable answers from CodeGraph MCP during real c
 
 ## The Short Version
 
-Use CodeGraph MCP as the first source of repository context, then open exact source slices only when the graph packet says more evidence is needed.
+Do not use free-form `MCP-first` as the default for every task. For answerable
+investigation, review, and planning tasks, ask CodeGraph to compile one bounded
+evidence packet, then stop when the packet says it is answerable.
 
 ```text
-Use CodeGraph MCP first. Use shell only if CodeGraph evidence is missing.
+Use CodeGraph MCP compile_evidence first.
 Trace <target API/method/field/change>.
-Include handlers, service calls, callers/callees, dependencies, tests, and risks.
+Include handlers, service calls, callers/callees, dependencies, tests, and risks as a quality rubric.
+If answerable=true, do not search further; answer from the evidence ids.
 Cite repository-relative files and methods.
 ```
 
 For benchmark or audit runs, remove fallback:
 
 ```text
-Use CodeGraph MCP only. Do not use shell/read/write/edit.
+Use CodeGraph MCP compile_evidence only. Do not use shell/read/write/edit.
 Return evidence-backed JSON with keyFiles, keySymbols, flow, risks, tests, and confidence.
 ```
 
+Use shell or `rg` first for tiny repositories and broad tasks without a concrete
+anchor. Use CodeGraph when it is likely to replace several search/read turns.
+
 ## Before You Ask Questions
 
-Prewarm the repository once:
+Set up the repository once for the default MCP facade path:
+
+```powershell
+node dist/cli.js setup --root "<project>"
+```
+
+Run the MCP server with the same root:
+
+```powershell
+node dist/cli.js mcp --root "<project>"
+```
+
+Refresh the SQLite graph index when you need current callers, dependencies,
+freshness checks, or lower-level graph tools:
 
 ```powershell
 node dist/cli.js index --root "<project>" --workspace-key "<project-key>" --parse-workers 8
-```
-
-Run the MCP server with the same root and workspace key:
-
-```powershell
 node dist/cli.js mcp --root "<project>" --workspace-key "<project-key>"
 ```
 
@@ -74,6 +88,7 @@ You usually do not need to remember tool names. Ask for the task, and let the ag
 
 | Task | Best first tool | Why |
 | --- | --- | --- |
+| Answer-ready investigation, review, or planning | `compile_evidence` | Returns an answerability certificate, compact evidence ids, missing coverage, allowed exact follow-ups, and stop rules. |
 | API, RPC, handler, or method flow | `get_flow_pack` | Returns entry point, flow steps, callers/callees, tests, and risk hints. |
 | Broad investigation or architecture | `get_research_pack` | Finds ranked symbols, files, evidence slices, and follow-up hints. |
 | Implementation planning | `get_change_pack` | Produces target files, symbols, tests, edit plan, and validation hints. |
@@ -86,9 +101,10 @@ You usually do not need to remember tool names. Ask for the task, and let the ag
 Recommended pattern:
 
 ```text
-Use CodeGraph MCP. Start with the best pack tool for this task.
-Use granular tools only for missing facts or exact source slices.
-Do not open broad files until the pack identifies target files.
+Use CodeGraph MCP compile_evidence for this task.
+If answerable=true, answer from the packet and do not call more tools.
+If missing is non-empty, use only allowedFollowups from the packet.
+Do not open broad files or run broad shell search.
 ```
 
 ## Correct Workflows
@@ -183,7 +199,7 @@ CodeGraph queries read completed snapshots. That is good for consistency, but it
 | Large branch checkout | Run explicit `index --root ...` after checkout. |
 | Pull, rebase, generated-file burst | Run explicit `index --root ...` before relying on answers. |
 | Two branches at once | Use two worktrees or clones with different workspace keys. |
-| Docker `/workspace` mount | Always set a stable `CODEGRAPH_WORKSPACE_KEY`. |
+| Container `/workspace` mount | Always set a stable `CODEGRAPH_WORKSPACE_KEY`. |
 
 Good prompt after a checkout:
 
@@ -243,12 +259,12 @@ A weak answer usually has one of these problems:
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| Agent does not call MCP | Prompt did not require MCP, or MCP client is not configured | Ask for `get_index_stats`; check daemon logs. |
+| Agent does not call MCP | Prompt did not require MCP, or MCP client is not configured | Ask for `get_index_stats`; check `.codegraph/logs/query.jsonl`. |
 | Answer references old branch | Snapshot is stale | Run explicit `index --root ...` with the same workspace key. |
 | Field impact lacks read/write/init | Field usage indexing was not enabled before indexing | Re-index with `CODEGRAPH_ENABLE_FIELD_USAGES=1`. |
 | Too many tokens | Agent opened broad files or used large dependency output | Ask for one pack tool first and bounded `get_file_slice` calls only. |
 | Review answer is slower than shell | Agent used MCP and then unnecessary shell fallback | Use `MCP only` for review benchmarks, or require `review_patch` plus bounded slices. |
-| Docker repo has no files | Bind mount is wrong | Check `/workspace` in the container and rerun index. |
+| Container repo has no files | Bind mount is wrong | Check `/workspace` in the container and rerun index. |
 
 ## Copy-Paste Starters
 

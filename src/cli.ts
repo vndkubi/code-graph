@@ -6,17 +6,19 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openCodeGraphDb } from './v2/storage/database.js';
 import { V2Indexer, type IndexProgressEvent } from './v2/index/indexer.js';
-import { runDaemon } from './v2/daemon/server.js';
-import { DaemonClient, stopDaemon } from './v2/daemon/client.js';
+import { V2QueryService } from './v2/query/service.js';
 import { runMcpProxy } from './v2/mcp/proxy.js';
-import { getCodeGraphPaths } from './v2/paths.js';
+import { getWorkspacePaths } from './v2/paths.js';
 import { generateSyntheticJavaRepo } from './v2/benchmark/synthetic-java.js';
 import { runIndexBenchmark } from './v2/benchmark/run.js';
 import { loadGoldenEvalTasks, runGoldenEval } from './v2/benchmark/golden-eval.js';
 import { deriveContextProofTasks, loadContextProofTasks, runContextProofEval } from './v2/benchmark/context-proof.js';
+import { runLocalFallbackBenchmark } from './v2/benchmark/local-fallback.js';
 import { deriveReviewProofTasks, loadReviewProofTasks, runReviewProofEval } from './v2/benchmark/review-proof.js';
 import { runCodexE2eBenchmark, type CodexBenchmarkMode } from './v2/benchmark/codex-e2e.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
+import { buildLocalArtifactIndex, localArtifactStatus } from './v2/mcp/local-artifact.js';
+import { isWorkspaceIndexed } from './v2/storage/sqlite-backend.js';
 
 interface ParsedArgs {
   command: string[];
@@ -31,23 +33,26 @@ async function main(): Promise<void> {
     case 'mcp':
       await runMcpProxy({
         root: getFlag(parsed, 'root') ?? process.cwd(),
-        homeDir: getFlag(parsed, 'home'),
-        prewarm: parsed.flags.get('no-prewarm') !== true,
+        prewarm: parsed.flags.get('no-prewarm') === true
+          ? false
+          : parsed.flags.get('prewarm') === true || envFlag('CODEGRAPH_MCP_PREWARM') || undefined,
         refreshOnStart: parsed.flags.get('refresh-on-start') === true || envFlag('CODEGRAPH_REFRESH_ON_START'),
         workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
         autoRefresh: parsed.flags.get('auto-refresh') === true || envFlag('CODEGRAPH_AUTO_REFRESH'),
         watch: parsed.flags.get('watch') === true || envFlag('CODEGRAPH_WATCH'),
         warnStale: parsed.flags.get('warn-stale') === true || envFlag('CODEGRAPH_WARN_STALE'),
-        toolAllowlist: getFlag(parsed, 'mcp-tools') ?? process.env.CODEGRAPH_MCP_TOOLS,
         indexProviders: indexProvidersFlag(parsed),
         scipIndexPath: scipIndexFlag(parsed),
       });
       return;
-    case 'daemon':
-      await runDaemonCommand(subcommand, parsed);
+    case 'setup':
+      await runSetupCommand(parsed);
       return;
     case 'index':
       await runIndexCommand(parsed);
+      return;
+    case 'atlas':
+      await runAtlasCommand(parsed);
       return;
     case 'graph':
       await runGraphCommand(parsed);
@@ -81,7 +86,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     }
     case 'index': {
       const root = getFlag(parsed, 'root') ?? process.cwd();
-      console.log(JSON.stringify(await runIndexBenchmark(root, getFlag(parsed, 'home'), {
+      console.log(JSON.stringify(await runIndexBenchmark(root, {
         indexProviders: indexProvidersFlag(parsed),
         scipIndexPath: scipIndexFlag(parsed),
       }), null, 2));
@@ -89,7 +94,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     }
     case 'eval': {
       const root = getFlag(parsed, 'root') ?? process.cwd();
-      const { db } = await openCodeGraphDb(getFlag(parsed, 'home'));
+      const { db } = await openCodeGraphDb(root);
       try {
         const tasks = loadGoldenEvalTasks(getFlag(parsed, 'tasks'));
         console.log(JSON.stringify(await runGoldenEval(db, root, tasks), null, 2));
@@ -100,7 +105,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     }
     case 'proof': {
       const root = getFlag(parsed, 'root') ?? process.cwd();
-      const { db } = await openCodeGraphDb(getFlag(parsed, 'home'));
+      const { db } = await openCodeGraphDb(root);
       try {
         const tasks = shouldUseAutoTasks(parsed)
           ? deriveContextProofTasks(root, { limit: getNumberFlag(parsed, 'task-count') })
@@ -115,7 +120,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     }
     case 'review': {
       const root = getFlag(parsed, 'root') ?? process.cwd();
-      const { db } = await openCodeGraphDb(getFlag(parsed, 'home'));
+      const { db } = await openCodeGraphDb(root);
       try {
         const tasks = shouldUseAutoTasks(parsed)
           ? deriveReviewProofTasks(root, { limit: getNumberFlag(parsed, 'task-count') })
@@ -128,6 +133,14 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     }
+    case 'fallback': {
+      const root = getFlag(parsed, 'root') ?? process.cwd();
+      const tasks = shouldUseAutoTasks(parsed)
+        ? deriveContextProofTasks(root, { limit: getNumberFlag(parsed, 'task-count') })
+        : loadContextProofTasks(getFlag(parsed, 'tasks'));
+      console.log(JSON.stringify(await runLocalFallbackBenchmark(root, tasks), null, 2));
+      return;
+    }
     case 'copilot-e2e':
       runCopilotE2eBenchmark(parsed);
       return;
@@ -135,9 +148,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       console.log(JSON.stringify(await runCodexE2eBenchmark({
         suitePath: getFlag(parsed, 'suite') ?? getFlag(parsed, 'tasks'),
         root: getFlag(parsed, 'root'),
-        homeDir: getFlag(parsed, 'home'),
         workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
-        databaseUrl: getFlag(parsed, 'database-url') ?? process.env.CODEGRAPH_DATABASE_URL,
         runDir: getFlag(parsed, 'run-dir'),
         models: splitCsv(getFlag(parsed, 'models')),
         modes: splitCodexModes(getFlag(parsed, 'modes')),
@@ -151,7 +162,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }), null, 2));
       return;
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|copilot-e2e|codex-e2e');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|copilot-e2e|codex-e2e');
   }
 }
 
@@ -171,7 +182,6 @@ function runCopilotE2eBenchmark(parsed: ParsedArgs): void {
   appendPowerShellFlag(args, '-SuitePath', getFlag(parsed, 'suite') ?? getFlag(parsed, 'tasks'));
   appendPowerShellFlag(args, '-RunDir', getFlag(parsed, 'run-dir'));
   appendPowerShellFlag(args, '-CodeGraphRoot', getFlag(parsed, 'codegraph-root') ?? projectRootForCli());
-  appendPowerShellFlag(args, '-DatabaseUrl', getFlag(parsed, 'database-url'));
   appendPowerShellFlag(args, '-Models', getFlag(parsed, 'models'));
   appendPowerShellFlag(args, '-TaskIds', getFlag(parsed, 'task-ids') ?? getFlag(parsed, 'task'));
   appendPowerShellFlag(args, '-Modes', getFlag(parsed, 'modes'));
@@ -207,38 +217,56 @@ function projectRootForCli(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 }
 
-async function runDaemonCommand(subcommand: string | undefined, parsed: ParsedArgs): Promise<void> {
-  switch (subcommand) {
-    case 'run':
-      await runDaemon({
-        homeDir: getFlag(parsed, 'home'),
-        port: getNumberFlag(parsed, 'port'),
-      });
-      return;
-    case 'start':
-      await DaemonClient.ensure(getFlag(parsed, 'home'));
-      console.log('codegraph daemon is running');
-      return;
-    case 'stop':
-      console.log(await stopDaemon(getFlag(parsed, 'home')) ? 'codegraph daemon stopped' : 'codegraph daemon was not running');
-      return;
-    case 'status': {
-      const client = await DaemonClient.ensure(getFlag(parsed, 'home'));
-      console.log(JSON.stringify(await client.status(), null, 2));
-      return;
-    }
-    default:
-      throw new Error('Usage: codegraph daemon start|stop|status|run');
+async function runSetupCommand(parsed: ParsedArgs): Promise<void> {
+  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const { db, dbPath, paths } = await openCodeGraphDb(root);
+  const indexer = new V2Indexer(db);
+  const progress = parsed.flags.get('quiet') === true ? undefined : createIndexProgressReporter(dbPath);
+  try {
+    const index = await indexer.indexWorkspace({
+      root,
+      workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
+      parseWorkers: getNumberFlag(parsed, 'parse-workers'),
+      indexProviders: indexProvidersFlag(parsed),
+      scipIndexPath: scipIndexFlag(parsed),
+      progress,
+    });
+    const artifact = await buildLocalArtifactIndex(root, {
+      maxFiles: getNumberFlag(parsed, 'max-files'),
+      maxFileBytes: getNumberFlag(parsed, 'max-file-bytes'),
+      maxContentBytes: getNumberFlag(parsed, 'max-content-bytes'),
+    });
+    const state = {
+      backend: 'sqlite',
+      root: path.resolve(root),
+      dbPath,
+      graphDir: paths.graphDir,
+      setupAt: new Date().toISOString(),
+      index,
+      artifact,
+    };
+    fs.writeFileSync(paths.setupStatePath, JSON.stringify(state, null, 2), 'utf-8');
+    console.log(JSON.stringify({
+      ...index,
+      backend: 'sqlite',
+      dbPath,
+      graphDir: paths.graphDir,
+      setupStatePath: paths.setupStatePath,
+      artifactPath: artifact.artifactPath,
+      next: 'Point your MCP client at `codegraph mcp --root <workspace>`.',
+    }, null, 2));
+  } finally {
+    await db.close();
   }
 }
 
 async function runIndexCommand(parsed: ParsedArgs): Promise<void> {
   const root = getFlag(parsed, 'root') ?? process.cwd();
-  const { db, connectionString } = await openCodeGraphDb(getFlag(parsed, 'home'));
+  const { db, dbPath } = await openCodeGraphDb(root);
   const indexer = new V2Indexer(db);
   const progress = parsed.flags.get('quiet') === true
     ? undefined
-    : createIndexProgressReporter(connectionString);
+    : createIndexProgressReporter(dbPath);
   try {
     const result = await indexer.indexWorkspace({
       root,
@@ -250,7 +278,75 @@ async function runIndexCommand(parsed: ParsedArgs): Promise<void> {
       scipIndexPath: scipIndexFlag(parsed),
       progress,
     });
-    console.log(JSON.stringify({ ...result, backend: 'postgres', databaseUrl: redactDatabaseUrl(connectionString) }, null, 2));
+    console.log(JSON.stringify({ ...result, backend: 'sqlite', dbPath }, null, 2));
+  } finally {
+    await db.close();
+  }
+}
+
+async function runAtlasCommand(parsed: ParsedArgs): Promise<void> {
+  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const out = getFlag(parsed, 'out');
+  const format = getFlag(parsed, 'format') === 'markdown' ? 'markdown' : 'json';
+  const profile = getFlag(parsed, 'profile') ?? 'compact';
+  const workspaceKey = getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY;
+  const { db, dbPath } = await openCodeGraphDb(root);
+  const indexer = new V2Indexer(db);
+  const progress = parsed.flags.get('quiet') === true
+    ? undefined
+    : createIndexProgressReporter(dbPath);
+  try {
+    const snapshot = parsed.flags.get('no-index') === true
+      ? await resolveCurrentGraphSnapshot(db, root, workspaceKey)
+      : await indexer.indexWorkspace({
+        root,
+        workspaceKey,
+        parseWorkers: getNumberFlag(parsed, 'parse-workers'),
+        indexProviders: indexProvidersFlag(parsed),
+        scipIndexPath: scipIndexFlag(parsed),
+        progress,
+      });
+    if (!snapshot) {
+      throw new Error('No current CodeGraph snapshot found for this workspace. Run codegraph index --root <workspace>, or omit --no-index.');
+    }
+
+    const queries = new V2QueryService(db);
+    const report = await queries.query({
+      workspaceId: snapshot.workspaceId,
+      toolName: 'generate_repo_atlas',
+      args: {
+        format,
+        profile,
+        maxModules: getNumberFlag(parsed, 'max-modules'),
+        maxEntrypoints: getNumberFlag(parsed, 'max-entrypoints'),
+        maxHotspots: getNumberFlag(parsed, 'max-hotspots'),
+        includeTests: parsed.flags.get('no-tests') !== true,
+        includeGenerated: parsed.flags.get('include-generated') === true,
+        warnStale: parsed.flags.get('warn-stale') === true,
+      },
+    });
+    const content = format === 'markdown' && isCliRecord(report) && typeof report.markdown === 'string'
+      ? report.markdown
+      : JSON.stringify(report, null, 2);
+    if (!out) {
+      console.log(content);
+      return;
+    }
+    const outputPath = path.resolve(out);
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, content, 'utf-8');
+    const budget = isCliRecord(report) && isCliRecord(report.budget) ? report.budget : {};
+    console.log(JSON.stringify({
+      out: outputPath,
+      format,
+      profile,
+      workspaceId: snapshot.workspaceId,
+      snapshotId: snapshot.snapshotId,
+      estimatedResponseTokens: budget.estimatedResponseTokens,
+      queryTimeMs: budget.queryTimeMs,
+      backend: 'sqlite',
+      dbPath,
+    }, null, 2));
   } finally {
     await db.close();
   }
@@ -261,12 +357,12 @@ async function runGraphCommand(parsed: ParsedArgs): Promise<void> {
   const out = getFlag(parsed, 'out');
   if (!out) throw new Error('Usage: codegraph graph --root <workspace> --out <graph.html>');
 
-  const { db, connectionString } = await openCodeGraphDb(getFlag(parsed, 'home'));
+  const { db, dbPath } = await openCodeGraphDb(root);
   const indexer = new V2Indexer(db);
   const workspaceKey = getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY;
   const progress = parsed.flags.get('quiet') === true
     ? undefined
-    : createIndexProgressReporter(connectionString);
+    : createIndexProgressReporter(dbPath);
   try {
     const snapshot = parsed.flags.get('no-index') === true
       ? await resolveCurrentGraphSnapshot(db, root, workspaceKey)
@@ -305,8 +401,8 @@ async function runGraphCommand(parsed: ParsedArgs): Promise<void> {
       truncated: graph.metadata.truncated,
       hiddenNodes: graph.stats.hiddenNodes,
       hiddenEdges: graph.stats.hiddenEdges,
-      backend: 'postgres',
-      databaseUrl: redactDatabaseUrl(connectionString),
+      backend: 'sqlite',
+      dbPath,
     }, null, 2));
   } finally {
     await db.close();
@@ -314,32 +410,47 @@ async function runGraphCommand(parsed: ParsedArgs): Promise<void> {
 }
 
 async function runDoctorCommand(parsed: ParsedArgs): Promise<void> {
-  const paths = getCodeGraphPaths(getFlag(parsed, 'home'));
-  const databaseUrl = process.env.CODEGRAPH_DATABASE_URL ?? defaultPostgresUrl();
-  const daemon = DaemonClient.readInfo(getFlag(parsed, 'home'));
-  const client = daemon ? new DaemonClient(daemon) : undefined;
-  const daemonAlive = client ? await client.isAlive() : false;
-  const daemonStatus = daemonAlive && client ? await client.status().catch(() => undefined) : undefined;
+  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const paths = getWorkspacePaths(root);
+  const artifact = localArtifactStatus(root);
+  const indexed = isWorkspaceIndexed(root);
+  const dbExists = fs.existsSync(paths.dbPath);
+  let database: Record<string, unknown> = {
+    ok: indexed,
+    state: indexed ? 'ready' : dbExists ? 'unindexed' : 'missing',
+    dbPath: paths.dbPath,
+  };
+  if (dbExists) {
+    const { graph } = await openCodeGraphDb(root);
+    try {
+      database = {
+        ...database,
+        healthy: graph.isHealthy(),
+      };
+    } finally {
+      await graph.close();
+    }
+  }
   console.log(JSON.stringify({
-    homeDir: paths.homeDir,
-    backend: 'postgres',
-    databaseUrl: redactDatabaseUrl(databaseUrl),
-    daemonInfoPath: paths.daemonInfoPath,
-    daemonLogPath: paths.daemonLogPath,
-    daemonKnown: Boolean(daemon),
-    daemonAlive,
-    daemonStatus,
+    root: paths.root,
+    graphDir: paths.graphDir,
+    backend: 'sqlite',
+    artifact,
+    database,
+    setupStatePath: paths.setupStatePath,
+    queryLogPath: paths.queryLogPath,
   }, null, 2));
 }
 
 async function runLogsCommand(parsed: ParsedArgs): Promise<void> {
-  const paths = getCodeGraphPaths(getFlag(parsed, 'home'));
+  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const paths = getWorkspacePaths(root);
   const tail = Math.max(1, Math.min(getNumberFlag(parsed, 'tail') ?? 50, 1000));
-  if (!fs.existsSync(paths.daemonLogPath)) {
-    console.log(`No daemon log found at ${paths.daemonLogPath}`);
+  if (!fs.existsSync(paths.queryLogPath)) {
+    console.log(`No query log found at ${paths.queryLogPath}`);
     return;
   }
-  const lines = fs.readFileSync(paths.daemonLogPath, 'utf-8')
+  const lines = fs.readFileSync(paths.queryLogPath, 'utf-8')
     .split(/\r?\n/)
     .filter(Boolean)
     .slice(-tail);
@@ -379,6 +490,10 @@ function getNumberFlag(args: ParsedArgs, name: string): number | undefined {
   return value ? Number(value) : undefined;
 }
 
+function isCliRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
 function splitCsv(value: string | undefined): string[] | undefined {
   if (!value) return undefined;
   const parts = value.split(',').map(part => part.trim()).filter(Boolean);
@@ -388,10 +503,18 @@ function splitCsv(value: string | undefined): string[] | undefined {
 function splitCodexModes(value: string | undefined): CodexBenchmarkMode[] | undefined {
   const parts = splitCsv(value);
   if (!parts) return undefined;
-  const allowed = new Set<CodexBenchmarkMode>(['baseline', 'mcp-first', 'mcp-only']);
+  const allowed = new Set<CodexBenchmarkMode>([
+    'baseline',
+    'terse-no-mcp',
+    'mcp-first',
+    'mcp-only',
+    'compiled-packet',
+    'compiled-packet+gate',
+    'oracle-packet',
+  ]);
   for (const part of parts) {
     if (!allowed.has(part as CodexBenchmarkMode)) {
-      throw new Error(`Unknown Codex benchmark mode: ${part}. Use baseline,mcp-first,mcp-only.`);
+      throw new Error(`Unknown Codex benchmark mode: ${part}. Use baseline,terse-no-mcp,mcp-first,mcp-only,compiled-packet,compiled-packet+gate,oracle-packet.`);
     }
   }
   return parts as CodexBenchmarkMode[];
@@ -418,30 +541,39 @@ function printHelp(): void {
 codegraph
 
 Usage:
-  codegraph mcp --root <workspace>       Run MCP stdio proxy and auto-start daemon
-  codegraph daemon start|stop|status     Manage local daemon
-  codegraph index --root <workspace>     Prewarm persistent index
+  codegraph mcp --root <workspace>       Run MCP stdio proxy
+  codegraph setup --root <workspace>     Build .codegraph/graph.sqlite and local artifact index
+  codegraph index --root <workspace>     Build or refresh the SQLite graph index
+  codegraph atlas --root <workspace>     Generate deterministic repo atlas JSON/Markdown from indexed facts
   codegraph graph --root <workspace> --out <graph.html>
                                              Export a self-contained static HTML graph viewer
-  codegraph doctor                       Inspect local configuration
-  codegraph logs --tail <number>         Print recent daemon query/index events
-  codegraph benchmark generate|index|eval|proof|review|copilot-e2e|codex-e2e
+  codegraph doctor --root <workspace>    Inspect workspace graph configuration
+  codegraph logs --root <workspace> --tail <number>
+                                             Print recent workspace query events
+  codegraph benchmark generate|index|eval|proof|review|fallback|copilot-e2e|codex-e2e
                                              Generate synthetic repos, measure indexing, run evals, or prove context/review savings
 
 Options:
   --root <path>                          Workspace root
-  --home <path>                          Override CODEGRAPH_HOME
-  --port <number>                        Daemon port for daemon run
   --tasks <path>                         Golden eval task JSON file
   --tasks auto                           Derive proof/review tasks from indexed-looking source files
   --task-count <number>                  Number of auto-derived proof/review tasks
   --no-index                             Reuse the current proof/review/graph snapshot instead of refreshing first
   --out <path>                           Output path for graph HTML export
+  --format <json|markdown>               Atlas output format (default: json)
+  --profile <micro|compact|full>         Atlas or pack output profile (default: compact)
+  --max-modules <number>                 Maximum modules in atlas
+  --max-entrypoints <number>             Maximum endpoints in atlas
+  --max-hotspots <number>                Maximum change-risk hotspots in atlas
+  --no-tests                             Exclude test/mock files from atlas module and flow summaries
   --max-nodes <number>                   Maximum graph nodes for static export (default: 800)
   --max-edges <number>                   Maximum graph edges for static export (default: 2000)
   --include-tests                        Include test and mock files in graph export
   --include-generated                    Include generated files in graph export
   --parse-workers <number>               Worker threads for cold/cache-miss parsing during index
+  --max-files <number>                   Max files for setup artifact indexing
+  --max-file-bytes <number>              Max file size for setup artifact indexing
+  --max-content-bytes <number>           Max bytes read per file for setup artifact terms/symbols
   --index-providers <a,b>                Index providers: tree-sitter, scip
   --scip-index <path>                    SCIP JSON or .scip index path for the scip provider
   --no-incremental                       Force changed-file index runs through full snapshot rebuild
@@ -452,13 +584,13 @@ Options:
   --refresh-on-start                     Queue a workspace refresh when MCP starts, without blocking startup
   --watch                                Watch workspace files and queue background refreshes on changes
   --warn-stale                           Include freshness checks in MCP tool responses
-  --mcp-tools <a,b,c>                    Comma-separated MCP tool allowlist; also CODEGRAPH_MCP_TOOLS
+  --prewarm                             Index missing snapshots inside MCP startup/runtime. Off by default; prefer explicit index/setup.
   --models <a,b,c>                       Copilot E2E model list for benchmark copilot-e2e
   --modes <codegraph,baseline>           Copilot E2E comparison modes
-  --modes <baseline,mcp-first,mcp-only>  Codex E2E comparison modes
+  --modes <baseline,terse-no-mcp,mcp-first,mcp-only,compiled-packet,compiled-packet+gate,oracle-packet>
+                                             Codex E2E comparison modes
   --task-ids <a,b,c>                     Copilot/Codex E2E task ids
   --run-dir <path>                       Output directory for E2E benchmark artifacts
-  --database-url <url>                   Postgres URL for isolated benchmark runs
   --codex-command <path>                 Codex CLI executable for benchmark codex-e2e
   --codex-command-args <a,b>             Args before "exec", e.g. "-y,@openai/codex" for npx.cmd
   --codex-timeout-seconds <number>       Timeout per Codex task run
@@ -466,11 +598,10 @@ Options:
 `);
 }
 
-function createIndexProgressReporter(connectionString: string): (event: IndexProgressEvent) => void {
+function createIndexProgressReporter(dbPath: string): (event: IndexProgressEvent) => void {
   const startedAt = Date.now();
   let lastLineAt = 0;
   let lastPhase = '';
-  const redactedDb = redactDatabaseUrl(connectionString);
 
   return (event: IndexProgressEvent) => {
     const now = Date.now();
@@ -488,7 +619,7 @@ function createIndexProgressReporter(connectionString: string): (event: IndexPro
     const count = formatProgressCount(event.current, event.total);
     const message = event.message ? ` ${shorten(event.message, 140)}` : '';
     const details = formatProgressDetails(event.details);
-    const db = event.phase === 'start' ? ` db=${redactedDb}` : '';
+    const db = event.phase === 'start' ? ` db=${dbPath}` : '';
     process.stderr.write(`[codegraph:index] ${elapsed} ${event.phase}:${event.status}${count}${message}${details}${db}\n`);
   };
 }
@@ -517,20 +648,6 @@ function formatDuration(ms: number): string {
 
 function shorten(value: string, maxLength: number): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
-}
-
-function redactDatabaseUrl(value: string): string {
-  try {
-    const url = new URL(value);
-    if (url.password) url.password = '***';
-    return url.toString();
-  } catch {
-    return value.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:***@');
-  }
-}
-
-function defaultPostgresUrl(): string {
-  return 'postgres://codegraph:codegraph_local@127.0.0.1:54329/codegraph';
 }
 
 main().catch((error) => {

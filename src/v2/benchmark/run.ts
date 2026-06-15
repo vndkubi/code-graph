@@ -8,10 +8,9 @@ export interface BenchmarkIndexResult {
 
 export async function runIndexBenchmark(
   root: string,
-  homeDir?: string,
   options: Pick<IndexWorkspaceOptions, 'indexProviders' | 'scipIndexPath'> = {},
 ): Promise<BenchmarkIndexResult> {
-  const { db } = await openCodeGraphDb(homeDir);
+  const { db } = await openCodeGraphDb(root);
   const indexer = new V2Indexer(db);
   try {
     const result = await indexer.indexWorkspace({ root, ...options });

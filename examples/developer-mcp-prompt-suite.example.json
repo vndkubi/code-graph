@@ -65,7 +65,7 @@
       "id": "dev-implement-path-delta-refresh",
       "category": "implement-plan",
       "intent": "Plan a code change across multiple modules without editing files.",
-      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Design path-delta incremental refresh for local source changes without sacrificing full graph completeness. You must call get_context_packet, not get_research_pack, for path delta watcher incremental refresh watcher indexer manifest daemon. Then use returned toolHints or sliceHints with one batch get_file_slice call when exact source is needed. Return valid compact JSON only, no markdown, max 2800 chars, with keys: task,toolCallsUsed,batchSliceUsed,files,proposedApi,algorithm,concurrencyAndPerf,fullGraphCompleteness,testPlan,rollbackPlan,risks. Final JSON must include these exact repository-relative file path strings: src/v2/index/watcher.ts, src/v2/index/indexer.ts, src/v2/index/manifest.ts. Final JSON must include these exact terms somewhere in string values: watcher, indexer, manifest, full graph.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_context_packet. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Design path-delta incremental refresh for local source changes without sacrificing full graph completeness. You must call get_context_packet, not get_research_pack, for path delta watcher incremental refresh watcher indexer manifest sqlite. Then use returned toolHints or sliceHints with one batch get_file_slice call when exact source is needed. Return valid compact JSON only, no markdown, max 2800 chars, with keys: task,toolCallsUsed,batchSliceUsed,files,proposedApi,algorithm,concurrencyAndPerf,fullGraphCompleteness,testPlan,rollbackPlan,risks. Final JSON must include these exact repository-relative file path strings: src/v2/index/watcher.ts, src/v2/index/indexer.ts, src/v2/index/manifest.ts. Final JSON must include these exact terms somewhere in string values: watcher, indexer, manifest, full graph.",
       "requiredTools": [
         "get_context_packet"
       ],
@@ -109,7 +109,7 @@
       "id": "dev-break-down-incremental-refresh",
       "category": "break-task",
       "intent": "Turn a complex implementation into ordered tasks.",
-      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_research_pack. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Break down path-delta incremental refresh into implementable engineering tasks. Call get_research_pack for watcher indexer daemon manifest incremental refresh task breakdown. Return valid compact JSON only, no markdown, max 1800 chars, with keys: epics,tasks,order,files,testMilestones,risks,definitionOfDone. Final JSON must include these exact repository-relative file path strings: src/v2/index/watcher.ts, src/v2/index/indexer.ts. Final JSON must include these exact terms somewhere in string values: incremental, watcher, tests. Use short string values and avoid embedded double quotes inside strings.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_research_pack. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Break down path-delta incremental refresh into implementable engineering tasks. Call get_research_pack for watcher indexer sqlite manifest incremental refresh task breakdown. Return valid compact JSON only, no markdown, max 1800 chars, with keys: epics,tasks,order,files,testMilestones,risks,definitionOfDone. Final JSON must include these exact repository-relative file path strings: src/v2/index/watcher.ts, src/v2/index/indexer.ts. Final JSON must include these exact terms somewhere in string values: incremental, watcher, tests. Use short string values and avoid embedded double quotes inside strings.",
       "requiredTools": [
         "get_research_pack"
       ],
@@ -456,7 +456,7 @@
       "id": "dev-endpoint-flow-generalization",
       "category": "endpoint-flow",
       "intent": "Trace a request or command flow using graph packs.",
-      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_flow_pack. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Explain the MCP request flow from Copilot tool call to V2QueryService.query and back to JSON content. You must call get_flow_pack first for MCP proxy query daemon service flow. Return valid compact JSON only, no markdown, max 2600 chars, with keys: flow,entryPoints,keyFiles,protocolSteps,errorHandling,performanceNotes,glossary,confidence. Final JSON must include these exact repository-relative file path strings: src/v2/mcp/proxy.ts, src/v2/daemon/client.ts, src/v2/query/service.ts. Final JSON must include these exact terms somewhere in string values: runMcpProxy, DaemonClient, V2QueryService.query.",
+      "prompt": "Use only CodeGraph MCP server codegraph-bench. Do not use shell/read/write/edit. Mandatory MCP calls: get_flow_pack. Do not answer from prompt text alone; make the mandatory CodeGraph call before final JSON. Explain the MCP request flow from Copilot tool call to V2QueryService.query and back to JSON content. You must call get_flow_pack first for MCP proxy sqlite query service flow. Return valid compact JSON only, no markdown, max 2600 chars, with keys: flow,entryPoints,keyFiles,protocolSteps,errorHandling,performanceNotes,glossary,confidence. Final JSON must include these exact repository-relative file path strings: src/v2/mcp/proxy.ts, src/v2/storage/sqlite-backend.ts, src/v2/query/service.ts. Final JSON must include these exact terms somewhere in string values: runMcpProxy, SQLiteGraphBackend, V2QueryService.query.",
       "requiredTools": [
         "get_flow_pack"
       ],
@@ -478,12 +478,12 @@
         ],
         "expectedContains": [
           "runMcpProxy",
-          "DaemonClient",
+          "SQLiteGraphBackend",
           "V2QueryService.query"
         ],
         "expectedFiles": [
           "src/v2/mcp/proxy.ts",
-          "src/v2/daemon/client.ts",
+          "src/v2/storage/sqlite-backend.ts",
           "src/v2/query/service.ts"
         ],
         "qualityChecks": [

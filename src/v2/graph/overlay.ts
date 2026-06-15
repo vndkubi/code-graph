@@ -5,6 +5,7 @@ export interface GraphOverlayStats {
   nodes: number;
   edges: number;
   elapsedMs: number;
+  fieldUsageEdgesIncluded: boolean;
 }
 
 export interface GraphOverlayCallFileEdge {
@@ -16,6 +17,7 @@ export interface GraphOverlayCallFileEdge {
 
 export interface GraphOverlayBuildOptions {
   callFileEdges?: GraphOverlayCallFileEdge[];
+  includeFieldUsageEdges?: boolean;
 }
 
 interface FileRow {
@@ -340,6 +342,7 @@ export async function rebuildGraphOverlay(
     nodes: nodeRows.length,
     edges: edgeRows.length,
     elapsedMs: Date.now() - started,
+    fieldUsageEdgesIncluded: shouldIncludeFieldUsageEdges(options),
   };
 }
 
@@ -499,6 +502,8 @@ async function addAggregateEdges(
     });
   }
 
+  if (!shouldIncludeFieldUsageEdges(options)) return;
+
   const fieldRows = await db.prepare(`
     WITH field_targets AS (
       SELECT fq_name, MIN(file) AS file
@@ -534,6 +539,11 @@ async function addAggregateEdges(
       accessKind: row.access_kind,
     });
   }
+}
+
+function shouldIncludeFieldUsageEdges(options: GraphOverlayBuildOptions): boolean {
+  return options.includeFieldUsageEdges === true
+    || envFlag(process.env.CODEGRAPH_GRAPH_OVERLAY_FIELD_USAGE_EDGES);
 }
 
 function addModuleAggregateEdge(

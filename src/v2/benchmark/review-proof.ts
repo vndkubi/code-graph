@@ -98,12 +98,18 @@ interface BaselineManifest {
 const BASELINE_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
 const BASELINE_SKIP_DIRS = new Set([
   '.git',
+  '.codegraph',
+  '.tmp',
   '.idea',
   '.vscode',
   'node_modules',
   'target',
   'build',
   'dist',
+  'coverage',
+  '.next',
+  '.turbo',
+  '.cache',
   'bin',
   'obj',
   '.gradle',
@@ -305,7 +311,7 @@ function walkBaselineManifest(root: string, dir: string, files: BaselineManifest
     const absPath = path.join(dir, entry.name);
     const relPath = path.relative(root, absPath).replace(/\\/g, '/');
     if (entry.isDirectory()) {
-      if (BASELINE_SKIP_DIRS.has(entry.name)) continue;
+      if (BASELINE_SKIP_DIRS.has(entry.name) || entry.name.startsWith('.tmp')) continue;
       walkBaselineManifest(root, absPath, files);
       continue;
     }

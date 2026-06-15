@@ -68,12 +68,18 @@ interface GitIndexEntry {
 
 const DEFAULT_SKIP_DIRS = new Set([
   '.git',
+  '.codegraph',
+  '.tmp',
   '.idea',
   '.vscode',
   'node_modules',
   'target',
   'build',
   'dist',
+  'coverage',
+  '.next',
+  '.turbo',
+  '.cache',
   'bin',
   'obj',
   '.gradle',
@@ -189,7 +195,7 @@ function walk(
     const relPath = path.relative(root, absPath).replace(/\\/g, '/');
 
     if (entry.isDirectory()) {
-      if (DEFAULT_SKIP_DIRS.has(entry.name)) continue;
+      if (DEFAULT_SKIP_DIRS.has(entry.name) || entry.name.startsWith('.tmp')) continue;
       walk(root, absPath, files, maxFileSizeBytes, previousByPath, gitHashes, stats, start, progress);
       continue;
     }

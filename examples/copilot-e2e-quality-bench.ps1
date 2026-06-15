@@ -2,7 +2,6 @@ param(
   [string]$SuitePath = (Join-Path $PSScriptRoot 'copilot-e2e-quality-suite.example.json'),
   [string]$RunDir = '',
   [string]$CodeGraphRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
-  [string]$DatabaseUrl = 'postgres://codegraph:codegraph_local@127.0.0.1:54329/codegraph',
   [string[]]$Models = @(),
   [string[]]$TaskIds = @(),
   [string[]]$Modes = @(),
@@ -184,7 +183,7 @@ function Initialize-Workspace([pscustomobject]$Task, [string]$TaskRunDir, [strin
   }
 }
 
-function Write-McpConfig([string]$Path, [string]$Workspace, [string]$WorkspaceKey, [string]$HomeDir, [string]$CodeGraphRoot, [string]$DatabaseUrl, [string[]]$McpTools = @()) {
+function Write-McpConfig([string]$Path, [string]$Workspace, [string]$WorkspaceKey, [string]$CodeGraphRoot, [string[]]$McpTools = @()) {
   $cliPath = Join-Path $CodeGraphRoot 'dist\cli.js'
   $defaultMcpTools = @(
     'get_change_pack',
@@ -210,16 +209,10 @@ function Write-McpConfig([string]$Path, [string]$Workspace, [string]$WorkspaceKe
           $Workspace,
           '--workspace-key',
           $WorkspaceKey,
-          '--home',
-          $HomeDir,
           '--no-prewarm',
           '--mcp-tools',
           ($toolsToExpose -join ',')
         )
-        env = @{
-          CODEGRAPH_DATABASE_URL = $DatabaseUrl
-          CODEGRAPH_PG_POOL_MAX = '10'
-        }
       }
     }
   }
@@ -230,16 +223,12 @@ function Write-McpConfig([string]$Path, [string]$Workspace, [string]$WorkspaceKe
 function Invoke-CodeGraphIndex(
   [string]$Workspace,
   [string]$WorkspaceKey,
-  [string]$HomeDir,
   [string]$RunDir,
   [string]$CodeGraphRoot,
-  [string]$DatabaseUrl,
   [int]$ParseWorkers
 ) {
   $stdout = Join-Path $RunDir 'index.stdout.json'
   $stderr = Join-Path $RunDir 'index.stderr.log'
-  $env:CODEGRAPH_DATABASE_URL = $DatabaseUrl
-  $env:CODEGRAPH_PG_POOL_MAX = '10'
   $indexArgs = @(
     (Join-Path $CodeGraphRoot 'dist\cli.js'),
     'index',
@@ -247,8 +236,6 @@ function Invoke-CodeGraphIndex(
     $Workspace,
     '--workspace-key',
     $WorkspaceKey,
-    '--home',
-    $HomeDir,
     '--parse-workers',
     [string]$ParseWorkers
   )
@@ -744,7 +731,6 @@ $runMeta = [pscustomobject]@{
   suitePath = $suiteFullPath.Path
   runDir = $RunDir
   codeGraphRoot = $CodeGraphRoot
-  databaseUrl = ($DatabaseUrl -replace '://([^:]+):([^@]+)@', '://$1:***@')
   startedAt = (Get-Date).ToString('o')
   dryRun = [bool]$DryRun
   models = @($modelsToRun | ForEach-Object { $_.id })
@@ -786,7 +772,6 @@ foreach ($model in $modelsToRun) {
         } else {
           "$($workspaceInfo.workspace)#codegraph-e2e#$($task.id)#$($model.id)#$mode#$(Get-Date -Format 'yyyyMMddHHmmss')"
         }
-        $homeDir = Join-Path $taskRunDir 'codegraph-home'
         $mcpConfigPath = Join-Path $taskRunDir 'mcp-config.json'
 
         $preChecks = @()
@@ -797,13 +782,13 @@ foreach ($model in $modelsToRun) {
 
         if ($mode -eq 'codegraph') {
           if (-not $SkipIndex) {
-            $indexRun = Invoke-CodeGraphIndex $mcpWorkspace $workspaceKey $homeDir $taskRunDir $CodeGraphRoot $DatabaseUrl $ParseWorkers
+            $indexRun = Invoke-CodeGraphIndex $mcpWorkspace $workspaceKey $taskRunDir $CodeGraphRoot $ParseWorkers
             if ($indexRun.exitCode -ne 0) {
               throw "CodeGraph index failed for $($task.id) $($model.id) $mode with exit $($indexRun.exitCode)"
             }
           }
           $taskMcpTools = Get-TaskStringArray $task 'mcpTools'
-          Write-McpConfig $mcpConfigPath $mcpWorkspace $workspaceKey $homeDir $CodeGraphRoot $DatabaseUrl $taskMcpTools
+          Write-McpConfig $mcpConfigPath $mcpWorkspace $workspaceKey $CodeGraphRoot $taskMcpTools
         }
 
         $copilot = Invoke-CopilotTask $task $model $mode $workspaceInfo.workspace $mcpConfigPath $taskRunDir $DisabledMcpServers $CopilotTimeoutSeconds

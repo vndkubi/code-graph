@@ -1,9 +1,9 @@
 # Example: C:/Users/<your-user>/.codex/config.toml
 #
 # Use one MCP server per project/branch when using Docker from Codex CLI.
-# All entries can share the same Docker image and codegraph-cache volume.
-# Keep CODEGRAPH_WORKSPACE_KEY unique per host project path so /workspace does
-# not collapse different repositories into one cached workspace identity.
+# All entries can share the same Docker image. Keep CODEGRAPH_WORKSPACE_KEY
+# unique per host project path so /workspace does not collapse different
+# repositories into one workspace identity.
 
 [mcp_servers.code_graph_doughnut]
 command = "docker"
@@ -12,15 +12,9 @@ args = [
   "--rm",
   "-i",
   "-v",
-  "D:/Personal/Projects/doughnut:/workspace:ro",
-  "-v",
-  "codegraph-cache:/codegraph-home",
+  "D:/Personal/Projects/doughnut:/workspace",
   "-e",
   "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/doughnut",
-  "-e",
-  "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
-  "-e",
-  "CODEGRAPH_PG_POOL_MAX=10",
   "mcp-code-graph:latest",
   "mcp",
   "--root",
@@ -35,15 +29,9 @@ args = [
   "--rm",
   "-i",
   "-v",
-  "D:/Personal/Projects/mall:/workspace:ro",
-  "-v",
-  "codegraph-cache:/codegraph-home",
+  "D:/Personal/Projects/mall:/workspace",
   "-e",
   "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/mall",
-  "-e",
-  "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
-  "-e",
-  "CODEGRAPH_PG_POOL_MAX=10",
   "mcp-code-graph:latest",
   "mcp",
   "--root",
@@ -58,15 +46,9 @@ args = [
   "--rm",
   "-i",
   "-v",
-  "D:/Personal/Projects/samples/jarkataEE8:/workspace:ro",
-  "-v",
-  "codegraph-cache:/codegraph-home",
+  "D:/Personal/Projects/samples/jarkataEE8:/workspace",
   "-e",
   "CODEGRAPH_WORKSPACE_KEY=D:/Personal/Projects/samples/jarkataEE8",
-  "-e",
-  "CODEGRAPH_DATABASE_URL=postgres://codegraph:codegraph_local@host.docker.internal:54329/codegraph",
-  "-e",
-  "CODEGRAPH_PG_POOL_MAX=10",
   "mcp-code-graph:latest",
   "mcp",
   "--root",

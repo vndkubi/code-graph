@@ -166,7 +166,7 @@ function defaultGoldenEvalTasks(): GoldenEvalTask[] {
       id: 'find-service-files',
       question: 'Which files are related to payment service behavior?',
       codegraphTool: 'search_files',
-      codegraphArgs: { query: 'Payment Service', limit: 5 },
+      codegraphArgs: { query: 'Payment Service', limit: 5, includeFixtures: true },
       baselineSearchTerms: ['PaymentService', 'payment service'],
       expectedContains: ['PaymentService'],
     },

@@ -113,13 +113,20 @@ export class V2QueryService {
       case 'find_tests_for':
         return withFreshness(await this.findTestsFor(snapshotId, envelope.args));
       case 'get_flow_pack':
-        return withFreshness(await this.getResearchPack(snapshotId, { ...envelope.args, taskType: envelope.args.taskType ?? 'architecture' }));
+        return withFreshness(await this.getResearchPack(snapshotId, {
+          ...envelope.args,
+          taskType: envelope.args.taskType ?? 'architecture',
+        }));
       case 'get_research_pack':
         return withFreshness(await this.getResearchPack(snapshotId, envelope.args));
       case 'get_context_packet':
         return withFreshness(await this.getContextPacket(snapshotId, envelope.args));
       case 'get_change_pack':
         return withFreshness(await this.getChangePack(snapshotId, envelope.args));
+      case 'compile_evidence':
+        return withFreshness(await this.compileEvidence(snapshotId, envelope.args));
+      case 'generate_repo_atlas':
+        return withFreshness(await this.generateRepoAtlas(snapshotId, envelope.args));
       case 'search_code':
         return withFreshness(await this.searchCode(snapshotId, envelope.args));
       case 'get_index_stats':
@@ -356,7 +363,7 @@ export class V2QueryService {
           'No query tokens were supplied, so no per-result ranking score was computed.',
         ]) } : {}),
         confidence: 0.8,
-        confidenceNotes: ['Postgres-backed symbol lookup; exact Java semantic confidence is shown on graph edges.'],
+        confidenceNotes: ['SQLite-backed symbol lookup; exact Java semantic confidence is shown on graph edges.'],
       };
     }
 
@@ -1293,6 +1300,8 @@ export class V2QueryService {
 
   private async simulatePatchImpact(snapshotId: string, args: Record<string, unknown>) {
     const limit = clampInt(Number(args.limit ?? 50), 1, 200);
+    const outputMode = normalizePatchImpactOutputMode(args.outputMode);
+    const maxResponseTokens = responseTokenCap(args, outputMode === 'full' ? 16000 : 8000);
     const requestedFiles = stringArray(args.files).map(normalizePatchPath).filter(Boolean);
     const diffFiles = parsePatchFilePaths(stringOrUndefined(args.diff) ?? '');
     const fileInputs = uniqueFilesInOrder([...requestedFiles, ...diffFiles]);
@@ -1399,7 +1408,8 @@ export class V2QueryService {
       Math.min(limit, 20),
     );
 
-    return {
+    const fullResult = {
+      outputMode: 'full',
       inputs: {
         files: requestedFiles,
         diffFiles,
@@ -1450,6 +1460,46 @@ export class V2QueryService {
         'Dependency impact follows indexed file dependency edges; call impact follows indexed call edges and may include lower-confidence name-only matches.',
       ],
     };
+    const requestedResult = outputMode === 'full'
+      ? fullResult
+      : compactPatchImpactResult(fullResult, compactLimitForResponseCap(maxResponseTokens), {
+        outputMode: 'compact',
+        includeArchitecture: maxResponseTokens >= 6000,
+        includeFieldImpact: maxResponseTokens >= 3000,
+      });
+    const requestedTokens = estimateTokens(JSON.stringify(requestedResult));
+    if (requestedTokens <= maxResponseTokens) {
+      return withResponseCapBudget(requestedResult, {
+        fullPayload: fullResult,
+        maxResponseTokens,
+        capped: false,
+        policy: outputMode === 'full'
+          ? 'full patch impact returned within response cap'
+          : 'compact patch impact returns ranked evidence and counts; expand exact files with get_file_slice',
+      });
+    }
+
+    let cappedResult = compactPatchImpactResult(fullResult, compactLimitForResponseCap(maxResponseTokens), {
+      outputMode: 'compact-capped',
+      includeArchitecture: false,
+      includeFieldImpact: maxResponseTokens >= 3000,
+      cappedReason: 'response-token-cap',
+    });
+    if (estimateTokens(JSON.stringify(cappedResult)) > maxResponseTokens) {
+      cappedResult = compactPatchImpactResult(fullResult, 1, {
+        outputMode: 'compact-capped',
+        includeArchitecture: false,
+        includeFieldImpact: false,
+        countsOnly: true,
+        cappedReason: 'response-token-cap',
+      });
+    }
+    return withResponseCapBudget(cappedResult, {
+      fullPayload: fullResult,
+      maxResponseTokens,
+      capped: true,
+      policy: 'response exceeded maxResponseTokens; returned compact ranked impact, counts, and follow-up handles instead of expanded graph rows',
+    });
   }
 
   private async fieldImpactForInputs(
@@ -1565,7 +1615,7 @@ export class V2QueryService {
     if (fieldFqNames.length > 0) {
       clauses.push(`field_fq_name IN (${fieldFqNames.map(() => '?').join(', ')})`);
       params.push(...fieldFqNames);
-      clauses.push(`field_fq_name LIKE ANY(ARRAY[${fieldFqNames.map(() => '?').join(', ')}])`);
+      clauses.push(`(${fieldFqNames.map(() => `field_fq_name LIKE ? ESCAPE '\\'`).join(' OR ')})`);
       params.push(...fieldFqNames.map(name => `%${escapeLike(name)}%`));
     }
     if (clauses.length === 0) return [];
@@ -1648,6 +1698,60 @@ export class V2QueryService {
     const cappedTests = tests
       .slice(0, budget.maxTests)
       .map(test => compactReviewObject(test, budget.maxEvidencePerFinding, 2) as Record<string, unknown>);
+    const followUpSliceHints = reviewSliceHints(lineFocus, reviewTargets, budget.maxRequiredToolCalls);
+    const firstFollowUpToolCall = followUpSliceHints.length > 0
+      ? {
+        tool: 'get_file_slice',
+        args: {
+          slices: followUpSliceHints.map(hint => ({
+            file: hint.file,
+            lines: hint.lines,
+            symbol: hint.symbol,
+            maxChars: hint.maxChars,
+          })),
+        },
+        when: 'Inspect these exact changed ranges before broad repository search or final review comments.',
+        batching: 'Call get_file_slice once with args.slices; do not loop one call per hunk.',
+      }
+      : undefined;
+    const requiredToolCalls = reviewToolCalls(changedFiles, lineFocus, findings, budget.maxRequiredToolCalls);
+    const reviewProfile: PackProfile = outputMode === 'full' ? 'full' : 'compact';
+    const evidenceHandles = evidenceHandlesForObjects([
+      ...lineFocus,
+      ...reviewTargets,
+    ], reviewProfile);
+    const packedFieldImpact = fieldImpact ? compactReviewObject(fieldImpact, budget.maxEvidencePerFinding, 2) : undefined;
+    const packedArchitectureContext = architectureContext ? compactReviewObject(architectureContext, budget.maxEvidencePerFinding, 2) : undefined;
+    const packedValidation = compactReviewObject(validation, budget.maxEvidencePerFinding, 2);
+    const returnedPayloadForBudget = {
+      impactSummary: impact.summary,
+      changedFiles,
+      fieldImpact: packedFieldImpact,
+      architectureContext: packedArchitectureContext,
+      diffStats,
+      reviewFindings: findings,
+      lineFocus,
+      reviewTargets,
+      followUpSliceHints,
+      firstFollowUpToolCall,
+      evidenceHandles,
+      riskFlags: cappedRiskFlags,
+      testsLikelyRelevant: cappedTests,
+      validation: packedValidation,
+      requiredToolCalls,
+    };
+    const fullPayloadForBudget = {
+      impact,
+      allHunks,
+      allFindings,
+      reviewTargets,
+      followUpSliceHints,
+      firstFollowUpToolCall,
+      riskFlags,
+      tests,
+      validation,
+      requiredToolCalls,
+    };
 
     return {
       outputMode,
@@ -1655,8 +1759,8 @@ export class V2QueryService {
       reviewStatus: reviewStatusFor(findings, changedFiles),
       impactSummary: impact.summary,
       changedFiles,
-      fieldImpact: fieldImpact ? compactReviewObject(fieldImpact, budget.maxEvidencePerFinding, 2) : undefined,
-      architectureContext: architectureContext ? compactReviewObject(architectureContext, budget.maxEvidencePerFinding, 2) : undefined,
+      fieldImpact: packedFieldImpact,
+      architectureContext: packedArchitectureContext,
       diffStats,
       reviewPlan: reviewPlanForPatch(diffStats, findings, impact),
       seededRiskCategories: seededRiskCategoriesForReview(focus, findings, riskFlags, diffStats),
@@ -1667,11 +1771,14 @@ export class V2QueryService {
       reviewFocus: reviewFocusForPatch(focus, impact, findings, budget.maxEvidencePerFinding),
       lineFocus,
       reviewTargets,
-      agentGuidance: reviewAgentGuidance(focus, findings, reviewTargets),
+      evidenceHandles,
+      followUpSliceHints,
+      firstFollowUpToolCall,
+      agentGuidance: reviewAgentGuidance(focus, findings, reviewTargets, followUpSliceHints),
       riskFlags: cappedRiskFlags,
       testsLikelyRelevant: cappedTests,
-      validation: compactReviewObject(validation, budget.maxEvidencePerFinding, 2),
-      requiredToolCalls: reviewToolCalls(changedFiles, lineFocus, findings, budget.maxRequiredToolCalls),
+      validation: packedValidation,
+      requiredToolCalls,
       reviewerQuestions: reviewQuestionsForPatch(findings, impact),
       metrics: {
         changedFileCount: changedFiles.length,
@@ -1687,6 +1794,13 @@ export class V2QueryService {
         omittedRiskFlags: Math.max(0, riskFlags.length - cappedRiskFlags.length),
         omittedTests: Math.max(0, tests.length - cappedTests.length),
       },
+      budget: responseBudgetReport({
+        profile: reviewProfile,
+        returnedPayload: returnedPayloadForBudget,
+        fullPayload: fullPayloadForBudget,
+        handleCount: evidenceHandles.length,
+        policy: 'review packets keep findings and risky hunks compact; exact changed source is expanded through get_file_slice handles',
+      }),
       confidence: reviewConfidence(changedFiles.length, hunks.length, findings, riskFlags),
       confidenceNotes: [
         'Review findings are deterministic risk hypotheses from the diff and graph impact, not proof of bugs.',
@@ -1861,11 +1975,13 @@ export class V2QueryService {
   private async getResearchPack(snapshotId: string, args: Record<string, unknown>) {
     const target = String(args.target ?? '').trim();
     const profile = normalizePackProfile(args.profile);
+    const responseMode = normalizePackResponseMode(args.responseMode);
     const requestedTaskType = normalizeOracleTaskType(String(args.taskType ?? 'research'));
     if (requestedTaskType === 'implement' || requestedTaskType === 'debug' || requestedTaskType === 'refactor' || requestedTaskType === 'create-testcase') {
       return {
         target,
         taskType: args.taskType ?? requestedTaskType,
+        responseMode,
         profile,
         routing: {
           intendedUse: 'redirect edit/debug request to edit-ready context',
@@ -1886,10 +2002,19 @@ export class V2QueryService {
         missingFacts: ['Edit/debug tasks need change_pack edit ranges, invariants, and targeted validation.'],
         nextAction: 'Call get_change_pack with the full user task, then open only routing.firstToolCall slices before editing.',
         confidence: 0.45,
-        budget: {
+        budget: responseBudgetReport({
           profile,
-          estimatedResponseTokens: 120,
-        },
+          returnedPayload: {
+            target,
+            taskType: args.taskType ?? requestedTaskType,
+            responseMode,
+            profile,
+            redirectTool: 'get_change_pack',
+            missingFacts: ['Edit/debug tasks need change_pack edit ranges, invariants, and targeted validation.'],
+          },
+          handleCount: 0,
+          policy: 'research pack redirects edit/debug tasks to get_change_pack before source exploration',
+        }),
       };
     }
     const defaultTokenBudget = packProfileValue(profile, 3500, 6000, 8000);
@@ -2097,10 +2222,130 @@ export class V2QueryService {
       definitions: returnedDefinitions,
     });
     const architectureContext = await architectureContextForFiles(this.db, snapshotId, returnedTopFiles, target, packProfileValue(profile, 6, 8, 10));
+    const packedEvidenceSlices = slimEvidenceSlicesForPack(evidenceSlices, profile);
+    const evidenceHandles = evidenceHandlesForObjects([
+      ...evidenceSlices,
+      ...returnedDefinitions,
+      ...candidateFiles,
+    ], profile);
+    const returnedPayloadForBudget = {
+      flowSteps: returnedFlowSteps,
+      definitionCandidates: returnedDefinitions,
+      callers: returnedCallers,
+      callees: returnedCallees,
+      impactedEndpoints: returnedEndpoints,
+      topFiles: returnedTopFiles,
+      evidenceSlices: packedEvidenceSlices,
+      evidenceHandles,
+      architectureContext,
+      compressedEvidence,
+    };
+    const fullPayloadForBudget = {
+      flowSteps,
+      definitionCandidates: relevantSymbols,
+      callers: callers.map(compactCallEdge),
+      callees: callees.map(compactCallEdge),
+      impactedEndpoints,
+      topFiles,
+      evidenceSlices,
+      architectureContext,
+      compressedEvidence,
+    };
+    const completeness = {
+      sufficientForAnswer,
+      evidenceSliceCount: evidenceSlices.length,
+      symbolCandidateCount: relevantSymbols.length,
+      fileCandidateCount: candidateFiles.length,
+      omittedFileMatches: Math.max(0, Number(fileResults.totalFound ?? candidateFiles.length) - candidateFiles.length),
+    };
+    const answerGuidance = sufficientForAnswer
+      ? [
+        'Answer directly from this pack.',
+        'Treat evidenceSlices as already-read source; cite file and line ranges from them.',
+        'Do not call search_code, search_symbol, get_file_slice, grep, or Read unless the user asks for more detail.',
+      ]
+      : [
+        'This pack is incomplete; perform only the targeted follow-up named in missingFacts.',
+        'Prefer one get_file_slice for a listed missing file/range over broad grep/read loops.',
+      ];
+    const nextAction = sufficientForAnswer
+      ? 'Answer the user directly from flowSteps and evidenceSlices.'
+      : `Resolve missing fact: ${missingFacts[0]}`;
+    const confidence = sufficientForAnswer ? 0.82 : relevantSymbols.length > 0 ? 0.62 : 0.35;
+    const confidenceNotes = [
+      'The pack intentionally includes capped source evidence so architecture answers do not need many follow-up slice calls.',
+      'Flow steps are ranked from indexed symbols, call edges, endpoints, and file evidence; ambiguous Java call edges remain confidence-scored.',
+      'Use granular tools only for explicit missing facts, not for broad rediscovery.',
+    ];
+    const slimTaskOracle = slimTaskOracleForPack(taskOracle, profile);
+    const agentPayloadForBudget = {
+      ...returnedPayloadForBudget,
+      seedTerms: returnedSeedTerms,
+      taskOracle: slimTaskOracle,
+      completeness,
+      answerGuidance,
+      nextAction,
+    };
+    if (responseMode === 'answer') {
+      const compactAnswerGuidance = sufficientForAnswer
+        ? ['Answer directly from evidenceSlices and flowSteps; cite file/line ranges.']
+        : ['Resolve only the listed missingFacts before answering.'];
+      const answerPayloadForBudget = {
+        flowSteps: returnedFlowSteps,
+        definitionCandidates: returnedDefinitions,
+        callers: returnedCallers,
+        callees: returnedCallees,
+        impactedEndpoints: returnedEndpoints,
+        topFiles: returnedTopFiles,
+        evidenceSlices: packedEvidenceSlices,
+        completeness,
+        missingFacts,
+        answerGuidance: compactAnswerGuidance,
+      };
+      return {
+        target,
+        taskType: args.taskType ?? 'research',
+        responseMode,
+        tokenBudget,
+        profile,
+        routing: {
+          intendedUse: 'answer-ready architecture/research context',
+          expectedToolCalls: sufficientForAnswer ? 1 : 2,
+          answerDirectly: sufficientForAnswer,
+          followUpRule: 'Use get_file_slice only for a specific item listed in missingFacts.',
+        },
+        flowSteps: returnedFlowSteps,
+        definitionCandidates: returnedDefinitions,
+        callers: returnedCallers,
+        callees: returnedCallees,
+        impactedEndpoints: returnedEndpoints,
+        topFiles: returnedTopFiles,
+        evidenceSlices: packedEvidenceSlices,
+        completeness,
+        missingFacts,
+        answerGuidance: compactAnswerGuidance,
+        nextAction,
+        confidence,
+        confidenceNotes: confidenceNotes.slice(0, 2),
+        budget: {
+          ...responseBudgetReport({
+            profile,
+            tokenBudget,
+            returnedPayload: answerPayloadForBudget,
+            fullPayload: agentPayloadForBudget,
+            handleCount: 0,
+            policy: 'answer mode omits compressedEvidence, taskOracle, evidenceHandles, architectureContext, and seedTerms; set responseMode=agent when planner metadata is needed',
+          }),
+          preferredFileRole,
+          preferredLanguage,
+        },
+      };
+    }
 
     return {
       target,
       taskType: args.taskType ?? 'research',
+      responseMode,
       tokenBudget,
       profile,
       routing: {
@@ -2116,51 +2361,30 @@ export class V2QueryService {
       callees: returnedCallees,
       impactedEndpoints: returnedEndpoints,
       topFiles: returnedTopFiles,
-      evidenceSlices: slimEvidenceSlicesForPack(evidenceSlices, profile),
+      evidenceSlices: packedEvidenceSlices,
+      evidenceHandles,
       compressedEvidence,
       architectureContext,
-      taskOracle: slimTaskOracleForPack(taskOracle, profile),
-      completeness: {
-        sufficientForAnswer,
-        evidenceSliceCount: evidenceSlices.length,
-        symbolCandidateCount: relevantSymbols.length,
-        fileCandidateCount: candidateFiles.length,
-        omittedFileMatches: Math.max(0, Number(fileResults.totalFound ?? candidateFiles.length) - candidateFiles.length),
-      },
+      taskOracle: slimTaskOracle,
+      completeness,
       missingFacts,
-      answerGuidance: sufficientForAnswer
-        ? [
-          'Answer directly from this pack.',
-          'Treat evidenceSlices as already-read source; cite file and line ranges from them.',
-          'Do not call search_code, search_symbol, get_file_slice, grep, or Read unless the user asks for more detail.',
-        ]
-        : [
-          'This pack is incomplete; perform only the targeted follow-up named in missingFacts.',
-          'Prefer one get_file_slice for a listed missing file/range over broad grep/read loops.',
-        ],
-      nextAction: sufficientForAnswer
-        ? 'Answer the user directly from flowSteps and evidenceSlices.'
-        : `Resolve missing fact: ${missingFacts[0]}`,
-      confidence: sufficientForAnswer ? 0.82 : relevantSymbols.length > 0 ? 0.62 : 0.35,
-      confidenceNotes: [
-        'The pack intentionally includes capped source evidence so architecture answers do not need many follow-up slice calls.',
-        'Flow steps are ranked from indexed symbols, call edges, endpoints, and file evidence; ambiguous Java call edges remain confidence-scored.',
-        'Use granular tools only for explicit missing facts, not for broad rediscovery.',
-      ],
+      answerGuidance,
+      nextAction,
+      confidence,
+      confidenceNotes,
       budget: {
-        profile,
+        ...responseBudgetReport({
+          profile,
+          tokenBudget,
+          returnedPayload: agentPayloadForBudget,
+          fullPayload: fullPayloadForBudget,
+          handleCount: evidenceHandles.length,
+          policy: profile === 'full'
+            ? 'full profile requested; source evidence is still bounded by slice budgets'
+            : 'compact evidence slices plus exact get_file_slice handles',
+        }),
         preferredFileRole,
         preferredLanguage,
-        estimatedResponseTokens: estimateTokens(JSON.stringify({
-          flowSteps: returnedFlowSteps,
-          definitionCandidates: returnedDefinitions,
-          callers: returnedCallers,
-          callees: returnedCallees,
-          impactedEndpoints: returnedEndpoints,
-          topFiles: returnedTopFiles,
-          architectureContext,
-          compressedEvidence,
-        })),
       },
     };
   }
@@ -2583,6 +2807,7 @@ export class V2QueryService {
       ...myBatisContext.topFiles,
     ].filter(Boolean)).slice(0, maxFiles);
     const sliceHints = contextSliceHints(candidateFiles, relevantSymbols, Math.min(packProfileValue(profile, 3, 4, 5), maxFiles));
+    const evidenceHandles = evidenceHandlesForObjects(sliceHints, profile);
     const toolHints = sliceHints.length > 0 ? [{
       tool: 'get_file_slice',
       args: {
@@ -2649,6 +2874,7 @@ export class V2QueryService {
         nextTool: toolHints[0],
       },
       sliceHints,
+      evidenceHandles,
       toolHints,
       myBatis: isMyBatisIntent(query) ? {
         mapperFiles: myBatisContext.topFiles.filter(file => file.endsWith('.xml')).slice(0, maxFiles),
@@ -2678,14 +2904,18 @@ export class V2QueryService {
     return {
       ...result,
       budget: {
-        profile,
-        tokenBudget,
+        ...responseBudgetReport({
+          profile,
+          tokenBudget,
+          returnedPayload: result,
+          handleCount: evidenceHandles.length,
+          policy: 'context packet returns ranked handles first; source text is fetched only by explicit get_file_slice',
+        }),
         maxFiles,
         maxSymbols,
         includeSnippets,
         snippetLines,
         snippetTokenBudget,
-        estimatedResponseTokens: estimateTokens(JSON.stringify(result)),
       },
     };
   }
@@ -2821,11 +3051,47 @@ export class V2QueryService {
         why: 'Open this exact range before editing.',
       }))
       .filter(range => range.file || range.symbol);
+    const evidenceHandles = evidenceHandlesForObjects([
+      ...editRanges,
+      ...candidateFiles,
+      ...relevantSymbols,
+    ], profile);
     const patchArchitectureContext = patchImpact && isPlainObject(patchImpact.architectureContext)
       ? patchImpact.architectureContext
       : undefined;
     const architectureContext = patchArchitectureContext
       ?? await architectureContextForFiles(this.db, snapshotId, topFiles, task, packProfileValue(profile, 6, 8, 10));
+    const packedTestsLikelyRelevant = slimTestsForPack(testsLikelyRelevant, profile);
+    const packedTaskOracle = slimTaskOracleForPack(taskOracle, profile);
+    const packedPatchImpact = patchImpact ? compactReviewObject(patchImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined;
+    const packedFieldImpact = fieldImpact ? compactReviewObject(fieldImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined;
+    const packedArchitectureContext = architectureContext ? compactReviewObject(architectureContext, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined;
+    const changeTokenBudget = typeof contextBudget.tokenBudget === 'number'
+      ? contextBudget.tokenBudget
+      : Number(args.tokenBudget ?? packProfileValue(profile, 3000, 5000, 8000));
+    const returnedPayloadForBudget = {
+      files: candidateFiles,
+      symbols: relevantSymbols,
+      editRanges,
+      evidenceHandles,
+      testsLikelyRelevant: packedTestsLikelyRelevant,
+      commands,
+      taskOracle: packedTaskOracle,
+      patchImpact: packedPatchImpact,
+      fieldImpact: packedFieldImpact,
+      architectureContext: packedArchitectureContext,
+    };
+    const fullPayloadForBudget = {
+      files: candidateFiles,
+      symbols: relevantSymbols,
+      editRanges,
+      testsLikelyRelevant,
+      commands,
+      taskOracle,
+      patchImpact,
+      fieldImpact,
+      architectureContext,
+    };
 
     return {
       task,
@@ -2842,37 +3108,191 @@ export class V2QueryService {
       files: candidateFiles,
       symbols: relevantSymbols,
       editRanges,
-      testsLikelyRelevant: slimTestsForPack(testsLikelyRelevant, profile),
+      evidenceHandles,
+      testsLikelyRelevant: packedTestsLikelyRelevant,
       invariants: changePackInvariants(changeType, taskOracle, patchImpact).slice(0, packProfileValue(profile, 5, 8, 12)),
       expectedVerification: isPlainObject(taskOracle.expectedVerification)
         ? taskOracle.expectedVerification
         : { commands, targetedTestFiles: stringArray(validation.targetedTestFiles) },
       commands,
-      taskOracle: slimTaskOracleForPack(taskOracle, profile),
-      patchImpact: patchImpact ? compactReviewObject(patchImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined,
-      fieldImpact: fieldImpact ? compactReviewObject(fieldImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined,
-      architectureContext: architectureContext ? compactReviewObject(architectureContext, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined,
+      taskOracle: packedTaskOracle,
+      patchImpact: packedPatchImpact,
+      fieldImpact: packedFieldImpact,
+      architectureContext: packedArchitectureContext,
       topFiles,
       nextAction: editRanges.length > 0
         ? 'Call get_file_slice once with routing.firstToolCall.args, then make the smallest scoped edit.'
         : 'Resolve a concrete file/symbol first with search_symbol or search_files before editing.',
       confidence: context.confidence ?? 0.4,
       budget: {
-        profile,
-        tokenBudget: typeof contextBudget.tokenBudget === 'number'
-          ? contextBudget.tokenBudget
-          : Number(args.tokenBudget ?? packProfileValue(profile, 3000, 5000, 8000)),
-        estimatedResponseTokens: estimateTokens(JSON.stringify({
-          files: candidateFiles,
-          symbols: relevantSymbols,
-          editRanges,
-          testsLikelyRelevant,
-          commands,
-          taskOracle,
-          patchImpact,
-        })),
+        ...responseBudgetReport({
+          profile,
+          tokenBudget: changeTokenBudget,
+          returnedPayload: returnedPayloadForBudget,
+          fullPayload: fullPayloadForBudget,
+          handleCount: evidenceHandles.length,
+          policy: 'edit packets return exact edit handles; source text is deferred until the required get_file_slice call',
+        }),
       },
     };
+  }
+
+  private async compileEvidence(snapshotId: string, args: Record<string, unknown>) {
+    const task = String(args.task ?? '').trim();
+    if (!task) return { error: 'compile_evidence requires a non-empty task.' };
+
+    const profile = normalizePackProfile(args.profile);
+    const taskType = normalizeCompileEvidenceTaskType(args.taskType ?? args.task_type, task, args);
+    const target = String(args.target ?? task).trim();
+    const tokenBudget = clampInt(Number(args.budgetTokens ?? args.budget_tokens ?? 5000), 1000, 30000);
+    const maxEvidenceItems = clampInt(Number(args.maxEvidenceItems ?? args.max_evidence_items ?? 8), 1, 20);
+    const allowTargetedShell = Boolean(args.allowTargetedShell ?? args.allow_targeted_shell ?? true);
+    const qualityRubric = compileEvidenceRubric(args.qualityRubric ?? args.quality_rubric, taskType);
+
+    const source = await this.compileEvidenceSourcePacket(snapshotId, {
+      ...args,
+      task,
+      target,
+      taskType,
+      profile,
+      tokenBudget,
+    });
+    const sourcePacket = source.packet;
+    const evidence = compileEvidenceItemsFromPacket(source.tool, sourcePacket, maxEvidenceItems);
+    const coverage = compileCoverageCertificate({
+      taskType,
+      rubric: qualityRubric,
+      packet: sourcePacket,
+      evidence,
+    });
+    const missing = Object.entries(coverage)
+      .filter(([, value]) => value.status === 'missing')
+      .map(([key]) => key);
+    const partial = Object.entries(coverage)
+      .filter(([, value]) => value.status === 'partial')
+      .map(([key]) => key);
+    const answerable = compileEvidenceAnswerable(source.tool, sourcePacket, evidence, missing);
+    const recommendedEscalation = !answerable && allowTargetedShell
+      ? targetedShellEscalationForCompile(task, missing.length > 0 ? missing : partial, sourcePacket)
+      : undefined;
+    const allowedFollowups = answerable
+      ? []
+      : compileAllowedFollowups(missing.length > 0 ? missing : partial, sourcePacket, recommendedEscalation);
+    const recommendedNextAction = answerable
+      ? 'answer_now'
+      : recommendedEscalation
+        ? 'targeted_shell'
+        : evidence.length > 0
+          ? 'expand_exact'
+          : 'ask_user';
+    const disallowedFollowups = answerable
+      ? [
+        'shell_rg',
+        'shell_read_loop',
+        'search_symbol',
+        'search_files',
+        'search_code',
+        'get_file_slice',
+        'find_references',
+      ]
+      : ['broad_shell_search', 'unbounded_file_reads', 'unbounded_mcp_exploration'];
+    const evidenceHandleCount = evidence.filter(item => item.expandTool).length;
+    const packetSummary = compilePacketSummary(source.tool, sourcePacket);
+    const result = {
+      task,
+      taskType,
+      sourceTool: source.tool,
+      answerable,
+      confidence: compileEvidenceConfidence(answerable, coverage, evidence, sourcePacket),
+      coverage,
+      coverageCertificate: {
+        rubric: coverage,
+        missing,
+        partial,
+        answerability: answerable ? 'answer_now' : recommendedNextAction,
+      },
+      evidence,
+      missing,
+      allowedFollowups,
+      disallowedFollowups,
+      recommendedNextAction,
+      maxAdditionalCalls: answerable ? 0 : allowedFollowups.length,
+      gatePolicy: {
+        stateKey: compileEvidenceStateKey(task),
+        whenAnswerable: 'deny broad shell/search/read and extra MCP exploration; answer from evidence ids',
+        allowOnly: answerable ? [] : allowedFollowups.map(followup => followup.tool),
+        denyMessage: 'Evidence packet already covers the required rubric. Answer now from the listed evidence ids.',
+      },
+      pathCoverage: compilePathCoverageMap(source.tool, sourcePacket, recommendedEscalation),
+      packetSummary,
+    };
+
+    return {
+      ...result,
+      budget: {
+        ...responseBudgetReport({
+          profile,
+          tokenBudget,
+          returnedPayload: result,
+          fullPayload: sourcePacket,
+          handleCount: evidenceHandleCount,
+          policy: answerable
+            ? 'compiled evidence is answer-ready; gate should deny further broad search'
+            : 'compiled evidence is partial; allow only listed exact follow-ups',
+        }),
+        sourceTool: source.tool,
+      },
+    };
+  }
+
+  private async compileEvidenceSourcePacket(
+    snapshotId: string,
+    args: Record<string, unknown> & {
+      task: string;
+      target: string;
+      taskType: CompileEvidenceTaskType;
+      profile: PackProfile;
+      tokenBudget: number;
+    },
+  ): Promise<{ tool: string; packet: Record<string, unknown> }> {
+    if (args.taskType === 'review_diff' || stringOrUndefined(args.diff)) {
+      const packet = await this.reviewPatch(snapshotId, {
+        ...args,
+        outputMode: 'compact',
+        includeLikelyTests: args.includeLikelyTests ?? true,
+        limit: args.limit ?? 50,
+      }) as Record<string, unknown>;
+      return { tool: 'review_patch', packet };
+    }
+
+    if (args.taskType === 'implement' || args.taskType === 'test') {
+      const packet = await this.getChangePack(snapshotId, {
+        ...args,
+        task: args.task,
+        target: args.target,
+        changeType: args.taskType === 'test' ? 'test' : 'implement',
+        tokenBudget: args.tokenBudget,
+        profile: args.profile,
+        includeSnippets: args.includeSnippets ?? false,
+      }) as Record<string, unknown>;
+      return { tool: 'get_change_pack', packet };
+    }
+
+    const researchTaskType = args.taskType === 'api_flow' || args.taskType === 'startup_flow'
+      ? 'architecture'
+      : args.taskType === 'field_impact'
+        ? 'investigate'
+        : 'research';
+    const packet = await this.getResearchPack(snapshotId, {
+      ...args,
+      target: args.target,
+      taskType: researchTaskType,
+      tokenBudget: args.tokenBudget,
+      responseMode: 'answer',
+      profile: args.profile,
+      includeSnippets: args.includeSnippets ?? true,
+    }) as Record<string, unknown>;
+    return { tool: 'get_research_pack', packet };
   }
 
   private async relatedMyBatisFiles(snapshotId: string, files: string[], limit: number): Promise<string[]> {
@@ -2950,6 +3370,7 @@ export class V2QueryService {
     const query = String(args.query ?? '').trim();
     const outputMode = String(args.outputMode ?? 'compact');
     const compact = outputMode !== 'full';
+    const maxResponseTokens = responseTokenCap(args, compact ? 8000 : 12000);
     const limit = Math.min(Number(args.limit ?? 10), compact ? 8 : 50);
     const includeReferences = Boolean(args.includeReferences ?? true);
     const includeDependencies = Boolean(args.includeDependencies ?? true);
@@ -2996,37 +3417,486 @@ export class V2QueryService {
         limit: Math.max(limit * 5, 50),
       }) as Record<string, unknown>
       : undefined;
-    const sections = compact
-      ? compactSearchCodeSections(fileResults, symbolResults, endpointResults, references, dependencies, limit)
-      : {
-        files: fileResults,
-        symbols: symbolResults,
-        endpoints: endpointResults,
-        references,
-        dependencies,
-      };
-
-    return {
+    const fullSections = {
+      files: fileResults,
+      symbols: symbolResults,
+      endpoints: endpointResults,
+      references,
+      dependencies,
+    };
+    const summary = {
+      fileMatches: Number(fileResults.totalFound ?? 0),
+      symbolMatches: Number(symbolResults.totalFound ?? 0),
+      endpointMatches: Number(endpointResults.totalCount ?? 0),
+      referenceMatches: references ? Number(references.totalCount ?? 0) : undefined,
+      dependencyEdges: dependencies ? ((dependencies.edges as unknown[]) ?? []).length : undefined,
+    };
+    const debug = Boolean(args.explainRank) ? { debug: rankDebug('search_code', [
+      'Mixed search delegates ranking to search_files, search_symbol, find_endpoints, find_references, and trace_dependencies.',
+      'Use the section-specific nextCursor values when one result type needs deeper pagination.',
+    ]) } : {};
+    const fullResult = {
       query,
-      outputMode: compact ? 'compact' : 'full',
-      sections,
-      summary: {
-        fileMatches: Number(fileResults.totalFound ?? 0),
-        symbolMatches: Number(symbolResults.totalFound ?? 0),
-        endpointMatches: Number(endpointResults.totalCount ?? 0),
-        referenceMatches: references ? Number(references.totalCount ?? 0) : undefined,
-        dependencyEdges: dependencies ? ((dependencies.edges as unknown[]) ?? []).length : undefined,
-      },
-      ...(Boolean(args.explainRank) ? { debug: rankDebug('search_code', [
-        'Mixed search delegates ranking to search_files, search_symbol, find_endpoints, find_references, and trace_dependencies.',
-        'Use the section-specific nextCursor values when one result type needs deeper pagination.',
-      ]) } : {}),
+      outputMode: 'full',
+      sections: fullSections,
+      summary,
+      ...debug,
       confidenceNotes: [
-        compact
-          ? 'search_code returns compact sections by default; call a pack tool or get_file_slice for exact source text, or set outputMode=full for expanded retrieval.'
-          : 'search_code is a mixed retrieval view; use the section-specific tools when you need deeper pagination or fewer result types.',
+        'search_code is a mixed retrieval view; use the section-specific tools when you need deeper pagination or fewer result types.',
       ],
     };
+    const requestedResult = compact
+      ? {
+        query,
+        outputMode: 'compact',
+        sections: compactSearchCodeSections(fileResults, symbolResults, endpointResults, references, dependencies, limit),
+        summary,
+        ...debug,
+        confidenceNotes: [
+          'search_code returns compact sections by default; call a pack tool or get_file_slice for exact source text, or set outputMode=full for expanded retrieval.',
+        ],
+      }
+      : fullResult;
+    const requestedTokens = estimateTokens(JSON.stringify(requestedResult));
+    if (requestedTokens <= maxResponseTokens) {
+      return withResponseCapBudget(requestedResult, {
+        fullPayload: fullResult,
+        maxResponseTokens,
+        capped: false,
+        policy: compact
+          ? 'compact mixed retrieval returns ranked candidates and graph counts; expand exact files with get_file_slice'
+          : 'full mixed retrieval returned within response cap',
+      });
+    }
+
+    let cappedResult: Record<string, unknown> = {
+      query,
+      outputMode: 'compact-capped',
+      sections: compactSearchCodeSections(
+        fileResults,
+        symbolResults,
+        endpointResults,
+        references,
+        dependencies,
+        compactLimitForResponseCap(maxResponseTokens),
+        {
+          includeReferences: maxResponseTokens >= 6000,
+          includeDependencies: maxResponseTokens >= 6000,
+        },
+      ),
+      summary,
+      omissions: {
+        reason: 'response-token-cap',
+        requestedOutputMode: compact ? 'compact' : 'full',
+        referencesOmitted: includeReferences && maxResponseTokens < 6000,
+        dependenciesOmitted: includeDependencies && maxResponseTokens < 6000,
+      },
+      ...debug,
+      confidenceNotes: [
+        'search_code exceeded maxResponseTokens; returned ranked compact sections and counts instead of expanded mixed retrieval.',
+        'Use get_file_slice, search_symbol, find_references, or trace_dependencies for the specific missing fact instead of expanding every section.',
+      ],
+    };
+    if (estimateTokens(JSON.stringify(cappedResult)) > maxResponseTokens) {
+      cappedResult = {
+        ...cappedResult,
+        sections: compactSearchCodeSections(
+          fileResults,
+          symbolResults,
+          endpointResults,
+          references,
+          dependencies,
+          1,
+          { includeReferences: false, includeDependencies: false },
+        ),
+        omissions: {
+          reason: 'response-token-cap',
+          requestedOutputMode: compact ? 'compact' : 'full',
+          referencesOmitted: includeReferences,
+          dependenciesOmitted: includeDependencies,
+          detail: 'response remained over cap after compacting; returned top file/symbol/endpoint only',
+        },
+      };
+    }
+    return withResponseCapBudget(cappedResult, {
+      fullPayload: fullResult,
+      maxResponseTokens,
+      capped: true,
+      policy: 'response exceeded maxResponseTokens; returned compact ranked candidates and omitted broad reference/dependency details first',
+    });
+  }
+
+  private async generateRepoAtlas(snapshotId: string, args: Record<string, unknown> = {}) {
+    const startedAt = Date.now();
+    const format = normalizeRepoAtlasFormat(args.format);
+    const profile = normalizePackProfile(args.profile);
+    const includeTests = args.includeTests !== false;
+    const includeGenerated = args.includeGenerated === true;
+    const maxModules = clampInt(Number(args.maxModules ?? 12), 1, 80);
+    const maxEntrypoints = clampInt(Number(args.maxEntrypoints ?? 30), 1, 200);
+    const maxHotspots = clampInt(Number(args.maxHotspots ?? 25), 1, 200);
+    const moduleLimit = Math.min(maxModules, packProfileValue(profile, 6, 12, 40));
+    const entrypointLimit = Math.min(maxEntrypoints, packProfileValue(profile, 8, 30, 120));
+    const hotspotLimit = Math.min(maxHotspots, packProfileValue(profile, 8, 25, 100));
+    const flowLimit = Math.min(entrypointLimit, packProfileValue(profile, 4, 8, 24));
+
+    const [
+      snapshot,
+      snapshotStats,
+      files,
+      symbolCounts,
+      endpoints,
+      hotspotRows,
+      overlayModuleRows,
+      overlayFileRows,
+      overlayModuleEdgeRows,
+      dependencyPairs,
+    ] = await Promise.all([
+      this.db.prepare(`
+        SELECT s.id, s.workspace_id, s.branch, s.head_commit, s.created_at, s.index_time_ms,
+               s.manifest_scan_ms, s.files_total, s.files_parsed, s.parse_cache_hits,
+               w.root AS workspace_root, w.workspace_key
+        FROM snapshots s
+        JOIN workspaces w ON w.id = s.workspace_id
+        WHERE s.id = ?
+      `).get(snapshotId) as Promise<RepoAtlasSnapshotRow | undefined>,
+      this.snapshotStats(snapshotId),
+      this.db.prepare(`
+        SELECT path, language, file_role, parse_status, size
+        FROM files
+        WHERE snapshot_id = ?
+        ORDER BY path
+        LIMIT 200000
+      `).all(snapshotId) as Promise<RepoAtlasFileRow[]>,
+      this.db.prepare(`
+        SELECT file, COUNT(*) AS count
+        FROM symbols
+        WHERE snapshot_id = ?
+        GROUP BY file
+        LIMIT 200000
+      `).all(snapshotId) as Promise<Array<{ file: string; count: number | string }>>,
+      this.db.prepare(`
+        SELECT method, path, path_resolution, path_resolution_reason,
+               handler_symbol, controller, file, line, framework, confidence, file_role
+        FROM endpoints
+        WHERE snapshot_id = ?
+        ORDER BY confidence DESC, file, line
+        LIMIT 5000
+      `).all(snapshotId) as Promise<EndpointRow[]>,
+      this.db.prepare(`
+        SELECT f.path, f.language, f.file_role, f.parse_status, f.size,
+               COALESCE(outd.count, 0) AS outgoing_deps,
+               COALESCE(ind.count, 0) AS incoming_deps,
+               COALESCE(calls.count, 0) AS call_edges,
+               COALESCE(syms.count, 0) AS symbols,
+               COALESCE(eps.count, 0) AS endpoints
+        FROM files f
+        LEFT JOIN (
+          SELECT from_file AS file, COUNT(*) AS count
+          FROM dependency_edges
+          WHERE snapshot_id = ?
+          GROUP BY from_file
+        ) outd ON outd.file = f.path
+        LEFT JOIN (
+          SELECT to_file AS file, COUNT(*) AS count
+          FROM dependency_edges
+          WHERE snapshot_id = ?
+          GROUP BY to_file
+        ) ind ON ind.file = f.path
+        LEFT JOIN (
+          SELECT file, COUNT(*) AS count
+          FROM call_edges
+          WHERE snapshot_id = ? AND signal_tier IN ('primary', 'provider')
+          GROUP BY file
+        ) calls ON calls.file = f.path
+        LEFT JOIN (
+          SELECT file, COUNT(*) AS count
+          FROM symbols
+          WHERE snapshot_id = ?
+          GROUP BY file
+        ) syms ON syms.file = f.path
+        LEFT JOIN (
+          SELECT file, COUNT(*) AS count
+          FROM endpoints
+          WHERE snapshot_id = ?
+          GROUP BY file
+        ) eps ON eps.file = f.path
+        WHERE f.snapshot_id = ?
+        ORDER BY
+          (COALESCE(ind.count, 0) * 3)
+          + (COALESCE(outd.count, 0) * 2)
+          + (COALESCE(calls.count, 0) * 2)
+          + (COALESCE(eps.count, 0) * 25)
+          + COALESCE(syms.count, 0) DESC,
+          f.path
+        LIMIT 500
+      `).all(snapshotId, snapshotId, snapshotId, snapshotId, snapshotId, snapshotId) as Promise<RepoAtlasHotspotRow[]>,
+      this.db.prepare(`
+        SELECT node_id, label, stats_json, evidence_json
+        FROM graph_nodes
+        WHERE snapshot_id = ? AND node_type = 'module'
+        ORDER BY label
+        LIMIT 500
+      `).all(snapshotId) as Promise<RepoAtlasOverlayModuleRow[]>,
+      this.db.prepare(`
+        SELECT file, parent_node_id
+        FROM graph_nodes
+        WHERE snapshot_id = ? AND node_type = 'file' AND file IS NOT NULL AND parent_node_id IS NOT NULL
+        LIMIT 200000
+      `).all(snapshotId) as Promise<Array<{ file: string; parent_node_id: string }>>,
+      this.db.prepare(`
+        SELECT e.from_node_id, e.to_node_id, e.edge_type, e.confidence, e.edge_count,
+               src.label AS from_label, dst.label AS to_label, e.evidence_json
+        FROM graph_edges e
+        LEFT JOIN graph_nodes src ON src.snapshot_id = e.snapshot_id AND src.node_id = e.from_node_id
+        LEFT JOIN graph_nodes dst ON dst.snapshot_id = e.snapshot_id AND dst.node_id = e.to_node_id
+        WHERE e.snapshot_id = ? AND e.edge_type LIKE 'module_%'
+        ORDER BY e.edge_count DESC, e.confidence DESC
+        LIMIT 500
+      `).all(snapshotId) as Promise<RepoAtlasOverlayEdgeRow[]>,
+      this.db.prepare(`
+        SELECT from_file, to_file, COUNT(*) AS count, MAX(confidence) AS confidence
+        FROM dependency_edges
+        WHERE snapshot_id = ?
+        GROUP BY from_file, to_file
+        ORDER BY count DESC, confidence DESC
+        LIMIT 50000
+      `).all(snapshotId) as Promise<Array<{ from_file: string; to_file: string; count: number | string; confidence: number | string }>>,
+    ]);
+
+    const workspaceRoot = snapshot?.workspace_root ?? '';
+    const workspaceLabel = path.basename(path.resolve(workspaceRoot || 'workspace')) || 'workspace';
+    const counts = snapshotStats
+      ? countsFromSnapshotStats(snapshotStats)
+      : await this.liveIndexCounts(snapshotId);
+    const fileRoles = snapshotStats
+      ? fileRolesFromSnapshotStats(snapshotStats)
+      : await this.liveFileRoles(snapshotId);
+    const roleOptions = { includeTests, includeGenerated };
+    const symbolCountByFile = new Map(symbolCounts.map(row => [row.file, atlasNumber(row.count)]));
+    const endpointCountByFile = new Map<string, number>();
+    for (const endpoint of endpoints) {
+      endpointCountByFile.set(endpoint.file, (endpointCountByFile.get(endpoint.file) ?? 0) + 1);
+    }
+    const includedFiles = files.filter(file => repoAtlasIncludesRole(file.file_role, roleOptions));
+    const includedFileSet = new Set(includedFiles.map(file => file.path));
+    const includedEndpoints = endpoints
+      .filter(endpoint => includedFileSet.has(endpoint.file) && repoAtlasIncludesRole(endpoint.file_role, roleOptions));
+    const fileToModule = buildRepoAtlasFileModuleMap({
+      workspaceLabel,
+      files: includedFiles,
+      overlayFiles: overlayFileRows,
+      overlayModules: overlayModuleRows,
+    });
+    const modules = buildRepoAtlasModules({
+      workspaceLabel,
+      files: includedFiles,
+      symbolCountByFile,
+      endpointCountByFile,
+      fileToModule,
+      overlayModules: overlayModuleRows,
+      limit: moduleLimit,
+    });
+    const moduleDependencies = buildRepoAtlasModuleDependencies({
+      dependencyPairs,
+      overlayEdges: overlayModuleEdgeRows,
+      moduleById: new Map(modules.map(module => [module.id, module])),
+      fileToModule,
+      limit: Math.max(moduleLimit * 3, 10),
+    });
+    const entrypoints = compactEndpointCandidates(includedEndpoints.map(endpoint => endpointDto(endpoint)))
+      .slice(0, entrypointLimit);
+    const topFiles = hotspotRows
+      .filter(row => includedFileSet.has(row.path) && repoAtlasIncludesRole(row.file_role, roleOptions))
+      .map(row => repoAtlasHotspot(row, symbolCountByFile, endpointCountByFile))
+      .slice(0, hotspotLimit);
+    const featureFlows = await mapWithConcurrency(
+      entrypoints.slice(0, flowLimit),
+      4,
+      async endpoint => {
+        const handler = String(endpoint.handlerSymbol ?? '');
+        const callees = handler
+          ? ((await this.getCallees(snapshotId, {
+            symbol: handler,
+            limit: packProfileValue(profile, 4, 6, 12),
+          })) as { callees: CallEdgeRow[] }).callees
+          : [];
+        const callGraph = callees
+          .filter(edge => repoAtlasIncludesRole(edge.file_role ?? 'main_source', roleOptions))
+          .map(compactCallEdge)
+          .slice(0, packProfileValue(profile, 4, 6, 12));
+        const primaryFiles = rankFiles([
+          String(endpoint.file ?? ''),
+          ...callGraph.map(edge => String(edge.file ?? '')),
+        ]).slice(0, packProfileValue(profile, 3, 5, 10));
+        const likelyTests = includeTests
+          ? await this.findRelevantTestsForSeeds(snapshotId, repoAtlasFlowTestSeeds(endpoint, callGraph), packProfileValue(profile, 2, 4, 8))
+          : [];
+        return {
+          id: `${endpoint.method} ${endpoint.path}`,
+          name: repoAtlasFlowName(endpoint),
+          entrypoint: endpoint,
+          handler,
+          primaryFiles,
+          callGraph,
+          likelyTests,
+          confidence: repoAtlasFlowConfidence(endpoint, callGraph, likelyTests),
+          evidence: [
+            {
+              file: endpoint.file,
+              line: endpoint.line,
+              reason: 'indexed endpoint handler',
+            },
+            ...callGraph.slice(0, 3).map(edge => ({
+              file: edge.file,
+              line: edge.line,
+              reason: 'direct primary/provider call edge from handler seed',
+            })),
+          ],
+        };
+      },
+    );
+    const likelyTests = includeTests
+      ? await this.findRelevantTestsForSeeds(snapshotId, uniqueStrings([
+        ...featureFlows.flatMap(flow => [flow.handler, flow.name]),
+        ...topFiles.slice(0, 8).map(file => {
+          const filePath = String(file.file ?? '');
+          return path.posix.basename(filePath, path.posix.extname(filePath));
+        }),
+      ]), packProfileValue(profile, 4, 10, 25))
+      : [];
+    const validation = await this.validationHints(snapshotId, likelyTests, topFiles.slice(0, 12).map(file => String(file.file ?? '')).filter(Boolean));
+    const diagnostics = {
+      parseFailures: parseJson<Array<Record<string, unknown>>>(snapshotStats?.parse_failures_json ?? undefined, []).slice(0, packProfileValue(profile, 3, 8, 30)),
+      topUnresolvedImports: parseJson<Array<Record<string, unknown>>>(snapshotStats?.top_unresolved_imports_json ?? undefined, []).slice(0, packProfileValue(profile, 3, 8, 30)),
+      topUnresolvedCalls: parseJson<Array<Record<string, unknown>>>(snapshotStats?.top_unresolved_calls_json ?? undefined, []).slice(0, packProfileValue(profile, 3, 8, 30)),
+      endpointWarnings: parseJson<Array<Record<string, unknown>>>(snapshotStats?.endpoint_warnings_json ?? undefined, []).slice(0, packProfileValue(profile, 3, 8, 30)),
+    };
+    const atlas = {
+      reportType: 'repo_atlas',
+      version: 1,
+      format: 'json',
+      profile,
+      generatedAt: new Date().toISOString(),
+      snapshot: {
+        workspaceId: snapshot?.workspace_id,
+        snapshotId,
+        root: workspaceRoot,
+        workspaceKey: snapshot?.workspace_key,
+        branch: snapshot?.branch,
+        headCommit: snapshot?.head_commit,
+        createdAt: snapshot?.created_at,
+        indexTimeMs: atlasNumber(snapshot?.index_time_ms),
+        manifestScanMs: atlasNumber(snapshot?.manifest_scan_ms),
+        filesTotal: atlasNumber(snapshot?.files_total),
+        filesParsed: atlasNumber(snapshot?.files_parsed),
+        parseCacheHits: atlasNumber(snapshot?.parse_cache_hits),
+      },
+      systemMentalModel: [
+        `The current snapshot contains ${counts.files} files, ${counts.symbols} symbols, ${counts.dependencyEdges} file dependency edges, ${counts.callEdgesPrimary} primary/provider call edges, and ${counts.endpoints} endpoints.`,
+        'Repo Atlas is generated from persistent CodeGraph facts only; it does not read raw source text or call an AI model.',
+        overlayModuleRows.length > 0
+          ? 'Graph overlay rows are available, so module boundaries and aggregate module edges come from graph_nodes/graph_edges.'
+          : 'Graph overlay rows are absent, so module boundaries fall back to path-based grouping and dependency_edges aggregation.',
+      ],
+      executionPipeline: [
+        { step: 1, owner: 'indexer', mechanism: 'source files were parsed into files, symbols, endpoints, call_edges, and dependency_edges tables' },
+        { step: 2, owner: 'query service', mechanism: 'generate_repo_atlas reads snapshot stats and bounded graph aggregates' },
+        { step: 3, owner: 'atlas renderer', mechanism: 'modules, flows, hotspots, validation hints, and follow-up tool calls are ranked deterministically' },
+      ],
+      summary: {
+        counts,
+        fileRoles: fileRoles.map(row => ({ fileRole: row.file_role, count: atlasNumber(row.count) })),
+        languages: repoAtlasLanguageSummary(includedFiles),
+        health: {
+          parseFailureCount: diagnostics.parseFailures.length,
+          unresolvedImportKinds: diagnostics.topUnresolvedImports.length,
+          unresolvedCallKinds: diagnostics.topUnresolvedCalls.length,
+          endpointWarningCount: diagnostics.endpointWarnings.length,
+          overlayAvailable: overlayModuleRows.length > 0,
+        },
+      },
+      architecture: {
+        modules,
+        moduleDependencies,
+        entrypoints,
+        topFiles,
+      },
+      featureMap: {
+        generationMode: 'deterministic-index-facts',
+        flows: featureFlows,
+        confidenceNotes: [
+          'Flows start from indexed endpoints and attach direct primary/provider callees from the handler seed.',
+          'Business names are heuristic; file, symbol, endpoint, and test evidence are graph-derived.',
+        ],
+      },
+      changePlaybook: {
+        hotspots: topFiles,
+        validation,
+        likelyTests,
+        recommendedWorkflow: [
+          'For architecture questions, read architecture.modules and architecture.moduleDependencies first.',
+          'For API/feature work, start from featureMap.flows and then call get_flow_pack on the selected endpoint or handler.',
+          'For edits, call simulate_patch_impact with the planned files before changing code.',
+        ],
+      },
+      diagnostics,
+      automation: {
+        recommendedToolCalls: [
+          entrypoints[0] ? {
+            tool: 'get_flow_pack',
+            args: {
+              target: `${entrypoints[0].method} ${entrypoints[0].path}`,
+              responseMode: 'answer',
+              profile: 'compact',
+            },
+            why: 'Expand the highest-ranked endpoint flow with line-level evidence.',
+          } : undefined,
+          topFiles[0] ? {
+            tool: 'simulate_patch_impact',
+            args: {
+              files: [topFiles[0].file],
+              outputMode: 'compact',
+            },
+            why: 'Check blast radius before editing the highest-risk file.',
+          } : undefined,
+          {
+            tool: 'get_index_stats',
+            args: { warnStale: false },
+            why: 'Inspect index health diagnostics without rescanning dirty files.',
+          },
+        ].filter(Boolean),
+      },
+      assumptions: [
+        'No AI was used to infer this report.',
+        'Feature names are derived from endpoint path/method and handler names.',
+        'Call-chain depth is intentionally shallow; call get_flow_pack for deeper endpoint-specific evidence.',
+      ],
+      budget: {
+        profile,
+        dataSources: ['snapshot_stats', 'files', 'symbols', 'endpoints', 'dependency_edges', 'call_edges', 'graph_nodes', 'graph_edges'],
+        queryTimeMs: Date.now() - startedAt,
+        estimatedResponseTokens: 0,
+        policy: 'bounded aggregate report; raw source slices are omitted and exposed through follow-up tool calls',
+      },
+    };
+    atlas.budget.estimatedResponseTokens = estimateTokens(JSON.stringify(atlas));
+    if (format === 'markdown') {
+      const markdown = renderRepoAtlasMarkdown(atlas);
+      return {
+        reportType: 'repo_atlas',
+        version: atlas.version,
+        format,
+        profile,
+        markdown,
+        snapshot: atlas.snapshot,
+        budget: {
+          ...atlas.budget,
+          estimatedResponseTokens: estimateTokens(markdown),
+        },
+      };
+    }
+    return atlas;
   }
 
   private async getIndexStats(snapshotId: string, args: Record<string, unknown> = {}) {
@@ -3728,40 +4598,23 @@ export class V2QueryService {
 
   private async topUnresolvedImports(snapshotId: string): Promise<Array<Record<string, unknown>>> {
     const rows = await this.db.prepare(`
-      WITH import_counts AS (
-        SELECT source, substring(source FROM '[^.]+$') AS simple_name, COUNT(*) AS count
-        FROM imports
-        WHERE snapshot_id = ? AND ${COMMON_EXTERNAL_IMPORT_SQL}
-        GROUP BY source
-      ),
-      ranked_import_counts AS (
-        SELECT source, simple_name, count
-        FROM import_counts
-        ORDER BY count DESC, source
-        LIMIT 200
-      )
-      SELECT i.source, i.count
-      FROM ranked_import_counts i
-      WHERE NOT EXISTS (
-        SELECT 1
-        FROM symbols s
-        WHERE s.snapshot_id = ?
-          AND s.kind IN ('class', 'interface', 'enum', 'type')
-          AND s.fq_name = i.source
-        LIMIT 1
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM symbols s
-        WHERE s.snapshot_id = ?
-          AND s.kind IN ('class', 'interface', 'enum', 'type')
-          AND s.simple_name = i.simple_name
-        LIMIT 1
-      )
-      ORDER BY i.count DESC, i.source
-      LIMIT 20
-    `).all(snapshotId, snapshotId, snapshotId) as Array<{ source: string; count: number | string }>;
-    return rows.map(row => ({ source: row.source, count: Number(row.count) }));
+      SELECT source, COUNT(*) AS count
+      FROM imports
+      WHERE snapshot_id = ? AND ${COMMON_EXTERNAL_IMPORT_SQL}
+      GROUP BY source
+      ORDER BY count DESC, source
+      LIMIT 200
+    `).all(snapshotId) as Array<{ source: string; count: number | string }>;
+    const knownTypes = new Set((await this.db.prepare(`
+      SELECT fq_name, simple_name
+      FROM symbols
+      WHERE snapshot_id = ? AND kind IN ('class', 'interface', 'enum', 'type')
+    `).all(snapshotId) as Array<{ fq_name: string; simple_name: string }>)
+      .flatMap(row => [row.fq_name, row.simple_name]));
+    return rows
+      .filter(row => !knownTypes.has(row.source) && !knownTypes.has(simpleTypeName(row.source)))
+      .slice(0, 20)
+      .map(row => ({ source: row.source, count: Number(row.count) }));
   }
 
   private async impactedEndpoints(snapshotId: string, files: string[]): Promise<Array<Record<string, unknown>>> {
@@ -3799,6 +4652,67 @@ interface SymbolRow {
   file_role: FileRole;
 }
 
+interface RepoAtlasSnapshotRow {
+  id: string;
+  workspace_id: string;
+  workspace_root: string;
+  workspace_key?: string;
+  branch?: string;
+  head_commit?: string;
+  created_at?: string;
+  index_time_ms?: number | string;
+  manifest_scan_ms?: number | string;
+  files_total?: number | string;
+  files_parsed?: number | string;
+  parse_cache_hits?: number | string;
+}
+
+interface RepoAtlasFileRow {
+  path: string;
+  language?: string;
+  file_role: string;
+  parse_status: string;
+  size: number | string;
+}
+
+interface RepoAtlasHotspotRow extends RepoAtlasFileRow {
+  outgoing_deps: number | string;
+  incoming_deps: number | string;
+  call_edges: number | string;
+  symbols: number | string;
+  endpoints: number | string;
+}
+
+interface RepoAtlasOverlayModuleRow {
+  node_id: string;
+  label: string;
+  stats_json?: string;
+  evidence_json?: string;
+}
+
+interface RepoAtlasOverlayEdgeRow {
+  from_node_id: string;
+  to_node_id: string;
+  edge_type: string;
+  confidence: number | string;
+  edge_count: number | string;
+  from_label?: string;
+  to_label?: string;
+  evidence_json?: string;
+}
+
+interface RepoAtlasModule {
+  id: string;
+  label: string;
+  rootPrefix?: string;
+  files: number;
+  symbols: number;
+  endpoints: number;
+  topFiles: string[];
+  evidence: string[];
+  confidence: number;
+}
+
 interface CallEdgeRow {
   caller: string;
   callee: string;
@@ -3808,6 +4722,7 @@ interface CallEdgeRow {
   resolution_kind: string;
   signal_tier?: string;
   signal_reasons_json?: string;
+  file_role?: string;
 }
 
 interface FieldUsageRow {
@@ -3966,7 +4881,10 @@ function compactSearchCodeSections(
   references: Record<string, unknown> | undefined,
   dependencies: Record<string, unknown> | undefined,
   limit: number,
+  options: { includeReferences?: boolean; includeDependencies?: boolean } = {},
 ): Record<string, unknown> {
+  const includeReferences = options.includeReferences !== false;
+  const includeDependencies = options.includeDependencies !== false;
   return {
     files: {
       totalFound: Number(fileResults.totalFound ?? 0),
@@ -3982,14 +4900,14 @@ function compactSearchCodeSections(
       totalCount: Number(endpointResults.totalCount ?? 0),
       endpoints: compactEndpointCandidates(arrayRecords(endpointResults.endpoints)).slice(0, limit),
     },
-    references: references ? {
+    references: includeReferences && references ? {
       totalCount: Number(references.totalCount ?? 0),
       truncated: Boolean(references.truncated),
       nextCursor: references.nextCursor,
       references: arrayRecords(references.references).slice(0, limit).map(row => compactReviewObject(row, 8, 2)),
       groups: arrayRecords(references.groups).slice(0, Math.min(limit, 5)).map(row => compactReviewObject(row, 8, 2)),
     } : undefined,
-    dependencies: dependencies ? {
+    dependencies: includeDependencies && dependencies ? {
       seedFiles: stringArray(dependencies.seedFiles).slice(0, limit),
       transitiveFiles: stringArray(dependencies.transitiveFiles).slice(0, limit * 2),
       edges: arrayRecords(dependencies.edges).slice(0, limit * 3).map(row => compactReviewObject(row, 8, 2)),
@@ -4732,8 +5650,81 @@ function estimateTokens(value: string): number {
 }
 
 type PackProfile = 'micro' | 'compact' | 'full';
+type PatchImpactOutputMode = 'compact' | 'full';
+type PackResponseMode = 'answer' | 'agent' | 'full';
 
-function normalizePackProfile(value: unknown, fallback: PackProfile = 'full'): PackProfile {
+function normalizePatchImpactOutputMode(value: unknown): PatchImpactOutputMode {
+  return String(value ?? '').trim().toLowerCase() === 'full' ? 'full' : 'compact';
+}
+
+function normalizePackResponseMode(value: unknown, fallback: PackResponseMode = 'agent'): PackResponseMode {
+  const mode = String(value ?? '').trim().toLowerCase();
+  if (mode === 'answer' || mode === 'agent' || mode === 'full') return mode;
+  return fallback;
+}
+
+function responseTokenCap(args: Record<string, unknown>, fallback: number): number {
+  const value = args.maxResponseTokens;
+  if (value === undefined || value === null || value === '') return fallback;
+  return clampInt(Number(value), 500, 30000);
+}
+
+function compactLimitForResponseCap(maxResponseTokens: number): number {
+  if (maxResponseTokens <= 1500) return 2;
+  if (maxResponseTokens <= 3000) return 3;
+  if (maxResponseTokens <= 6000) return 5;
+  return 8;
+}
+
+function responseCapBudget(input: {
+  returnedPayload: unknown;
+  fullPayload?: unknown;
+  maxResponseTokens: number;
+  capped: boolean;
+  policy: string;
+}): Record<string, unknown> {
+  const estimatedResponseTokens = estimateTokens(JSON.stringify(input.returnedPayload));
+  const rawFullResponseTokens = input.fullPayload
+    ? estimateTokens(JSON.stringify(input.fullPayload))
+    : estimatedResponseTokens;
+  const estimatedFullResponseTokens = Math.max(rawFullResponseTokens, estimatedResponseTokens);
+  return {
+    maxResponseTokens: input.maxResponseTokens,
+    estimatedResponseTokens,
+    estimatedFullResponseTokens,
+    estimatedTokensSaved: Math.max(0, estimatedFullResponseTokens - estimatedResponseTokens),
+    compressionRatio: estimatedFullResponseTokens > 0
+      ? Math.round((estimatedResponseTokens / estimatedFullResponseTokens) * 100) / 100
+      : 1,
+    capped: input.capped,
+    capExceeded: estimatedResponseTokens > input.maxResponseTokens,
+    policy: input.policy,
+  };
+}
+
+function withResponseCapBudget<T extends Record<string, unknown>>(result: T, input: {
+  fullPayload?: unknown;
+  maxResponseTokens: number;
+  capped: boolean;
+  policy: string;
+}): T & { budget: Record<string, unknown> } {
+  const existingBudget = isPlainObject(result.budget) ? result.budget : {};
+  return {
+    ...result,
+    budget: {
+      ...existingBudget,
+      responseCap: responseCapBudget({
+        returnedPayload: result,
+        fullPayload: input.fullPayload,
+        maxResponseTokens: input.maxResponseTokens,
+        capped: input.capped,
+        policy: input.policy,
+      }),
+    },
+  };
+}
+
+function normalizePackProfile(value: unknown, fallback: PackProfile = 'compact'): PackProfile {
   const profile = String(value ?? '').trim().toLowerCase();
   if (profile === 'micro' || profile === 'compact' || profile === 'full') return profile;
   return fallback;
@@ -4743,6 +5734,868 @@ function packProfileValue(profile: PackProfile, micro: number, compact: number, 
   if (profile === 'micro') return micro;
   if (profile === 'full') return full;
   return compact;
+}
+
+type RepoAtlasFormat = 'json' | 'markdown';
+
+function normalizeRepoAtlasFormat(value: unknown): RepoAtlasFormat {
+  return String(value ?? '').trim().toLowerCase() === 'markdown' ? 'markdown' : 'json';
+}
+
+function repoAtlasIncludesRole(
+  fileRole: string | undefined,
+  options: { includeTests: boolean; includeGenerated: boolean },
+): boolean {
+  const role = fileRole ?? '';
+  if (!options.includeGenerated && role === 'generated') return false;
+  if (!options.includeTests && (role === 'test_source' || role === 'mock_source')) return false;
+  return true;
+}
+
+function atlasNumber(value: unknown): number {
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function repoAtlasLanguageSummary(files: RepoAtlasFileRow[]): Array<{ language: string; files: number; bytes: number }> {
+  const buckets = new Map<string, { language: string; files: number; bytes: number }>();
+  for (const file of files) {
+    const language = file.language || 'unknown';
+    const current = buckets.get(language) ?? { language, files: 0, bytes: 0 };
+    current.files++;
+    current.bytes += atlasNumber(file.size);
+    buckets.set(language, current);
+  }
+  return [...buckets.values()]
+    .sort((a, b) => b.files - a.files || a.language.localeCompare(b.language))
+    .slice(0, 20);
+}
+
+function buildRepoAtlasFileModuleMap(input: {
+  workspaceLabel: string;
+  files: RepoAtlasFileRow[];
+  overlayFiles: Array<{ file: string; parent_node_id: string }>;
+  overlayModules: RepoAtlasOverlayModuleRow[];
+}): Map<string, string> {
+  const moduleIds = new Set(input.overlayModules.map(row => row.node_id));
+  const result = new Map<string, string>();
+  if (moduleIds.size > 0) {
+    for (const row of input.overlayFiles) {
+      if (row.file && moduleIds.has(row.parent_node_id)) result.set(row.file, row.parent_node_id);
+    }
+  }
+  for (const file of input.files) {
+    if (result.has(file.path)) continue;
+    const root = repoAtlasModuleRootForFile(file.path);
+    result.set(file.path, repoAtlasModuleId(root || input.workspaceLabel));
+  }
+  return result;
+}
+
+function buildRepoAtlasModules(input: {
+  workspaceLabel: string;
+  files: RepoAtlasFileRow[];
+  symbolCountByFile: Map<string, number>;
+  endpointCountByFile: Map<string, number>;
+  fileToModule: Map<string, string>;
+  overlayModules: RepoAtlasOverlayModuleRow[];
+  limit: number;
+}): RepoAtlasModule[] {
+  const overlayById = new Map(input.overlayModules.map(row => [row.node_id, row]));
+  const modules = new Map<string, RepoAtlasModule>();
+  for (const file of input.files) {
+    const id = input.fileToModule.get(file.path) ?? repoAtlasModuleId(input.workspaceLabel);
+    let module = modules.get(id);
+    if (!module) {
+      const overlay = overlayById.get(id);
+      const overlayEvidence = parseJson<Array<Record<string, unknown>>>(overlay?.evidence_json, []);
+      const rootPrefix = stringOrUndefined(overlayEvidence.find(item => stringOrUndefined(item.rootPrefix))?.rootPrefix)
+        ?? repoAtlasModuleRootForFile(file.path);
+      module = {
+        id,
+        label: overlay?.label ?? repoAtlasModuleLabel(rootPrefix, input.workspaceLabel),
+        rootPrefix,
+        files: 0,
+        symbols: 0,
+        endpoints: 0,
+        topFiles: [],
+        evidence: overlayEvidence
+          .map(item => stringOrUndefined(item.reason))
+          .filter((item): item is string => Boolean(item))
+          .slice(0, 4),
+        confidence: overlay ? 0.9 : 0.65,
+      };
+      modules.set(id, module);
+    }
+    module.files++;
+    module.symbols += input.symbolCountByFile.get(file.path) ?? 0;
+    module.endpoints += input.endpointCountByFile.get(file.path) ?? 0;
+    module.topFiles.push(file.path);
+  }
+  for (const module of modules.values()) {
+    if (module.evidence.length === 0) {
+      module.evidence = module.rootPrefix
+        ? [`path prefix ${module.rootPrefix}`]
+        : ['workspace root fallback'];
+    }
+    module.topFiles = module.topFiles
+      .sort((a, b) => {
+        const aScore = (input.endpointCountByFile.get(a) ?? 0) * 100 + (input.symbolCountByFile.get(a) ?? 0);
+        const bScore = (input.endpointCountByFile.get(b) ?? 0) * 100 + (input.symbolCountByFile.get(b) ?? 0);
+        return bScore - aScore || a.localeCompare(b);
+      })
+      .slice(0, 6);
+  }
+  return [...modules.values()]
+    .sort((a, b) => b.endpoints - a.endpoints || b.files - a.files || a.label.localeCompare(b.label))
+    .slice(0, input.limit);
+}
+
+function buildRepoAtlasModuleDependencies(input: {
+  dependencyPairs: Array<{ from_file: string; to_file: string; count: number | string; confidence: number | string }>;
+  overlayEdges: RepoAtlasOverlayEdgeRow[];
+  moduleById: Map<string, RepoAtlasModule>;
+  fileToModule: Map<string, string>;
+  limit: number;
+}): Array<Record<string, unknown>> {
+  if (input.overlayEdges.length > 0) {
+    return input.overlayEdges
+      .filter(edge => input.moduleById.has(edge.from_node_id) && input.moduleById.has(edge.to_node_id))
+      .slice(0, input.limit)
+      .map(edge => ({
+        from: edge.from_node_id,
+        to: edge.to_node_id,
+        fromLabel: edge.from_label ?? input.moduleById.get(edge.from_node_id)?.label,
+        toLabel: edge.to_label ?? input.moduleById.get(edge.to_node_id)?.label,
+        kind: edge.edge_type,
+        count: atlasNumber(edge.edge_count),
+        confidence: atlasNumber(edge.confidence),
+        evidence: parseJson<Array<Record<string, unknown>>>(edge.evidence_json, []).slice(0, 3),
+      }));
+  }
+  const aggregates = new Map<string, { from: string; to: string; count: number; confidence: number }>();
+  for (const pair of input.dependencyPairs) {
+    const from = input.fileToModule.get(pair.from_file);
+    const to = input.fileToModule.get(pair.to_file);
+    if (!from || !to || from === to) continue;
+    if (!input.moduleById.has(from) || !input.moduleById.has(to)) continue;
+    const key = `${from}\0${to}`;
+    const current = aggregates.get(key) ?? { from, to, count: 0, confidence: 0 };
+    current.count += atlasNumber(pair.count);
+    current.confidence = Math.max(current.confidence, atlasNumber(pair.confidence));
+    aggregates.set(key, current);
+  }
+  return [...aggregates.values()]
+    .sort((a, b) => b.count - a.count || b.confidence - a.confidence)
+    .slice(0, input.limit)
+    .map(edge => ({
+      from: edge.from,
+      to: edge.to,
+      fromLabel: input.moduleById.get(edge.from)?.label,
+      toLabel: input.moduleById.get(edge.to)?.label,
+      kind: 'module_dependency',
+      count: edge.count,
+      confidence: edge.confidence,
+      evidence: [],
+    }));
+}
+
+function repoAtlasHotspot(
+  row: RepoAtlasHotspotRow,
+  symbolCountByFile: Map<string, number>,
+  endpointCountByFile: Map<string, number>,
+): Record<string, unknown> {
+  const outgoingDependencies = atlasNumber(row.outgoing_deps);
+  const incomingDependents = atlasNumber(row.incoming_deps);
+  const callEdges = atlasNumber(row.call_edges);
+  const symbols = Math.max(atlasNumber(row.symbols), symbolCountByFile.get(row.path) ?? 0);
+  const endpoints = Math.max(atlasNumber(row.endpoints), endpointCountByFile.get(row.path) ?? 0);
+  const riskScore = Math.round(
+    endpoints * 25
+    + incomingDependents * 3
+    + outgoingDependencies * 2
+    + callEdges * 2
+    + Math.min(symbols, 100),
+  );
+  const why: string[] = [];
+  if (endpoints > 0) why.push(`${endpoints} indexed endpoint(s)`);
+  if (incomingDependents > 0) why.push(`${incomingDependents} dependent file edge(s)`);
+  if (outgoingDependencies > 0) why.push(`${outgoingDependencies} dependency edge(s)`);
+  if (callEdges > 0) why.push(`${callEdges} primary/provider call edge(s)`);
+  if (symbols > 20) why.push(`${symbols} declared symbol(s)`);
+  return {
+    file: row.path,
+    language: row.language,
+    fileRole: row.file_role,
+    size: atlasNumber(row.size),
+    metrics: {
+      endpoints,
+      symbols,
+      callEdges,
+      outgoingDependencies,
+      incomingDependents,
+    },
+    riskScore,
+    riskLevel: riskScore >= 80 ? 'high' : riskScore >= 25 ? 'medium' : 'low',
+    why: why.length > 0 ? why : ['ranked by graph connectivity'],
+  };
+}
+
+function repoAtlasFlowName(endpoint: Record<string, unknown>): string {
+  const method = String(endpoint.method ?? '').toUpperCase() || 'REQUEST';
+  const route = String(endpoint.path ?? '').replace(/^\/api\//, '/').replace(/[{}]/g, '').replace(/\/+/g, '/');
+  const handler = String(endpoint.handlerSymbol ?? '').split('.').slice(-2).join('.');
+  return handler ? `${method} ${route} via ${handler}` : `${method} ${route}`;
+}
+
+function repoAtlasFlowTestSeeds(endpoint: Record<string, unknown>, callGraph: Array<Record<string, unknown>>): string[] {
+  return uniqueStrings([
+    String(endpoint.handlerSymbol ?? ''),
+    String(endpoint.controller ?? ''),
+    String(endpoint.path ?? '').split(/[/?#]/)[1] ?? '',
+    ...callGraph.flatMap(edge => [String(edge.callee ?? ''), String(edge.caller ?? '')]),
+  ].flatMap(value => value.split(/[/:{}._\-\s]+/).concat(value)).filter(value => value.length >= 3));
+}
+
+function repoAtlasFlowConfidence(
+  endpoint: Record<string, unknown>,
+  callGraph: Array<Record<string, unknown>>,
+  tests: Array<Record<string, unknown>>,
+): number {
+  const endpointConfidence = atlasNumber(endpoint.confidence) || 0.65;
+  const callBoost = callGraph.length > 0 ? 0.08 : 0;
+  const testBoost = tests.length > 0 ? 0.05 : 0;
+  return Math.min(0.95, Math.round((endpointConfidence + callBoost + testBoost) * 100) / 100);
+}
+
+function repoAtlasModuleRootForFile(file: string): string {
+  const normalized = file.replace(/\\/g, '/');
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts.length >= 2 && /^(apps|packages|services|modules|crates)$/.test(parts[0] ?? '')) {
+    return parts.slice(0, 2).join('/');
+  }
+  const srcIndex = normalized.indexOf('/src/');
+  if (srcIndex > 0) return normalized.slice(0, srcIndex);
+  if (normalized.startsWith('src/')) return '';
+  return parts.length > 2 ? parts[0] ?? '' : '';
+}
+
+function repoAtlasModuleLabel(rootPrefix: string | undefined, fallback: string): string {
+  if (!rootPrefix) return fallback;
+  return path.posix.basename(rootPrefix) || rootPrefix;
+}
+
+function repoAtlasModuleId(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/\\/g, '/')
+    .replace(/[^a-z0-9/._-]+/g, '-')
+    .replace(/[/.]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return `module:${normalized || 'workspace'}`;
+}
+
+function renderRepoAtlasMarkdown(atlas: Record<string, unknown>): string {
+  const snapshot = isPlainObject(atlas.snapshot) ? atlas.snapshot : {};
+  const summary = isPlainObject(atlas.summary) ? atlas.summary : {};
+  const architecture = isPlainObject(atlas.architecture) ? atlas.architecture : {};
+  const featureMap = isPlainObject(atlas.featureMap) ? atlas.featureMap : {};
+  const changePlaybook = isPlainObject(atlas.changePlaybook) ? atlas.changePlaybook : {};
+  const diagnostics = isPlainObject(atlas.diagnostics) ? atlas.diagnostics : {};
+  const counts = isPlainObject(summary.counts) ? summary.counts : {};
+  const modules = arrayRecords(architecture.modules);
+  const moduleDependencies = arrayRecords(architecture.moduleDependencies);
+  const entrypoints = arrayRecords(architecture.entrypoints);
+  const flows = arrayRecords(featureMap.flows);
+  const hotspots = arrayRecords(changePlaybook.hotspots);
+  const likelyTests = arrayRecords(changePlaybook.likelyTests);
+  const lines: string[] = [];
+  lines.push('# CodeGraph Repo Atlas', '');
+  lines.push(`Generated: ${String(atlas.generatedAt ?? '')}`);
+  lines.push(`Workspace: ${String(snapshot.root ?? '')}`);
+  lines.push(`Snapshot: ${String(snapshot.snapshotId ?? '')}`);
+  lines.push('');
+  lines.push('## System Mental Model', '');
+  for (const item of stringArray(atlas.systemMentalModel)) lines.push(`- ${item}`);
+  lines.push('');
+  lines.push('## Index Summary', '');
+  lines.push('| Metric | Value |');
+  lines.push('|---|---:|');
+  for (const key of ['files', 'symbols', 'dependencyEdges', 'callEdgesPrimary', 'endpoints', 'graphNodes', 'graphEdges']) {
+    lines.push(`| ${repoAtlasMd(key)} | ${repoAtlasMd(String(counts[key] ?? 0))} |`);
+  }
+  lines.push('');
+  lines.push('## Modules', '');
+  lines.push('| Module | Files | Symbols | Endpoints | Evidence |');
+  lines.push('|---|---:|---:|---:|---|');
+  for (const module of modules.slice(0, 20)) {
+    lines.push(`| ${repoAtlasMd(module.label)} | ${repoAtlasMd(module.files)} | ${repoAtlasMd(module.symbols)} | ${repoAtlasMd(module.endpoints)} | ${repoAtlasMd(stringArray(module.evidence).join(', '))} |`);
+  }
+  if (modules.length === 0) lines.push('| none | 0 | 0 | 0 | no module facts |');
+  lines.push('');
+  lines.push('## Module Dependencies', '');
+  lines.push('| From | To | Kind | Count |');
+  lines.push('|---|---|---|---:|');
+  for (const edge of moduleDependencies.slice(0, 20)) {
+    lines.push(`| ${repoAtlasMd(edge.fromLabel ?? edge.from)} | ${repoAtlasMd(edge.toLabel ?? edge.to)} | ${repoAtlasMd(edge.kind)} | ${repoAtlasMd(edge.count)} |`);
+  }
+  if (moduleDependencies.length === 0) lines.push('| none | none | none | 0 |');
+  lines.push('');
+  lines.push('## Entrypoints', '');
+  lines.push('| Endpoint | Handler | File | Line |');
+  lines.push('|---|---|---|---:|');
+  for (const endpoint of entrypoints.slice(0, 30)) {
+    lines.push(`| ${repoAtlasMd(`${endpoint.method ?? ''} ${endpoint.path ?? ''}`)} | ${repoAtlasMd(endpoint.handlerSymbol)} | ${repoAtlasMd(endpoint.file)} | ${repoAtlasMd(endpoint.line)} |`);
+  }
+  if (entrypoints.length === 0) lines.push('| none | none | none | 0 |');
+  lines.push('');
+  lines.push('## Feature Flows', '');
+  for (const flow of flows.slice(0, 12)) {
+    lines.push(`### ${String(flow.name ?? flow.id ?? 'Flow')}`, '');
+    lines.push(`- Handler: ${String(flow.handler ?? '')}`);
+    lines.push(`- Primary files: ${stringArray(flow.primaryFiles).join(', ') || 'none'}`);
+    lines.push(`- Likely tests: ${arrayRecords(flow.likelyTests).map(test => String(test.file ?? '')).filter(Boolean).join(', ') || 'none'}`);
+    lines.push(`- Confidence: ${String(flow.confidence ?? '')}`);
+    lines.push('');
+  }
+  lines.push('## Change Impact Hotspots', '');
+  lines.push('| File | Risk | Score | Why |');
+  lines.push('|---|---|---:|---|');
+  for (const hotspot of hotspots.slice(0, 30)) {
+    lines.push(`| ${repoAtlasMd(hotspot.file)} | ${repoAtlasMd(hotspot.riskLevel)} | ${repoAtlasMd(hotspot.riskScore)} | ${repoAtlasMd(stringArray(hotspot.why).join(', '))} |`);
+  }
+  if (hotspots.length === 0) lines.push('| none | low | 0 | no graph hotspots |');
+  lines.push('');
+  lines.push('## Validation', '');
+  lines.push(`Likely tests: ${likelyTests.map(test => String(test.file ?? '')).filter(Boolean).join(', ') || 'none'}`);
+  const validation = isPlainObject(changePlaybook.validation) ? changePlaybook.validation : {};
+  const commands = stringArray(validation.suggestedCommands);
+  if (commands.length > 0) {
+    lines.push('');
+    lines.push('Suggested commands:');
+    for (const command of commands) lines.push(`- \`${command}\``);
+  }
+  lines.push('');
+  lines.push('## Diagnostics', '');
+  lines.push(`Parse failures: ${arrayRecords(diagnostics.parseFailures).length}`);
+  lines.push(`Unresolved imports: ${arrayRecords(diagnostics.topUnresolvedImports).length}`);
+  lines.push(`Unresolved calls: ${arrayRecords(diagnostics.topUnresolvedCalls).length}`);
+  lines.push('');
+  lines.push('## Recommended Priority Order', '');
+  lines.push('1. Use the top entrypoint flow for feature/API research.');
+  lines.push('2. Use the highest-risk hotspot with simulate_patch_impact before editing.');
+  lines.push('3. Use get_index_stats if diagnostics show parse, endpoint, or unresolved-call gaps.');
+  lines.push('');
+  return lines.join('\n');
+}
+
+function repoAtlasMd(value: unknown): string {
+  return String(value ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim();
+}
+
+function evidenceHandleForObject(value: Record<string, unknown>, maxChars = 3000): Record<string, unknown> | undefined {
+  const file = stringOrUndefined(value.file);
+  const lines = stringOrUndefined(value.fileSliceLines ?? value.lines ?? value.newLines);
+  const symbol = stringOrUndefined(value.symbol);
+  if (!file && !symbol) return undefined;
+  const args: Record<string, unknown> = { maxChars };
+  if (file) args.file = file;
+  if (lines) args.lines = lines;
+  if (symbol) args.symbol = symbol;
+  return {
+    tool: 'get_file_slice',
+    args,
+    source: stringOrUndefined(value.targetId) ?? stringOrUndefined(value.why) ?? stringOrUndefined(value.whyRelevant),
+  };
+}
+
+function evidenceHandlesForObjects(values: Array<Record<string, unknown>>, profile: PackProfile, maxChars?: number): Array<Record<string, unknown>> {
+  const limit = packProfileValue(profile, 4, 6, 12);
+  const charLimit = maxChars ?? packProfileValue(profile, 1800, 2600, 5000);
+  const seen = new Set<string>();
+  const handles: Array<Record<string, unknown>> = [];
+  for (const value of values) {
+    const handle = evidenceHandleForObject(value, charLimit);
+    if (!handle) continue;
+    const key = JSON.stringify(handle.args);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    handles.push(handle);
+    if (handles.length >= limit) break;
+  }
+  return handles;
+}
+
+function responseBudgetReport(input: {
+  profile: PackProfile;
+  tokenBudget?: number;
+  returnedPayload: unknown;
+  fullPayload?: unknown;
+  handleCount?: number;
+  policy?: string;
+}): Record<string, unknown> {
+  const estimatedResponseTokens = estimateTokens(JSON.stringify(input.returnedPayload));
+  const rawFullResponseTokens = input.fullPayload
+    ? estimateTokens(JSON.stringify(input.fullPayload))
+    : estimatedResponseTokens;
+  const estimatedFullResponseTokens = Math.max(rawFullResponseTokens, estimatedResponseTokens);
+  const estimatedTokensSaved = Math.max(0, estimatedFullResponseTokens - estimatedResponseTokens);
+  const handleCount = input.handleCount ?? 0;
+  const capExceeded = typeof input.tokenBudget === 'number'
+    ? estimatedResponseTokens > input.tokenBudget
+    : false;
+  return {
+    profile: input.profile,
+    tokenBudget: input.tokenBudget,
+    requestedTokenBudget: input.tokenBudget,
+    estimatedResponseTokens,
+    estimatedFullResponseTokens,
+    estimatedTokensSaved,
+    compressionRatio: estimatedFullResponseTokens > 0
+      ? Math.round((estimatedResponseTokens / estimatedFullResponseTokens) * 100) / 100
+      : 1,
+    handleCount,
+    evidenceHandleCount: handleCount,
+    capExceeded,
+    policy: input.policy ?? 'compact evidence first; expand exact slices only when needed',
+  };
+}
+
+type CompileEvidenceTaskType = 'api_flow' | 'field_impact' | 'review_diff' | 'startup_flow' | 'implement' | 'investigate' | 'test' | 'unknown';
+type CompileCoverageStatus = 'covered' | 'partial' | 'missing';
+
+function normalizeCompileEvidenceTaskType(value: unknown, task: string, args: Record<string, unknown>): CompileEvidenceTaskType {
+  const raw = String(value ?? '').trim().toLowerCase().replace(/[-\s]+/g, '_');
+  const allowed = new Set<CompileEvidenceTaskType>([
+    'api_flow',
+    'field_impact',
+    'review_diff',
+    'startup_flow',
+    'implement',
+    'investigate',
+    'test',
+    'unknown',
+  ]);
+  if (allowed.has(raw as CompileEvidenceTaskType) && raw !== 'unknown') return raw as CompileEvidenceTaskType;
+  if (stringOrUndefined(args.diff) || /\bdiff\b|\bpatch\b|\breview\b/i.test(task)) return 'review_diff';
+  if (/\b(unit\s+test|testcase|write\s+tests?|spec)\b/i.test(task)) return 'test';
+  if (/\b(implement|fix|refactor|debug|change|edit)\b/i.test(task)) return 'implement';
+  if (/\b(GET|POST|PUT|PATCH|DELETE)\s+\//.test(task) || /\b(endpoint|api|route|handler)\b/i.test(task)) return 'api_flow';
+  if (/\b(field|initialized|read|write|usage|usages)\b/i.test(task)) return 'field_impact';
+  if (/\b(startup|handshake|proxy|mode selection|watchdog)\b/i.test(task)) return 'startup_flow';
+  if (/\b(investigate|trace|understand|explain|flow|impact)\b/i.test(task)) return 'investigate';
+  return 'unknown';
+}
+
+function compileEvidenceRubric(value: unknown, taskType: CompileEvidenceTaskType): string[] {
+  const provided = Array.isArray(value)
+    ? value.map(item => normalizeCoverageKey(String(item))).filter(Boolean)
+    : [];
+  if (provided.length > 0) return uniqueStrings(provided).slice(0, 20);
+  switch (taskType) {
+    case 'api_flow':
+      return ['handler', 'flow', 'dependencies', 'tests', 'risks'];
+    case 'field_impact':
+      return ['definitions', 'usages', 'flow', 'tests', 'risks'];
+    case 'review_diff':
+      return ['changed_lines', 'findings', 'impact', 'tests'];
+    case 'startup_flow':
+      return ['entrypoint', 'mode_selection', 'handshake', 'tests'];
+    case 'implement':
+      return ['target_files', 'symbols', 'edit_ranges', 'tests', 'validation'];
+    case 'test':
+      return ['target_files', 'symbols', 'tests', 'validation'];
+    case 'investigate':
+      return ['definitions', 'flow', 'files', 'tests'];
+    case 'unknown':
+      return ['files', 'symbols', 'evidence'];
+  }
+}
+
+function normalizeCoverageKey(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function compileEvidenceItemsFromPacket(
+  sourceTool: string,
+  packet: Record<string, unknown>,
+  maxItems: number,
+): Array<Record<string, unknown>> {
+  const candidates: Array<Record<string, unknown>> = [];
+  const pushRecords = (source: string, values: Array<Record<string, unknown>>, kind: string) => {
+    for (const value of values) candidates.push({ ...value, source, kind });
+  };
+
+  pushRecords('evidenceSlices', arrayRecords(packet.evidenceSlices), 'source-slice');
+  pushRecords('reviewFindings', arrayRecords(packet.reviewFindings), 'review-finding');
+  pushRecords('flowSteps', arrayRecords(packet.flowSteps), 'flow-step');
+  pushRecords('definitionCandidates', arrayRecords(packet.definitionCandidates), 'definition');
+  pushRecords('symbols', arrayRecords(packet.symbols).concat(arrayRecords(packet.relevantSymbols)), 'symbol');
+  pushRecords('candidateFiles', arrayRecords(packet.candidateFiles).concat(arrayRecords(packet.files)), 'file');
+  pushRecords('lineFocus', arrayRecords(packet.lineFocus), 'changed-line');
+  pushRecords('reviewTargets', arrayRecords(packet.reviewTargets), 'review-target');
+  pushRecords('editRanges', arrayRecords(packet.editRanges), 'edit-range');
+  pushRecords('testsLikelyRelevant', arrayRecords(packet.testsLikelyRelevant), 'test');
+
+  const evidence: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    if (evidence.length >= maxItems) break;
+    const file = stringOrUndefined(candidate.file);
+    const lines = stringOrUndefined(candidate.lines ?? candidate.fileSliceLines ?? candidate.newLines);
+    const symbol = stringOrUndefined(candidate.symbol)
+      ?? stringOrUndefined(candidate.handlerSymbol)
+      ?? (isPlainObject(candidate.changedSymbol) ? stringOrUndefined(candidate.changedSymbol.symbol) : undefined);
+    const claim = compileEvidenceClaim(candidate);
+    const snippet = truncateOptional(candidate.text ?? candidate.snippet ?? candidate.context, 900);
+    const key = [candidate.source, file, lines, symbol, claim].join('\0');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    evidence.push({
+      id: `E${evidence.length + 1}`,
+      kind: stringOrUndefined(candidate.kind) ?? 'evidence',
+      claim,
+      file,
+      lines,
+      symbol,
+      snippet,
+      sourceTool,
+      sourceSection: candidate.source,
+      expandTool: file || symbol ? {
+        tool: 'get_file_slice',
+        args: {
+          file,
+          lines,
+          symbol,
+          maxChars: 1800,
+        },
+      } : undefined,
+    });
+  }
+  return evidence;
+}
+
+function compileEvidenceClaim(value: Record<string, unknown>): string {
+  const direct = stringOrUndefined(value.claim)
+    ?? stringOrUndefined(value.title)
+    ?? stringOrUndefined(value.summary)
+    ?? stringOrUndefined(value.message)
+    ?? stringOrUndefined(value.why)
+    ?? stringOrUndefined(value.whyRelevant)
+    ?? stringOrUndefined(value.check)
+    ?? stringOrUndefined(value.id);
+  if (direct) return truncateOptional(direct, 240) ?? direct;
+  const symbol = stringOrUndefined(value.symbol)
+    ?? stringOrUndefined(value.handlerSymbol)
+    ?? (isPlainObject(value.changedSymbol) ? stringOrUndefined(value.changedSymbol.symbol) : undefined);
+  const file = stringOrUndefined(value.file);
+  if (symbol && file) return `Evidence for ${symbol} in ${file}`;
+  if (symbol) return `Evidence for ${symbol}`;
+  if (file) return `Evidence from ${file}`;
+  return `Evidence from ${stringOrUndefined(value.source) ?? stringOrUndefined(value.kind) ?? 'compiled packet'}`;
+}
+
+function compileCoverageCertificate(input: {
+  taskType: CompileEvidenceTaskType;
+  rubric: string[];
+  packet: Record<string, unknown>;
+  evidence: Array<Record<string, unknown>>;
+}): Record<string, { status: CompileCoverageStatus; evidence: string[]; reason: string }> {
+  const summary = compilePacketSummary('compile_evidence', input.packet);
+  const haystack = compactSearchText(JSON.stringify({
+    packet: input.packet,
+    evidence: input.evidence.map(item => ({
+      claim: item.claim,
+      file: item.file,
+      symbol: item.symbol,
+      sourceSection: item.sourceSection,
+    })),
+  }));
+  const result: Record<string, { status: CompileCoverageStatus; evidence: string[]; reason: string }> = {};
+  for (const key of input.rubric) {
+    const status = coverageStatusForKey(key, summary, haystack, input.evidence);
+    result[key] = {
+      status,
+      evidence: evidenceIdsForCoverageKey(key, input.evidence, haystack).slice(0, 4),
+      reason: coverageReasonForStatus(key, status, summary),
+    };
+  }
+  if (Object.keys(result).length === 0) {
+    result.evidence = {
+      status: input.evidence.length > 0 ? 'covered' : 'missing',
+      evidence: input.evidence.slice(0, 4).map(item => String(item.id)),
+      reason: input.evidence.length > 0 ? 'compiled packet returned evidence items' : 'compiled packet has no evidence items',
+    };
+  }
+  return result;
+}
+
+function coverageStatusForKey(
+  key: string,
+  summary: Record<string, number | string[]>,
+  haystack: string,
+  evidence: Array<Record<string, unknown>>,
+): CompileCoverageStatus {
+  const count = (name: string) => typeof summary[name] === 'number' ? summary[name] as number : 0;
+  switch (key) {
+    case 'handler':
+    case 'entrypoint':
+    case 'definitions':
+      return count('symbols') > 0 || count('endpoints') > 0 ? 'covered' : evidence.length > 0 ? 'partial' : 'missing';
+    case 'flow':
+    case 'mode_selection':
+    case 'handshake':
+    case 'impact':
+    case 'dependencies':
+    case 'usages':
+      return count('flowSteps') > 0 || count('callEdges') > 0 || haystack.includes(key.replace(/_/g, ' '))
+        ? 'covered'
+        : evidence.length > 1 ? 'partial' : 'missing';
+    case 'changed_lines':
+    case 'edit_ranges':
+      return count('editRanges') > 0 || count('changedLines') > 0 ? 'covered' : 'missing';
+    case 'tests':
+      return count('tests') > 0 ? 'covered' : haystack.includes('test') ? 'partial' : 'missing';
+    case 'risks':
+    case 'findings':
+      return count('findings') > 0 || count('riskFlags') > 0 || haystack.includes('risk') || haystack.includes('finding')
+        ? 'covered'
+        : 'partial';
+    case 'validation':
+      return haystack.includes('validation') || haystack.includes('command') || haystack.includes('test') ? 'covered' : 'partial';
+    case 'target_files':
+    case 'files':
+      return count('files') > 0 ? 'covered' : 'missing';
+    case 'symbols':
+      return count('symbols') > 0 ? 'covered' : 'missing';
+    case 'evidence':
+      return evidence.length > 0 ? 'covered' : 'missing';
+    default: {
+      const tokens = key.split('_').filter(token => token.length > 2);
+      if (tokens.length === 0) return evidence.length > 0 ? 'covered' : 'missing';
+      const hitCount = tokens.filter(token => haystack.includes(token)).length;
+      if (hitCount === tokens.length) return 'covered';
+      if (hitCount > 0 || evidence.length > 2) return 'partial';
+      return 'missing';
+    }
+  }
+}
+
+function evidenceIdsForCoverageKey(key: string, evidence: Array<Record<string, unknown>>, haystack: string): string[] {
+  const keyTokens = key.split('_').filter(token => token.length > 2);
+  const matching = evidence
+    .filter(item => {
+      const text = compactSearchText(JSON.stringify(item));
+      return keyTokens.some(token => text.includes(token));
+    })
+    .map(item => String(item.id));
+  if (matching.length > 0) return matching;
+  if (haystack.includes(key.replace(/_/g, ' '))) return evidence.slice(0, 2).map(item => String(item.id));
+  return evidence.slice(0, 2).map(item => String(item.id));
+}
+
+function coverageReasonForStatus(
+  key: string,
+  status: CompileCoverageStatus,
+  summary: Record<string, number | string[]>,
+): string {
+  if (status === 'covered') return `${key} is covered by compiled packet evidence.`;
+  if (status === 'partial') return `${key} has partial signal; use only listed exact follow-ups if this is required.`;
+  return `${key} is missing from the compiled packet.`;
+}
+
+function compileEvidenceAnswerable(
+  sourceTool: string,
+  packet: Record<string, unknown>,
+  evidence: Array<Record<string, unknown>>,
+  missing: string[],
+): boolean {
+  if (missing.length > 0 || evidence.length === 0) return false;
+  if (sourceTool === 'get_research_pack') {
+    const routing = isPlainObject(packet.routing) ? packet.routing : {};
+    const completeness = isPlainObject(packet.completeness) ? packet.completeness : {};
+    return routing.answerDirectly === true
+      || completeness.sufficientForAnswer === true
+      || stringArray(packet.missingFacts).length === 0
+      || evidence.length >= 2;
+  }
+  if (sourceTool === 'review_patch') {
+    return stringArray(packet.changedFiles).length > 0
+      && (arrayRecords(packet.reviewTargets).length > 0 || arrayRecords(packet.lineFocus).length > 0 || arrayRecords(packet.reviewFindings).length > 0);
+  }
+  if (sourceTool === 'get_change_pack') {
+    return arrayRecords(packet.editRanges).length > 0 || arrayRecords(packet.files).length > 0 || arrayRecords(packet.symbols).length > 0;
+  }
+  return evidence.length > 0;
+}
+
+function compileEvidenceConfidence(
+  answerable: boolean,
+  coverage: Record<string, { status: CompileCoverageStatus }>,
+  evidence: Array<Record<string, unknown>>,
+  packet: Record<string, unknown>,
+): number {
+  const statuses = Object.values(coverage);
+  const covered = statuses.filter(item => item.status === 'covered').length;
+  const partial = statuses.filter(item => item.status === 'partial').length;
+  const base = typeof packet.confidence === 'number' ? packet.confidence : answerable ? 0.78 : 0.45;
+  const coverageScore = statuses.length > 0 ? (covered + partial * 0.5) / statuses.length : 0;
+  const evidenceBonus = Math.min(0.1, evidence.length * 0.015);
+  return Math.max(0.1, Math.min(0.95, Math.round((base * 0.55 + coverageScore * 0.35 + evidenceBonus) * 100) / 100));
+}
+
+function compileAllowedFollowups(
+  missing: string[],
+  packet: Record<string, unknown>,
+  recommendedEscalation?: Record<string, unknown>,
+): Array<Record<string, unknown>> {
+  const followups: Array<Record<string, unknown>> = [];
+  const handle = firstExactEvidenceHandle(packet);
+  if (missing.some(item => item.includes('test'))) {
+    followups.push({
+      tool: 'find_tests_for',
+      args: { symbol: firstPacketSymbol(packet) ?? '<target-symbol>', limit: 20 },
+      reason: 'Only tests coverage is missing; do not perform broad search.',
+    });
+  }
+  if (handle) {
+    followups.push({
+      tool: 'get_file_slice',
+      args: handle.args,
+      reason: 'Exact source expansion from compiled packet handle.',
+    });
+  }
+  if (recommendedEscalation) followups.push(recommendedEscalation);
+  return followups.slice(0, 3);
+}
+
+function firstExactEvidenceHandle(packet: Record<string, unknown>): Record<string, unknown> | undefined {
+  const handles = arrayRecords(packet.evidenceHandles);
+  return handles.find(handle => handle.tool === 'get_file_slice' && isPlainObject(handle.args));
+}
+
+function firstPacketSymbol(packet: Record<string, unknown>): string | undefined {
+  for (const section of ['definitionCandidates', 'symbols', 'relevantSymbols', 'reviewTargets', 'editRanges']) {
+    for (const item of arrayRecords(packet[section])) {
+      const symbol = stringOrUndefined(item.symbol)
+        ?? stringOrUndefined(item.handlerSymbol)
+        ?? (isPlainObject(item.changedSymbol) ? stringOrUndefined(item.changedSymbol.symbol) : undefined);
+      if (symbol) return symbol;
+    }
+  }
+  return undefined;
+}
+
+function targetedShellEscalationForCompile(
+  task: string,
+  missing: string[],
+  packet: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const terms = uniqueStrings([
+    ...missing,
+    ...researchSeedTerms(task).slice(0, 4),
+    ...stringArray(packet.topFiles).slice(0, 2).map(file => path.posix.basename(file, path.posix.extname(file))),
+  ])
+    .map(term => term.replace(/[_-]+/g, ' ').trim())
+    .filter(term => term.length >= 3)
+    .slice(0, 6);
+  if (terms.length === 0) return undefined;
+  const pattern = terms
+    .map(term => term.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&').replace(/\s+/g, '.*'))
+    .join('|');
+  return {
+    tool: 'shell',
+    args: {
+      command: `rg --line-number --hidden -g "!node_modules" -g "!dist" -g "!build" "${pattern}" .`,
+      maxOutputTokens: 800,
+    },
+    reason: 'Graph coverage is partial or missing for this rubric; allow one exact targeted shell escalation only.',
+  };
+}
+
+function compilePathCoverageMap(
+  sourceTool: string,
+  packet: Record<string, unknown>,
+  recommendedEscalation?: Record<string, unknown>,
+): Record<string, unknown> {
+  const summary = compilePacketSummary(sourceTool, packet);
+  return {
+    knownCoverage: {
+      staticSymbols: Number(summary.symbols) > 0 ? 'high' : 'low',
+      imports: Number(summary.files) > 0 ? 'medium' : 'low',
+      callEdges: Number(summary.callEdges) > 0 || Number(summary.flowSteps) > 0 ? 'medium' : 'low',
+      frameworkRuntimeRoutes: Number(summary.endpoints) > 0 ? 'medium' : 'low',
+      tests: Number(summary.tests) > 0 ? 'medium' : 'low',
+    },
+    risk: recommendedEscalation ? 'graph_may_miss_runtime_or_test_flow' : 'compiled_packet_has_enough_indexed_evidence',
+    recommendedEscalation,
+  };
+}
+
+function compilePacketSummary(sourceTool: string, packet: Record<string, unknown>): Record<string, number | string[]> {
+  const files = uniqueStrings([
+    ...stringArray(packet.changedFiles),
+    ...stringArray(packet.topFiles),
+    ...arrayRecords(packet.candidateFiles).map(item => String(item.file ?? '')).filter(Boolean),
+    ...arrayRecords(packet.files).map(item => String(item.file ?? item.path ?? '')).filter(Boolean),
+    ...arrayRecords(packet.evidenceSlices).map(item => String(item.file ?? '')).filter(Boolean),
+    ...arrayRecords(packet.definitionCandidates).map(item => String(item.file ?? '')).filter(Boolean),
+    ...arrayRecords(packet.lineFocus).map(item => String(item.file ?? '')).filter(Boolean),
+    ...arrayRecords(packet.reviewTargets).map(item => String(item.file ?? '')).filter(Boolean),
+    ...arrayRecords(packet.editRanges).map(item => String(item.file ?? '')).filter(Boolean),
+  ]);
+  const symbols = uniqueStrings([
+    ...arrayRecords(packet.definitionCandidates).map(item => String(item.symbol ?? item.name ?? '')).filter(Boolean),
+    ...arrayRecords(packet.symbols).map(item => String(item.symbol ?? item.name ?? '')).filter(Boolean),
+    ...arrayRecords(packet.relevantSymbols).map(item => String(item.symbol ?? item.name ?? '')).filter(Boolean),
+    ...arrayRecords(packet.editRanges).map(item => String(item.symbol ?? '')).filter(Boolean),
+    ...arrayRecords(packet.reviewTargets)
+      .map(item => isPlainObject(item.changedSymbol) ? String(item.changedSymbol.symbol ?? '') : '')
+      .filter(Boolean),
+  ]);
+  const endpoints = [
+    ...arrayRecords(packet.impactedEndpoints),
+    ...arrayRecords(packet.endpointCandidates),
+    ...arrayRecords(packet.changedEndpoints),
+  ];
+  const tests = [
+    ...arrayRecords(packet.testsLikelyRelevant),
+    ...stringArray(isPlainObject(packet.validation) ? packet.validation.targetedTestFiles : undefined).map(file => ({ file })),
+  ];
+  const callEdges = [
+    ...arrayRecords(packet.callers),
+    ...arrayRecords(packet.callees),
+  ];
+  return {
+    sourceTool: [sourceTool],
+    files: files.length,
+    symbols: symbols.length,
+    endpoints: endpoints.length,
+    tests: tests.length,
+    flowSteps: arrayRecords(packet.flowSteps).length,
+    evidenceSlices: arrayRecords(packet.evidenceSlices).length,
+    findings: arrayRecords(packet.reviewFindings).length,
+    riskFlags: arrayRecords(packet.riskFlags).length,
+    editRanges: arrayRecords(packet.editRanges).length,
+    changedLines: arrayRecords(packet.lineFocus).length,
+    callEdges: callEdges.length,
+    topFiles: files.slice(0, 6),
+    topSymbols: symbols.slice(0, 6),
+  };
+}
+
+function compileEvidenceStateKey(task: string): string {
+  let hash = 2166136261;
+  for (const char of task) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `compiled:${(hash >>> 0).toString(16)}`;
 }
 
 function slimCandidateFilesForPack(files: Array<Record<string, unknown>>, profile: PackProfile): Array<Record<string, unknown>> {
@@ -4835,8 +6688,8 @@ function slimTaskOracleForPack(taskOracle: Record<string, unknown>, profile: Pac
 
 function slimEvidenceSlicesForPack(slices: Array<Record<string, unknown>>, profile: PackProfile): Array<Record<string, unknown>> {
   if (profile === 'full') return slices;
-  const limit = profile === 'micro' ? 3 : 4;
-  const textLimit = profile === 'micro' ? 700 : 1100;
+  const limit = profile === 'micro' ? 2 : 3;
+  const textLimit = profile === 'micro' ? 320 : 560;
   return slices.slice(0, limit).map(slice => ({
     file: String(slice.file ?? ''),
     lines: stringOrUndefined(slice.lines),
@@ -5964,6 +7817,7 @@ function reviewAgentGuidance(
   focus: ReviewFocus,
   findings: ReviewFinding[],
   reviewTargets: Array<Record<string, unknown>>,
+  followUpSliceHints: Array<Record<string, unknown>> = [],
 ): Record<string, unknown> {
   const highPriorityFindings = findings.filter(finding => finding.priority === 'P0' || finding.priority === 'P1');
   const targetOrder = reviewTargets
@@ -5986,12 +7840,48 @@ function reviewAgentGuidance(
       requiredFields: ['priority', 'severity', 'category', 'file', 'line', 'why', 'suggestedFix', 'confidence'],
       commentRule: 'Only leave a final review comment after confirming the changed line or symbol through reviewTargets or get_file_slice.',
     },
+    sourceInspection: followUpSliceHints.length > 0 ? {
+      firstTool: 'get_file_slice',
+      batching: 'Use one get_file_slice call with args.slices from firstFollowUpToolCall.',
+      sliceCount: followUpSliceHints.length,
+    } : undefined,
     stopRules: [
       'Do not open unrelated files until the listed reviewTargets have been checked.',
       'For each issue, include a concrete failure mode or caller/endpoint path, not only style preference.',
       'If no targeted tests are listed for production code, report that gap or request the smallest validation command.',
     ],
   };
+}
+
+function reviewSliceHints(
+  lineFocus: Array<Record<string, unknown>>,
+  reviewTargets: Array<Record<string, unknown>>,
+  maxHints = 6,
+): Array<Record<string, unknown>> {
+  const hints: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  for (const item of [...reviewTargets, ...lineFocus]) {
+    if (hints.length >= maxHints) break;
+    const file = stringOrUndefined(item.file);
+    const lines = stringOrUndefined(item.fileSliceLines);
+    const symbol = isPlainObject(item.changedSymbol)
+      ? stringOrUndefined(item.changedSymbol.symbol)
+      : stringOrUndefined(item.symbol);
+    if (!file || !lines) continue;
+    const key = `${file}\0${lines}\0${symbol ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    hints.push({
+      file,
+      lines,
+      symbol,
+      maxChars: 4000,
+      why: stringOrUndefined(item.targetId)
+        ? `Exact changed range for ${item.targetId}.`
+        : 'Exact changed range for review validation.',
+    });
+  }
+  return hints;
 }
 
 function reviewToolCalls(
@@ -6169,6 +8059,100 @@ function compactReviewObject(value: unknown, maxArrayItems: number, depth: numbe
     }
   }
   return output;
+}
+
+function compactPatchImpactResult(result: Record<string, unknown>, maxItems: number, options: {
+  outputMode: string;
+  includeArchitecture?: boolean;
+  includeFieldImpact?: boolean;
+  countsOnly?: boolean;
+  cappedReason?: string;
+}): Record<string, unknown> {
+  const itemLimit = clampInt(maxItems, 1, 20);
+  const depth = 2;
+  const listLimit = options.countsOnly ? itemLimit : itemLimit * 2;
+  const dependencyImpact = isPlainObject(result.dependencyImpact) ? result.dependencyImpact : {};
+  const callImpact = isPlainObject(result.callImpact) ? result.callImpact : {};
+  const fieldImpact = isPlainObject(result.fieldImpact) ? result.fieldImpact : undefined;
+  const architectureContext = isPlainObject(result.architectureContext) ? result.architectureContext : undefined;
+  const changedFiles = stringArray(result.changedFiles);
+  const touchedSymbols = arrayRecords(result.touchedSymbols);
+  const changedEndpoints = arrayRecords(result.changedEndpoints);
+  const dependencies = arrayRecords(dependencyImpact.dependencies);
+  const dependents = arrayRecords(dependencyImpact.dependents);
+  const callers = arrayRecords(callImpact.callers);
+  const callees = arrayRecords(callImpact.callees);
+  const impactedFiles = stringArray(result.impactedFiles);
+  const impactedEndpoints = arrayRecords(result.impactedEndpoints);
+  const tests = arrayRecords(result.testsLikelyRelevant);
+  const riskFlags = arrayRecords(result.riskFlags);
+  const notes = stringArray(result.confidenceNotes);
+  if (options.cappedReason) {
+    notes.push('Expanded patch-impact evidence was omitted because the response exceeded maxResponseTokens; use get_file_slice or graph-specific tools for exact follow-up evidence.');
+  }
+
+  const compacted: Record<string, unknown> = {
+    outputMode: options.outputMode,
+    inputs: compactReviewObject(result.inputs, itemLimit, depth),
+    changedFiles: changedFiles.slice(0, listLimit),
+    touchedSymbols: compactReviewObject(touchedSymbols.slice(0, itemLimit), itemLimit, depth),
+    changedEndpoints: compactReviewObject(changedEndpoints.slice(0, itemLimit), itemLimit, depth),
+    dependencyImpact: {
+      dependencies: compactReviewObject(dependencies.slice(0, itemLimit), itemLimit, depth),
+      dependents: compactReviewObject(dependents.slice(0, itemLimit), itemLimit, depth),
+      dependencyCount: dependencyImpact.dependencyCount,
+      dependentCount: dependencyImpact.dependentCount,
+    },
+    callImpact: {
+      queriedSymbols: stringArray(callImpact.queriedSymbols).slice(0, itemLimit),
+      callers: compactReviewObject(callers.slice(0, itemLimit), itemLimit, depth),
+      callees: compactReviewObject(callees.slice(0, itemLimit), itemLimit, depth),
+      callerCount: callImpact.callerCount,
+      calleeCount: callImpact.calleeCount,
+    },
+    impactedFiles: impactedFiles.slice(0, listLimit),
+    impactedEndpoints: compactReviewObject(impactedEndpoints.slice(0, itemLimit), itemLimit, depth),
+    testsLikelyRelevant: compactReviewObject(tests.slice(0, itemLimit), itemLimit, depth),
+    validation: compactReviewObject(result.validation, itemLimit, depth),
+    riskFlags: compactReviewObject(riskFlags.slice(0, itemLimit), itemLimit, depth),
+    summary: result.summary,
+    nextActions: stringArray(result.nextActions).slice(0, itemLimit + 2),
+    confidence: result.confidence,
+    confidenceNotes: notes,
+    omissions: {
+      reason: options.cappedReason ?? 'compact-output-mode',
+      changedFilesOmitted: Math.max(0, changedFiles.length - listLimit),
+      touchedSymbolsOmitted: Math.max(0, touchedSymbols.length - itemLimit),
+      changedEndpointsOmitted: Math.max(0, changedEndpoints.length - itemLimit),
+      dependenciesOmitted: Math.max(0, dependencies.length - itemLimit),
+      dependentsOmitted: Math.max(0, dependents.length - itemLimit),
+      callersOmitted: Math.max(0, callers.length - itemLimit),
+      calleesOmitted: Math.max(0, callees.length - itemLimit),
+      impactedFilesOmitted: Math.max(0, impactedFiles.length - listLimit),
+      impactedEndpointsOmitted: Math.max(0, impactedEndpoints.length - itemLimit),
+      testsOmitted: Math.max(0, tests.length - itemLimit),
+      riskFlagsOmitted: Math.max(0, riskFlags.length - itemLimit),
+    },
+  };
+  if (options.includeFieldImpact && fieldImpact) {
+    compacted.fieldImpact = compactReviewObject(fieldImpact, itemLimit, depth);
+  } else if (fieldImpact) {
+    compacted.fieldImpact = {
+      omitted: true,
+      reason: options.cappedReason ?? 'compact-output-mode',
+      usageCount: fieldImpact.usageCount,
+      fileCount: stringArray(fieldImpact.files).length,
+    };
+  }
+  if (options.includeArchitecture && architectureContext) {
+    compacted.architectureContext = compactReviewObject(architectureContext, itemLimit, depth);
+  } else if (architectureContext) {
+    compacted.architectureContext = {
+      omitted: true,
+      reason: options.cappedReason ?? 'compact-output-mode',
+    };
+  }
+  return compacted;
 }
 
 function reviewPlanForPatch(
@@ -7278,6 +9262,12 @@ function callGraphName(symbol: string): string {
   const parts = withoutParams.split('.').filter(Boolean);
   if (parts.length >= 2) return `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
   return withoutParams;
+}
+
+function simpleTypeName(typeName: string): string {
+  const withoutParams = typeName.replace(/\([^)]*\)$/, '');
+  const parts = withoutParams.split('.').filter(Boolean);
+  return parts[parts.length - 1] ?? withoutParams;
 }
 
 function searchTermsForTarget(target: string): string[] {

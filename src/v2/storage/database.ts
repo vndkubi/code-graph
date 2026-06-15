@@ -1,23 +1,24 @@
-import { ensureCodeGraphDirs, getCodeGraphPaths, type CodeGraphPaths } from '../paths.js';
-import { openPostgresCodeGraphDb, type PostgresCodeGraphDb } from './postgres.js';
+import { openSQLiteGraphBackend, type SQLiteGraphBackend } from './sqlite-backend.js';
+import type { CodeGraphDb } from './graph-backend.js';
+import type { WorkspacePaths } from '../paths.js';
 
-export type CodeGraphDb = PostgresCodeGraphDb;
+export type { CodeGraphDb } from './graph-backend.js';
 
 export interface OpenCodeGraphDbResult {
   db: CodeGraphDb;
-  paths: CodeGraphPaths;
-  backend: 'postgres';
-  connectionString: string;
+  paths: WorkspacePaths;
+  backend: 'sqlite';
+  dbPath: string;
+  graph: SQLiteGraphBackend;
 }
 
-export async function openCodeGraphDb(homeOverride?: string): Promise<OpenCodeGraphDbResult> {
-  const paths = getCodeGraphPaths(homeOverride);
-  ensureCodeGraphDirs(paths);
-  const { db, connectionString } = await openPostgresCodeGraphDb();
+export async function openCodeGraphDb(root = process.cwd(), graphDirName?: string): Promise<OpenCodeGraphDbResult> {
+  const graph = openSQLiteGraphBackend(root, graphDirName);
   return {
-    db,
-    paths,
-    backend: 'postgres',
-    connectionString,
+    db: graph.db,
+    paths: graph.paths,
+    backend: 'sqlite',
+    dbPath: graph.dbPath,
+    graph,
   };
 }

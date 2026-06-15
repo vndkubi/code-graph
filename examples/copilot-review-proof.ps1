@@ -1,7 +1,6 @@
 param(
   [string]$RepoRoot = (Get-Location).Path,
   [string]$CodeGraphRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
-  [string]$CodeGraphHome = (Join-Path $CodeGraphRoot '.tmp-debug-home\copilot-review-proof'),
   [string]$OutDir = (Join-Path $CodeGraphRoot '.tmp-debug-home\copilot-review-proof-runs'),
   [string]$PromptFile = '',
   [string]$DiffFile = '',
@@ -77,15 +76,13 @@ function New-ReviewPrompt($Root, $DiffText, $PromptPath, $DiffPath) {
   ) -join "`n"
 }
 
-function Write-McpConfig($Path, $RepoRoot, $CodeGraphRoot, $CodeGraphHome, $WorkspaceKey) {
+function Write-McpConfig($Path, $RepoRoot, $CodeGraphRoot, $WorkspaceKey) {
   $cliPath = Join-Path $CodeGraphRoot 'dist\cli.js'
   $mcpArgs = @(
     $cliPath,
     'mcp',
     '--root',
-    $RepoRoot,
-    '--home',
-    $CodeGraphHome
+    $RepoRoot
   )
   if ($WorkspaceKey) {
     $mcpArgs += @('--workspace-key', $WorkspaceKey)
@@ -253,7 +250,7 @@ $runDir = Join-Path $OutDir $runId
 New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 
 if (-not $SkipIndex) {
-  $indexArgs = @((Join-Path $CodeGraphRoot 'dist\cli.js'), 'index', '--root', $RepoRoot, '--home', $CodeGraphHome)
+  $indexArgs = @((Join-Path $CodeGraphRoot 'dist\cli.js'), 'index', '--root', $RepoRoot)
   if ($WorkspaceKey) {
     $indexArgs += @('--workspace-key', $WorkspaceKey)
   }
@@ -272,7 +269,7 @@ $prompt = New-ReviewPrompt $RepoRoot $diff $PromptFile $diffPath
 $prompt | Set-Content -LiteralPath (Join-Path $runDir 'prompt.md') -Encoding UTF8
 
 $mcpConfigPath = Join-Path $runDir 'codegraph-mcp.json'
-Write-McpConfig $mcpConfigPath $RepoRoot $CodeGraphRoot $CodeGraphHome $WorkspaceKey | Out-Null
+Write-McpConfig $mcpConfigPath $RepoRoot $CodeGraphRoot $WorkspaceKey | Out-Null
 
 $baseline = Invoke-CopilotReview 'baseline-no-codegraph' $RepoRoot $prompt $runDir @('--disable-mcp-server=codegraph')
 $withCodeGraph = Invoke-CopilotReview 'with-codegraph' $RepoRoot $prompt $runDir @("--additional-mcp-config=@$mcpConfigPath")

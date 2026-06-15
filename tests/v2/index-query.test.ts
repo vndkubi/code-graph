@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { CodeGraphDb } from '../../src/v2/storage/database.js';
 import { openCodeGraphDb } from '../../src/v2/storage/database.js';
 import { V2Indexer, type IndexProgressEvent } from '../../src/v2/index/indexer.js';
@@ -13,19 +13,12 @@ import { runContextProofEval } from '../../src/v2/benchmark/context-proof.js';
 import { runReviewProofEval } from '../../src/v2/benchmark/review-proof.js';
 import { parseCodexJsonEvents, scoreCodexOutput } from '../../src/v2/benchmark/codex-e2e.js';
 import { buildGraphExport, renderGraphHtml } from '../../src/v2/graph/export.js';
+import { rebuildGraphOverlay } from '../../src/v2/graph/overlay.js';
+import { buildV2ToolDefinitions, mcpToolNamesForProfile, V2_TOOL_DEFINITIONS, V2_TOOL_PROFILES } from '../../src/v2/mcp/tools.js';
 
 const tempDirs: string[] = [];
 const dbs: CodeGraphDb[] = [];
 const JAVA_FIXTURE = path.resolve('tests/fixtures/java-project');
-
-beforeEach(async () => {
-  const { db } = await openCodeGraphDb();
-  try {
-    await resetDb(db);
-  } finally {
-    await db.close();
-  }
-});
 
 afterEach(async () => {
   for (const db of dbs.splice(0)) {
@@ -36,7 +29,7 @@ afterEach(async () => {
   }
 });
 
-describe('v2 Postgres index and query service', () => {
+describe('v2 SQLite index and query service', () => {
   it('indexes Java symbols into persistent storage and serves search queries', async () => {
     const home = tempDir('codegraph-home-');
     const { db } = await openDb(home);
@@ -835,6 +828,41 @@ class Order {
     expect(mixed.sections.symbols.symbols.length).toBeGreaterThan(0);
     expect(mixed.sections.references?.references.length).toBeGreaterThan(0);
     expect(mixed.sections.dependencies?.edges.length).toBeGreaterThan(0);
+
+    const cappedMixed = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_code',
+      args: {
+        query: 'PaymentService',
+        outputMode: 'full',
+        limit: 50,
+        maxResponseTokens: 500,
+      },
+    }) as {
+      outputMode: string;
+      sections: {
+        files: { files: unknown[] };
+        symbols: { symbols: unknown[] };
+      };
+      budget: {
+        responseCap: {
+          maxResponseTokens: number;
+          capped: boolean;
+          estimatedResponseTokens: number;
+          estimatedFullResponseTokens: number;
+          estimatedTokensSaved: number;
+        };
+      };
+    };
+
+    expect(cappedMixed.outputMode).toBe('compact-capped');
+    expect(cappedMixed.sections.files.files.length).toBeGreaterThan(0);
+    expect(cappedMixed.sections.symbols.symbols.length).toBeGreaterThan(0);
+    expect(cappedMixed.budget.responseCap.maxResponseTokens).toBe(500);
+    expect(cappedMixed.budget.responseCap.capped).toBe(true);
+    expect(cappedMixed.budget.responseCap.estimatedFullResponseTokens)
+      .toBeGreaterThan(cappedMixed.budget.responseCap.estimatedResponseTokens);
+    expect(cappedMixed.budget.responseCap.estimatedTokensSaved).toBeGreaterThan(0);
   });
 
   it('returns bounded source snippets for symbols, files, and endpoints', async () => {
@@ -959,7 +987,14 @@ public class PaymentServiceTest {
       sliceHints: Array<{ file: string; lines?: string; symbol?: string }>;
       toolHints: Array<{ tool: string; args: { slices?: Array<{ file?: string; lines?: string; symbol?: string }> } }>;
       nextAction: string;
-      budget: { estimatedResponseTokens: number };
+      budget: {
+        requestedTokenBudget: number;
+        estimatedResponseTokens: number;
+        estimatedFullResponseTokens: number;
+        estimatedTokensSaved: number;
+        evidenceHandleCount: number;
+        capExceeded: boolean;
+      };
     };
 
     expect(packet.candidateFiles.length).toBeGreaterThan(0);
@@ -978,7 +1013,12 @@ public class PaymentServiceTest {
     expect(packet.sliceHints.some(hint => hint.file.endsWith('PaymentService.java'))).toBe(true);
     expect(packet.toolHints.some(hint => hint.tool === 'get_file_slice' && Array.isArray(hint.args.slices))).toBe(true);
     expect(packet.nextAction).toContain('get_file_slice');
+    expect(packet.budget.requestedTokenBudget).toBe(4000);
     expect(packet.budget.estimatedResponseTokens).toBeGreaterThan(0);
+    expect(packet.budget.estimatedFullResponseTokens).toBeGreaterThanOrEqual(packet.budget.estimatedResponseTokens);
+    expect(packet.budget.estimatedTokensSaved).toBeGreaterThanOrEqual(0);
+    expect(packet.budget.evidenceHandleCount).toBe(packet.sliceHints.length);
+    expect(packet.budget.capExceeded).toBe(packet.budget.estimatedResponseTokens > packet.budget.requestedTokenBudget);
 
     const slice = await queries.query({
       workspaceId: result.workspaceId,
@@ -1054,11 +1094,22 @@ public class PaymentServiceTest {
       symbols: Array<{ symbol: string }>;
       editRanges: Array<{ file?: string; lines?: string; symbol?: string }>;
       testsLikelyRelevant: Array<{ file: string }>;
-      budget: { profile: string; tokenBudget: number };
+      budget: {
+        profile: string;
+        tokenBudget: number;
+        requestedTokenBudget: number;
+        estimatedResponseTokens: number;
+        evidenceHandleCount: number;
+        capExceeded: boolean;
+      };
     };
 
     expect(microChangePack.budget.profile).toBe('micro');
     expect(microChangePack.budget.tokenBudget).toBe(3000);
+    expect(microChangePack.budget.requestedTokenBudget).toBe(3000);
+    expect(microChangePack.budget.evidenceHandleCount).toBeGreaterThanOrEqual(microChangePack.editRanges.length);
+    expect(microChangePack.budget.capExceeded)
+      .toBe(microChangePack.budget.estimatedResponseTokens > microChangePack.budget.requestedTokenBudget);
     expect(microChangePack.files.length).toBeLessThanOrEqual(4);
     expect(microChangePack.symbols.length).toBeLessThanOrEqual(6);
     expect(microChangePack.editRanges.length).toBeLessThanOrEqual(4);
@@ -1103,7 +1154,9 @@ public class PaymentService {
         tokenBudget: 5000,
       },
     }) as {
+      profile: string;
       evidenceSlices: Array<{ file: string; text: string; lines: string }>;
+      evidenceHandles: Array<{ tool: string; args: { file?: string; lines?: string; symbol?: string; maxChars?: number } }>;
       completeness: { sufficientForAnswer: boolean; evidenceSliceCount: number };
       answerGuidance: string[];
       nextAction: string;
@@ -1120,13 +1173,32 @@ public class PaymentService {
         sourceSliceRefs: Array<{ file?: string; textPreview?: string }>;
         compressionRatio: number;
       };
+      budget: {
+        profile: string;
+        requestedTokenBudget: number;
+        estimatedResponseTokens: number;
+        estimatedFullResponseTokens: number;
+        estimatedTokensSaved: number;
+        handleCount: number;
+        evidenceHandleCount: number;
+        capExceeded: boolean;
+      };
     };
 
+    expect(researchPack.profile).toBe('compact');
     expect(researchPack.completeness.sufficientForAnswer).toBe(true);
     expect(researchPack.completeness.evidenceSliceCount).toBeGreaterThan(0);
     expect(researchPack.definitionCandidates.some(symbol => symbol.symbol.includes('PaymentService'))).toBe(true);
     expect(researchPack.evidenceSlices.some(slice => slice.file.endsWith('PaymentService.java'))).toBe(true);
     expect(researchPack.evidenceSlices.some(slice => slice.text.includes('processRefund'))).toBe(true);
+    expect(researchPack.evidenceHandles.some(handle => handle.tool === 'get_file_slice' && handle.args.file?.endsWith('PaymentService.java'))).toBe(true);
+    expect(researchPack.budget.profile).toBe('compact');
+    expect(researchPack.budget.requestedTokenBudget).toBe(5000);
+    expect(researchPack.budget.estimatedResponseTokens).toBeGreaterThan(0);
+    expect(researchPack.budget.estimatedFullResponseTokens).toBeGreaterThanOrEqual(researchPack.budget.estimatedResponseTokens);
+    expect(researchPack.budget.handleCount).toBe(researchPack.evidenceHandles.length);
+    expect(researchPack.budget.evidenceHandleCount).toBe(researchPack.evidenceHandles.length);
+    expect(researchPack.budget.capExceeded).toBe(researchPack.budget.estimatedResponseTokens > researchPack.budget.requestedTokenBudget);
     expect(researchPack.answerGuidance.join(' ')).toContain('Answer directly');
     expect(researchPack.nextAction).toContain('Answer');
     expect(researchPack.flowSteps.length).toBeGreaterThan(0);
@@ -1145,13 +1217,94 @@ public class PaymentService {
       },
     }) as {
       taskType: string;
+      responseMode: string;
+      profile: string;
       routing: { answerDirectly: boolean };
       evidenceSlices: Array<{ text: string }>;
+      evidenceHandles: Array<{ tool: string }>;
+      compressedEvidence: { factCards: unknown[] };
+      taskOracle: { goldenFacts: unknown[] };
     };
 
     expect(flowPack.taskType).toBe('architecture');
+    expect(flowPack.responseMode).toBe('agent');
+    expect(flowPack.profile).toBe('compact');
     expect(flowPack.routing.answerDirectly).toBe(true);
     expect(flowPack.evidenceSlices.some(slice => slice.text.includes('processRefund'))).toBe(true);
+    expect(flowPack.evidenceHandles.some(handle => handle.tool === 'get_file_slice')).toBe(true);
+    expect(flowPack.taskOracle.goldenFacts.length).toBeGreaterThan(0);
+    expect(flowPack.compressedEvidence.factCards.length).toBeGreaterThan(0);
+
+    const flowAnswerPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_flow_pack',
+      args: {
+        target: 'PaymentService refund flow',
+        tokenBudget: 5000,
+        responseMode: 'answer',
+      },
+    }) as {
+      responseMode: string;
+      evidenceSlices: Array<{ text: string }>;
+      evidenceHandles?: Array<{ tool: string }>;
+      compressedEvidence?: unknown;
+      taskOracle?: unknown;
+      budget: { requestedTokenBudget: number; estimatedResponseTokens: number; estimatedFullResponseTokens: number; capExceeded: boolean };
+    };
+
+    expect(flowAnswerPack.responseMode).toBe('answer');
+    expect(flowAnswerPack.evidenceSlices.some(slice => slice.text.includes('processRefund'))).toBe(true);
+    expect(flowAnswerPack.evidenceHandles).toBeUndefined();
+    expect(flowAnswerPack.compressedEvidence).toBeUndefined();
+    expect(flowAnswerPack.taskOracle).toBeUndefined();
+    expect(flowAnswerPack.budget.requestedTokenBudget).toBe(5000);
+    expect(flowAnswerPack.budget.estimatedFullResponseTokens).toBeGreaterThan(flowAnswerPack.budget.estimatedResponseTokens);
+    expect(flowAnswerPack.budget.capExceeded).toBe(flowAnswerPack.budget.estimatedResponseTokens > flowAnswerPack.budget.requestedTokenBudget);
+
+    const compiled = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'compile_evidence',
+      args: {
+        task: 'Trace how PaymentService refund calls PaymentGateway processRefund and answer with evidence.',
+        task_type: 'api_flow',
+        budget_tokens: 5000,
+        quality_rubric: ['definitions', 'flow', 'evidence'],
+      },
+    }) as {
+      sourceTool: string;
+      answerable: boolean;
+      recommendedNextAction: string;
+      maxAdditionalCalls: number;
+      coverage: Record<string, { status: string; evidence: string[] }>;
+      coverageCertificate: { answerability: string; missing: string[] };
+      evidence: Array<{ id: string; file?: string; symbol?: string; snippet?: string; sourceTool: string }>;
+      disallowedFollowups: string[];
+      gatePolicy: { whenAnswerable: string; denyMessage: string };
+      budget: {
+        requestedTokenBudget: number;
+        estimatedResponseTokens: number;
+        estimatedFullResponseTokens: number;
+        evidenceHandleCount: number;
+        capExceeded: boolean;
+        sourceTool: string;
+      };
+    };
+
+    expect(compiled.sourceTool).toBe('get_research_pack');
+    expect(compiled.answerable).toBe(true);
+    expect(compiled.recommendedNextAction).toBe('answer_now');
+    expect(compiled.maxAdditionalCalls).toBe(0);
+    expect(compiled.coverage.definitions.status).toBe('covered');
+    expect(compiled.coverage.flow.status).toBe('covered');
+    expect(compiled.coverage.evidence.status).toBe('covered');
+    expect(compiled.coverageCertificate.missing).toHaveLength(0);
+    expect(compiled.evidence.some(item => item.id === 'E1')).toBe(true);
+    expect(compiled.evidence.some(item => item.file?.endsWith('PaymentService.java') && item.snippet?.includes('processRefund'))).toBe(true);
+    expect(compiled.disallowedFollowups).toContain('shell_rg');
+    expect(compiled.gatePolicy.whenAnswerable).toContain('deny broad shell');
+    expect(compiled.budget.requestedTokenBudget).toBe(5000);
+    expect(compiled.budget.estimatedFullResponseTokens).toBeGreaterThanOrEqual(compiled.budget.estimatedResponseTokens);
+    expect(compiled.budget.sourceTool).toBe('get_research_pack');
   });
 
   it('promotes endpoint targets into flow pack handler evidence and callees', async () => {
@@ -1312,6 +1465,119 @@ export const V2_TOOL_DEFINITIONS = Object.entries(V2ToolSchemas);
     expect(researchPack.evidenceSlices.some(slice => slice.file === 'src/v2/query/service.ts' && slice.text.includes('reviewPatch'))).toBe(true);
   });
 
+  it('generates a deterministic repo atlas from indexed facts', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-repo-atlas-');
+    writeFile(repo, 'package.json', JSON.stringify({
+      scripts: {
+        test: 'vitest run',
+      },
+    }, null, 2));
+    writeFile(repo, 'src/main/java/com/example/orders/OrderController.java', `package com.example.orders;
+
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.Path;
+
+@Path("/orders")
+public class OrderController {
+    private final OrderService service = new OrderService();
+
+    @GET
+    public String list() {
+        return service.listOrders();
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/orders/OrderService.java', `package com.example.orders;
+
+public class OrderService {
+    private final OrderRepository repository = new OrderRepository();
+
+    public String listOrders() {
+        return repository.findAll();
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/orders/OrderRepository.java', `package com.example.orders;
+
+public class OrderRepository {
+    public String findAll() {
+        return "[]";
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/orders/OrderServiceTest.java', `package com.example.orders;
+
+public class OrderServiceTest {
+    void listOrders() {
+        new OrderService().listOrders();
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const atlas = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'generate_repo_atlas',
+      args: {
+        profile: 'compact',
+        maxModules: 8,
+        maxEntrypoints: 10,
+        maxHotspots: 10,
+        warnStale: false,
+      },
+    }) as {
+      reportType: string;
+      systemMentalModel: string[];
+      summary: { counts: { files: number; endpoints: number } };
+      architecture: {
+        modules: Array<{ label: string; files: number }>;
+        entrypoints: Array<{ method: string; path: string; handlerSymbol: string; file: string }>;
+        topFiles: Array<{ file: string; riskLevel: string; why: string[] }>;
+      };
+      featureMap: { flows: Array<{ handler: string; primaryFiles: string[]; likelyTests: Array<{ file: string }> }> };
+      changePlaybook: { validation: { suggestedCommands: string[] } };
+      budget: { estimatedResponseTokens: number; queryTimeMs: number };
+    };
+
+    expect(atlas.reportType).toBe('repo_atlas');
+    expect(atlas.systemMentalModel.join(' ')).toContain('persistent CodeGraph facts');
+    expect(atlas.summary.counts.files).toBeGreaterThanOrEqual(5);
+    expect(atlas.summary.counts.endpoints).toBeGreaterThanOrEqual(1);
+    expect(atlas.architecture.modules.length).toBeGreaterThan(0);
+    expect(atlas.architecture.modules[0].files).toBeGreaterThan(0);
+    expect(atlas.architecture.entrypoints).toContainEqual(expect.objectContaining({
+      method: 'GET',
+      path: '/orders',
+      handlerSymbol: expect.stringContaining('OrderController.list'),
+      file: 'src/main/java/com/example/orders/OrderController.java',
+    }));
+    expect(atlas.featureMap.flows.some(flow => flow.handler.includes('OrderController.list'))).toBe(true);
+    expect(atlas.featureMap.flows.some(flow => flow.primaryFiles.includes('src/main/java/com/example/orders/OrderController.java'))).toBe(true);
+    expect(atlas.featureMap.flows.some(flow => flow.likelyTests.some(test => test.file.endsWith('OrderServiceTest.java')))).toBe(true);
+    expect(atlas.architecture.topFiles.some(file => file.file.endsWith('OrderController.java') && file.riskLevel !== 'low')).toBe(true);
+    expect(atlas.changePlaybook.validation.suggestedCommands.length).toBeGreaterThan(0);
+    expect(atlas.budget.estimatedResponseTokens).toBeGreaterThan(0);
+
+    const markdown = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'generate_repo_atlas',
+      args: {
+        format: 'markdown',
+        profile: 'micro',
+        warnStale: false,
+      },
+    }) as { format: string; markdown: string; budget: { estimatedResponseTokens: number } };
+    expect(markdown.format).toBe('markdown');
+    expect(markdown.markdown).toContain('# CodeGraph Repo Atlas');
+    expect(markdown.markdown).toContain('GET /orders');
+    expect(markdown.budget.estimatedResponseTokens).toBeLessThan(atlas.budget.estimatedResponseTokens);
+  });
+
   it('simulates patch impact from changed files, symbols, and diffs', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-patch-impact-');
@@ -1400,6 +1666,43 @@ public class OrderServiceTest {
     expect(impact.summary.changedFileCount).toBe(2);
     expect(['medium', 'high']).toContain(impact.summary.blastRadius);
 
+    const cappedImpact = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'simulate_patch_impact',
+      args: {
+        files: ['src/main/java/com/example/orders/OrderService.java'],
+        symbols: ['OrderController.list'],
+        diff,
+        limit: 20,
+        outputMode: 'full',
+        maxResponseTokens: 500,
+      },
+    }) as {
+      outputMode: string;
+      changedFiles: string[];
+      changedEndpoints: Array<{ path: string }>;
+      summary: { changedFileCount: number };
+      budget: {
+        responseCap: {
+          maxResponseTokens: number;
+          capped: boolean;
+          estimatedResponseTokens: number;
+          estimatedFullResponseTokens: number;
+          estimatedTokensSaved: number;
+        };
+      };
+    };
+
+    expect(cappedImpact.outputMode).toBe('compact-capped');
+    expect(cappedImpact.changedFiles.some(file => file.endsWith('OrderService.java'))).toBe(true);
+    expect(cappedImpact.changedEndpoints.some(endpoint => endpoint.path === '/orders')).toBe(true);
+    expect(cappedImpact.summary.changedFileCount).toBe(2);
+    expect(cappedImpact.budget.responseCap.maxResponseTokens).toBe(500);
+    expect(cappedImpact.budget.responseCap.capped).toBe(true);
+    expect(cappedImpact.budget.responseCap.estimatedFullResponseTokens)
+      .toBeGreaterThan(cappedImpact.budget.responseCap.estimatedResponseTokens);
+    expect(cappedImpact.budget.responseCap.estimatedTokensSaved).toBeGreaterThan(0);
+
     const review = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'review_patch',
@@ -1425,9 +1728,16 @@ public class OrderServiceTest {
       mustCheckInvariants: string[];
       knownSensitiveDataPatterns: Array<{ id: string; pattern: string }>;
       precisionTargets: { requireFileLineForBlockers: boolean; maxUnsupportedClaims: number };
-      agentGuidance?: { findingContract?: { requiredFields?: string[] }; reviewOrder?: unknown[] };
+      followUpSliceHints: Array<{ file: string; lines: string; maxChars: number }>;
+      firstFollowUpToolCall?: { tool: string; args: { slices?: Array<{ file?: string; lines?: string; maxChars?: number }> } };
+      agentGuidance?: {
+        findingContract?: { requiredFields?: string[] };
+        reviewOrder?: unknown[];
+        sourceInspection?: { firstTool?: string; sliceCount?: number };
+      };
       requiredToolCalls: Array<{ tool: string }>;
       metrics: { findingCount: number; omittedHunks: number; reviewTargetCount: number };
+      budget: { evidenceHandleCount: number; capExceeded: boolean; estimatedResponseTokens: number };
     };
 
     expect(review.outputMode).toBe('compact');
@@ -1447,6 +1757,10 @@ public class OrderServiceTest {
     expect(review.precisionTargets).toMatchObject({ requireFileLineForBlockers: true, maxUnsupportedClaims: 0 });
     expect(review.agentGuidance?.findingContract?.requiredFields).toContain('suggestedFix');
     expect(review.requiredToolCalls.some(call => call.tool === 'get_file_summary')).toBe(true);
+    expect(review.followUpSliceHints).toHaveLength(0);
+    expect(review.firstFollowUpToolCall).toBeUndefined();
+    expect(review.budget.evidenceHandleCount).toBeGreaterThan(0);
+    expect(review.budget.capExceeded).toBe(false);
     expect(review.metrics.findingCount).toBeGreaterThan(0);
     expect(review.metrics.omittedHunks).toBe(0);
     expect(review.metrics.reviewTargetCount).toBeGreaterThan(0);
@@ -1471,10 +1785,17 @@ public class OrderServiceTest {
       },
     }) as {
       lineFocus: Array<{ lineMappingConfidence?: string }>;
+      followUpSliceHints: Array<{ file: string; lines: string }>;
+      firstFollowUpToolCall?: { tool: string; args: { slices?: Array<{ file?: string; lines?: string }> } };
+      agentGuidance?: { sourceInspection?: { firstTool?: string; sliceCount?: number } };
       requiredToolCalls: Array<{ tool: string }>;
     };
     expect(matchingReview.lineFocus.some(hunk => hunk.lineMappingConfidence === 'high')).toBe(true);
     expect(matchingReview.requiredToolCalls.some(call => call.tool === 'get_file_slice')).toBe(true);
+    expect(matchingReview.followUpSliceHints.some(hint => hint.file.endsWith('OrderController.java'))).toBe(true);
+    expect(matchingReview.firstFollowUpToolCall?.tool).toBe('get_file_slice');
+    expect(matchingReview.firstFollowUpToolCall?.args.slices?.some(slice => slice.file?.endsWith('OrderController.java'))).toBe(true);
+    expect(matchingReview.agentGuidance?.sourceInspection?.firstTool).toBe('get_file_slice');
   });
 
   it('indexes XML, JSON, YAML, and properties config evidence', async () => {
@@ -1837,6 +2158,97 @@ public class PaymentClient {
     expect(html).not.toMatch(/<link[^>]+href=/i);
   });
 
+  it('keeps field usage facts full but skips expensive field overlay edges unless opted in', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-field-overlay-');
+    writeFile(repo, 'field-owner/pom.xml', `<project>
+  <artifactId>field-owner</artifactId>
+</project>
+`);
+    writeFile(repo, 'field-reader/pom.xml', `<project>
+  <artifactId>field-reader</artifactId>
+</project>
+`);
+    writeFile(repo, 'field-owner/src/main/java/com/example/owner/Owner.java', `package com.example.owner;
+
+public class Owner {
+    public int fieldA;
+}
+`);
+    writeFile(repo, 'field-reader/src/main/java/com/example/reader/Reader.java', `package com.example.reader;
+
+import com.example.owner.Owner;
+
+public class Reader {
+    public int read(Owner owner) {
+        return owner.fieldA;
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const previousOverlayFlag = process.env.CODEGRAPH_ENABLE_GRAPH_OVERLAY;
+    const previousFieldOverlayFlag = process.env.CODEGRAPH_GRAPH_OVERLAY_FIELD_USAGE_EDGES;
+    process.env.CODEGRAPH_ENABLE_GRAPH_OVERLAY = '1';
+    delete process.env.CODEGRAPH_GRAPH_OVERLAY_FIELD_USAGE_EDGES;
+    try {
+      const defaultResult = await indexer.indexWorkspace({ root: repo, workspaceKey: 'field-overlay-default' });
+      const ownerFile = 'field-owner/src/main/java/com/example/owner/Owner.java';
+      const readerFile = 'field-reader/src/main/java/com/example/reader/Reader.java';
+      await db.prepare(`
+        INSERT INTO symbols (
+          snapshot_id, fq_name, simple_name, kind, file, line, column, end_line,
+          signature, visibility, parent, package_name, return_type,
+          parameter_types_json, annotations_json, framework_role, framework_meta_json, file_role
+        )
+        VALUES (?, 'Owner.fieldA', 'fieldA', 'field', ?, 4, 16, 4, 'public int fieldA', 'public',
+          'Owner', 'com.example.owner', '', '[]', '[]', NULL, '{}', 'source')
+        ON CONFLICT DO NOTHING
+      `).run(defaultResult.snapshotId, ownerFile);
+      await db.prepare(`
+        INSERT INTO field_usages (
+          snapshot_id, field_name, field_fq_name, owner_class, file, line, column,
+          enclosing_class, enclosing_symbol, access_kind, receiver_text, context,
+          confidence, resolution_kind, file_role
+        )
+        VALUES (?, 'fieldA', 'Owner.fieldA', 'Owner', ?, 7, 22, 'Reader',
+          'Reader.read', 'read', 'owner', 'return owner.fieldA;', 0.8, 'receiver-type-field', 'source')
+      `).run(defaultResult.snapshotId, readerFile);
+
+      const fieldUsageRow = await db.prepare(`
+        SELECT COUNT(*) AS count FROM field_usages
+        WHERE snapshot_id = ? AND field_name = 'fieldA'
+      `).get(defaultResult.snapshotId) as { count: number | string };
+      expect(Number(fieldUsageRow.count)).toBeGreaterThan(0);
+
+      await rebuildGraphOverlay(db, defaultResult.snapshotId);
+      const defaultOverlayRow = await db.prepare(`
+        SELECT COUNT(*) AS count FROM graph_edges
+        WHERE snapshot_id = ? AND edge_type = 'module_field_usage'
+      `).get(defaultResult.snapshotId) as { count: number | string };
+      expect(Number(defaultOverlayRow.count)).toBe(0);
+
+      await rebuildGraphOverlay(db, defaultResult.snapshotId, { includeFieldUsageEdges: true });
+      const optInOverlayRow = await db.prepare(`
+        SELECT COUNT(*) AS count FROM graph_edges
+        WHERE snapshot_id = ? AND edge_type = 'module_field_usage'
+      `).get(defaultResult.snapshotId) as { count: number | string };
+      expect(Number(optInOverlayRow.count)).toBeGreaterThan(0);
+    } finally {
+      if (previousOverlayFlag === undefined) {
+        delete process.env.CODEGRAPH_ENABLE_GRAPH_OVERLAY;
+      } else {
+        process.env.CODEGRAPH_ENABLE_GRAPH_OVERLAY = previousOverlayFlag;
+      }
+      if (previousFieldOverlayFlag === undefined) {
+        delete process.env.CODEGRAPH_GRAPH_OVERLAY_FIELD_USAGE_EDGES;
+      } else {
+        process.env.CODEGRAPH_GRAPH_OVERLAY_FIELD_USAGE_EDGES = previousFieldOverlayFlag;
+      }
+    }
+  });
+
   it('exports graph HTML from the CLI and reports missing snapshots for --no-index', () => {
     const repo = tempDir('codegraph-cli-graph-');
     const outDir = tempDir('codegraph-cli-graph-out-');
@@ -2067,6 +2479,22 @@ public class NoisyOrder${i} {
         item: { id: 'call-2', type: 'tool_call', name: 'shell_command' },
       }),
       JSON.stringify({
+        type: 'item.started',
+        item: {
+          id: 'call-4',
+          type: 'command_execution',
+          command: 'rg "RMWebServices" D:/Personal/Projects/hadoop',
+        },
+      }),
+      JSON.stringify({
+        type: 'item.completed',
+        item: {
+          id: 'call-4',
+          type: 'command_execution',
+          command: 'rg "RMWebServices" D:/Personal/Projects/hadoop',
+        },
+      }),
+      JSON.stringify({
         type: 'assistant.message',
         data: {
           role: 'assistant',
@@ -2085,10 +2513,10 @@ public class NoisyOrder${i} {
     ].join('\n');
 
     const parsed = parseCodexJsonEvents(jsonl, 'Trace /ws/v1/cluster/apps');
-    expect(parsed.eventCount).toBe(6);
+    expect(parsed.eventCount).toBe(8);
     expect(parsed.mcpCalls).toBe(2);
-    expect(parsed.shellCalls).toBe(1);
-    expect(parsed.toolCalls).toBe(3);
+    expect(parsed.shellCalls).toBe(2);
+    expect(parsed.toolCalls).toBe(4);
     expect(parsed.inputTokens).toBe(1200);
     expect(parsed.cachedInputTokens).toBe(400);
     expect(parsed.outputTokens).toBe(180);
@@ -2106,6 +2534,34 @@ public class NoisyOrder${i} {
     }, parsed.finalOutput);
     expect(quality.score).toBe(1);
     expect(quality.misses).toHaveLength(0);
+  });
+
+  it('builds compact MCP tool descriptions without changing tool schemas', () => {
+    const normal = buildV2ToolDefinitions();
+    const compact = buildV2ToolDefinitions({ compactDescriptions: true });
+
+    expect(compact.map(tool => tool.name)).toEqual(normal.map(tool => tool.name));
+    expect(compact.map(tool => tool.inputSchema)).toEqual(normal.map(tool => tool.inputSchema));
+    expect(compact.find(tool => tool.name === 'get_flow_pack')?.description).toContain('get_change_pack');
+    expect(compact.find(tool => tool.name === 'get_file_slice')?.description).toContain('slices[]');
+    expect(V2_TOOL_DEFINITIONS.find(tool => tool.name === 'get_flow_pack')?.description).toBe(
+      compact.find(tool => tool.name === 'get_flow_pack')?.description,
+    );
+
+    const normalChars = normal.reduce((sum, tool) => sum + tool.description.length, 0);
+    const compactChars = compact.reduce((sum, tool) => sum + tool.description.length, 0);
+    expect(compactChars).toBeLessThan(normalChars * 0.75);
+  });
+
+  it('uses a single full MCP tool mode and treats legacy profiles as aliases', () => {
+    expect(mcpToolNamesForProfile('minimal')).toBeUndefined();
+    expect(mcpToolNamesForProfile('research')).toBeUndefined();
+    expect(mcpToolNamesForProfile('change')).toBeUndefined();
+    expect(mcpToolNamesForProfile('review')).toBeUndefined();
+    expect(mcpToolNamesForProfile('client')).toBeUndefined();
+    expect(mcpToolNamesForProfile('full')).toBeUndefined();
+    expect(V2_TOOL_PROFILES.full).toEqual(V2_TOOL_DEFINITIONS.map(tool => tool.name));
+    expect(() => mcpToolNamesForProfile('unknown')).toThrow(/full MCP toolset/);
   });
 
   it('resolves Java parameter and local-variable receiver calls through sharded full indexing', async () => {
@@ -2848,30 +3304,6 @@ async function openDb(home: string): Promise<{ db: CodeGraphDb }> {
   const opened = await openCodeGraphDb(home);
   dbs.push(opened.db);
   return opened;
-}
-
-async function resetDb(db: CodeGraphDb): Promise<void> {
-  await db.run(`
-    TRUNCATE TABLE
-      workspaces,
-      snapshots,
-      snapshot_stats,
-      files,
-      parse_cache,
-      symbols,
-      imports,
-      type_refs,
-      field_usages,
-      call_edges,
-      dependency_edges,
-      graph_edges,
-      graph_nodes,
-      annotations,
-      endpoints,
-      beans,
-      inheritance
-    RESTART IDENTITY CASCADE
-  `);
 }
 
 function writeFile(root: string, relPath: string, content: string): void {

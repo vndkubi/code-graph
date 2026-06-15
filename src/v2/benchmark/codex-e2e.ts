@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { openCodeGraphDb } from '../storage/database.js';
 import { V2Indexer, type IndexProgressEvent } from '../index/indexer.js';
 
-export type CodexBenchmarkMode = 'baseline' | 'mcp-first' | 'mcp-only';
+export type CodexBenchmarkMode = 'baseline' | 'terse-no-mcp' | 'mcp-first' | 'mcp-only' | 'compiled-packet' | 'compiled-packet+gate' | 'oracle-packet';
 
 export interface CodexE2eTask {
   id: string;
@@ -28,9 +28,7 @@ export interface CodexE2eSuite {
 export interface CodexE2eBenchmarkOptions {
   suitePath?: string;
   root?: string;
-  homeDir?: string;
   workspaceKey?: string;
-  databaseUrl?: string;
   runDir?: string;
   models?: string[];
   modes?: CodexBenchmarkMode[];
@@ -120,12 +118,14 @@ const DEFAULT_CODEGRAPH_TOOLS = new Set([
   'get_research_pack',
   'get_context_packet',
   'get_change_pack',
+  'compile_evidence',
   'search_code',
   'get_index_stats',
 ]);
 
 const SHELL_TOOL_PATTERNS = [
   /shell/i,
+  /command_execution/i,
   /powershell/i,
   /exec_command/i,
   /terminal/i,
@@ -147,19 +147,14 @@ export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): P
   fs.mkdirSync(runDir, { recursive: true });
   writeJson(path.join(runDir, 'suite.resolved.json'), { ...suite, repoRoot: root, workspaceKey, tasks });
 
-  const envBefore = process.env.CODEGRAPH_DATABASE_URL;
-  if (options.databaseUrl) process.env.CODEGRAPH_DATABASE_URL = options.databaseUrl;
-  try {
-    const index = options.skipIndex
-      ? undefined
-      : await runColdIndex(root, workspaceKey, options.homeDir, options.parseWorkers);
-    const mcpConfig = writeCodexMcpConfig({
-      runDir,
-      root,
-      workspaceKey,
-      homeDir: options.homeDir,
-      databaseUrl: options.databaseUrl,
-    });
+  const index = options.skipIndex
+    ? undefined
+    : await runColdIndex(root, workspaceKey, options.parseWorkers);
+  const mcpConfig = writeCodexMcpConfig({
+    runDir,
+    root,
+    workspaceKey,
+  });
     const plan = {
       root,
       workspaceKey,
@@ -215,14 +210,7 @@ export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): P
       runs,
     });
     writeJson(path.join(runDir, 'report.json'), report);
-    return report;
-  } finally {
-    if (envBefore === undefined) {
-      delete process.env.CODEGRAPH_DATABASE_URL;
-    } else {
-      process.env.CODEGRAPH_DATABASE_URL = envBefore;
-    }
-  }
+  return report;
 }
 
 export function loadCodexE2eSuite(suitePath?: string): CodexE2eSuite {
@@ -352,7 +340,7 @@ function runCodexTask(options: {
   codexCommandArgs: string[];
   timeoutSeconds: number;
 }): CodexRunResult {
-  const prompt = promptForMode(options.task.prompt, options.mode);
+  const prompt = promptForMode(options.task, options.mode);
   const taskDir = path.join(options.runDir, `${safePathPart(options.task.id)}-${options.mode}-${safePathPart(options.model)}`);
   fs.mkdirSync(taskDir, { recursive: true });
   fs.writeFileSync(path.join(taskDir, 'prompt.txt'), prompt, 'utf-8');
@@ -369,7 +357,7 @@ function runCodexTask(options: {
     '-',
   ];
   const env = { ...process.env };
-  if (options.mode !== 'baseline') {
+  if (modeUsesMcp(options.mode)) {
     args.splice(args.indexOf('--model'), 0, ...options.mcpConfigOverrides);
   }
 
@@ -409,10 +397,9 @@ function runCodexTask(options: {
 async function runColdIndex(
   root: string,
   workspaceKey: string,
-  homeDir: string | undefined,
   parseWorkers: number | undefined,
 ): Promise<NonNullable<CodexE2eBenchmarkReport['index']>> {
-  const { db } = await openCodeGraphDb(homeDir);
+  const { db } = await openCodeGraphDb(root);
   const indexer = new V2Indexer(db);
   const phases: IndexProgressEvent[] = [];
   const started = Date.now();
@@ -437,8 +424,6 @@ function writeCodexMcpConfig(options: {
   runDir: string;
   root: string;
   workspaceKey: string;
-  homeDir?: string;
-  databaseUrl?: string;
 }): { path: string; overrides: string[] } {
   const codexHome = path.join(options.runDir, 'codex-home');
   fs.mkdirSync(codexHome, { recursive: true });
@@ -453,19 +438,12 @@ function writeCodexMcpConfig(options: {
     '--no-prewarm',
   ];
   if (envFlag('CODEGRAPH_CODEX_BENCH_AUTO_REFRESH')) args.push('--auto-refresh');
-  if (options.homeDir) args.push('--home', path.resolve(options.homeDir));
-  const envObject = options.databaseUrl
-    ? { CODEGRAPH_DATABASE_URL: options.databaseUrl, CODEGRAPH_QUERY_FRESHNESS_CACHE_MS: '30000' }
-    : undefined;
-  const envEntries = envObject
-    ? `\nenv = ${tomlInlineObject(envObject)}\n`
-    : '\n';
   const config = `[mcp_servers.codegraph_bench]
 command = ${tomlString(cli.command)}
 args = [
 ${args.map(arg => `  ${tomlString(arg)},`).join('\n')}
 ]
-${envEntries}`;
+`;
   const configPath = path.join(codexHome, 'config.toml');
   fs.writeFileSync(configPath, config, 'utf-8');
   const overrides = [
@@ -474,20 +452,20 @@ ${envEntries}`;
     '--config',
     `mcp_servers.codegraph_bench.args=${tomlArray(args)}`,
   ];
-  if (envObject) {
-    overrides.push(
-      '--config',
-      `mcp_servers.codegraph_bench.env=${tomlInlineObject(envObject)}`,
-    );
-  }
   return { path: configPath, overrides };
 }
 
-function promptForMode(prompt: string, mode: CodexBenchmarkMode): string {
+function promptForMode(task: CodexE2eTask, mode: CodexBenchmarkMode): string {
+  const prompt = task.prompt;
   switch (mode) {
     case 'baseline':
       return [
         'Do not use CodeGraph MCP. Use shell/search/read commands only if needed. Do not modify files.',
+        prompt,
+      ].join('\n\n');
+    case 'terse-no-mcp':
+      return [
+        'Do not use CodeGraph MCP. Use shell/search/read commands only if needed. Be terse: answer with compact evidence-first JSON or bullets, avoid narration, and keep file/line/symbol names exact. Do not modify files.',
         prompt,
       ].join('\n\n');
     case 'mcp-only':
@@ -500,7 +478,65 @@ function promptForMode(prompt: string, mode: CodexBenchmarkMode): string {
         'Use CodeGraph MCP server codegraph_bench first. Use shell/search/read only if CodeGraph evidence is missing. Do not modify files.',
         prompt,
       ].join('\n\n');
+    case 'compiled-packet':
+      return [
+        'Use CodeGraph MCP server codegraph_bench only for context acquisition. Start with compile_evidence using the full task, inferred task_type, budget_tokens=5000, and required answer fields as quality_rubric. If compile_evidence returns answerable=true, answer immediately from its evidence ids. If it is not answerable, use only allowedFollowups from the packet. Do not use shell/search/read fallback unless compile_evidence explicitly returns a shell allowedFollowup.',
+        compiledPacketTaskHints(task, false),
+        prompt,
+      ].join('\n\n');
+    case 'compiled-packet+gate':
+      return [
+        'Use CodeGraph MCP server codegraph_bench only. Hard gate: call compile_evidence first. When answerable=true, make zero additional tool calls and answer from the evidence packet. When answerable=false, make at most one listed allowedFollowup, then answer or report the missing rubric item. Do not use broad shell/search/read fallback.',
+        compiledPacketTaskHints(task, false),
+        prompt,
+      ].join('\n\n');
+    case 'oracle-packet':
+      return [
+        'Use CodeGraph MCP server codegraph_bench only. Call compile_evidence once with the full task, inferred task_type, budget_tokens=5000, and the provided oracle quality_rubric. Then answer only from that packet. Do not call any other tool unless compile_evidence says answerable=false and lists exactly one allowedFollowup.',
+        compiledPacketTaskHints(task, true),
+        prompt,
+      ].join('\n\n');
   }
+}
+
+function modeUsesMcp(mode: CodexBenchmarkMode): boolean {
+  return mode === 'mcp-first'
+    || mode === 'mcp-only'
+    || mode === 'compiled-packet'
+    || mode === 'compiled-packet+gate'
+    || mode === 'oracle-packet';
+}
+
+function compiledPacketTaskHints(task: CodexE2eTask, includeOracleRubric: boolean): string {
+  const taskType = compileBenchmarkTaskType(task);
+  const rubric = includeOracleRubric
+    ? [
+      ...(task.expectedFiles ?? []).map(item => `file:${item}`),
+      ...(task.expectedMethods ?? []).map(item => `method:${item}`),
+      ...(task.expectedTerms ?? []).map(item => `term:${item}`),
+      ...(task.requiredAnswerFields ?? []).map(item => `field:${item}`),
+    ]
+    : [
+      ...(task.requiredAnswerFields ?? []).map(item => `field:${item}`),
+      task.type ? `task:${task.type}` : undefined,
+    ].filter((item): item is string => Boolean(item));
+  return [
+    `compile_evidence arguments hint: task_type=${taskType}`,
+    rubric.length > 0 ? `quality_rubric=${JSON.stringify(rubric)}` : 'quality_rubric=<infer from task>',
+  ].join('\n');
+}
+
+function compileBenchmarkTaskType(task: CodexE2eTask): string {
+  const type = String(task.type ?? '').toLowerCase();
+  const prompt = task.prompt;
+  if (type.includes('review') || /\bdiff\b|\bpatch\b|\breview\b/i.test(prompt)) return 'review_diff';
+  if (type.includes('api') || /\b(GET|POST|PUT|PATCH|DELETE)\s+\//.test(prompt) || /\bendpoint|api|route\b/i.test(prompt)) return 'api_flow';
+  if (type.includes('field') || /\bfield\b|\busages?\b|\binitialized\b/i.test(prompt)) return 'field_impact';
+  if (/\bstartup|handshake|proxy|watchdog\b/i.test(prompt)) return 'startup_flow';
+  if (type.includes('test') || /\bunit\s+test|testcase|write\s+tests?\b/i.test(prompt)) return 'test';
+  if (type.includes('implement') || /\bimplement|fix|debug|refactor\b/i.test(prompt)) return 'implement';
+  if (type.includes('investigat')) return 'investigate';
+  return 'unknown';
 }
 
 function aggregateReport(input: Omit<CodexE2eBenchmarkReport, 'aggregate'>): CodexE2eBenchmarkReport {
@@ -665,7 +701,11 @@ function inferToolName(event: unknown): string | undefined {
     pathValue(event, ['item', 'tool']),
     pathValue(event, ['item', 'name']),
   );
-  if (!direct) return undefined;
+  if (!direct) {
+    const itemType = stringValue(pathValue(event, ['item', 'type']));
+    if (itemType === 'command_execution') return itemType;
+    return undefined;
+  }
   return direct.includes('.') ? direct.split('.').pop() : direct;
 }
 
@@ -765,10 +805,6 @@ function tomlString(value: string): string {
 
 function tomlArray(values: string[]): string {
   return `[${values.map(tomlString).join(', ')}]`;
-}
-
-function tomlInlineObject(values: Record<string, string>): string {
-  return `{ ${Object.entries(values).map(([key, value]) => `${key} = ${tomlString(value)}`).join(', ')} }`;
 }
 
 function resolveCliEntrypoint(): { command: string; args: string[] } {

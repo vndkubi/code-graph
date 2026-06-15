@@ -3,7 +3,6 @@ param(
   [string]$RunDir = '',
   [string]$CodeGraphRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
   [string]$ExternalCodeGraphRoot = 'D:\Personal\Projects\codegraph',
-  [string]$DatabaseUrl = 'postgres://codegraph:codegraph_local@127.0.0.1:54329/codegraph',
   [string[]]$Models = @('gpt-5.4-mini', 'claude-haiku-4.5'),
   [string[]]$Modes = @('baseline', 'internal', 'external'),
   [string[]]$TaskIds = @(),
@@ -408,9 +407,7 @@ function Write-InternalMcpConfig(
   [string]$Path,
   [string]$Workspace,
   [string]$WorkspaceKey,
-  [string]$HomeDir,
-  [string]$CodeGraphRoot,
-  [string]$DatabaseUrl
+  [string]$CodeGraphRoot
 ) {
   $cliPath = Join-Path $CodeGraphRoot 'dist\cli.js'
   $config = @{
@@ -425,16 +422,10 @@ function Write-InternalMcpConfig(
           $Workspace,
           '--workspace-key',
           $WorkspaceKey,
-          '--home',
-          $HomeDir,
           '--no-prewarm',
           '--mcp-tools',
           'get_research_pack,get_flow_pack,get_context_packet,search_symbol,search_code,get_file_slice,find_tests_for,search_files'
         )
-        env = @{
-          CODEGRAPH_DATABASE_URL = $DatabaseUrl
-          CODEGRAPH_PG_POOL_MAX = '10'
-        }
       }
     }
   }
@@ -459,16 +450,12 @@ function Write-ExternalMcpConfig([string]$Path, [string]$Workspace, [string]$Ext
 function Invoke-CodeGraphIndex(
   [string]$Workspace,
   [string]$WorkspaceKey,
-  [string]$HomeDir,
   [string]$RunDir,
   [string]$CodeGraphRoot,
-  [string]$DatabaseUrl,
   [int]$ParseWorkers
 ) {
   $stdout = Join-Path $RunDir 'internal-index.stdout.log'
   $stderr = Join-Path $RunDir 'internal-index.stderr.log'
-  $env:CODEGRAPH_DATABASE_URL = $DatabaseUrl
-  $env:CODEGRAPH_PG_POOL_MAX = '10'
   $indexArgs = @(
     (Join-Path $CodeGraphRoot 'dist\cli.js'),
     'index',
@@ -476,8 +463,6 @@ function Invoke-CodeGraphIndex(
     $Workspace,
     '--workspace-key',
     $WorkspaceKey,
-    '--home',
-    $HomeDir,
     '--parse-workers',
     [string]$ParseWorkers
   )
@@ -513,8 +498,7 @@ function Invoke-ExternalCodeGraphIndex(
 
 function New-RepoWorktree(
   [string]$SourceRoot,
-  [string]$RunDir,
-  [string]$CodeGraphHome
+  [string]$RunDir
 ) {
   $repoLeaf = Split-Path -Leaf $SourceRoot
   $key = "$(New-SafeName $repoLeaf)-$(Get-ShortHash $SourceRoot)"
@@ -532,7 +516,6 @@ function New-RepoWorktree(
     workspace = $workspace
     baselineCommit = $baselineCommit
     workspaceKey = "realrepo-$key"
-    internalHome = Join-Path $CodeGraphHome $key
     indexDir = Join-Path $RunDir "indexes\$key"
   }
 }
@@ -774,7 +757,6 @@ if ($selectedTasks.Count -eq 0) { throw "No tasks selected." }
 Write-Host "Run dir: $RunDir"
 Write-Host "Tasks: $($selectedTasks.Count); models: $($Models -join ', '); modes: $($Modes -join ', ')"
 
-$codeGraphHome = Join-Path $RunDir 'internal-codegraph-home'
 $workspaceByRepo = @{}
 foreach ($task in $selectedTasks) {
   $repoRoot = Resolve-BenchPath ([string]$task.repoRoot) $suiteDir $CodeGraphRoot
@@ -782,7 +764,7 @@ foreach ($task in $selectedTasks) {
   $repoRoot = [System.IO.Path]::GetFullPath($repoRoot)
   if (-not $workspaceByRepo.ContainsKey($repoRoot)) {
     Write-Host "Creating worktree for $repoRoot"
-    $workspaceByRepo[$repoRoot] = New-RepoWorktree $repoRoot $RunDir $codeGraphHome
+    $workspaceByRepo[$repoRoot] = New-RepoWorktree $repoRoot $RunDir
   }
   $task | Add-Member -NotePropertyName resolvedRepoRoot -NotePropertyValue $repoRoot -Force
 }
@@ -805,7 +787,7 @@ foreach ($repoRoot in $workspaceByRepo.Keys) {
       Write-Host "Reusing internal CodeGraph index: $($workspaceInfo.key)"
     } else {
       Write-Host "Indexing internal CodeGraph: $($workspaceInfo.key)"
-      $run = Invoke-CodeGraphIndex $workspaceInfo.workspace $workspaceInfo.workspaceKey $workspaceInfo.internalHome $workspaceInfo.indexDir $CodeGraphRoot $DatabaseUrl $ParseWorkers
+      $run = Invoke-CodeGraphIndex $workspaceInfo.workspace $workspaceInfo.workspaceKey $workspaceInfo.indexDir $CodeGraphRoot $ParseWorkers
       if ($run.exitCode -ne 0) {
         throw "Internal CodeGraph index failed for $($workspaceInfo.workspace). See $($workspaceInfo.indexDir)."
       }
@@ -841,7 +823,7 @@ try {
         New-Item -ItemType Directory -Force -Path $taskRunDir | Out-Null
         $mcpConfigPath = Join-Path $taskRunDir 'mcp-config.json'
         if ($mode -eq 'internal') {
-          Write-InternalMcpConfig $mcpConfigPath $workspaceInfo.workspace $workspaceInfo.workspaceKey $workspaceInfo.internalHome $CodeGraphRoot $DatabaseUrl
+          Write-InternalMcpConfig $mcpConfigPath $workspaceInfo.workspace $workspaceInfo.workspaceKey $CodeGraphRoot
         } elseif ($mode -eq 'external') {
           Write-ExternalMcpConfig $mcpConfigPath $workspaceInfo.workspace $externalCli
         }
