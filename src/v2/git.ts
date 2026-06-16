@@ -41,7 +41,7 @@ export function getGitInfo(root: string): GitInfo {
   const branch = git(root, ['rev-parse', '--abbrev-ref', 'HEAD']);
   const headCommit = git(root, ['rev-parse', 'HEAD']);
   const treeHash = git(root, ['rev-parse', `${headCommit ?? 'HEAD'}^{tree}`]);
-  const dirty = git(root, ['status', '--porcelain=v1', '--untracked-files=normal']) ?? '';
+  const dirty = filteredGitStatus(root) ?? '';
 
   return {
     root: path.resolve(topLevel),
@@ -64,7 +64,7 @@ export function getGitFreshnessInfo(root: string): Pick<GitInfo, 'root' | 'headC
       available: false,
     };
   }
-  const dirty = git(root, ['status', '--porcelain=v1', '--untracked-files=normal']) ?? '';
+  const dirty = filteredGitStatus(root) ?? '';
   return {
     root,
     headCommit,
@@ -75,7 +75,7 @@ export function getGitFreshnessInfo(root: string): Pick<GitInfo, 'root' | 'headC
 
 export function getGitDirtyFiles(root: string): GitDirtyFiles {
   const start = Date.now();
-  const status = git(root, ['status', '--porcelain=v1', '--untracked-files=normal']);
+  const status = filteredGitStatus(root, true);
   if (status === undefined) {
     return {
       added: [],
@@ -133,6 +133,23 @@ function normalizeStatusPath(value: string): string {
     return trimmed.slice(1, -1).replace(/\\"/g, '"');
   }
   return trimmed;
+}
+
+function filteredGitStatus(root: string, preserveUndefined = false): string | undefined {
+  const status = git(root, ['status', '--porcelain=v1', '--untracked-files=normal']);
+  if (status === undefined) return preserveUndefined ? undefined : '';
+  const filtered = status
+    .split(/\r?\n/)
+    .filter(line => {
+      if (line.length < 4) return Boolean(line.trim());
+      return !isCodeGraphArtifactPath(normalizeStatusPath(line.slice(3)));
+    });
+  return filtered.join('\n');
+}
+
+function isCodeGraphArtifactPath(file: string): boolean {
+  const topLevel = file.replace(/\\/g, '/').split('/')[0] ?? '';
+  return topLevel === '.codegraph' || topLevel.startsWith('.codegraph-');
 }
 
 function git(cwd: string, args: string[]): string | undefined {

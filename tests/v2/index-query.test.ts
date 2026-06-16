@@ -3210,6 +3210,38 @@ public class FeatureBranchMarker {
     expect(second.skippedUnchanged).toBe(true);
   });
 
+  it('ignores .codegraph artifacts when checking git freshness for warm reindex', async () => {
+    if (!hasGit()) return;
+
+    const repo = tempDir('codegraph-git-clean-warm-');
+    runGit(repo, 'init');
+    runGit(repo, 'config', 'user.email', 'codegraph@example.test');
+    runGit(repo, 'config', 'user.name', 'CodeGraph Test');
+    writeFile(repo, 'src/main/java/com/example/Demo.java', `package com.example;
+
+public class Demo {
+    public void run() {
+    }
+}
+`);
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'initial');
+
+    const opened = await openCodeGraphDb(repo);
+    dbs.push(opened.db);
+    const indexer = new V2Indexer(opened.db);
+
+    const first = await indexer.indexWorkspace({ root: repo });
+    expect(fs.existsSync(path.join(repo, '.codegraph', 'graph.sqlite'))).toBe(true);
+
+    const second = await indexer.indexWorkspace({ root: repo });
+    expect(first.filesParsed).toBeGreaterThan(0);
+    expect(second.filesParsed).toBe(0);
+    expect(second.parseCacheHits).toBe(second.filesTotal);
+    expect(second.filesChanged).toBe(0);
+    expect(second.skippedUnchanged).toBe(true);
+  });
+
   it('hydrates sharded full facts from parse cache for a new workspace key', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-sharded-cache-hydrate-');

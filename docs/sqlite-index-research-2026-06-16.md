@@ -127,15 +127,39 @@ Interpretation:
 
 Cold index numbers on the repo itself were noisy on this Windows workstation and varied much more than the synthetic A/B runs. I do not trust a single local cold-index number here as architecture evidence. The synthetic A/B comparison is the cleaner signal for the maintenance change.
 
+### Real Java repo benchmarks
+
+Representative repo/subtree runs on this workstation:
+
+- `D:/Personal/Projects/doughnut/backend`
+  - cold: `542` files, `9123 ms`
+  - warm: `483 ms`
+- `D:/Personal/Projects/hadoop/hadoop-common-project`
+  - cold: `2335` files, `50903 ms`
+  - warm: `1010 ms`
+- `D:/Personal/Projects/elasticsearch/server`
+  - before git-freshness fix:
+    - warm run incorrectly created a new snapshot and took `103875 ms` even with `filesChanged = 0`
+  - after git-freshness fix:
+    - cold: `7979` files, `520250 ms`
+    - warm: `1401 ms`
+    - warm run reuses the same `snapshotId` and short-circuits correctly
+
+Interpretation:
+
+- The main remaining speed issue on large clean repos was not SQLite itself; it was git-freshness invalidation caused by `.codegraph*` artifact directories showing up as untracked repo dirt.
+- Fixing that restored the intended warm-index fast path on a large Java-heavy target.
+
 ## Quality Evidence
 
 Verified locally:
 
 - `npm.cmd run lint`
 - `npm.cmd run build`
-- `npm.cmd test -- tests/v2/index-query.test.ts tests/v2/sqlite-backend.test.ts`
+- `npm.cmd test`
 
 The callback/method-reference path now has direct tests for caller/callee behavior instead of relying on incidental coverage.
+The git-freshness path now also has direct regression coverage for warm reindex with `.codegraph` artifacts present inside a git repo.
 
 ## Compare With `codegraph-external`
 
@@ -175,6 +199,7 @@ The callback/method-reference path now has direct tests for caller/callee behavi
   - worktree mismatch detection
   - watcher fallback policies
   - git hook sync fallback
+  - This repo did close one important gap here: `.codegraph*` index artifacts are now ignored by git-freshness checks so they do not force false reindexing on clean repos.
 - SQLite operational hardening is more mature.
   - connection PRAGMAs
   - maintenance/checkpoint habits
@@ -266,7 +291,9 @@ Status:
 
 - SQLite migration is already architecturally complete in this repo.
 - This turn improved SQLite operational behavior and parse-cache correctness.
-- Measured speed improvement is currently proven for the post-index maintenance tail on larger synthetic workloads, not for every local cold-index scenario.
+- Measured speed improvement is proven in two places:
+  - post-index maintenance tail on larger synthetic workloads
+  - restored warm-index fast-path behavior on large real git repos by ignoring `.codegraph*` artifacts in git freshness checks
 
 ### 2. Improve index quality
 
