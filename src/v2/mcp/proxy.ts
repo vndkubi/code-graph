@@ -10,7 +10,7 @@ import { openCodeGraphDb, type CodeGraphDb } from '../storage/database.js';
 import { isWorkspaceIndexed } from '../storage/sqlite-backend.js';
 import { localArtifactStatus } from './local-artifact.js';
 import { isLocalMcpFallbackTool, runLocalMcpFallback } from './local-fallback.js';
-import { V2_TOOL_DEFINITIONS, parseToolArgs } from './tools.js';
+import { V2_TOOL_DEFINITIONS, mcpToolNamesForProfile, parseToolArgs } from './tools.js';
 
 export interface RunMcpProxyOptions {
   root: string;
@@ -22,6 +22,7 @@ export interface RunMcpProxyOptions {
   warnStale?: boolean;
   indexProviders?: string[] | string;
   scipIndexPath?: string;
+  mcpProfile?: string;
 }
 
 type RegisteredWorkspace = Awaited<ReturnType<V2Indexer['registerWorkspace']>>;
@@ -46,6 +47,10 @@ class McpStructuredError extends Error {
 }
 
 export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
+  const allowedToolNames = mcpToolNamesForProfile(options.mcpProfile);
+  const toolDefinitions = allowedToolNames
+    ? V2_TOOL_DEFINITIONS.filter(tool => allowedToolNames.has(tool.name))
+    : V2_TOOL_DEFINITIONS;
   const providerOptions = {
     indexProviders: options.indexProviders,
     scipIndexPath: options.scipIndexPath,
@@ -155,13 +160,27 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: V2_TOOL_DEFINITIONS,
+    tools: toolDefinitions,
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     let args: Record<string, unknown> | undefined;
     const startedAt = Date.now();
     try {
+      if (allowedToolNames && !allowedToolNames.has(request.params.name)) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              error: {
+                code: 'tool_not_available_in_profile',
+                message: `Tool ${request.params.name} is not available in MCP profile ${options.mcpProfile}. Use codegraph_context or codegraph_slice, or run with --mcp-profile full.`,
+              },
+            }),
+          }],
+          isError: true,
+        };
+      }
       args = parseToolArgs(request.params.name, request.params.arguments);
       if (request.params.name === 'codegraph_status') {
         const result = await codegraphStatus(options.root, args, runtimeValue);

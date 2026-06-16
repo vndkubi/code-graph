@@ -7,11 +7,9 @@ function estimatedSchemaTokens(tools: Array<{ name: string; description: string;
 }
 
 describe('MCP full tool mode', () => {
-  it('exposes one full MCP tool surface while keeping client facade tools available', () => {
+  it('exposes the full MCP tool surface by default while keeping client facade tools available', () => {
     expect(mcpToolNamesForProfile(undefined)).toBeUndefined();
-    expect(mcpToolNamesForProfile('full')).toBeUndefined();
-    expect(mcpToolNamesForProfile('client')).toBeUndefined();
-    expect(mcpToolNamesForProfile('minimal')).toBeUndefined();
+    expect([...mcpToolNamesForProfile('full')!]).toEqual(V2_TOOL_DEFINITIONS.map(tool => tool.name));
     expect(V2_TOOL_PROFILES.full).toEqual(V2_TOOL_DEFINITIONS.map(tool => tool.name));
     expect(V2_TOOL_DEFINITIONS.map(tool => tool.name)).toEqual(expect.arrayContaining([
       'codegraph_status',
@@ -22,6 +20,15 @@ describe('MCP full tool mode', () => {
       'review_patch',
       'search_symbol',
     ]));
+  });
+
+  it('keeps named MCP profiles on the facade surface to avoid duplicate low-level choices', () => {
+    const facadeTools = ['codegraph_context', 'codegraph_slice', 'codegraph_status'];
+    expect([...mcpToolNamesForProfile('client')!]).toEqual(facadeTools);
+    expect([...mcpToolNamesForProfile('minimal')!]).toEqual(facadeTools);
+    expect([...mcpToolNamesForProfile('research')!]).toEqual(facadeTools);
+    expect([...mcpToolNamesForProfile('change')!]).toEqual(facadeTools);
+    expect([...mcpToolNamesForProfile('review')!]).toEqual(facadeTools);
   });
 
   it('routes the client context facade to bounded internal tools', () => {
@@ -61,11 +68,8 @@ describe('MCP full tool mode', () => {
     expect(inferCodeGraphContextMode('Understand the architecture', {})).toBe('research');
   });
 
-  it('keeps legacy profile names as aliases for the single full mode', () => {
-    expect(mcpToolNamesForProfile('research')).toBeUndefined();
-    expect(mcpToolNamesForProfile('change')).toBeUndefined();
-    expect(mcpToolNamesForProfile('review')).toBeUndefined();
-    expect(() => mcpToolNamesForProfile('unknown')).toThrow(/full MCP toolset/);
+  it('rejects unknown MCP profile names', () => {
+    expect(() => mcpToolNamesForProfile('unknown')).toThrow(/Expected client, minimal, research, change, review, or full/);
   });
 
   it('parses facade tool arguments with client-safe defaults', () => {

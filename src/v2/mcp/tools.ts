@@ -302,9 +302,14 @@ export const V2ToolSchemas = {
 };
 
 export type V2ToolName = keyof typeof V2ToolSchemas;
-export type V2ToolProfile = 'full';
+export type V2ToolProfile = 'client' | 'minimal' | 'research' | 'change' | 'review' | 'full';
 
 export const V2_TOOL_PROFILES: Record<V2ToolProfile, readonly V2ToolName[]> = {
+  client: ['codegraph_context', 'codegraph_slice', 'codegraph_status'],
+  minimal: ['codegraph_context', 'codegraph_slice', 'codegraph_status'],
+  research: ['codegraph_context', 'codegraph_slice', 'codegraph_status'],
+  change: ['codegraph_context', 'codegraph_slice', 'codegraph_status'],
+  review: ['codegraph_context', 'codegraph_slice', 'codegraph_status'],
   full: Object.keys(V2ToolSchemas) as V2ToolName[],
 };
 
@@ -335,17 +340,18 @@ export function parseToolArgs(name: string, args: unknown): Record<string, unkno
 }
 
 export function mcpToolNamesForProfile(profile: string | undefined): Set<string> | undefined {
-  normalizeMcpToolProfile(profile);
-  return undefined;
+  const normalized = normalizeMcpToolProfile(profile);
+  if (!normalized) return undefined;
+  return new Set(V2_TOOL_PROFILES[normalized]);
 }
 
 export function normalizeMcpToolProfile(profile: string | undefined): V2ToolProfile | undefined {
   const value = profile?.trim().toLowerCase();
   if (!value) return undefined;
   if (value === 'client' || value === 'minimal' || value === 'research' || value === 'change' || value === 'review' || value === 'full') {
-    return 'full';
+    return value;
   }
-  throw new Error(`Unknown MCP tool profile: ${profile}. CodeGraph now exposes the full MCP toolset by default.`);
+  throw new Error(`Unknown MCP tool profile: ${profile}. Expected client, minimal, research, change, review, or full.`);
 }
 
 function descriptionFor(name: V2ToolName, options: V2ToolDefinitionOptions = {}): string {

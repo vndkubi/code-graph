@@ -43,6 +43,7 @@ async function main(): Promise<void> {
         warnStale: parsed.flags.get('warn-stale') === true || envFlag('CODEGRAPH_WARN_STALE'),
         indexProviders: indexProvidersFlag(parsed),
         scipIndexPath: scipIndexFlag(parsed),
+        mcpProfile: getFlag(parsed, 'mcp-profile') ?? process.env.CODEGRAPH_MCP_PROFILE,
       });
       return;
     case 'setup':
@@ -585,6 +586,8 @@ Options:
   --watch                                Watch workspace files and queue background refreshes on changes
   --warn-stale                           Include freshness checks in MCP tool responses
   --prewarm                             Index missing snapshots inside MCP startup/runtime. Off by default; prefer explicit index/setup.
+  --mcp-profile <client|minimal|research|change|review|full>
+                                             Tool surface for MCP. Named profiles expose facade tools; full exposes every tool.
   --models <a,b,c>                       Copilot E2E model list for benchmark copilot-e2e
   --modes <codegraph,baseline>           Copilot E2E comparison modes
   --modes <baseline,terse-no-mcp,mcp-first,mcp-only,compiled-packet,compiled-packet+gate,oracle-packet>
