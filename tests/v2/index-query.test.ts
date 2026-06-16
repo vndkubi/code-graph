@@ -2851,6 +2851,71 @@ class PaymentInfo {
     }));
   });
 
+  it('resolves inherited and qualified outer Java method references to the owning method', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-java-outer-this-method-refs-');
+    writeFile(repo, 'src/main/java/com/example/OuterCallback.java', `package com.example;
+
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+
+public class OuterCallback extends BaseCallback {
+    void register(EventBus bus) {
+        bus.onPayment(this::inheritedHook);
+    }
+
+    String mapInfo(PaymentInfo info) {
+        return "";
+    }
+
+    class InnerRegistrar {
+        void wire(Stream<PaymentInfo> payments) {
+            payments.map(OuterCallback.this::mapInfo).toList();
+        }
+    }
+}
+
+class BaseCallback {
+    void inheritedHook(PaymentInfo info) {
+    }
+}
+
+interface EventBus {
+    void onPayment(Consumer<PaymentInfo> callback);
+}
+
+class PaymentInfo {
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const inheritedCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'BaseCallback.inheritedHook', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(inheritedCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'OuterCallback.register',
+      callee: 'BaseCallback.inheritedHook',
+      resolution_kind: 'method-reference',
+    }));
+
+    const outerThisCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'OuterCallback.mapInfo', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(outerThisCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'InnerRegistrar.wire',
+      callee: 'OuterCallback.mapInfo',
+      resolution_kind: 'method-reference',
+    }));
+  });
+
   it('resolves inherited Java field receiver calls through superclass fields', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-inherited-field-receiver-');

@@ -77,9 +77,11 @@ Without a provider version bump, old parse-cache rows could silently hide the ne
 Added/verified coverage for:
 
 - `this::handlePayment`
+- `this::inheritedHook`
 - `super::baseHook`
 - `gateway::processPayment`
 - `PaymentGateway::audit`
+- `OuterCallback.this::mapInfo`
 - `() -> worker.runJob()`
 
 Implementation/tests:
@@ -316,6 +318,14 @@ Java chained field receiver probes:
   - `this.fsState.getRootFallbackLink` fell from `16` unresolved edges to `0`
   - top recovered callees include `FileStatus.isDirectory`, `FileStatus.isSymlink`, `ReentrantReadWriteLock.writeLock`, `ReentrantReadWriteLock.readLock`, and `InodeTree.getRootFallbackLink`
 
+Java qualified/inherited method-reference probe:
+
+- `D:/Personal/Projects/doughnut/backend`
+  - `EmbeddingService.this::combineNoteContent` previously stayed as unresolved raw callee `EmbeddingService.this.combineNoteContent`
+  - after the patch it resolves to `EmbeddingService.combineNoteContent`
+  - `get_callers('EmbeddingService.combineNoteContent')` now returns `EmbeddingService.streamEmbeddingsForNotes` with `resolution_kind: 'method-reference'`
+  - targeted cold-index timing on the same repo stayed in the same range: `15.1s -> 16.6s`
+
 Interpretation:
 
 - The main remaining speed issue on large clean repos was not SQLite itself; it was git-freshness invalidation caused by `.codegraph*` artifact directories showing up as untracked repo dirt.
@@ -327,6 +337,7 @@ Interpretation:
 - Java static-import resolution materially reduces unresolved helper calls and turns a large body of formerly low-context assertion/mock/util edges into explicit owner-qualified calls.
 - Java receiver typing is now broader inside ordinary control-flow, which removes a large batch of unresolved loop and exception-handling calls on real Java repos.
 - Java field-chain resolution closes another real test-helper gap, especially where builder/test harness objects expose service fields that are called repeatedly.
+- Java method-reference resolution now also handles explicit outer-instance receivers like `OuterClass.this::method` and inherited `this::baseMethod` ownership.
 
 ## Quality Evidence
 
@@ -485,6 +496,7 @@ Status:
 Status:
 
 - Improved for Java callback/method-reference cases.
+- Java method-reference ownership now covers inherited `this::method` and explicit outer-instance `OuterClass.this::method`.
 - Java field usage facts now index by default, with explicit opt-out only for speed-sensitive cold runs.
 - Java inherited-field receiver calls now resolve across superclass and nested-class access patterns.
 - Java unqualified helper-method calls now resolve across current classes, superclass chains, and nested outer-class access paths.

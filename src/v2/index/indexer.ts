@@ -4226,7 +4226,11 @@ function resolveReceiverExpressionType(args: {
   let currentType: string | undefined;
   let index = 0;
   let fieldDepth = 0;
-  if (parts[0] === 'this') {
+  const qualifiedOuter = resolveQualifiedOuterReceiverStart(parts, args.caller, args.superClassByClass, args.outerClassByClass);
+  if (qualifiedOuter) {
+    currentType = qualifiedOuter.type;
+    index = qualifiedOuter.index;
+  } else if (parts[0] === 'this') {
     currentType = enclosingClassFromCaller(args.caller);
     index = 1;
   } else if (parts[0] === 'super') {
@@ -4255,6 +4259,19 @@ function resolveReceiverExpressionType(args: {
   }
 
   return currentType ? { type: simpleTypeName(currentType), fieldDepth } : undefined;
+}
+
+function resolveQualifiedOuterReceiverStart(
+  parts: string[],
+  caller: string,
+  superClassByClass: Map<string, string>,
+  outerClassByClass: Map<string, string>,
+): { type: string; index: number } | undefined {
+  if (parts.length < 2 || (parts[1] !== 'this' && parts[1] !== 'super')) return undefined;
+  const visibleClass = resolveVisibleClassFromCaller(caller, parts[0] ?? '', superClassByClass, outerClassByClass);
+  if (!visibleClass) return undefined;
+  const type = parts[1] === 'super' ? superClassByClass.get(visibleClass) : visibleClass;
+  return type ? { type, index: 2 } : undefined;
 }
 
 function resolveMethodOwnerCall(args: {
@@ -4309,6 +4326,25 @@ function resolveMethodOwnerCall(args: {
     };
   }
 
+  if (args.resolutionKind === 'method-reference') {
+    const owner = resolveMethodReferenceVisibleOwner({
+      caller: args.caller,
+      receiver,
+      method,
+      methodOwners: args.methodOwners,
+      superClassByClass: args.superClassByClass,
+      outerClassByClass: args.outerClassByClass,
+    });
+    if (owner) {
+      return {
+        callee: `${owner}.${method}`,
+        confidence: 0.84,
+        resolutionKind: 'method-reference',
+        method,
+      };
+    }
+  }
+
   const receiverType = resolveReceiverExpressionType({
     file: args.file,
     caller: args.caller,
@@ -4344,6 +4380,48 @@ function resolveMethodOwnerCall(args: {
   return undefined;
 }
 
+function resolveMethodReferenceVisibleOwner(args: {
+  caller: string;
+  receiver: string;
+  method: string;
+  methodOwners: Set<string>;
+  superClassByClass: Map<string, string>;
+  outerClassByClass: Map<string, string>;
+}): string | undefined {
+  const explicitOuter = parseQualifiedThisLikeReceiver(args.receiver);
+  if (explicitOuter) {
+    const visibleClass = resolveVisibleClassFromCaller(
+      args.caller,
+      explicitOuter.className,
+      args.superClassByClass,
+      args.outerClassByClass,
+    );
+    if (!visibleClass) return undefined;
+    const startClass = explicitOuter.mode === 'super'
+      ? args.superClassByClass.get(visibleClass)
+      : visibleClass;
+    return resolveMethodInClassChain(startClass, args.method, args.methodOwners, args.superClassByClass);
+  }
+
+  if (args.receiver.includes('.') || !/^[A-Z]/.test(args.receiver)) return undefined;
+  const visibleClass = resolveVisibleClassFromCaller(
+    args.caller,
+    args.receiver,
+    args.superClassByClass,
+    args.outerClassByClass,
+  );
+  if (!visibleClass) return undefined;
+  return resolveMethodInClassChain(visibleClass, args.method, args.methodOwners, args.superClassByClass);
+}
+
+function parseQualifiedThisLikeReceiver(receiver: string): { className: string; mode: 'this' | 'super' } | undefined {
+  const match = receiver.match(/^([A-Za-z_$][A-Za-z0-9_$]*)\.(this|super)$/);
+  if (!match) return undefined;
+  const className = match[1];
+  const mode = match[2] === 'super' ? 'super' : 'this';
+  return className ? { className, mode } : undefined;
+}
+
 function resolveEnclosingMethodOwner(args: {
   caller: string;
   method: string;
@@ -4368,6 +4446,28 @@ function resolveEnclosingMethodOwner(args: {
     const owner = resolveMethodInClassChain(searchOuter, args.method, args.methodOwners, args.superClassByClass);
     if (owner) return owner;
     searchOuter = args.outerClassByClass.get(searchOuter);
+  }
+  return undefined;
+}
+
+function resolveVisibleClassFromCaller(
+  caller: string,
+  className: string,
+  superClassByClass: Map<string, string>,
+  outerClassByClass: Map<string, string>,
+): string | undefined {
+  let currentClass = enclosingClassFromCaller(caller);
+  const seenOuter = new Set<string>();
+  while (currentClass && !seenOuter.has(currentClass)) {
+    seenOuter.add(currentClass);
+    let searchClass: string | undefined = currentClass;
+    const seenSuper = new Set<string>();
+    while (searchClass && !seenSuper.has(searchClass)) {
+      seenSuper.add(searchClass);
+      if (searchClass === className || simpleTypeName(searchClass) === className) return searchClass;
+      searchClass = superClassByClass.get(searchClass);
+    }
+    currentClass = outerClassByClass.get(currentClass);
   }
   return undefined;
 }
