@@ -7081,6 +7081,7 @@ function researchCallEdgeScore(edge: CallEdgeRow): number {
     || edge.resolution_kind === 'interface-implementation'
     || edge.resolution_kind === 'enclosing-method'
     || edge.resolution_kind === 'super-method'
+    || edge.resolution_kind === 'static-import'
   ) score += 8;
   if (/\b(Service|Client|Manager|Context|Store|Repository|Dao|Request|Response|Builder|Info|Entity|Controller)\b/.test(callee)) score += 18;
   if (/\b(Logger|String|HashSet|ArrayList|List|Set|Map|ConcurrentMap|AtomicLong|Objects|Optional)\./.test(callee)) score -= 24;

@@ -143,6 +143,24 @@ Java test and service code often calls helper methods as `helper()` rather than
 `this.helper()`, and those calls were previously stored only as low-context `name-only`
 edges.
 
+### 9. Java named static imports now resolve to owner methods
+
+The current worktree now resolves Java calls imported through named static imports:
+
+- `import static com.example.Utility.parseXmlSecure;`
+- `import static org.mockito.Mockito.eq;`
+- `import static org.junit.jupiter.api.Assertions.assertEquals;`
+
+Those calls now index as explicit owner-qualified edges such as `Utility.parseXmlSecure`,
+`Mockito.eq`, and `Assertions.assertEquals` instead of falling back to bare unresolved names.
+
+This matters in real Java test-heavy repos because static imports are extremely common for:
+
+- assertions
+- Mockito helpers
+- Spring MockMvc helpers
+- internal static utility methods
+
 ## Benchmark Evidence
 
 ### A/B: lightweight maintenance vs full ANALYZE
@@ -221,6 +239,17 @@ Java unqualified method-owner resolution probes:
   - `4035` primary unqualified Java `name-only` calls still remain
   - many recovered callees come from inherited test helpers such as `AbstractFSContractTestBase.getFileSystem`, `FileContextMainOperationsBaseTest.getTestRootPath`, and `Configured.getConf`
 
+Java named static import resolution probes:
+
+- `D:/Personal/Projects/doughnut/backend`
+  - primary unqualified Java `name-only` calls dropped from `266` to `101`
+  - `2694` Java call edges now resolve as explicit `static-import`
+  - top recovered static-import callees include `MatcherAssert.assertThat`, `Matchers.equalTo`, `Assertions.assertThrows`, `MockMvcResultMatchers.status`, and internal helpers such as `EpubPackageIo.readEntryBytes`
+- `D:/Personal/Projects/hadoop/hadoop-common-project`
+  - primary unqualified Java `name-only` calls dropped from `4067` to `1298`
+  - `15237` Java call edges now resolve as explicit `static-import`
+  - top recovered static-import callees include `Assertions.assertEquals`, `Assertions.assertTrue`, `Mockito.when`, `Mockito.verify`, `LambdaTestUtils.intercept`, and `BindingUtils.loadStaticMethod`
+
 Interpretation:
 
 - The main remaining speed issue on large clean repos was not SQLite itself; it was git-freshness invalidation caused by `.codegraph*` artifact directories showing up as untracked repo dirt.
@@ -229,6 +258,7 @@ Interpretation:
 - Manifest scan correctness now lines up better with git-visible project scope instead of raw filesystem scope.
 - Java call quality also improved on a concrete real-repo inheritance pattern instead of only synthetic fixtures.
 - Java call quality improved again for the much larger bucket of same-class, superclass, and outer-class helper method calls, with strong wins on both Doughnut and Hadoop.
+- Java static-import resolution materially reduces unresolved helper calls and turns a large body of formerly low-context assertion/mock/util edges into explicit owner-qualified calls.
 
 ## Quality Evidence
 
@@ -264,6 +294,7 @@ The git-freshness path now also has direct regression coverage for warm reindex 
   - field usages
   - graph overlay
   - unqualified method-owner resolution for current/super/outer Java method calls
+  - named static-import method resolution for Java utility/assertion/helper calls
   - field usage facts are now enabled by default instead of living behind an extra indexing flag
 
 ### Where `codegraph-external` is stronger
@@ -387,6 +418,7 @@ Status:
 - Java field usage facts now index by default, with explicit opt-out only for speed-sensitive cold runs.
 - Java inherited-field receiver calls now resolve across superclass and nested-class access patterns.
 - Java unqualified helper-method calls now resolve across current classes, superclass chains, and nested outer-class access paths.
+- Java named static-import calls now resolve to explicit owner methods instead of bare unresolved names.
 - Added TS/JS and Python callback reference coverage for `this/self` registrations and inline callback bodies.
 - Cache invalidation now preserves that improvement in real runs.
 - Largest remaining quality gap versus external is generalized callback/function-as-value capture breadth across more positions and languages.

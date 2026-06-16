@@ -2995,6 +2995,62 @@ public class HelperTest extends BaseHelper {
     }));
   });
 
+  it('resolves Java named static imports to owner methods', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-java-static-imports-');
+    writeFile(repo, 'src/main/java/com/example/Utility.java', `package com.example;
+
+public class Utility {
+    public static String parseXmlSecure() {
+        return "";
+    }
+
+    public static byte[] readEntryBytes() {
+        return new byte[0];
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/Consumer.java', `package com.example;
+
+import static com.example.Utility.parseXmlSecure;
+import static com.example.Utility.readEntryBytes;
+
+public class Consumer {
+    void run() {
+        parseXmlSecure();
+        readEntryBytes();
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const parseXmlCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Utility.parseXmlSecure', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(parseXmlCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'Consumer.run',
+      callee: 'Utility.parseXmlSecure',
+      resolution_kind: 'static-import',
+    }));
+
+    const readEntryCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Utility.readEntryBytes', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(readEntryCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'Consumer.run',
+      callee: 'Utility.readEntryBytes',
+      resolution_kind: 'static-import',
+    }));
+  });
+
   it('indexes TypeScript and Python callback references and inline callback bodies', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-script-callback-refs-');

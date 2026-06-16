@@ -91,6 +91,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   private parsePackageName: string | undefined;
   private javaFieldsByClass = new Map<string, Map<string, JavaFieldInfo>>();
   private javaSuperClassByClass = new Map<string, string>();
+  private javaStaticImports = new Map<string, Set<string>>();
   private javaStringConstants = new Map<string, string>();
   private externalJavaConstantCache = new Map<string, Map<string, string> | undefined>();
 
@@ -132,6 +133,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     this.parsePackageName = undefined;
     this.javaFieldsByClass = new Map();
     this.javaSuperClassByClass = new Map();
+    this.javaStaticImports = new Map();
     this.javaStringConstants = new Map();
     if (lang === 'java') {
       this.javaStringConstants = this.collectJavaStringConstants(tree.rootNode);
@@ -210,6 +212,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         }
 
         case 'import_declaration': {
+          this.collectJavaStaticImport(child);
           const importPath = child.children
             .filter(c => c.type === 'scoped_identifier' || c.type === 'identifier')
             .map(c => c.text)
@@ -1570,15 +1573,23 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       const funcNode = node.childForFieldName('name') ?? node.children[0];
       if (funcNode) {
         let calleeName = '';
+        let resolutionKind: string | undefined;
         const objectNode = node.childForFieldName('object');
         if (objectNode) {
           const receiverType = resolveReceiverType(objectNode.text, receiverTypes);
           calleeName = `${receiverType ?? objectNode.text}.${funcNode.text}`;
         } else {
-          calleeName = funcNode.text;
+          calleeName = this.resolveJavaStaticImportCallee(funcNode.text) ?? funcNode.text;
+          if (calleeName !== funcNode.text) resolutionKind = 'static-import';
         }
         if (calleeName) {
-          calls.push({ caller: callerName, callee: calleeName, file, line: node.startPosition.row + 1 });
+          calls.push({
+            caller: callerName,
+            callee: calleeName,
+            file,
+            line: node.startPosition.row + 1,
+            resolutionKind,
+          });
           references.push({
             file,
             line: node.startPosition.row + 1,
@@ -1704,6 +1715,28 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     return this.resolveScriptCallCallee(node, enclosingClass);
   }
 
+  private collectJavaStaticImport(node: SyntaxNode): void {
+    const match = node.text.match(/^\s*import\s+static\s+([A-Za-z0-9_$.]+)\s*;\s*$/);
+    if (!match) return;
+    const importPath = match[1];
+    if (!importPath || importPath.endsWith('.*')) return;
+    const dot = importPath.lastIndexOf('.');
+    if (dot <= 0 || dot >= importPath.length - 1) return;
+    const owner = simpleTypeName(importPath.substring(0, dot));
+    const symbol = importPath.substring(dot + 1);
+    if (!owner || !symbol || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(symbol)) return;
+    const owners = this.javaStaticImports.get(symbol) ?? new Set<string>();
+    owners.add(owner);
+    this.javaStaticImports.set(symbol, owners);
+  }
+
+  private resolveJavaStaticImportCallee(methodName: string): string | undefined {
+    const owners = this.javaStaticImports.get(methodName);
+    if (!owners || owners.size !== 1) return undefined;
+    const [owner] = [...owners];
+    return owner ? `${owner}.${methodName}` : undefined;
+  }
+
   private getLineText(lines: string[], row: number): string {
     return lines[row] ?? '';
   }
@@ -1786,6 +1819,12 @@ function resolveReceiverType(receiver: string, receiverTypes?: Map<string, strin
   if (receiverTypes.has(receiver)) return receiverTypes.get(receiver);
   const lastSegment = receiver.split('.').pop();
   return lastSegment ? receiverTypes.get(lastSegment) : undefined;
+}
+
+function simpleTypeName(typeName: string): string {
+  const normalized = typeName.trim().replace(/<.*$/, '');
+  const lastDot = normalized.lastIndexOf('.');
+  return lastDot >= 0 ? normalized.substring(lastDot + 1) : normalized;
 }
 
 function treeSitterParseOptions(contentLength: number): { bufferSize: number } | undefined {
