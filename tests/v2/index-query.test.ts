@@ -3408,6 +3408,291 @@ public class PatternScope {
     }));
   });
 
+  it('resolves Java record accessors, Lombok getters, and var-inferred stream lambda receivers', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-java-accessor-streams-');
+    writeFile(repo, 'src/test/java/com/example/Folder.java', `package com.example;
+
+public class Folder {
+    public Integer getId() {
+        return 0;
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/FolderListing.java', `package com.example;
+
+import java.util.List;
+
+public record FolderListing(List<Folder> folders) {
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/FolderScope.java', `package com.example;
+
+public class FolderScope {
+    boolean hasFolder(FolderListing listing, Integer needle) {
+        return listing.folders().stream()
+            .anyMatch(f -> f.getId().equals(needle));
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/UserForListing.java', `package com.example;
+
+public class UserForListing {
+    public Integer getId() {
+        return 0;
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/UserListingPage.java', `package com.example;
+
+import java.util.List;
+import lombok.Getter;
+
+@Getter
+public class UserListingPage {
+    private List<UserForListing> users;
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/UserScope.java', `package com.example;
+
+public class UserScope {
+    boolean containsUser(UserListingPage result, Integer needle) {
+        return result.getUsers().stream()
+            .anyMatch(u -> u.getId().equals(needle));
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/NoteTopology.java', `package com.example;
+
+public class NoteTopology {
+    public Integer getId() {
+        return 0;
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/NoteSearchResult.java', `package com.example;
+
+public class NoteSearchResult {
+    public NoteTopology getNoteTopology() {
+        return new NoteTopology();
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/SearchResult.java', `package com.example;
+
+public class SearchResult {
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/RelationshipLiteralSearchHits.java', `package com.example;
+
+import java.util.List;
+
+public class RelationshipLiteralSearchHits {
+    public static List<NoteSearchResult> noteMatches(SearchResult result) {
+        return List.of();
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/RelationshipScope.java', `package com.example;
+
+import java.util.List;
+
+public class RelationshipScope {
+    List<Integer> noteIds(SearchResult result) {
+        var notes = RelationshipLiteralSearchHits.noteMatches(result);
+        return notes.stream()
+            .map(r -> r.getNoteTopology().getId())
+            .toList();
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const folderGetIdCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Folder.getId', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(folderGetIdCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^FolderScope[.]hasFolder[.]lambda\d+_\d+$/),
+      callee: 'Folder.getId',
+      resolution_kind: 'receiver-type',
+    }));
+
+    const userGetIdCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'UserForListing.getId', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(userGetIdCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^UserScope[.]containsUser[.]lambda\d+_\d+$/),
+      callee: 'UserForListing.getId',
+      resolution_kind: 'receiver-type',
+    }));
+
+    const noteTopologyGetIdCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'NoteTopology.getId', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(noteTopologyGetIdCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^RelationshipScope[.]noteIds[.]lambda\d+_\d+$/),
+      callee: 'NoteTopology.getId',
+      resolution_kind: 'receiver-type',
+    }));
+  });
+
+  it('resolves Java stream receiver inference across src/main and src/test roots', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-java-cross-root-streams-');
+    writeFile(repo, 'src/main/java/com/example/CatalogItems.java', `package com.example;
+
+public class CatalogItems {
+    public void stream() {
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/NotebooksViewedByUser.java', `package com.example;
+
+public class NotebooksViewedByUser {
+    public CatalogItems catalogItems = new CatalogItems();
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/Controller.java', `package com.example;
+
+public class Controller {
+    public NotebooksViewedByUser myNotebooks() {
+        return new NotebooksViewedByUser();
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/ControllerBase.java', `package com.example;
+
+public class ControllerBase {
+    protected Controller controller = new Controller();
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/NotebookSharingGroupControllerTest.java', `package com.example;
+
+public class NotebookSharingGroupControllerTest extends ControllerBase {
+    void render() {
+        var view = controller.myNotebooks();
+        view.catalogItems.stream();
+    }
+
+    class MyNotebooksCatalog {
+        void renderNested() {
+            var view = controller.myNotebooks();
+            view.catalogItems.stream();
+        }
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/UserForListing.java', `package com.example;
+
+public class UserForListing {
+    public Integer getId() {
+        return 0;
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/UserListingPage.java', `package com.example;
+
+import java.util.List;
+import lombok.Getter;
+
+@Getter
+public class UserListingPage {
+    private List<UserForListing> users;
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/AdminUserControllerTest.java', `package com.example;
+
+public class AdminUserControllerTest {
+    boolean hasUser(UserListingPage result, Integer needle) {
+        return result.getUsers().stream()
+            .anyMatch(u -> u.getId().equals(needle));
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/Folder.java', `package com.example;
+
+public class Folder {
+    public Integer getId() {
+        return 0;
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/FolderRepository.java', `package com.example;
+
+import java.util.List;
+
+public class FolderRepository {
+    public List<Folder> findCandidateChildContainers() {
+        return List.of();
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/FolderService.java', `package com.example;
+
+public class FolderService {
+    private final FolderRepository folderRepository = new FolderRepository();
+
+    boolean hasConflict(Integer needle) {
+        return folderRepository.findCandidateChildContainers().stream()
+            .anyMatch(f -> f.getId().equals(needle));
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const streamCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'CatalogItems.stream', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(streamCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'NotebookSharingGroupControllerTest.render',
+      callee: 'CatalogItems.stream',
+      resolution_kind: 'receiver-type-field',
+    }));
+    expect(streamCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'MyNotebooksCatalog.renderNested',
+      callee: 'CatalogItems.stream',
+      resolution_kind: 'receiver-type-field',
+    }));
+
+    const userGetIdCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'UserForListing.getId', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(userGetIdCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^AdminUserControllerTest[.]hasUser[.]lambda\d+_\d+$/),
+      callee: 'UserForListing.getId',
+      resolution_kind: 'receiver-type',
+    }));
+
+    const folderGetIdCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Folder.getId', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(folderGetIdCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^FolderService[.]hasConflict[.]lambda\d+_\d+$/),
+      callee: 'Folder.getId',
+      resolution_kind: 'receiver-type',
+    }));
+  });
+
   it('indexes TypeScript and Python callback references and inline callback bodies', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-script-callback-refs-');

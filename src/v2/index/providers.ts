@@ -79,8 +79,8 @@ interface ScipSymbolInformation {
 }
 
 const TREE_SITTER_PROVIDER_ID = 'tree-sitter';
-const TREE_SITTER_PROVIDER_VERSION = 'tree-sitter-analyzer-v15-default-field-usages';
-const TREE_SITTER_FIELD_USAGE_DISABLED_PROVIDER_VERSION = 'tree-sitter-analyzer-v15-field-usages-disabled';
+const TREE_SITTER_PROVIDER_VERSION = 'tree-sitter-analyzer-v18-default-field-usages';
+const TREE_SITTER_FIELD_USAGE_DISABLED_PROVIDER_VERSION = 'tree-sitter-analyzer-v18-field-usages-disabled';
 const SCIP_PROVIDER_ID = 'scip';
 const SYMBOL_ROLE_DEFINITION = 0x1;
 const SYMBOL_ROLE_IMPORT = 0x2;

@@ -194,6 +194,23 @@ This is still a scoped static resolution. It follows:
 
 It does not attempt full data-flow or arbitrary method-return chaining.
 
+### 12. Java method-return stream typing now spans records, Lombok getters, `var`, and sibling source roots
+
+The current worktree now extends Java type inference for receiver calls that depend on
+method-return types rather than only declared local/parameter types.
+
+Covered cases now include:
+
+- record accessors like `listing.folders()`
+- Lombok-generated getters like `result.getUsers()`
+- explicit methods returning collections like `RelationshipLiteralSearchHits.noteMatches(...)`
+- `var view = controller.myNotebooks()` followed by typed field chains
+- test code in `src/test/java` resolving same-package or imported DTO/controller types from `src/main/java`
+- nested `@Nested`/inner test classes that read outer or inherited controller/service fields before chaining into method-return typing
+
+To keep parse-cache reuse correct for these analyzer changes, the tree-sitter provider version was
+bumped again and now uses the `v18` provider cache key.
+
 ## Benchmark Evidence
 
 ### A/B: lightweight maintenance vs full ANALYZE
@@ -350,6 +367,31 @@ Java pattern-variable and cast-inferred lambda probes:
     - `item instanceof NotebookCatalogSubscribedNotebookItem s && s.notebook.getId()...`
     - `.map(NotebookCatalogNotebookItem.class::cast).map(n -> n.notebook.getId())`
 
+Java method-return / sibling-source-root / `var` stream probes:
+
+- `D:/Personal/Projects/doughnut/backend`
+  - total primary Java `name-only` calls dropped again from `544` to `501`
+  - `receiver-type*` call edges increased from `5859` to `6296`
+  - unresolved counts fell to `0` for:
+    - `f.getId`
+    - `u.getId`
+    - `r.getNoteTopology`
+    - `n.getEdgeType`
+    - `view.catalogItems.stream`
+  - recovered real-repo shapes now include:
+    - `listing.folders().stream().anyMatch(f -> f.getId()...)`
+    - `result.getUsers().stream().filter(u -> u.getId()...)`
+    - `var notes = RelationshipLiteralSearchHits.noteMatches(result); notes.stream()...`
+    - inner test classes calling `var view = controller.myNotebooks(); view.catalogItems.stream()`
+- `D:/Personal/Projects/hadoop/hadoop-common-project`
+  - total primary Java `name-only` calls stayed effectively flat: `4449` to `4448`
+  - the remaining top unresolved set is still dominated by library/static/helper cases such as:
+    - `System.out.println`
+    - `getClass`
+    - `exists`
+    - `onChanged`
+  - this is consistent with the patch scope: the change mainly targets project-local method-return typing rather than broad library or reflective dispatch recovery
+
 Interpretation:
 
 - The main remaining speed issue on large clean repos was not SQLite itself; it was git-freshness invalidation caused by `.codegraph*` artifact directories showing up as untracked repo dirt.
@@ -364,6 +406,7 @@ Interpretation:
 - Java method-reference resolution now also handles explicit outer-instance receivers like `OuterClass.this::method` and inherited `this::baseMethod` ownership.
 - Java typed-receiver field-chain resolution closes a larger cross-file gap where the first receiver segment is a typed local/parameter and later segments are project fields.
 - Java pattern variables and narrow class-cast lambda inference close another practical Java 17/test-heavy gap without attempting a broad generic stream-type solver.
+- Java method-return typing now closes a further gap where the receiver type is only recoverable by following record/Lombok/ordinary accessor return types across `src/main` and `src/test`, including nested test classes that rely on inherited outer controller fields.
 
 ## Quality Evidence
 

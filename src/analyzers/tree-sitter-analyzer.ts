@@ -50,6 +50,11 @@ interface JavaFieldInfo {
   type?: string;
 }
 
+interface JavaTypeMembers {
+  accessorsByClass: Map<string, Map<string, string>>;
+  fieldsByClass: Map<string, Map<string, string>>;
+}
+
 function javaFieldUsagesEnabled(): boolean {
   const value = String(process.env.CODEGRAPH_ENABLE_FIELD_USAGES ?? '').trim().toLowerCase();
   if (!value) return true;
@@ -90,10 +95,18 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   private parseFieldUsages: FieldUsageInfo[] = [];
   private parsePackageName: string | undefined;
   private javaFieldsByClass = new Map<string, Map<string, JavaFieldInfo>>();
+  private javaRawFieldTypesByClass = new Map<string, Map<string, string>>();
+  private javaAccessorReturnsByClass = new Map<string, Map<string, string>>();
+  private javaOuterClassByClass = new Map<string, string>();
   private javaSuperClassByClass = new Map<string, string>();
   private javaStaticImports = new Map<string, Set<string>>();
   private javaStringConstants = new Map<string, string>();
   private externalJavaConstantCache = new Map<string, Map<string, string> | undefined>();
+  private externalJavaTypeMembersCache = new Map<string, JavaTypeMembers | undefined>();
+  private currentJavaFilePath: string | undefined;
+  private currentJavaRootDir: string | undefined;
+  private currentJavaImports: string[] = [];
+  private currentJavaSourceRoots: string[] = [];
 
   parse(filePath: string, content: string, rootDir: string): ParseResult {
     const lang = detectLanguage(filePath);
@@ -132,11 +145,19 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     this.parseFieldUsages = [];
     this.parsePackageName = undefined;
     this.javaFieldsByClass = new Map();
+    this.javaRawFieldTypesByClass = new Map();
+    this.javaAccessorReturnsByClass = new Map();
+    this.javaOuterClassByClass = new Map();
     this.javaSuperClassByClass = new Map();
     this.javaStaticImports = new Map();
     this.javaStringConstants = new Map();
+    this.currentJavaFilePath = lang === 'java' ? filePath : undefined;
+    this.currentJavaRootDir = lang === 'java' ? rootDir : undefined;
+    this.currentJavaImports = [];
+    this.currentJavaSourceRoots = lang === 'java' ? this.javaSourceRootsFor(filePath, rootDir) : [];
     if (lang === 'java') {
       this.javaStringConstants = this.collectJavaStringConstants(tree.rootNode);
+      this.currentJavaImports = this.collectJavaImportPaths(tree.rootNode);
       if (EXTERNAL_JAVA_ANNOTATION_CONSTANT_PATTERN.test(content)) {
         this.mergeExternalJavaStringConstants(tree.rootNode, filePath, rootDir, this.javaStringConstants);
       }
@@ -263,6 +284,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             }
 
             const classHttpMeta = this.extractHttpAnnotationMeta(child);
+            if (parentClass) {
+              this.javaOuterClassByClass.set(nameNode.text, parentClass);
+            }
             if (extendsName) {
               this.javaSuperClassByClass.set(nameNode.text, extendsName);
             }
@@ -289,7 +313,10 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             const body = child.childForFieldName('body');
             if (body) {
               this.collectJavaClassFields(body, nameNode.text);
+              this.collectJavaClassAccessors(child, body, nameNode.text);
               this.extractJava(body, file, lines, symbols, imports, calls, references, nameNode.text);
+            } else if (child.type === 'record_declaration') {
+              this.collectJavaClassAccessors(child, undefined, nameNode.text);
             }
           }
           break;
@@ -397,7 +424,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             if (body) {
               const receiverTypes = this.extractMethodParamTypeMap(paramsNode);
               const shadowedNames = this.extractJavaParameterNames(paramsNode);
-              this.collectJavaLocalVariableTypes(body, receiverTypes, file, shadowedNames);
+              this.collectJavaLocalVariableTypes(body, receiverTypes, file, shadowedNames, parentClass);
               const fieldUsageContext = javaFieldUsagesEnabled() && parentClass
                 ? this.javaFieldUsageContext(parentClass, methodName, child.type === 'constructor_declaration', receiverTypes, shadowedNames)
                 : undefined;
@@ -424,10 +451,12 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
    */
   private collectJavaClassFields(body: SyntaxNode, className: string): void {
     const fields = new Map<string, JavaFieldInfo>();
+    const rawFieldTypes = new Map<string, string>();
     const packagePrefix = this.parsePackageName ? `${this.parsePackageName}.` : '';
     for (const child of body.children) {
       if (child.type !== 'field_declaration') continue;
       const fieldType = this.extractJavaTypeName(child.childForFieldName('type')) ?? undefined;
+      const rawFieldType = this.extractJavaTypeText(child.childForFieldName('type')) ?? undefined;
       for (const declarator of child.children.filter(c => c.type === 'variable_declarator')) {
         const nameNode = declarator.childForFieldName('name') ?? declarator.children.find(c => c.type === 'identifier');
         if (!nameNode) continue;
@@ -437,9 +466,60 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           fieldFqName: `${packagePrefix}${className}.${nameNode.text}`,
           type: fieldType,
         });
+        if (rawFieldType) rawFieldTypes.set(nameNode.text, rawFieldType);
       }
     }
     this.javaFieldsByClass.set(className, fields);
+    this.javaRawFieldTypesByClass.set(className, rawFieldTypes);
+  }
+
+  private collectJavaClassAccessors(
+    classNode: SyntaxNode,
+    body: SyntaxNode | undefined,
+    className: string,
+  ): void {
+    const accessors = new Map<string, string>();
+    const classAnnotations = new Set(this.getJavaAnnotations(classNode));
+    const classHasGetter = classAnnotations.has('Getter') || classAnnotations.has('Data');
+
+    if (body) {
+      for (const child of body.children) {
+        if (child.type === 'method_declaration') {
+          const nameNode = child.childForFieldName('name') ?? child.children.find(c => c.type === 'identifier');
+          const returnType = this.extractJavaTypeText(child.childForFieldName('type'));
+          if (nameNode && returnType) accessors.set(nameNode.text, returnType);
+        }
+
+        if (child.type === 'field_declaration') {
+          const fieldType = this.extractJavaTypeText(child.childForFieldName('type'));
+          if (!fieldType) continue;
+          const fieldAnnotations = new Set(this.getJavaAnnotations(child));
+          const fieldHasGetter = classHasGetter || fieldAnnotations.has('Getter') || fieldAnnotations.has('Data');
+          if (!fieldHasGetter) continue;
+          for (const declarator of child.children.filter(c => c.type === 'variable_declarator')) {
+            const nameNode = declarator.childForFieldName('name') ?? declarator.children.find(c => c.type === 'identifier');
+            if (!nameNode) continue;
+            accessors.set(javaBeanGetterName(nameNode.text, fieldType), fieldType);
+          }
+        }
+      }
+    }
+
+    if (classNode.type === 'record_declaration') {
+      const paramsNode = classNode.childForFieldName('parameters')
+        ?? classNode.namedChildren.find(child => child.type === 'formal_parameters');
+      if (paramsNode) {
+        for (const param of paramsNode.namedChildren) {
+          if (param.type !== 'formal_parameter' && param.type !== 'spread_parameter') continue;
+          const typeName = this.extractJavaTypeText(param.childForFieldName('type'));
+          const nameNode = param.childForFieldName('name')
+            ?? [...param.namedChildren].reverse().find(node => node.type === 'identifier');
+          if (typeName && nameNode) accessors.set(nameNode.text, typeName);
+        }
+      }
+    }
+
+    this.javaAccessorReturnsByClass.set(className, accessors);
   }
 
   private extractJavaParameterNames(paramsNode: SyntaxNode | null | undefined): Set<string> {
@@ -611,6 +691,11 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     }
   }
 
+  private extractJavaTypeText(node: SyntaxNode | null | undefined): string | undefined {
+    if (!node) return undefined;
+    return normalizeJavaTypeText(node.text);
+  }
+
   /**
    * Extract a list of type names from a super_interfaces / extends_interfaces /
    * interface_type_list node (Java implements / extends clause).
@@ -746,15 +831,20 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   private javaSourceRootsFor(filePath: string, rootDir: string): string[] {
     const roots = new Set<string>();
     const normalized = filePath.replace(/\\/g, '/');
-    for (const marker of [
+    const markers = [
       '/src/main/java/',
       '/src/test/java/',
       '/src/integration-test/java/',
       '/src/java/',
-    ]) {
+    ];
+    for (const marker of markers) {
       const index = normalized.indexOf(marker);
       if (index >= 0) {
-        roots.add(filePath.slice(0, index + marker.length));
+        const moduleRoot = filePath.slice(0, index);
+        for (const siblingMarker of markers) {
+          const candidateRoot = path.join(moduleRoot, ...siblingMarker.split('/').filter(Boolean));
+          if (fs.existsSync(candidateRoot)) roots.add(candidateRoot);
+        }
       }
     }
     roots.add(rootDir);
@@ -769,6 +859,12 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   ): string[] {
     const candidates = new Set<string>();
     candidates.add(path.join(currentDir, `${className}.java`));
+    if (this.parsePackageName) {
+      const packageParts = this.parsePackageName.split('.').filter(Boolean);
+      for (const sourceRoot of sourceRoots) {
+        candidates.add(path.join(sourceRoot, ...packageParts, `${className}.java`));
+      }
+    }
 
     for (const importPath of imports) {
       const parts = importPath.split('.').filter(Boolean);
@@ -806,6 +902,160 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
 
     this.externalJavaConstantCache.set(absolute, constants);
     return constants;
+  }
+
+  private readJavaTypeMembersFromFile(filePath: string): JavaTypeMembers | undefined {
+    const absolute = path.resolve(filePath);
+    if (this.externalJavaTypeMembersCache.has(absolute)) return this.externalJavaTypeMembersCache.get(absolute);
+
+    let members: JavaTypeMembers | undefined;
+    try {
+      const stat = fs.statSync(absolute);
+      if (stat.isFile() && stat.size <= 768 * 1024) {
+        const content = fs.readFileSync(absolute, 'utf8');
+        const tree = this.parser.parse(content, undefined, treeSitterParseOptions(content.length));
+        members = this.collectJavaTypeMembers(tree.rootNode);
+      }
+    } catch {
+      members = undefined;
+    }
+
+    this.externalJavaTypeMembersCache.set(absolute, members);
+    return members;
+  }
+
+  private collectJavaTypeMembers(root: SyntaxNode): JavaTypeMembers {
+    const accessorsByClass = new Map<string, Map<string, string>>();
+    const fieldsByClass = new Map<string, Map<string, string>>();
+
+    const visit = (node: SyntaxNode): void => {
+      for (const child of node.children) {
+        if (
+          child.type === 'class_declaration'
+          || child.type === 'interface_declaration'
+          || child.type === 'record_declaration'
+        ) {
+          const nameNode = child.childForFieldName('name');
+          if (!nameNode) continue;
+          const className = nameNode.text;
+          const fields = new Map<string, string>();
+          const accessors = new Map<string, string>();
+          const classAnnotations = new Set(this.getJavaAnnotations(child));
+          const classHasGetter = classAnnotations.has('Getter') || classAnnotations.has('Data');
+          const body = child.childForFieldName('body');
+
+          if (body) {
+            for (const member of body.children) {
+              if (member.type === 'field_declaration') {
+                const fieldType = this.extractJavaTypeText(member.childForFieldName('type'));
+                if (!fieldType) continue;
+                const fieldAnnotations = new Set(this.getJavaAnnotations(member));
+                const fieldHasGetter = classHasGetter || fieldAnnotations.has('Getter') || fieldAnnotations.has('Data');
+                for (const declarator of member.children.filter(c => c.type === 'variable_declarator')) {
+                  const fieldName = declarator.childForFieldName('name')?.text
+                    ?? declarator.children.find(c => c.type === 'identifier')?.text;
+                  if (!fieldName) continue;
+                  fields.set(fieldName, fieldType);
+                  if (fieldHasGetter) accessors.set(javaBeanGetterName(fieldName, fieldType), fieldType);
+                }
+              } else if (member.type === 'method_declaration') {
+                const methodName = member.childForFieldName('name')?.text
+                  ?? member.children.find(c => c.type === 'identifier')?.text;
+                const returnType = this.extractJavaTypeText(member.childForFieldName('type'));
+                if (methodName && returnType) accessors.set(methodName, returnType);
+              }
+            }
+          }
+
+          if (child.type === 'record_declaration') {
+            const paramsNode = child.childForFieldName('parameters')
+              ?? child.namedChildren.find(named => named.type === 'formal_parameters');
+            if (paramsNode) {
+              for (const param of paramsNode.namedChildren) {
+                if (param.type !== 'formal_parameter' && param.type !== 'spread_parameter') continue;
+                const fieldType = this.extractJavaTypeText(param.childForFieldName('type'));
+                const fieldName = param.childForFieldName('name')?.text
+                  ?? [...param.namedChildren].reverse().find(named => named.type === 'identifier')?.text;
+                if (!fieldType || !fieldName) continue;
+                fields.set(fieldName, fieldType);
+                accessors.set(fieldName, fieldType);
+              }
+            }
+          }
+
+          fieldsByClass.set(className, fields);
+          accessorsByClass.set(className, accessors);
+          if (body) visit(body);
+          continue;
+        }
+        visit(child);
+      }
+    };
+
+    visit(root);
+    return { accessorsByClass, fieldsByClass };
+  }
+
+  private resolveJavaAccessorReturnType(receiverType: string, methodName: string): string | undefined {
+    const className = simpleTypeName(receiverType);
+    const local = this.javaAccessorReturnsByClass.get(className)?.get(methodName);
+    if (local) return local;
+    return this.resolveExternalJavaClassMemberType(className, members => members.accessorsByClass.get(className)?.get(methodName));
+  }
+
+  private resolveJavaRawFieldType(receiverType: string, fieldName: string): string | undefined {
+    const className = simpleTypeName(receiverType);
+    const local = this.javaRawFieldTypesByClass.get(className)?.get(fieldName);
+    if (local) return local;
+    return this.resolveExternalJavaClassMemberType(className, members => members.fieldsByClass.get(className)?.get(fieldName));
+  }
+
+  private resolveJavaFieldTypeFromHierarchy(className: string | undefined, fieldName: string): string | undefined {
+    const seenClasses = new Set<string>();
+    const visit = (candidateClass: string | undefined): string | undefined => {
+      if (!candidateClass || seenClasses.has(candidateClass)) return undefined;
+      seenClasses.add(candidateClass);
+
+      const localType = this.javaFieldsByClass.get(candidateClass)?.get(fieldName)?.type;
+      if (localType) return localType;
+
+      const externalFields = this.resolveExternalJavaClassMembers(candidateClass, members => members.fieldsByClass.get(candidateClass));
+      const externalType = externalFields?.get(fieldName);
+      if (externalType) return simpleTypeName(externalType);
+
+      return visit(this.javaSuperClassByClass.get(candidateClass))
+        ?? visit(this.javaOuterClassByClass.get(candidateClass));
+    };
+
+    return visit(className);
+  }
+
+  private resolveExternalJavaClassMemberType(
+    className: string,
+    pick: (members: JavaTypeMembers) => string | undefined,
+  ): string | undefined {
+    return this.resolveExternalJavaClassMembers(className, pick);
+  }
+
+  private resolveExternalJavaClassMembers<T>(
+    className: string,
+    pick: (members: JavaTypeMembers) => T | undefined,
+  ): T | undefined {
+    const currentFilePath = this.currentJavaFilePath;
+    if (!currentFilePath) return undefined;
+    const currentDir = path.dirname(currentFilePath);
+    for (const candidatePath of this.javaConstantCandidatePaths(
+      className,
+      currentDir,
+      this.currentJavaSourceRoots,
+      this.currentJavaImports,
+    )) {
+      if (path.resolve(candidatePath) === path.resolve(currentFilePath)) continue;
+      const members = this.readJavaTypeMembersFromFile(candidatePath);
+      const resolved = members ? pick(members) : undefined;
+      if (resolved) return resolved;
+    }
+    return undefined;
   }
 
   private extractHttpAnnotationMeta(node: SyntaxNode): Record<string, string> {
@@ -1013,6 +1263,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     receiverTypes: Map<string, string>,
     file: string,
     shadowedNames?: Set<string>,
+    enclosingClass?: string,
   ): void {
     const bindReceiverType = (typeName: string | null | undefined, nameNode: SyntaxNode | null | undefined): void => {
       if (!typeName || !nameNode) return;
@@ -1067,18 +1318,23 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
 
     if (node.type === 'local_variable_declaration' || node.type === 'resource') {
       const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
+      const rawTypeName = this.extractJavaTypeText(node.childForFieldName('type'));
       if (typeName) {
         for (const declarator of node.children.filter(child => child.type === 'variable_declarator')) {
-          const nameNode = declarator.childForFieldName('name') ?? declarator.children.find(child => child.type === 'identifier');
-          if (nameNode) {
-            receiverTypes.set(nameNode.text, typeName);
-            shadowedNames?.add(nameNode.text);
+            const nameNode = declarator.childForFieldName('name') ?? declarator.children.find(child => child.type === 'identifier');
+            if (nameNode) {
+              const inferredType = typeName === 'var'
+                ? this.resolveJavaExpressionTypeText(declarator.childForFieldName('value'), receiverTypes, enclosingClass)
+                : typeName;
+              if (!inferredType) continue;
+              receiverTypes.set(nameNode.text, inferredType);
+              shadowedNames?.add(nameNode.text);
           }
         }
-        if (this.isReferenceType(typeName)) {
+        if (typeName !== 'var' && this.isReferenceType(typeName)) {
           this.parseTypeRefs.push({
             file,
-            referencedType: typeName,
+            referencedType: rawTypeName ?? typeName,
             context: 'parameter',
             line: node.startPosition.row + 1,
           });
@@ -1086,7 +1342,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       }
     }
     for (const child of node.children) {
-      this.collectJavaLocalVariableTypes(child, receiverTypes, file, shadowedNames);
+      this.collectJavaLocalVariableTypes(child, receiverTypes, file, shadowedNames, enclosingClass);
     }
   }
 
@@ -1551,7 +1807,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
 
     if (node.type === 'lambda_expression') {
       const callbackName = `${callerName}.lambda${node.startPosition.row + 1}_${node.startPosition.column + 1}`;
-      const lambdaReceiverTypes = this.extendJavaLambdaReceiverTypes(node, receiverTypes);
+      const lambdaReceiverTypes = this.extendJavaLambdaReceiverTypes(node, receiverTypes, enclosingClass);
       const lambdaFieldUsageContext = fieldUsageContext
         ? {
           ...fieldUsageContext,
@@ -1635,7 +1891,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         let resolutionKind: string | undefined;
         const objectNode = node.childForFieldName('object');
         if (objectNode) {
-          const receiverType = resolveJavaInvocationReceiver(objectNode.text, receiverTypes);
+          const receiverType = objectNode.type === 'method_invocation'
+            ? this.resolveJavaExpressionTypeText(objectNode, receiverTypes, enclosingClass)
+            : resolveJavaInvocationReceiver(objectNode.text, receiverTypes);
           calleeName = `${receiverType ?? objectNode.text}.${funcNode.text}`;
           if (receiverType) resolutionKind = 'receiver-type';
         } else {
@@ -1778,8 +2036,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   private extendJavaLambdaReceiverTypes(
     node: SyntaxNode,
     receiverTypes?: Map<string, string>,
+    enclosingClass?: string,
   ): Map<string, string> | undefined {
-    const paramTypes = this.extractJavaLambdaParamTypeMap(node);
+    const paramTypes = this.extractJavaLambdaParamTypeMap(node, receiverTypes, enclosingClass);
     if (paramTypes.size === 0) return receiverTypes;
     const scoped = new Map(receiverTypes ?? []);
     for (const [name, type] of paramTypes) scoped.set(name, type);
@@ -1795,7 +2054,11 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     return scoped;
   }
 
-  private extractJavaLambdaParamTypeMap(node: SyntaxNode): Map<string, string> {
+  private extractJavaLambdaParamTypeMap(
+    node: SyntaxNode,
+    receiverTypes?: Map<string, string>,
+    enclosingClass?: string,
+  ): Map<string, string> {
     const types = new Map<string, string>();
     if (node.type !== 'lambda_expression') return types;
 
@@ -1812,7 +2075,8 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       return types;
     }
 
-    const inferredType = this.inferJavaLambdaCastParamType(node);
+    const inferredType = this.inferJavaLambdaCastParamType(node)
+      ?? this.inferJavaStreamLambdaParamType(node, receiverTypes, enclosingClass);
     const names = this.extractJavaLambdaParamNames(node);
     if (inferredType && names.length === 1) types.set(names[0]!, inferredType);
     return types;
@@ -1856,6 +2120,96 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     if (!mapper || mapper.type !== 'method_reference') return undefined;
     const match = mapper.text.match(/^([A-Z][A-Za-z0-9_$.]*)\.class::cast$/);
     return match?.[1] ? simpleTypeName(match[1]) : undefined;
+  }
+
+  private inferJavaStreamLambdaParamType(
+    node: SyntaxNode,
+    receiverTypes?: Map<string, string>,
+    enclosingClass?: string,
+  ): string | undefined {
+    if (node.type !== 'lambda_expression') return undefined;
+    const argumentList = node.parent;
+    if (!argumentList || argumentList.type !== 'argument_list') return undefined;
+    const invocation = argumentList.parent;
+    if (!invocation || invocation.type !== 'method_invocation') return undefined;
+    const objectNode = invocation.childForFieldName('object');
+    return this.inferJavaStreamElementType(objectNode, receiverTypes, enclosingClass);
+  }
+
+  private inferJavaStreamElementType(
+    node: SyntaxNode | null | undefined,
+    receiverTypes?: Map<string, string>,
+    enclosingClass?: string,
+  ): string | undefined {
+    if (!node) return undefined;
+    if (node.type === 'method_invocation') {
+      const methodName = node.childForFieldName('name')?.text;
+      const objectNode = node.childForFieldName('object');
+      if (!methodName) return undefined;
+      if (methodName === 'stream') {
+        return extractJavaCollectionElementType(this.resolveJavaExpressionTypeText(objectNode, receiverTypes, enclosingClass));
+      }
+      if (methodName === 'filter' || methodName === 'peek' || methodName === 'distinct' || methodName === 'sorted' || methodName === 'limit' || methodName === 'skip') {
+        return this.inferJavaStreamElementType(objectNode, receiverTypes, enclosingClass);
+      }
+      if (methodName === 'map') {
+        const argsNode = node.childForFieldName('arguments');
+        const mapper = argsNode?.namedChildren[0];
+        if (mapper?.type === 'method_reference') {
+          const castType = mapper.text.match(/^([A-Z][A-Za-z0-9_$.]*)\.class::cast$/)?.[1];
+          if (castType) return simpleTypeName(castType);
+        }
+        return undefined;
+      }
+    }
+    return extractJavaCollectionElementType(this.resolveJavaExpressionTypeText(node, receiverTypes, enclosingClass));
+  }
+
+  private resolveJavaExpressionTypeText(
+    node: SyntaxNode | null | undefined,
+    receiverTypes?: Map<string, string>,
+    enclosingClass?: string,
+  ): string | undefined {
+    if (!node) return undefined;
+    if (node.type === 'identifier') {
+      return receiverTypes?.get(node.text) ?? this.resolveJavaFieldTypeFromHierarchy(enclosingClass, node.text);
+    }
+    if (node.type === 'parenthesized_expression') {
+      return node.namedChildren.length === 1
+        ? this.resolveJavaExpressionTypeText(node.namedChildren[0], receiverTypes, enclosingClass)
+        : undefined;
+    }
+    if (node.type === 'object_creation_expression') {
+      return this.extractJavaTypeText(node.childForFieldName('type'))
+        ?? this.extractJavaTypeText(node.namedChildren.find(child =>
+          child.type === 'type_identifier'
+          || child.type === 'generic_type'
+          || child.type === 'scoped_type_identifier'
+        ));
+    }
+    if (node.type === 'field_access') {
+      const objectNode = node.childForFieldName('object');
+      const fieldNode = node.childForFieldName('field')
+        ?? [...node.namedChildren].reverse().find(child => child.type === 'identifier' || child.type === 'field_identifier');
+      if (!fieldNode) return undefined;
+      const receiverType = this.resolveJavaExpressionTypeText(objectNode, receiverTypes, enclosingClass);
+      return receiverType ? this.resolveJavaRawFieldType(receiverType, fieldNode.text) : undefined;
+    }
+    if (node.type === 'method_invocation') {
+      const methodName = node.childForFieldName('name')?.text;
+      if (!methodName) return undefined;
+      const objectNode = node.childForFieldName('object');
+      if (!objectNode) return undefined;
+      const explicitReceiverType = this.resolveJavaExpressionTypeText(objectNode, receiverTypes, enclosingClass);
+      const staticReceiver = explicitReceiverType ? undefined : objectNode.text;
+      const receiverClass = explicitReceiverType
+        ? simpleTypeName(explicitReceiverType)
+        : staticReceiver && /^[A-Z]/.test(staticReceiver)
+          ? simpleTypeName(staticReceiver)
+          : undefined;
+      return receiverClass ? this.resolveJavaAccessorReturnType(receiverClass, methodName) : undefined;
+    }
+    return undefined;
   }
 
   private collectJavaStaticImport(node: SyntaxNode): void {
@@ -1957,11 +2311,37 @@ function syntaxNodeContains(parent: SyntaxNode | null | undefined, child: Syntax
   return child.startIndex >= parent.startIndex && child.endIndex <= parent.endIndex;
 }
 
+function normalizeJavaTypeText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function javaBeanGetterName(fieldName: string, fieldType: string): string {
+  const capitalized = fieldName.length > 0
+    ? fieldName[0]!.toUpperCase() + fieldName.slice(1)
+    : fieldName;
+  if (fieldType === 'boolean' && /^is[A-Z]/.test(fieldName)) return fieldName;
+  return `get${capitalized}`;
+}
+
 function resolveReceiverType(receiver: string, receiverTypes?: Map<string, string>): string | undefined {
   if (!receiverTypes) return undefined;
   if (receiverTypes.has(receiver)) return receiverTypes.get(receiver);
   const lastSegment = receiver.split('.').pop();
   return lastSegment ? receiverTypes.get(lastSegment) : undefined;
+}
+
+function extractJavaCollectionElementType(typeName: string | undefined): string | undefined {
+  if (!typeName) return undefined;
+  const normalized = normalizeJavaTypeText(typeName);
+  const arrayMatch = normalized.match(/^([A-Za-z_$][A-Za-z0-9_$.]*)\[\]$/);
+  if (arrayMatch?.[1]) return simpleTypeName(arrayMatch[1]);
+  const genericMatch = normalized.match(/^(?:[A-Za-z_$][A-Za-z0-9_$.]*)\s*<\s*(.+)\s*>$/);
+  if (!genericMatch?.[1]) return undefined;
+  let firstArg = genericMatch[1].trim();
+  const comma = firstArg.indexOf(',');
+  if (comma >= 0) firstArg = firstArg.slice(0, comma).trim();
+  firstArg = firstArg.replace(/^\?\s*(?:extends|super)\s+/, '').trim();
+  return firstArg ? simpleTypeName(firstArg) : undefined;
 }
 
 function resolveJavaInvocationReceiver(receiver: string, receiverTypes?: Map<string, string>): string | undefined {
