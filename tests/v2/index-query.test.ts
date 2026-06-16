@@ -2704,6 +2704,234 @@ public class PaymentInfo {
     expect(warm.parseCacheHits).toBe(warm.filesTotal);
   });
 
+  it('indexes Java method references and lambda callback call edges', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-callback-refs-');
+    writeFile(repo, 'src/main/java/com/example/CallbackRegistration.java', `package com.example;
+
+import java.util.function.Consumer;
+
+public class CallbackRegistration extends BaseCallback {
+    private final PaymentGateway gateway;
+
+    public CallbackRegistration(PaymentGateway gateway) {
+        this.gateway = gateway;
+    }
+
+    public void register(EventBus bus, WorkerService worker) {
+        bus.onPayment(this::handlePayment);
+        bus.onPayment(super::baseHook);
+        bus.onPayment(gateway::processPayment);
+        bus.onPayment(PaymentGateway::audit);
+        bus.runLater(() -> worker.runJob());
+    }
+
+    public void handlePayment(PaymentInfo info) {
+    }
+}
+
+class BaseCallback {
+    public void baseHook(PaymentInfo info) {
+    }
+}
+
+interface EventBus {
+    void onPayment(Consumer<PaymentInfo> callback);
+    void runLater(Runnable callback);
+}
+
+interface PaymentGateway {
+    void processPayment(PaymentInfo info);
+    static void audit(PaymentInfo info) {
+    }
+}
+
+class WorkerService {
+    public void runJob() {
+    }
+}
+
+class PaymentInfo {
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const handleCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'CallbackRegistration.handlePayment', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(handleCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'CallbackRegistration.register',
+      callee: 'CallbackRegistration.handlePayment',
+      resolution_kind: 'method-reference',
+    }));
+
+    const superCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'BaseCallback.baseHook', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(superCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'CallbackRegistration.register',
+      callee: 'BaseCallback.baseHook',
+      resolution_kind: 'method-reference',
+    }));
+
+    const fieldReceiverCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'PaymentGateway.processPayment', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(fieldReceiverCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'CallbackRegistration.register',
+      callee: 'PaymentGateway.processPayment',
+      resolution_kind: 'receiver-field',
+    }));
+
+    const staticReferenceCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'find_references',
+      args: { symbol: 'PaymentGateway.audit', kind: 'call', includeLowSignal: true },
+    }) as { references: Array<{ caller: string; callee: string; kind: string }> };
+    expect(staticReferenceCallers.references).toContainEqual(expect.objectContaining({
+      caller: 'CallbackRegistration.register',
+      callee: 'PaymentGateway.audit',
+      kind: 'call',
+    }));
+
+    const lambdaCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'WorkerService.runJob', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string }> };
+    expect(lambdaCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^CallbackRegistration[.]register[.]lambda\d+_\d+$/),
+      callee: 'WorkerService.runJob',
+    }));
+
+    const callbackEdges = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callees',
+      args: { symbol: 'CallbackRegistration.register', includeLowSignal: true },
+    }) as { callees: Array<{ callee: string; resolution_kind: string }> };
+    expect(callbackEdges.callees).toContainEqual(expect.objectContaining({
+      callee: expect.stringMatching(/^CallbackRegistration[.]register[.]lambda\d+_\d+$/),
+      resolution_kind: 'lambda-callback',
+    }));
+  });
+
+  it('indexes TypeScript and Python callback references and inline callback bodies', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-script-callback-refs-');
+    writeFile(repo, 'src/ui.ts', `class EventBus {
+  on(name: string, handler: (...args: unknown[]) => void) {}
+}
+
+class UiController {
+  mount(bus: EventBus) {
+    bus.on('click', this.handleClick);
+    bus.on('hover', () => this.handleHover());
+    bus.on('focus', function () { console.log('noop'); });
+  }
+
+  handleClick() {}
+
+  handleHover() {}
+}
+`);
+    writeFile(repo, 'src/worker.py', `class Scheduler:
+    def on_done(self, callback):
+        pass
+
+    def run_async(self, callback):
+        pass
+
+
+class Worker:
+    def register(self, scheduler: Scheduler):
+        scheduler.on_done(self.handle_done)
+        scheduler.run_async(lambda: self.handle_inline())
+
+    def handle_done(self):
+        pass
+
+    def handle_inline(self):
+        pass
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const tsCallbackRefCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'UiController.handleClick', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(tsCallbackRefCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'UiController.mount',
+      callee: 'UiController.handleClick',
+      resolution_kind: 'callback-reference',
+    }));
+
+    const tsInlineCallbackCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'UiController.handleHover', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string }> };
+    expect(tsInlineCallbackCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^UiController[.]mount[.]lambda\d+_\d+$/),
+      callee: 'UiController.handleHover',
+    }));
+
+    const tsCallbackEdges = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callees',
+      args: { symbol: 'UiController.mount', includeLowSignal: true },
+    }) as { callees: Array<{ callee: string; resolution_kind: string }> };
+    expect(tsCallbackEdges.callees).toContainEqual(expect.objectContaining({
+      callee: expect.stringMatching(/^UiController[.]mount[.]lambda\d+_\d+$/),
+      resolution_kind: 'lambda-callback',
+    }));
+
+    const pyCallbackRefCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Worker.handle_done', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(pyCallbackRefCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'Worker.register',
+      callee: 'Worker.handle_done',
+      resolution_kind: 'callback-reference',
+    }));
+
+    const pyInlineCallbackCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Worker.handle_inline', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string }> };
+    expect(pyInlineCallbackCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^Worker[.]register[.]lambda\d+_\d+$/),
+      callee: 'Worker.handle_inline',
+    }));
+
+    const pyCallbackEdges = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callees',
+      args: { symbol: 'Worker.register', includeLowSignal: true },
+    }) as { callees: Array<{ callee: string; resolution_kind: string }> };
+    expect(pyCallbackEdges.callees).toContainEqual(expect.objectContaining({
+      callee: expect.stringMatching(/^Worker[.]register[.]lambda\d+_\d+$/),
+      resolution_kind: 'lambda-callback',
+    }));
+  });
+
   it('writes parse context and empty-safe fact shards when result spooling is disabled', () => {
     const repo = tempDir('codegraph-shard-files-');
     writeFile(repo, 'src/main/java/com/example/One.java', `package com.example;

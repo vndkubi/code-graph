@@ -28,6 +28,7 @@ export interface CodeGraphDb {
   copyFromRows(table: string, columns: string[], rows: unknown[][], options?: CopyFromRowsOptions): Promise<boolean>;
   copyFromTextFiles(table: string, columns: string[], filePaths: string[], options?: CopyFromRowsOptions): Promise<boolean>;
   transaction<T>(fn: () => T | Promise<T>): () => Promise<T>;
+  runMaintenance?(): Promise<void>;
   close(): Promise<void>;
 }
 

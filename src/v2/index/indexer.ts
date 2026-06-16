@@ -823,7 +823,7 @@ export class V2Indexer {
     });
 
     await tx();
-    await this.analyzeQueryTables(options.progress, start);
+    await this.maintainQueryPlanner(options.progress, start);
 
     options.progress?.({
       phase: 'complete',
@@ -1181,7 +1181,28 @@ export class V2Indexer {
     });
   }
 
-  private async analyzeQueryTables(progress: IndexWorkspaceOptions['progress'], start: number): Promise<void> {
+  private async maintainQueryPlanner(progress: IndexWorkspaceOptions['progress'], start: number): Promise<void> {
+    if (!envFlag(process.env.CODEGRAPH_FULL_ANALYZE) && this.db.runMaintenance) {
+      progress?.({
+        phase: 'analyze',
+        status: 'start',
+        message: 'running lightweight SQLite maintenance',
+        current: 0,
+        total: 1,
+        elapsedMs: Date.now() - start,
+      });
+      await this.db.runMaintenance();
+      progress?.({
+        phase: 'analyze',
+        status: 'complete',
+        message: 'SQLite maintenance complete',
+        current: 1,
+        total: 1,
+        elapsedMs: Date.now() - start,
+      });
+      return;
+    }
+
     progress?.({
       phase: 'analyze',
       status: 'start',
@@ -2082,7 +2103,7 @@ export class V2Indexer {
       fs.rmSync(callShardDir, { recursive: true, force: true });
     }
 
-    await this.analyzeQueryTables(args.progress, args.start);
+    await this.maintainQueryPlanner(args.progress, args.start);
 
     args.progress?.({
       phase: 'complete',
@@ -2304,7 +2325,7 @@ export class V2Indexer {
     });
 
     await tx();
-    await this.analyzeQueryTables(args.progress, args.start);
+    await this.maintainQueryPlanner(args.progress, args.start);
 
     args.progress?.({
       phase: 'complete',
@@ -4056,7 +4077,7 @@ function preResolveCallEdge(
   implementationCallRows: SqlValue[][],
 ): { callee: string; confidence: number; resolutionKind: string } | undefined {
   const resolutionKind = call.resolutionKind ?? 'name-only';
-  if (resolutionKind !== 'name-only') return undefined;
+  if (!isPreResolvableCallResolutionKind(resolutionKind)) return undefined;
   if (normalizedCall.signalTier !== 'primary') return undefined;
   if (!/^(this[.])?[A-Za-z_$][A-Za-z0-9_$]*[.][A-Za-z_$][A-Za-z0-9_$]*$/.test(normalizedCall.callee)) {
     return undefined;
@@ -4082,16 +4103,20 @@ function preResolveCallEdge(
     return {
       callee: normalizedCall.callee,
       confidence: 0.8,
-      resolutionKind: 'static-or-type-receiver',
+      resolutionKind: resolutionKind === 'method-reference' ? 'method-reference' : 'static-or-type-receiver',
     };
   }
   return undefined;
 }
 
 function shouldAttemptPreResolveRawCall(raw: RawCallFact): boolean {
-  return raw.resolutionKind === 'name-only'
+  return isPreResolvableCallResolutionKind(raw.resolutionKind)
     && raw.signalTier === 'primary'
     && /^(this[.])?[A-Za-z_$][A-Za-z0-9_$]*[.][A-Za-z_$][A-Za-z0-9_$]*$/.test(raw.callee);
+}
+
+function isPreResolvableCallResolutionKind(resolutionKind: string | undefined): boolean {
+  return !resolutionKind || resolutionKind === 'name-only' || resolutionKind === 'method-reference';
 }
 
 function queueImplementationCallEdges(

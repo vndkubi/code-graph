@@ -177,6 +177,19 @@ export class SQLiteCodeGraphDb implements CodeGraphDb {
     };
   }
 
+  async runMaintenance(): Promise<void> {
+    try {
+      this.raw.pragma('optimize');
+    } catch {
+      // Best-effort planner maintenance; never load-bearing for correctness.
+    }
+    try {
+      this.raw.pragma('wal_checkpoint(PASSIVE)');
+    } catch {
+      // Ignore readonly/non-WAL/locked checkpoint failures.
+    }
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -250,6 +263,7 @@ class NoopStatement implements CodeGraphStatement {
 }
 
 function configurePragmas(db: DatabaseType, walMode: boolean): void {
+  db.pragma('busy_timeout = 5000');
   if (walMode) db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');

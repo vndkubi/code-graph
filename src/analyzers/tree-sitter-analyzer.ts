@@ -89,6 +89,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   private parseFieldUsages: FieldUsageInfo[] = [];
   private parsePackageName: string | undefined;
   private javaFieldsByClass = new Map<string, Map<string, JavaFieldInfo>>();
+  private javaSuperClassByClass = new Map<string, string>();
   private javaStringConstants = new Map<string, string>();
   private externalJavaConstantCache = new Map<string, Map<string, string> | undefined>();
 
@@ -129,6 +130,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     this.parseFieldUsages = [];
     this.parsePackageName = undefined;
     this.javaFieldsByClass = new Map();
+    this.javaSuperClassByClass = new Map();
     this.javaStringConstants = new Map();
     if (lang === 'java') {
       this.javaStringConstants = this.collectJavaStringConstants(tree.rootNode);
@@ -257,6 +259,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             }
 
             const classHttpMeta = this.extractHttpAnnotationMeta(child);
+            if (extendsName) {
+              this.javaSuperClassByClass.set(nameNode.text, extendsName);
+            }
             symbols.push({
               name: nameNode.text,
               kind,
@@ -392,7 +397,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
               const fieldUsageContext = javaFieldUsagesEnabled() && parentClass
                 ? this.javaFieldUsageContext(parentClass, methodName, child.type === 'constructor_declaration', receiverTypes, shadowedNames)
                 : undefined;
-              this.extractCallsFromNode(body, file, lines, calls, references, methodName, receiverTypes, fieldUsageContext);
+              this.extractCallsFromNode(body, file, lines, calls, references, methodName, receiverTypes, fieldUsageContext, parentClass);
             }
           }
           break;
@@ -1148,7 +1153,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             });
             const body = child.childForFieldName('body');
             if (body) {
-              this.extractCallsFromNode(body, file, lines, calls, references, funcName);
+              this.extractCallsFromNode(body, file, lines, calls, references, funcName, undefined, undefined, parentClass);
             }
           }
           break;
@@ -1176,7 +1181,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
                 });
                 if (isArrowFunction && value) {
                   const funcName = parentClass ? `${parentClass}.${nameNode.text}` : nameNode.text;
-                  this.extractCallsFromNode(value, file, lines, calls, references, funcName);
+                  this.extractCallsFromNode(value, file, lines, calls, references, funcName, undefined, undefined, parentClass);
                 }
                 if (value?.type === 'object') {
                   this.extractTypeScriptObjectPropertySymbols(value, file, lines, symbols, nameNode.text);
@@ -1358,7 +1363,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             });
             const body = child.childForFieldName('body');
             if (body) {
-              this.extractCallsFromNode(body, file, lines, calls, references, funcName);
+              this.extractCallsFromNode(body, file, lines, calls, references, funcName, undefined, undefined, parentClass);
             }
           }
           break;
@@ -1462,8 +1467,78 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     callerName: string,
     receiverTypes?: Map<string, string>,
     fieldUsageContext?: JavaFieldUsageContext,
+    enclosingClass?: string,
   ): void {
     if (this.maybeExtractJavaFieldUsageFromNode(node, file, lines, fieldUsageContext)) {
+      return;
+    }
+
+    const callbackReference = this.resolveCallbackReferenceCallee(node, enclosingClass);
+    if (callbackReference && isCallbackValuePosition(node)) {
+      calls.push({
+        caller: callerName,
+        callee: callbackReference,
+        file,
+        line: node.startPosition.row + 1,
+        confidence: 0.7,
+        resolutionKind: 'callback-reference',
+      });
+      references.push({
+        file,
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column + 1,
+        kind: 'call',
+        context: this.getContextLines(lines, node.startPosition.row, 0),
+        symbolName: callbackReference,
+      });
+      return;
+    }
+
+    if (node.type === 'lambda_expression') {
+      const callbackName = `${callerName}.lambda${node.startPosition.row + 1}_${node.startPosition.column + 1}`;
+      calls.push({
+        caller: callerName,
+        callee: callbackName,
+        file,
+        line: node.startPosition.row + 1,
+        confidence: 0.6,
+        resolutionKind: 'lambda-callback',
+      });
+      references.push({
+        file,
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column + 1,
+        kind: 'call',
+        context: this.getContextLines(lines, node.startPosition.row, 0),
+        symbolName: callbackName,
+      });
+      for (const child of node.children) {
+        this.extractCallsFromNode(child, file, lines, calls, references, callbackName, receiverTypes, fieldUsageContext, enclosingClass);
+      }
+      return;
+    }
+
+    if ((node.type === 'arrow_function' || node.type === 'function_expression' || node.type === 'lambda') && isCallbackValuePosition(node)) {
+      const callbackName = `${callerName}.lambda${node.startPosition.row + 1}_${node.startPosition.column + 1}`;
+      calls.push({
+        caller: callerName,
+        callee: callbackName,
+        file,
+        line: node.startPosition.row + 1,
+        confidence: 0.6,
+        resolutionKind: 'lambda-callback',
+      });
+      references.push({
+        file,
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column + 1,
+        kind: 'call',
+        context: this.getContextLines(lines, node.startPosition.row, 0),
+        symbolName: callbackName,
+      });
+      for (const child of node.children) {
+        this.extractCallsFromNode(child, file, lines, calls, references, callbackName, receiverTypes, fieldUsageContext, enclosingClass);
+      }
       return;
     }
 
@@ -1521,9 +1596,16 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       if (children.length >= 2) {
         const typePart = children[0].text;
         const methodPart = children[1].text;
-        const receiverType = resolveReceiverType(typePart, receiverTypes) ?? typePart;
+        const receiverType = this.resolveJavaMethodReferenceReceiver(typePart, receiverTypes, enclosingClass);
         const calleeName = methodPart === 'new' ? `${receiverType}.new` : `${receiverType}.${methodPart}`;
-        calls.push({ caller: callerName, callee: calleeName, file, line: node.startPosition.row + 1 });
+        calls.push({
+          caller: callerName,
+          callee: calleeName,
+          file,
+          line: node.startPosition.row + 1,
+          confidence: receiverType === typePart ? 0.75 : 0.85,
+          resolutionKind: 'method-reference',
+        });
         references.push({
           file,
           line: node.startPosition.row + 1,
@@ -1539,7 +1621,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     if (node.type === 'call_expression') {
       const funcNode = node.childForFieldName('function');
       if (funcNode) {
-        const calleeName = funcNode.text;
+        const calleeName = this.resolveScriptCallCallee(funcNode, enclosingClass) ?? funcNode.text;
         if (calleeName) {
           calls.push({ caller: callerName, callee: calleeName, file, line: node.startPosition.row + 1 });
           references.push({
@@ -1558,7 +1640,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     if (node.type === 'call') {
       const funcNode = node.childForFieldName('function');
       if (funcNode) {
-        const calleeName = funcNode.text;
+        const calleeName = this.resolveScriptCallCallee(funcNode, enclosingClass) ?? funcNode.text;
         if (calleeName) {
           calls.push({ caller: callerName, callee: calleeName, file, line: node.startPosition.row + 1 });
           references.push({
@@ -1574,8 +1656,51 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     }
 
     for (const child of node.children) {
-      this.extractCallsFromNode(child, file, lines, calls, references, callerName, receiverTypes, fieldUsageContext);
+      this.extractCallsFromNode(child, file, lines, calls, references, callerName, receiverTypes, fieldUsageContext, enclosingClass);
     }
+  }
+
+  private resolveJavaMethodReferenceReceiver(
+    receiver: string,
+    receiverTypes?: Map<string, string>,
+    enclosingClass?: string,
+  ): string {
+    if (receiver === 'this' && enclosingClass) return enclosingClass;
+    if (receiver === 'super' && enclosingClass) return this.javaSuperClassByClass.get(enclosingClass) ?? enclosingClass;
+    return resolveReceiverType(receiver, receiverTypes) ?? receiver;
+  }
+
+  private resolveScriptCallCallee(
+    node: SyntaxNode,
+    enclosingClass?: string,
+  ): string | undefined {
+    if (node.type === 'member_expression') {
+      const objectNode = node.childForFieldName('object');
+      const propertyNode = node.childForFieldName('property')
+        ?? [...node.namedChildren].reverse().find(child => child.type === 'property_identifier' || child.type === 'identifier');
+      if (!objectNode || !propertyNode) return undefined;
+      if (objectNode.type === 'this' && enclosingClass) return `${enclosingClass}.${propertyNode.text}`;
+      const objectText = objectNode.text.trim();
+      if (/^[A-Z][A-Za-z0-9_$]*$/.test(objectText)) return `${objectText}.${propertyNode.text}`;
+      return undefined;
+    }
+
+    if (node.type === 'attribute') {
+      const objectNode = node.childForFieldName('object');
+      const attributeNode = node.childForFieldName('attribute');
+      if (!objectNode || !attributeNode) return undefined;
+      if (objectNode.text === 'self' && enclosingClass) return `${enclosingClass}.${attributeNode.text}`;
+      return undefined;
+    }
+
+    return undefined;
+  }
+
+  private resolveCallbackReferenceCallee(
+    node: SyntaxNode,
+    enclosingClass?: string,
+  ): string | undefined {
+    return this.resolveScriptCallCallee(node, enclosingClass);
   }
 
   private getLineText(lines: string[], row: number): string {
@@ -1616,6 +1741,17 @@ function isJavaIdentifierReferenceCandidate(node: SyntaxNode): boolean {
   if (parent.type === 'package_declaration' || parent.type === 'import_declaration') return false;
   if (parent.type === 'scoped_identifier' || parent.type === 'scoped_type_identifier') return false;
   return true;
+}
+
+function isCallbackValuePosition(node: SyntaxNode): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  if (parent.type === 'arguments' || parent.type === 'argument_list') return true;
+  if (parent.type === 'argument' || parent.type === 'value_argument' || parent.type === 'parenthesized_expression') {
+    return isCallbackValuePosition(parent);
+  }
+  if (parent.type === 'keyword_argument') return sameSyntaxNode(parent.childForFieldName('value'), node);
+  return false;
 }
 
 function javaFieldAccessKind(node: SyntaxNode, isConstructor: boolean, ownClassField: boolean): FieldAccessKind {
