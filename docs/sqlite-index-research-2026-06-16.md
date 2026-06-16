@@ -128,6 +128,21 @@ This closes a real quality gap seen in Doughnut controller tests, where calls li
 `currentUser.getUser()` were previously left as unresolved `name-only` edges when
 `currentUser` came from `ControllerTestBase`.
 
+### 8. Java unqualified method-owner resolution improved
+
+The current worktree now resolves bare Java method calls and explicit `this.` / `super.`
+method calls through:
+
+- the current class
+- superclass chains
+- nested inner classes reaching outer-class methods
+- outer classes whose method comes from a superclass chain
+
+This closes a larger real-repo quality gap than the earlier field-receiver fix alone:
+Java test and service code often calls helper methods as `helper()` rather than
+`this.helper()`, and those calls were previously stored only as low-context `name-only`
+edges.
+
 ## Benchmark Evidence
 
 ### A/B: lightweight maintenance vs full ANALYZE
@@ -194,6 +209,18 @@ Java inherited-field receiver quality probe:
   - unresolved raw `currentUser.getUser` edges dropped to `3`
   - many recovered callers come from controller test classes inheriting `currentUser` from `ControllerTestBase`
 
+Java unqualified method-owner resolution probes:
+
+- `D:/Personal/Projects/doughnut/backend`
+  - before this patch, there were `1747` primary unqualified Java `name-only` calls
+  - after this patch, `1487` calls resolve as `enclosing-method` or `super-method`
+  - remaining primary unqualified Java `name-only` calls dropped to `266`
+  - top recovered callees include `NotebookBooksControllerTestBase.node`, `NotebookBooksControllerTestBase.myNotebook`, `JapaneseLemmaStemMasker.addSpec`, and `NotebookBooksControllerTestBase.bookOf`
+- `D:/Personal/Projects/hadoop/hadoop-common-project`
+  - `19275` calls now resolve as `enclosing-method` or `super-method`
+  - `4035` primary unqualified Java `name-only` calls still remain
+  - many recovered callees come from inherited test helpers such as `AbstractFSContractTestBase.getFileSystem`, `FileContextMainOperationsBaseTest.getTestRootPath`, and `Configured.getConf`
+
 Interpretation:
 
 - The main remaining speed issue on large clean repos was not SQLite itself; it was git-freshness invalidation caused by `.codegraph*` artifact directories showing up as untracked repo dirt.
@@ -201,6 +228,7 @@ Interpretation:
 - Field usage facts add measurable but bounded cold-index cost on the larger Java repos tested, and the quality gain is large enough to justify default-on behavior.
 - Manifest scan correctness now lines up better with git-visible project scope instead of raw filesystem scope.
 - Java call quality also improved on a concrete real-repo inheritance pattern instead of only synthetic fixtures.
+- Java call quality improved again for the much larger bucket of same-class, superclass, and outer-class helper method calls, with strong wins on both Doughnut and Hadoop.
 
 ## Quality Evidence
 
@@ -235,6 +263,7 @@ The git-freshness path now also has direct regression coverage for warm reindex 
   - inheritance
   - field usages
   - graph overlay
+  - unqualified method-owner resolution for current/super/outer Java method calls
   - field usage facts are now enabled by default instead of living behind an extra indexing flag
 
 ### Where `codegraph-external` is stronger
@@ -357,6 +386,7 @@ Status:
 - Improved for Java callback/method-reference cases.
 - Java field usage facts now index by default, with explicit opt-out only for speed-sensitive cold runs.
 - Java inherited-field receiver calls now resolve across superclass and nested-class access patterns.
+- Java unqualified helper-method calls now resolve across current classes, superclass chains, and nested outer-class access paths.
 - Added TS/JS and Python callback reference coverage for `this/self` registrations and inline callback bodies.
 - Cache invalidation now preserves that improvement in real runs.
 - Largest remaining quality gap versus external is generalized callback/function-as-value capture breadth across more positions and languages.

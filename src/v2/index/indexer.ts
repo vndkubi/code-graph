@@ -3012,7 +3012,6 @@ export class V2Indexer {
     if (files && files.size === 0) return;
     const fileFilter = files ? [...files] : undefined;
     const filePlaceholders = fileFilter?.map(() => '?').join(', ');
-    const receiverCallPattern = /^(this[.])?[A-Za-z_$][A-Za-z0-9_$]*[.][A-Za-z_$][A-Za-z0-9_$]*$/;
     const rows = (await this.db.prepare(`
       SELECT rowid AS row_id, caller, callee, file, line, file_role
       FROM call_edges
@@ -3027,7 +3026,7 @@ export class V2Indexer {
       file: string;
       line: number;
       file_role: string;
-    }>).filter(row => receiverCallPattern.test(row.callee));
+    }>).filter(row => isPreResolvableCallCallee(row.callee));
 
     const fieldsByFile = new Map<string, Map<string, string>>();
     const fieldsByClass = new Map<string, Map<string, string>>();
@@ -3128,28 +3127,22 @@ export class V2Indexer {
     };
 
     for (const row of rows) {
-      const dot = row.callee.lastIndexOf('.');
-      if (dot <= 0) continue;
-      const receiver = row.callee.substring(0, dot);
-      const normalizedReceiver = receiver.startsWith('this.') ? receiver.substring('this.'.length) : receiver;
-      const method = row.callee.substring(dot + 1);
-      const fieldType = resolveFieldReceiverType({
+      const resolved = resolveMethodOwnerCall({
         file: row.file,
         caller: row.caller,
-        receiver: normalizedReceiver,
+        callee: row.callee,
         fieldsByFile,
         fieldsByClass,
         superClassByClass,
         outerClassByClass,
+        methodOwners,
       });
-      if (fieldType) {
-        edgeUpdates.push([row.row_id, `${fieldType}.${method}`, 0.8, 'receiver-field']);
-        queueImplementationEdges(row, fieldType, method);
+      if (resolved) {
+        edgeUpdates.push([row.row_id, resolved.callee, resolved.confidence, resolved.resolutionKind]);
+        if (resolved.receiverTypeForImplementations) {
+          queueImplementationEdges(row, resolved.receiverTypeForImplementations, resolved.method);
+        }
         continue;
-      }
-      if (/^[A-Z]/.test(receiver)) {
-        edgeUpdates.push([row.row_id, row.callee, 0.8, 'static-or-type-receiver']);
-        queueImplementationEdges(row, receiver, method);
       }
     }
 
@@ -4148,42 +4141,28 @@ function preResolveCallEdge(
   const resolutionKind = call.resolutionKind ?? 'name-only';
   if (!isPreResolvableCallResolutionKind(resolutionKind)) return undefined;
   if (normalizedCall.signalTier !== 'primary') return undefined;
-  if (!/^(this[.])?[A-Za-z_$][A-Za-z0-9_$]*[.][A-Za-z_$][A-Za-z0-9_$]*$/.test(normalizedCall.callee)) {
-    return undefined;
-  }
+  if (!isPreResolvableCallCallee(normalizedCall.callee)) return undefined;
 
-  const dot = normalizedCall.callee.lastIndexOf('.');
-  if (dot <= 0) return undefined;
-  const receiver = normalizedCall.callee.substring(0, dot);
-  const normalizedReceiver = receiver.startsWith('this.') ? receiver.substring('this.'.length) : receiver;
-  const method = normalizedCall.callee.substring(dot + 1);
-  const fieldType = resolveFieldReceiverType({
+  const resolved = resolveMethodOwnerCall({
     file: file.relPath,
     caller: call.caller,
-    receiver: normalizedReceiver,
+    callee: normalizedCall.callee,
+    resolutionKind,
     fieldsByFile: context.fieldsByFile,
     fieldsByClass: context.fieldsByClass,
     superClassByClass: context.superClassByClass,
     outerClassByClass: context.outerClassByClass,
+    methodOwners: context.methodOwners,
   });
-  if (fieldType) {
-    queueImplementationCallEdges(snapshotId, file, normalizedCall, call.line, fieldType, method, context, implementationCallRows);
-    return {
-      callee: `${fieldType}.${method}`,
-      confidence: 0.8,
-      resolutionKind: 'receiver-field',
-    };
+  if (!resolved) return undefined;
+  if (resolved.receiverTypeForImplementations) {
+    queueImplementationCallEdges(snapshotId, file, normalizedCall, call.line, resolved.receiverTypeForImplementations, resolved.method, context, implementationCallRows);
   }
-
-  if (/^[A-Z]/.test(receiver)) {
-    queueImplementationCallEdges(snapshotId, file, normalizedCall, call.line, receiver, method, context, implementationCallRows);
-    return {
-      callee: normalizedCall.callee,
-      confidence: 0.8,
-      resolutionKind: resolutionKind === 'method-reference' ? 'method-reference' : 'static-or-type-receiver',
-    };
-  }
-  return undefined;
+  return {
+    callee: resolved.callee,
+    confidence: resolved.confidence,
+    resolutionKind: resolved.resolutionKind,
+  };
 }
 
 function resolveFieldReceiverType(args: {
@@ -4215,6 +4194,133 @@ function resolveFieldReceiverType(args: {
   return undefined;
 }
 
+function resolveMethodOwnerCall(args: {
+  file: string;
+  caller: string;
+  callee: string;
+  resolutionKind?: string;
+  fieldsByFile: Map<string, Map<string, string>>;
+  fieldsByClass: Map<string, Map<string, string>>;
+  superClassByClass: Map<string, string>;
+  outerClassByClass: Map<string, string>;
+  methodOwners: Set<string>;
+}): { callee: string; confidence: number; resolutionKind: string; method: string; receiverTypeForImplementations?: string } | undefined {
+  if (SIMPLE_METHOD_PATTERN.test(args.callee)) {
+    const owner = resolveEnclosingMethodOwner({
+      caller: args.caller,
+      method: args.callee,
+      mode: 'implicit',
+      methodOwners: args.methodOwners,
+      superClassByClass: args.superClassByClass,
+      outerClassByClass: args.outerClassByClass,
+    });
+    if (!owner) return undefined;
+    return {
+      callee: `${owner}.${args.callee}`,
+      confidence: 0.82,
+      resolutionKind: 'enclosing-method',
+      method: args.callee,
+    };
+  }
+
+  if (!RECEIVER_METHOD_PATTERN.test(args.callee)) return undefined;
+  const dot = args.callee.lastIndexOf('.');
+  if (dot <= 0) return undefined;
+  const receiver = args.callee.substring(0, dot);
+  const method = args.callee.substring(dot + 1);
+  if (receiver === 'this' || receiver === 'super') {
+    const owner = resolveEnclosingMethodOwner({
+      caller: args.caller,
+      method,
+      mode: receiver === 'super' ? 'super' : 'this',
+      methodOwners: args.methodOwners,
+      superClassByClass: args.superClassByClass,
+      outerClassByClass: args.outerClassByClass,
+    });
+    if (!owner) return undefined;
+    return {
+      callee: `${owner}.${method}`,
+      confidence: 0.82,
+      resolutionKind: receiver === 'super' ? 'super-method' : 'enclosing-method',
+      method,
+    };
+  }
+
+  const fieldType = resolveFieldReceiverType({
+    file: args.file,
+    caller: args.caller,
+    receiver,
+    fieldsByFile: args.fieldsByFile,
+    fieldsByClass: args.fieldsByClass,
+    superClassByClass: args.superClassByClass,
+    outerClassByClass: args.outerClassByClass,
+  });
+  if (fieldType) {
+    return {
+      callee: `${fieldType}.${method}`,
+      confidence: 0.8,
+      resolutionKind: 'receiver-field',
+      method,
+      receiverTypeForImplementations: fieldType,
+    };
+  }
+
+  if (/^[A-Z]/.test(receiver)) {
+    return {
+      callee: args.callee,
+      confidence: 0.8,
+      resolutionKind: args.resolutionKind === 'method-reference' ? 'method-reference' : 'static-or-type-receiver',
+      method,
+      receiverTypeForImplementations: receiver,
+    };
+  }
+  return undefined;
+}
+
+function resolveEnclosingMethodOwner(args: {
+  caller: string;
+  method: string;
+  mode: 'implicit' | 'this' | 'super';
+  methodOwners: Set<string>;
+  superClassByClass: Map<string, string>;
+  outerClassByClass: Map<string, string>;
+}): string | undefined {
+  const currentClass = enclosingClassFromCaller(args.caller);
+  if (!currentClass) return undefined;
+  if (args.mode === 'this') {
+    return resolveMethodInClassChain(currentClass, args.method, args.methodOwners, args.superClassByClass);
+  }
+  if (args.mode === 'super') {
+    return resolveMethodInClassChain(args.superClassByClass.get(currentClass), args.method, args.methodOwners, args.superClassByClass);
+  }
+
+  let searchOuter: string | undefined = currentClass;
+  const seenOuter = new Set<string>();
+  while (searchOuter && !seenOuter.has(searchOuter)) {
+    seenOuter.add(searchOuter);
+    const owner = resolveMethodInClassChain(searchOuter, args.method, args.methodOwners, args.superClassByClass);
+    if (owner) return owner;
+    searchOuter = args.outerClassByClass.get(searchOuter);
+  }
+  return undefined;
+}
+
+function resolveMethodInClassChain(
+  startClass: string | undefined,
+  method: string,
+  methodOwners: Set<string>,
+  superClassByClass: Map<string, string>,
+): string | undefined {
+  let current = startClass;
+  const seen = new Set<string>();
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    if (methodOwners.has(`${current}.${method}`)) return current;
+    current = superClassByClass.get(current);
+  }
+  return undefined;
+}
+
 function enclosingClassFromCaller(caller: string): string | undefined {
   let normalized = caller;
   while (/\.\blambda\d+_\d+$/.test(normalized)) {
@@ -4228,11 +4334,18 @@ function enclosingClassFromCaller(caller: string): string | undefined {
 function shouldAttemptPreResolveRawCall(raw: RawCallFact): boolean {
   return isPreResolvableCallResolutionKind(raw.resolutionKind)
     && raw.signalTier === 'primary'
-    && /^(this[.])?[A-Za-z_$][A-Za-z0-9_$]*[.][A-Za-z_$][A-Za-z0-9_$]*$/.test(raw.callee);
+    && isPreResolvableCallCallee(raw.callee);
 }
 
 function isPreResolvableCallResolutionKind(resolutionKind: string | undefined): boolean {
   return !resolutionKind || resolutionKind === 'name-only' || resolutionKind === 'method-reference';
+}
+
+const SIMPLE_METHOD_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const RECEIVER_METHOD_PATTERN = /^(this|super|[A-Za-z_$][A-Za-z0-9_$]*)[.][A-Za-z_$][A-Za-z0-9_$]*$/;
+
+function isPreResolvableCallCallee(callee: string): boolean {
+  return SIMPLE_METHOD_PATTERN.test(callee) || RECEIVER_METHOD_PATTERN.test(callee);
 }
 
 function queueImplementationCallEdges(

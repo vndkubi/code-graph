@@ -7076,7 +7076,12 @@ function researchCallEdgeScore(edge: CallEdgeRow): number {
   if (edge.signal_tier === 'provider') score += 30;
   else if (edge.signal_tier === 'primary') score += 20;
   else score += 5;
-  if (edge.resolution_kind === 'receiver-field' || edge.resolution_kind === 'interface-implementation') score += 8;
+  if (
+    edge.resolution_kind === 'receiver-field'
+    || edge.resolution_kind === 'interface-implementation'
+    || edge.resolution_kind === 'enclosing-method'
+    || edge.resolution_kind === 'super-method'
+  ) score += 8;
   if (/\b(Service|Client|Manager|Context|Store|Repository|Dao|Request|Response|Builder|Info|Entity|Controller)\b/.test(callee)) score += 18;
   if (/\b(Logger|String|HashSet|ArrayList|List|Set|Map|ConcurrentMap|AtomicLong|Objects|Optional)\./.test(callee)) score -= 24;
   if (/\.new$/.test(callee) && !/\b(Request|Response|Info|Entity|Builder|Service|Client)\.new$/.test(callee)) score -= 8;

@@ -2920,6 +2920,81 @@ public class CurrentUser {
     }));
   });
 
+  it('resolves unqualified Java method calls through current, outer, and superclass methods', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-enclosing-method-receiver-');
+    writeFile(repo, 'src/test/java/com/example/BaseHelper.java', `package com.example;
+
+public abstract class BaseHelper {
+    protected void baseOnly() {
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/HelperTest.java', `package com.example;
+
+public class HelperTest extends BaseHelper {
+    void helper() {
+    }
+
+    void wrapper() {
+        helper();
+        this.helper();
+        baseOnly();
+        super.baseOnly();
+    }
+
+    class NestedCase {
+        void nested() {
+            helper();
+            baseOnly();
+        }
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const helperCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'HelperTest.helper', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(helperCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'HelperTest.wrapper',
+      callee: 'HelperTest.helper',
+      resolution_kind: 'enclosing-method',
+    }));
+    expect(helperCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'NestedCase.nested',
+      callee: 'HelperTest.helper',
+      resolution_kind: 'enclosing-method',
+    }));
+
+    const baseCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'BaseHelper.baseOnly', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(baseCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'HelperTest.wrapper',
+      callee: 'BaseHelper.baseOnly',
+      resolution_kind: 'enclosing-method',
+    }));
+    expect(baseCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'HelperTest.wrapper',
+      callee: 'BaseHelper.baseOnly',
+      resolution_kind: 'super-method',
+    }));
+    expect(baseCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'NestedCase.nested',
+      callee: 'BaseHelper.baseOnly',
+      resolution_kind: 'enclosing-method',
+    }));
+  });
+
   it('indexes TypeScript and Python callback references and inline callback bodies', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-script-callback-refs-');
