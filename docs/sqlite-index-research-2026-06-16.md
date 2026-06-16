@@ -161,6 +161,20 @@ This matters in real Java test-heavy repos because static imports are extremely 
 - Spring MockMvc helpers
 - internal static utility methods
 
+### 10. Java enhanced-for and catch receiver typing improved
+
+The current worktree now extends Java receiver typing beyond method parameters and
+plain local variables to also cover:
+
+- `for (Map.Entry<K, V> entry : values.entrySet())`
+- `for (String k : data.keySet())`
+- `catch (IOException ex)`
+- `catch (RuntimeException e)`
+
+Those receivers now index as explicit `receiver-type` call edges rather than staying
+as raw unresolved names such as `entry.getKey`, `entry.getValue`, `e.getMessage`,
+or `ex.getMessage`.
+
 ## Benchmark Evidence
 
 ### A/B: lightweight maintenance vs full ANALYZE
@@ -250,6 +264,23 @@ Java named static import resolution probes:
   - `15237` Java call edges now resolve as explicit `static-import`
   - top recovered static-import callees include `Assertions.assertEquals`, `Assertions.assertTrue`, `Mockito.when`, `Mockito.verify`, `LambdaTestUtils.intercept`, and `BindingUtils.loadStaticMethod`
 
+Java enhanced-for and catch receiver typing probes:
+
+- `D:/Personal/Projects/doughnut/backend`
+  - total primary Java `name-only` calls dropped from `1095` to `742`
+  - `5294` Java call edges now resolve as explicit `receiver-type`
+  - `entry.getKey` fell from `12` unresolved edges to `2`
+  - `entry.getValue` fell from `7` unresolved edges to `0`
+  - former raw catch/message cases now surface as typed callees such as `Throwable.getMessage` and `Exception.getMessage`
+- `D:/Personal/Projects/hadoop/hadoop-common-project`
+  - total primary Java `name-only` calls dropped from `6590` to `4706`
+  - `35210` Java call edges now resolve as explicit `receiver-type`
+  - `e.getMessage` fell from `149` unresolved edges to `0`
+  - `ex.getMessage` fell from `60` unresolved edges to `0`
+  - `entry.getKey` fell from `84` unresolved edges to `3`
+  - `entry.getValue` fell from `80` unresolved edges to `3`
+  - recovered typed callees now include `Entry.getKey`, `Entry.getValue`, `IOException.getMessage`, `Throwable.getMessage`, and `Exception.getMessage`
+
 Interpretation:
 
 - The main remaining speed issue on large clean repos was not SQLite itself; it was git-freshness invalidation caused by `.codegraph*` artifact directories showing up as untracked repo dirt.
@@ -259,6 +290,7 @@ Interpretation:
 - Java call quality also improved on a concrete real-repo inheritance pattern instead of only synthetic fixtures.
 - Java call quality improved again for the much larger bucket of same-class, superclass, and outer-class helper method calls, with strong wins on both Doughnut and Hadoop.
 - Java static-import resolution materially reduces unresolved helper calls and turns a large body of formerly low-context assertion/mock/util edges into explicit owner-qualified calls.
+- Java receiver typing is now broader inside ordinary control-flow, which removes a large batch of unresolved loop and exception-handling calls on real Java repos.
 
 ## Quality Evidence
 
@@ -295,6 +327,7 @@ The git-freshness path now also has direct regression coverage for warm reindex 
   - graph overlay
   - unqualified method-owner resolution for current/super/outer Java method calls
   - named static-import method resolution for Java utility/assertion/helper calls
+  - typed Java receiver resolution for parameters, locals, enhanced-for variables, and catch variables
   - field usage facts are now enabled by default instead of living behind an extra indexing flag
 
 ### Where `codegraph-external` is stronger
@@ -419,6 +452,7 @@ Status:
 - Java inherited-field receiver calls now resolve across superclass and nested-class access patterns.
 - Java unqualified helper-method calls now resolve across current classes, superclass chains, and nested outer-class access paths.
 - Java named static-import calls now resolve to explicit owner methods instead of bare unresolved names.
+- Java receiver-type calls now cover enhanced-for variables and catch variables in addition to parameters and plain locals.
 - Added TS/JS and Python callback reference coverage for `this/self` registrations and inline callback bodies.
 - Cache invalidation now preserves that improvement in real runs.
 - Largest remaining quality gap versus external is generalized callback/function-as-value capture breadth across more positions and languages.

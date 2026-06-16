@@ -2679,7 +2679,7 @@ public class PaymentInfo {
 
     expect(paymentCallers.callers).toContainEqual(expect.objectContaining({
       callee: 'PaymentGateway.processPayment',
-      resolution_kind: 'static-or-type-receiver',
+      resolution_kind: 'receiver-type',
     }));
 
     const refundCallers = await queries.query({
@@ -2690,7 +2690,7 @@ public class PaymentInfo {
 
     expect(refundCallers.callers).toContainEqual(expect.objectContaining({
       callee: 'PaymentGateway.processRefund',
-      resolution_kind: 'static-or-type-receiver',
+      resolution_kind: 'receiver-type',
     }));
 
     const amountCallers = await queries.query({
@@ -2701,7 +2701,7 @@ public class PaymentInfo {
 
     expect(amountCallers.callers).toContainEqual(expect.objectContaining({
       callee: 'PaymentInfo.getAmount',
-      resolution_kind: 'static-or-type-receiver',
+      resolution_kind: 'receiver-type',
     }));
 
     const implementationCallers = await queries.query({
@@ -3048,6 +3048,71 @@ public class Consumer {
       caller: 'Consumer.run',
       callee: 'Utility.readEntryBytes',
       resolution_kind: 'static-import',
+    }));
+  });
+
+  it('resolves Java enhanced-for and catch receiver calls through declared types', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-java-loop-catch-types-');
+    writeFile(repo, 'src/main/java/com/example/LoopReceiver.java', `package com.example;
+
+import java.io.IOException;
+import java.util.Map;
+
+public class LoopReceiver {
+    void render(Map<String, String> values) {
+        for (Map.Entry<String, String> entry : values.entrySet()) {
+            entry.getKey();
+            entry.getValue();
+        }
+    }
+
+    void fail() {
+        try {
+            throw new IOException("x");
+        } catch (IOException ex) {
+            ex.getMessage();
+        }
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const keyCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Entry.getKey', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(keyCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'LoopReceiver.render',
+      callee: 'Entry.getKey',
+      resolution_kind: 'receiver-type',
+    }));
+
+    const valueCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Entry.getValue', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(valueCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'LoopReceiver.render',
+      callee: 'Entry.getValue',
+      resolution_kind: 'receiver-type',
+    }));
+
+    const messageCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'IOException.getMessage', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(messageCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'LoopReceiver.fail',
+      callee: 'IOException.getMessage',
+      resolution_kind: 'receiver-type',
     }));
   });
 

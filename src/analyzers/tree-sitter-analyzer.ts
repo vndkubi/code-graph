@@ -1014,6 +1014,45 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     file: string,
     shadowedNames?: Set<string>,
   ): void {
+    if (node.type === 'enhanced_for_statement') {
+      const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
+      const nameNode = node.childForFieldName('name')
+        ?? [...node.namedChildren].find(child => child.type === 'identifier');
+      if (typeName && nameNode) {
+        receiverTypes.set(nameNode.text, typeName);
+        shadowedNames?.add(nameNode.text);
+        if (this.isReferenceType(typeName)) {
+          this.parseTypeRefs.push({
+            file,
+            referencedType: typeName,
+            context: 'parameter',
+            line: node.startPosition.row + 1,
+          });
+        }
+      }
+    }
+
+    if (node.type === 'catch_formal_parameter') {
+      const catchTypeNode = node.namedChildren.find(child => child.type === 'catch_type');
+      const typeName = catchTypeNode
+        ? this.extractJavaTypeName(catchTypeNode.namedChildren[0] ?? catchTypeNode)
+        : undefined;
+      const nameNode = node.childForFieldName('name')
+        ?? [...node.namedChildren].reverse().find(child => child.type === 'identifier');
+      if (typeName && nameNode) {
+        receiverTypes.set(nameNode.text, typeName);
+        shadowedNames?.add(nameNode.text);
+        if (this.isReferenceType(typeName)) {
+          this.parseTypeRefs.push({
+            file,
+            referencedType: typeName,
+            context: 'parameter',
+            line: node.startPosition.row + 1,
+          });
+        }
+      }
+    }
+
     if (node.type === 'local_variable_declaration' || node.type === 'resource') {
       const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
       if (typeName) {
@@ -1578,6 +1617,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         if (objectNode) {
           const receiverType = resolveReceiverType(objectNode.text, receiverTypes);
           calleeName = `${receiverType ?? objectNode.text}.${funcNode.text}`;
+          if (receiverType) resolutionKind = 'receiver-type';
         } else {
           calleeName = this.resolveJavaStaticImportCallee(funcNode.text) ?? funcNode.text;
           if (calleeName !== funcNode.text) resolutionKind = 'static-import';

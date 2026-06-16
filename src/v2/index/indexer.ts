@@ -4269,7 +4269,11 @@ function resolveMethodOwnerCall(args: {
     return {
       callee: args.callee,
       confidence: 0.8,
-      resolutionKind: args.resolutionKind === 'method-reference' ? 'method-reference' : 'static-or-type-receiver',
+      resolutionKind: args.resolutionKind === 'method-reference'
+        ? 'method-reference'
+        : args.resolutionKind === 'receiver-type'
+          ? 'receiver-type'
+          : 'static-or-type-receiver',
       method,
       receiverTypeForImplementations: receiver,
     };
@@ -4338,7 +4342,10 @@ function shouldAttemptPreResolveRawCall(raw: RawCallFact): boolean {
 }
 
 function isPreResolvableCallResolutionKind(resolutionKind: string | undefined): boolean {
-  return !resolutionKind || resolutionKind === 'name-only' || resolutionKind === 'method-reference';
+  return !resolutionKind
+    || resolutionKind === 'name-only'
+    || resolutionKind === 'method-reference'
+    || resolutionKind === 'receiver-type';
 }
 
 const SIMPLE_METHOD_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
