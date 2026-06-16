@@ -2851,6 +2851,75 @@ class PaymentInfo {
     }));
   });
 
+  it('resolves inherited Java field receiver calls through superclass fields', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-inherited-field-receiver-');
+    writeFile(repo, 'src/test/java/com/example/ControllerTestBase.java', `package com.example;
+
+public abstract class ControllerTestBase {
+    protected CurrentUser currentUser = new CurrentUser();
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/BazaarControllerTest.java', `package com.example;
+
+public class BazaarControllerTest extends ControllerTestBase {
+    public void setup() {
+        currentUser.setUser("demo");
+        currentUser.getUser();
+    }
+
+    class NestedCase {
+        void nested() {
+            currentUser.getUser();
+        }
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/CurrentUser.java', `package com.example;
+
+public class CurrentUser {
+    public void setUser(String value) {
+    }
+
+    public String getUser() {
+        return "";
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const setUserCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'CurrentUser.setUser', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(setUserCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'BazaarControllerTest.setup',
+      callee: 'CurrentUser.setUser',
+      resolution_kind: 'receiver-field',
+    }));
+
+    const getUserCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'CurrentUser.getUser', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(getUserCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'BazaarControllerTest.setup',
+      callee: 'CurrentUser.getUser',
+      resolution_kind: 'receiver-field',
+    }));
+    expect(getUserCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'NestedCase.nested',
+      callee: 'CurrentUser.getUser',
+      resolution_kind: 'receiver-field',
+    }));
+  });
+
   it('indexes TypeScript and Python callback references and inline callback bodies', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-script-callback-refs-');

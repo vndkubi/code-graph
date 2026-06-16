@@ -116,6 +116,18 @@ The current worktree also ports a scoped version of external's repository-bounda
 
 This improves correctness for multi-repo workspaces without pulling in the full watcher/sync complexity from external.
 
+### 7. Java inherited-field receiver resolution improved
+
+The current worktree extends Java receiver-field resolution across:
+
+- superclass fields declared in another file
+- nested inner classes accessing outer-class fields
+- outer classes whose own fields come from a superclass chain
+
+This closes a real quality gap seen in Doughnut controller tests, where calls like
+`currentUser.getUser()` were previously left as unresolved `name-only` edges when
+`currentUser` came from `ControllerTestBase`.
+
 ## Benchmark Evidence
 
 ### A/B: lightweight maintenance vs full ANALYZE
@@ -175,12 +187,20 @@ Java field usage fact cost on real repos:
   - field usages off: `520250 ms`, `0` field usage facts
   - field usages on: `565637 ms`, `197521` field usage facts
 
+Java inherited-field receiver quality probe:
+
+- `D:/Personal/Projects/doughnut/backend`
+  - `CurrentUser.getUser` now has `311` resolved `receiver-field` callers
+  - unresolved raw `currentUser.getUser` edges dropped to `3`
+  - many recovered callers come from controller test classes inheriting `currentUser` from `ControllerTestBase`
+
 Interpretation:
 
 - The main remaining speed issue on large clean repos was not SQLite itself; it was git-freshness invalidation caused by `.codegraph*` artifact directories showing up as untracked repo dirt.
 - Fixing that restored the intended warm-index fast path on a large Java-heavy target.
 - Field usage facts add measurable but bounded cold-index cost on the larger Java repos tested, and the quality gain is large enough to justify default-on behavior.
 - Manifest scan correctness now lines up better with git-visible project scope instead of raw filesystem scope.
+- Java call quality also improved on a concrete real-repo inheritance pattern instead of only synthetic fixtures.
 
 ## Quality Evidence
 
@@ -336,6 +356,7 @@ Status:
 
 - Improved for Java callback/method-reference cases.
 - Java field usage facts now index by default, with explicit opt-out only for speed-sensitive cold runs.
+- Java inherited-field receiver calls now resolve across superclass and nested-class access patterns.
 - Added TS/JS and Python callback reference coverage for `this/self` registrations and inline callback bodies.
 - Cache invalidation now preserves that improvement in real runs.
 - Largest remaining quality gap versus external is generalized callback/function-as-value capture breadth across more positions and languages.

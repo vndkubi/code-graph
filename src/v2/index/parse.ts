@@ -55,9 +55,12 @@ export interface ParseContextItem {
   key: string;
   parseStatus: 'ok' | 'error';
   fields: Array<[string, string]>;
+  fieldsByClass?: Array<[string, string, string]>;
+  classParents?: Array<[string, string]>;
   methods: string[];
   methodFiles?: Array<[string, string]>;
   implementations: Array<[string, string]>;
+  classExtends?: Array<[string, string]>;
 }
 
 export interface ParseBatchOptions {
@@ -514,17 +517,27 @@ export function* readParseContextItemsJsonl(filePath: string): Iterable<ParseCon
 
 export function parseContextForResult(key: string, result: ParseResult): ParseContextItem {
   const fields: Array<[string, string]> = [];
+  const fieldsByClass: Array<[string, string, string]> = [];
+  const classParents: Array<[string, string]> = [];
   const methods: string[] = [];
   const methodFiles: Array<[string, string]> = [];
   const implementations: Array<[string, string]> = [];
+  const classExtends: Array<[string, string]> = [];
   for (const sym of result.symbols) {
     if (sym.kind === 'field' && sym.returnType) {
       fields.push([sym.name, sym.returnType]);
+      if (sym.parent) fieldsByClass.push([sym.parent, sym.name, sym.returnType]);
     }
     if (sym.kind === 'method' && sym.parent) {
       const method = `${sym.parent}.${sym.name}`;
       methods.push(method);
       methodFiles.push([method, key]);
+    }
+    if (sym.kind === 'class' && sym.extends) {
+      classExtends.push([sym.name, simpleTypeName(sym.extends)]);
+    }
+    if (sym.kind === 'class' && sym.parent) {
+      classParents.push([sym.name, sym.parent]);
     }
     if ((sym.kind === 'class' || sym.kind === 'interface') && sym.implements?.length) {
       const child = simpleTypeName(symbolFqName(sym).replace(/\([^)]*\)$/, ''));
@@ -537,9 +550,12 @@ export function parseContextForResult(key: string, result: ParseResult): ParseCo
     key,
     parseStatus: result.hasParseErrors ? 'error' : 'ok',
     fields,
+    fieldsByClass,
+    classParents,
     methods,
     methodFiles,
     implementations,
+    classExtends,
   };
 }
 

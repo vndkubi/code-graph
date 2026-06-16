@@ -211,6 +211,9 @@ interface DedupedParseCacheShard {
 
 interface CallResolutionContext {
   fieldsByFile: Map<string, Map<string, string>>;
+  fieldsByClass: Map<string, Map<string, string>>;
+  superClassByClass: Map<string, string>;
+  outerClassByClass: Map<string, string>;
   implementationsByInterface: Map<string, string[]>;
   methodOwners: Set<string>;
   methodFiles: Map<string, string>;
@@ -3027,12 +3030,13 @@ export class V2Indexer {
     }>).filter(row => receiverCallPattern.test(row.callee));
 
     const fieldsByFile = new Map<string, Map<string, string>>();
+    const fieldsByClass = new Map<string, Map<string, string>>();
     const fields = await this.db.prepare(`
-      SELECT file, simple_name, return_type
+      SELECT file, simple_name, return_type, parent
       FROM symbols
       WHERE snapshot_id = ? AND kind = 'field' AND return_type IS NOT NULL
       ${fileFilter ? `AND file IN (${filePlaceholders})` : ''}
-    `).all(...(fileFilter ? [snapshotId, ...fileFilter] : [snapshotId])) as Array<{ file: string; simple_name: string; return_type: string }>;
+    `).all(...(fileFilter ? [snapshotId, ...fileFilter] : [snapshotId])) as Array<{ file: string; simple_name: string; return_type: string; parent?: string }>;
     for (const field of fields) {
       let byName = fieldsByFile.get(field.file);
       if (!byName) {
@@ -3040,6 +3044,34 @@ export class V2Indexer {
         fieldsByFile.set(field.file, byName);
       }
       byName.set(field.simple_name, field.return_type);
+      if (field.parent) {
+        let byClass = fieldsByClass.get(field.parent);
+        if (!byClass) {
+          byClass = new Map();
+          fieldsByClass.set(field.parent, byClass);
+        }
+        byClass.set(field.simple_name, field.return_type);
+      }
+    }
+
+    const superClassByClass = new Map<string, string>();
+    const extendsRows = await this.db.prepare(`
+      SELECT child_type, parent_type
+      FROM inheritance
+      WHERE snapshot_id = ? AND kind = 'extends'
+    `).all(snapshotId) as Array<{ child_type: string; parent_type: string }>;
+    for (const row of extendsRows) {
+      superClassByClass.set(simpleTypeName(row.child_type), simpleTypeName(row.parent_type));
+    }
+
+    const outerClassByClass = new Map<string, string>();
+    const nestedClassRows = await this.db.prepare(`
+      SELECT simple_name, parent
+      FROM symbols
+      WHERE snapshot_id = ? AND kind = 'class' AND parent IS NOT NULL
+    `).all(snapshotId) as Array<{ simple_name: string; parent: string }>;
+    for (const row of nestedClassRows) {
+      outerClassByClass.set(row.simple_name, row.parent);
     }
 
     const implementationsByInterface = new Map<string, string[]>();
@@ -3101,7 +3133,15 @@ export class V2Indexer {
       const receiver = row.callee.substring(0, dot);
       const normalizedReceiver = receiver.startsWith('this.') ? receiver.substring('this.'.length) : receiver;
       const method = row.callee.substring(dot + 1);
-      const fieldType = fieldsByFile.get(row.file)?.get(normalizedReceiver);
+      const fieldType = resolveFieldReceiverType({
+        file: row.file,
+        caller: row.caller,
+        receiver: normalizedReceiver,
+        fieldsByFile,
+        fieldsByClass,
+        superClassByClass,
+        outerClassByClass,
+      });
       if (fieldType) {
         edgeUpdates.push([row.row_id, `${fieldType}.${method}`, 0.8, 'receiver-field']);
         queueImplementationEdges(row, fieldType, method);
@@ -3926,6 +3966,9 @@ function minimalManifestFile(relPath: string, role: string): ManifestFile {
 function createCallResolutionContext(): CallResolutionContext {
   return {
     fieldsByFile: new Map(),
+    fieldsByClass: new Map(),
+    superClassByClass: new Map(),
+    outerClassByClass: new Map(),
     implementationsByInterface: new Map(),
     methodOwners: new Set(),
     methodFiles: new Map(),
@@ -3946,12 +3989,27 @@ function addParseResultToCallResolutionContext(
         context.fieldsByFile.set(file.relPath, fields);
       }
       fields.set(sym.name, sym.returnType);
+      if (sym.parent) {
+        let classFields = context.fieldsByClass.get(sym.parent);
+        if (!classFields) {
+          classFields = new Map();
+          context.fieldsByClass.set(sym.parent, classFields);
+        }
+        classFields.set(sym.name, sym.returnType);
+      }
     }
 
     if (sym.kind === 'method' && sym.parent) {
       const method = `${sym.parent}.${sym.name}`;
       context.methodOwners.add(method);
       if (!context.methodFiles.has(method)) context.methodFiles.set(method, file.relPath);
+    }
+
+    if (sym.kind === 'class' && sym.extends) {
+      context.superClassByClass.set(sym.name, simpleTypeName(sym.extends));
+    }
+    if (sym.kind === 'class' && sym.parent) {
+      context.outerClassByClass.set(sym.name, sym.parent);
     }
 
     if ((sym.kind === 'class' || sym.kind === 'interface') && sym.implements?.length) {
@@ -3977,6 +4035,11 @@ function addParseContextItemToCallResolutionContext(
     }
     context.fieldsByFile.set(item.key, fields);
   }
+  for (const [ownerClass, fieldName, returnType] of item.fieldsByClass ?? []) {
+    const fields = context.fieldsByClass.get(ownerClass) ?? new Map<string, string>();
+    fields.set(fieldName, returnType);
+    context.fieldsByClass.set(ownerClass, fields);
+  }
   for (const method of item.methods) {
     context.methodOwners.add(method);
   }
@@ -3987,6 +4050,12 @@ function addParseContextItemToCallResolutionContext(
     const implementations = context.implementationsByInterface.get(parent) ?? [];
     implementations.push(child);
     context.implementationsByInterface.set(parent, implementations);
+  }
+  for (const [child, parent] of item.classExtends ?? []) {
+    context.superClassByClass.set(child, parent);
+  }
+  for (const [child, parent] of item.classParents ?? []) {
+    context.outerClassByClass.set(child, parent);
   }
 }
 
@@ -4088,7 +4157,15 @@ function preResolveCallEdge(
   const receiver = normalizedCall.callee.substring(0, dot);
   const normalizedReceiver = receiver.startsWith('this.') ? receiver.substring('this.'.length) : receiver;
   const method = normalizedCall.callee.substring(dot + 1);
-  const fieldType = context.fieldsByFile.get(file.relPath)?.get(normalizedReceiver);
+  const fieldType = resolveFieldReceiverType({
+    file: file.relPath,
+    caller: call.caller,
+    receiver: normalizedReceiver,
+    fieldsByFile: context.fieldsByFile,
+    fieldsByClass: context.fieldsByClass,
+    superClassByClass: context.superClassByClass,
+    outerClassByClass: context.outerClassByClass,
+  });
   if (fieldType) {
     queueImplementationCallEdges(snapshotId, file, normalizedCall, call.line, fieldType, method, context, implementationCallRows);
     return {
@@ -4107,6 +4184,45 @@ function preResolveCallEdge(
     };
   }
   return undefined;
+}
+
+function resolveFieldReceiverType(args: {
+  file: string;
+  caller: string;
+  receiver: string;
+  fieldsByFile: Map<string, Map<string, string>>;
+  fieldsByClass: Map<string, Map<string, string>>;
+  superClassByClass: Map<string, string>;
+  outerClassByClass: Map<string, string>;
+}): string | undefined {
+  const direct = args.fieldsByFile.get(args.file)?.get(args.receiver);
+  if (direct) return direct;
+
+  let currentClass = enclosingClassFromCaller(args.caller);
+  const seenOuter = new Set<string>();
+  while (currentClass && !seenOuter.has(currentClass)) {
+    seenOuter.add(currentClass);
+    let searchClass: string | undefined = currentClass;
+    const seenSuper = new Set<string>();
+    while (searchClass && !seenSuper.has(searchClass)) {
+      seenSuper.add(searchClass);
+      const fromClass = args.fieldsByClass.get(searchClass)?.get(args.receiver);
+      if (fromClass) return fromClass;
+      searchClass = args.superClassByClass.get(searchClass);
+    }
+    currentClass = args.outerClassByClass.get(currentClass);
+  }
+  return undefined;
+}
+
+function enclosingClassFromCaller(caller: string): string | undefined {
+  let normalized = caller;
+  while (/\.\blambda\d+_\d+$/.test(normalized)) {
+    normalized = normalized.replace(/\.\blambda\d+_\d+$/, '');
+  }
+  const dot = normalized.lastIndexOf('.');
+  if (dot <= 0) return undefined;
+  return normalized.substring(0, dot);
 }
 
 function shouldAttemptPreResolveRawCall(raw: RawCallFact): boolean {
