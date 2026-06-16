@@ -48,15 +48,19 @@ node dist/cli.js index --root "<project>" --workspace-key "<project-key>" --pars
 node dist/cli.js mcp --root "<project>" --workspace-key "<project-key>"
 ```
 
-If you need Java field impact answers such as "where is `fieldA` read or written?", enable field usage indexing before indexing:
+Java field usage indexing is enabled by default, so field-impact questions such as "where is `fieldA` read or written?" work after a normal index:
 
 ```powershell
-$env:CODEGRAPH_ENABLE_FIELD_USAGES="1"
 node dist/cli.js index --root "<project>" --workspace-key "<project-key>" --parse-workers 8
 node dist/cli.js mcp --root "<project>" --workspace-key "<project-key>"
 ```
 
-Field usage indexing is opt-in because it adds cold-index cost on large Java repositories. Without it, CodeGraph can still find text references, symbols, and calls, but it cannot reliably classify field reads, writes, or initialization.
+If you need to trade away that quality for a colder large-repo run, you can opt out explicitly:
+
+```powershell
+$env:CODEGRAPH_ENABLE_FIELD_USAGES="0"
+node dist/cli.js index --root "<project>" --workspace-key "<project-key>" --parse-workers 8
+```
 
 ## Prompt Contract
 
@@ -126,7 +130,7 @@ Expected quality:
 
 ### Field Impact
 
-Use this only after indexing with `CODEGRAPH_ENABLE_FIELD_USAGES=1`.
+Use this after a normal index. Set `CODEGRAPH_ENABLE_FIELD_USAGES=0` only when you explicitly want to skip field facts.
 
 ```text
 Use CodeGraph MCP first. Analyze impact of changing field <Class.field>.
@@ -261,7 +265,7 @@ A weak answer usually has one of these problems:
 | --- | --- | --- |
 | Agent does not call MCP | Prompt did not require MCP, or MCP client is not configured | Ask for `get_index_stats`; check `.codegraph/logs/query.jsonl`. |
 | Answer references old branch | Snapshot is stale | Run explicit `index --root ...` with the same workspace key. |
-| Field impact lacks read/write/init | Field usage indexing was not enabled before indexing | Re-index with `CODEGRAPH_ENABLE_FIELD_USAGES=1`. |
+| Field impact lacks read/write/init | Field usage indexing was explicitly disabled before indexing | Re-index normally, or unset `CODEGRAPH_ENABLE_FIELD_USAGES`, or set it to `1`. |
 | Too many tokens | Agent opened broad files or used large dependency output | Ask for one pack tool first and bounded `get_file_slice` calls only. |
 | Review answer is slower than shell | Agent used MCP and then unnecessary shell fallback | Use `MCP only` for review benchmarks, or require `review_patch` plus bounded slices. |
 | Container repo has no files | Bind mount is wrong | Check `/workspace` in the container and rerun index. |

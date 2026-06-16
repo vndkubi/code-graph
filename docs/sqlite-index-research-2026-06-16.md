@@ -98,6 +98,14 @@ Added/verified coverage for:
 
 This closes the high-confidence part of the cross-language callback gap without importing the full complexity of external's generalized function-value capture.
 
+### 5. Java field usage facts are now on by default
+
+The current worktree flips Java field usage extraction from opt-in to default-on, while preserving an explicit opt-out for colder large-repo runs:
+
+- default behavior now records Java field read/write/init facts
+- `CODEGRAPH_ENABLE_FIELD_USAGES=0` disables those facts when needed
+- provider versions now separate default-on versus explicit opt-out snapshots so parse cache reuse stays correct
+
 ## Benchmark Evidence
 
 ### A/B: lightweight maintenance vs full ANALYZE
@@ -145,10 +153,23 @@ Representative repo/subtree runs on this workstation:
     - warm: `1401 ms`
     - warm run reuses the same `snapshotId` and short-circuits correctly
 
+Java field usage fact cost on real repos:
+
+- `D:/Personal/Projects/doughnut/backend`
+  - field usages off: `10495 ms`, `0` field usage facts
+  - field usages on: `10631 ms`, `4026` field usage facts
+- `D:/Personal/Projects/hadoop/hadoop-common-project`
+  - field usages off: `59888 ms`, `0` field usage facts
+  - field usages on: `68762 ms`, `59218` field usage facts
+- `D:/Personal/Projects/elasticsearch/server`
+  - field usages off: `520250 ms`, `0` field usage facts
+  - field usages on: `565637 ms`, `197521` field usage facts
+
 Interpretation:
 
 - The main remaining speed issue on large clean repos was not SQLite itself; it was git-freshness invalidation caused by `.codegraph*` artifact directories showing up as untracked repo dirt.
 - Fixing that restored the intended warm-index fast path on a large Java-heavy target.
+- Field usage facts add measurable but bounded cold-index cost on the larger Java repos tested, and the quality gain is large enough to justify default-on behavior.
 
 ## Quality Evidence
 
@@ -183,6 +204,7 @@ The git-freshness path now also has direct regression coverage for warm reindex 
   - inheritance
   - field usages
   - graph overlay
+  - field usage facts are now enabled by default instead of living behind an extra indexing flag
 
 ### Where `codegraph-external` is stronger
 
@@ -300,6 +322,7 @@ Status:
 Status:
 
 - Improved for Java callback/method-reference cases.
+- Java field usage facts now index by default, with explicit opt-out only for speed-sensitive cold runs.
 - Added TS/JS and Python callback reference coverage for `this/self` registrations and inline callback bodies.
 - Cache invalidation now preserves that improvement in real runs.
 - Largest remaining quality gap versus external is generalized callback/function-as-value capture breadth across more positions and languages.

@@ -134,9 +134,6 @@ public class NoiseService {
   });
 
   it('indexes Java field usages for references, change packs, review packets, and warm cache reuse', async () => {
-    const previousFieldUsageFlag = process.env.CODEGRAPH_ENABLE_FIELD_USAGES;
-    process.env.CODEGRAPH_ENABLE_FIELD_USAGES = '1';
-    try {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-field-usage-');
     writeFile(repo, 'src/main/java/com/example/FieldImpactSubject.java', `package com.example;
@@ -189,6 +186,7 @@ public class FieldImpactSubjectTest {
     const { db } = await openDb(home);
     const indexer = new V2Indexer(db);
     const first = await indexer.indexWorkspace({ root: repo, workspaceKey: 'field-impact-first' });
+    expect(first.indexProviderVersions['tree-sitter']).toContain('default-field-usages');
     const queries = new V2QueryService(db);
 
     const rows = await db.prepare(`
@@ -257,6 +255,34 @@ public class FieldImpactSubjectTest {
       WHERE snapshot_id = ? AND field_name = 'fieldA'
     `).get(second.snapshotId) as { count: number | string } | undefined;
     expect(Number(warmRows?.count ?? 0)).toBeGreaterThan(0);
+  });
+
+  it('can explicitly disable Java field usage facts for colder large-repo runs', async () => {
+    const previousFieldUsageFlag = process.env.CODEGRAPH_ENABLE_FIELD_USAGES;
+    process.env.CODEGRAPH_ENABLE_FIELD_USAGES = '0';
+    try {
+      const home = tempDir('codegraph-home-');
+      const repo = tempDir('codegraph-field-usage-disabled-');
+      writeFile(repo, 'src/main/java/com/example/FieldImpactSubject.java', `package com.example;
+
+public class FieldImpactSubject {
+    private int fieldA;
+
+    public void update() {
+        fieldA++;
+    }
+}
+`);
+
+      const { db } = await openDb(home);
+      const indexer = new V2Indexer(db);
+      const result = await indexer.indexWorkspace({ root: repo });
+      expect(result.indexProviderVersions['tree-sitter']).toContain('field-usages-disabled');
+
+      const row = await db.prepare(`
+        SELECT COUNT(*) AS count FROM field_usages WHERE snapshot_id = ?
+      `).get(result.snapshotId) as { count: number | string };
+      expect(Number(row.count)).toBe(0);
     } finally {
       if (previousFieldUsageFlag === undefined) delete process.env.CODEGRAPH_ENABLE_FIELD_USAGES;
       else process.env.CODEGRAPH_ENABLE_FIELD_USAGES = previousFieldUsageFlag;

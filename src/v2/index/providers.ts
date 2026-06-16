@@ -79,8 +79,8 @@ interface ScipSymbolInformation {
 }
 
 const TREE_SITTER_PROVIDER_ID = 'tree-sitter';
-const TREE_SITTER_PROVIDER_VERSION = 'tree-sitter-analyzer-v8-cross-language-callback-refs';
-const TREE_SITTER_FIELD_USAGE_PROVIDER_VERSION = 'tree-sitter-analyzer-v11-field-usages-cross-language-callback-refs';
+const TREE_SITTER_PROVIDER_VERSION = 'tree-sitter-analyzer-v13-default-field-usages';
+const TREE_SITTER_FIELD_USAGE_DISABLED_PROVIDER_VERSION = 'tree-sitter-analyzer-v13-field-usages-disabled';
 const SCIP_PROVIDER_ID = 'scip';
 const SYMBOL_ROLE_DEFINITION = 0x1;
 const SYMBOL_ROLE_IMPORT = 0x2;
@@ -143,8 +143,8 @@ export function normalizeProviderNames(value: string[] | string | undefined): st
 class TreeSitterIndexProvider implements IndexProvider {
   readonly id = TREE_SITTER_PROVIDER_ID;
   readonly version = treeSitterFieldUsagesEnabled()
-    ? TREE_SITTER_FIELD_USAGE_PROVIDER_VERSION
-    : TREE_SITTER_PROVIDER_VERSION;
+    ? TREE_SITTER_PROVIDER_VERSION
+    : TREE_SITTER_FIELD_USAGE_DISABLED_PROVIDER_VERSION;
 
   parseFiles(workItems: ParseWorkItem[], options: ParseBatchOptions): ParseWorkResult[] {
     return parseFilesBatch(workItems, options);
@@ -424,7 +424,8 @@ function normalizeScipPath(value: string | undefined): string | undefined {
 
 function treeSitterFieldUsagesEnabled(): boolean {
   const value = String(process.env.CODEGRAPH_ENABLE_FIELD_USAGES ?? '').trim().toLowerCase();
-  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+  if (!value) return true;
+  return value !== '0' && value !== 'false' && value !== 'no' && value !== 'off';
 }
 
 function mergeParseResults(left: ParseResult, right: ParseResult): ParseResult {

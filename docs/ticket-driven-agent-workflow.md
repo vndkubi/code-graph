@@ -58,10 +58,16 @@ Before running implementation prompts, prewarm CodeGraph:
 node dist/cli.js index --root "<project>" --workspace-key "<project-key>" --parse-workers 8
 ```
 
-For Java field impact tasks, enable field usage indexing before indexing:
+For Java field impact tasks, a normal index already includes field usage facts:
 
 ```powershell
-$env:CODEGRAPH_ENABLE_FIELD_USAGES="1"
+node dist/cli.js index --root "<project>" --workspace-key "<project-key>" --parse-workers 8
+```
+
+If you intentionally need a cheaper cold index on a very large repo, you can opt out:
+
+```powershell
+$env:CODEGRAPH_ENABLE_FIELD_USAGES="0"
 node dist/cli.js index --root "<project>" --workspace-key "<project-key>" --parse-workers 8
 ```
 

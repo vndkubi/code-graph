@@ -52,7 +52,8 @@ interface JavaFieldInfo {
 
 function javaFieldUsagesEnabled(): boolean {
   const value = String(process.env.CODEGRAPH_ENABLE_FIELD_USAGES ?? '').trim().toLowerCase();
-  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+  if (!value) return true;
+  return value !== '0' && value !== 'false' && value !== 'no' && value !== 'off';
 }
 
 interface JavaFieldUsageContext {
