@@ -3116,6 +3116,69 @@ public class LoopReceiver {
     }));
   });
 
+  it('resolves chained Java field receiver calls through nested field types', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-java-field-chain-');
+    writeFile(repo, 'src/test/java/com/example/Persister.java', `package com.example;
+
+public class Persister {
+    public void flush() {
+    }
+
+    public void save() {
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/MakeMe.java', `package com.example;
+
+public class MakeMe {
+    protected Persister entityPersister = new Persister();
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/BaseBuilder.java', `package com.example;
+
+public abstract class BaseBuilder {
+    protected MakeMe makeMe = new MakeMe();
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/BuilderTest.java', `package com.example;
+
+public class BuilderTest extends BaseBuilder {
+    void run() {
+        makeMe.entityPersister.flush();
+        this.makeMe.entityPersister.save();
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const flushCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Persister.flush', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(flushCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'BuilderTest.run',
+      callee: 'Persister.flush',
+      resolution_kind: 'receiver-field-chain',
+    }));
+
+    const saveCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Persister.save', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(saveCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'BuilderTest.run',
+      callee: 'Persister.save',
+      resolution_kind: 'receiver-field-chain',
+    }));
+  });
+
   it('indexes TypeScript and Python callback references and inline callback bodies', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-script-callback-refs-');

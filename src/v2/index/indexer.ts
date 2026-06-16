@@ -4194,6 +4194,69 @@ function resolveFieldReceiverType(args: {
   return undefined;
 }
 
+function resolveFieldOnTypeChain(
+  startType: string | undefined,
+  fieldName: string,
+  fieldsByClass: Map<string, Map<string, string>>,
+  superClassByClass: Map<string, string>,
+): string | undefined {
+  let current = startType ? simpleTypeName(startType) : undefined;
+  const seen = new Set<string>();
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    const fieldType = fieldsByClass.get(current)?.get(fieldName);
+    if (fieldType) return fieldType;
+    current = superClassByClass.get(current);
+  }
+  return undefined;
+}
+
+function resolveReceiverExpressionType(args: {
+  file: string;
+  caller: string;
+  receiverExpression: string;
+  fieldsByFile: Map<string, Map<string, string>>;
+  fieldsByClass: Map<string, Map<string, string>>;
+  superClassByClass: Map<string, string>;
+  outerClassByClass: Map<string, string>;
+}): { type: string; fieldDepth: number } | undefined {
+  const parts = args.receiverExpression.split('.');
+  if (parts.length === 0 || parts.some(part => !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(part))) return undefined;
+
+  let currentType: string | undefined;
+  let index = 0;
+  let fieldDepth = 0;
+  if (parts[0] === 'this') {
+    currentType = enclosingClassFromCaller(args.caller);
+    index = 1;
+  } else if (parts[0] === 'super') {
+    const owner = enclosingClassFromCaller(args.caller);
+    currentType = owner ? args.superClassByClass.get(owner) : undefined;
+    index = 1;
+  } else {
+    currentType = resolveFieldReceiverType({
+      file: args.file,
+      caller: args.caller,
+      receiver: parts[0],
+      fieldsByFile: args.fieldsByFile,
+      fieldsByClass: args.fieldsByClass,
+      superClassByClass: args.superClassByClass,
+      outerClassByClass: args.outerClassByClass,
+    });
+    if (!currentType) return undefined;
+    index = 1;
+    fieldDepth = 1;
+  }
+
+  for (; index < parts.length; index++) {
+    currentType = resolveFieldOnTypeChain(currentType, parts[index], args.fieldsByClass, args.superClassByClass);
+    if (!currentType) return undefined;
+    fieldDepth++;
+  }
+
+  return currentType ? { type: simpleTypeName(currentType), fieldDepth } : undefined;
+}
+
 function resolveMethodOwnerCall(args: {
   file: string;
   caller: string;
@@ -4246,26 +4309,26 @@ function resolveMethodOwnerCall(args: {
     };
   }
 
-  const fieldType = resolveFieldReceiverType({
+  const receiverType = resolveReceiverExpressionType({
     file: args.file,
     caller: args.caller,
-    receiver,
+    receiverExpression: receiver,
     fieldsByFile: args.fieldsByFile,
     fieldsByClass: args.fieldsByClass,
     superClassByClass: args.superClassByClass,
     outerClassByClass: args.outerClassByClass,
   });
-  if (fieldType) {
+  if (receiverType) {
     return {
-      callee: `${fieldType}.${method}`,
+      callee: `${receiverType.type}.${method}`,
       confidence: 0.8,
-      resolutionKind: 'receiver-field',
+      resolutionKind: receiverType.fieldDepth > 1 ? 'receiver-field-chain' : 'receiver-field',
       method,
-      receiverTypeForImplementations: fieldType,
+      receiverTypeForImplementations: receiverType.type,
     };
   }
 
-  if (/^[A-Z]/.test(receiver)) {
+  if (!receiver.includes('.') && /^[A-Z]/.test(receiver)) {
     return {
       callee: args.callee,
       confidence: 0.8,
@@ -4349,7 +4412,7 @@ function isPreResolvableCallResolutionKind(resolutionKind: string | undefined): 
 }
 
 const SIMPLE_METHOD_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-const RECEIVER_METHOD_PATTERN = /^(this|super|[A-Za-z_$][A-Za-z0-9_$]*)[.][A-Za-z_$][A-Za-z0-9_$]*$/;
+const RECEIVER_METHOD_PATTERN = /^(this|super|[A-Za-z_$][A-Za-z0-9_$]*)(?:[.][A-Za-z_$][A-Za-z0-9_$]*)+$/;
 
 function isPreResolvableCallCallee(callee: string): boolean {
   return SIMPLE_METHOD_PATTERN.test(callee) || RECEIVER_METHOD_PATTERN.test(callee);
