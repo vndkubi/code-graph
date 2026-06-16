@@ -3318,6 +3318,96 @@ public class ViewRenderer {
     }));
   });
 
+  it('resolves Java pattern variables and class-cast lambda parameters through typed receiver chains', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-java-pattern-chain-');
+    writeFile(repo, 'src/test/java/com/example/Notebook.java', `package com.example;
+
+public class Notebook {
+    public Integer getId() {
+        return 0;
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/CatalogItem.java', `package com.example;
+
+public interface CatalogItem {
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/NotebookCatalogNotebookItem.java', `package com.example;
+
+public class NotebookCatalogNotebookItem implements CatalogItem {
+    Notebook notebook = new Notebook();
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/NotebookCatalogSubscribedNotebookItem.java', `package com.example;
+
+public class NotebookCatalogSubscribedNotebookItem implements CatalogItem {
+    Notebook notebook = new Notebook();
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/NotebookCatalogGroupItem.java', `package com.example;
+
+public class NotebookCatalogGroupItem implements CatalogItem {
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/PatternScope.java', `package com.example;
+
+import java.util.List;
+
+public class PatternScope {
+    Integer fromSwitch(CatalogItem item) {
+        return switch (item) {
+            case NotebookCatalogNotebookItem n -> n.notebook.getId();
+            case NotebookCatalogSubscribedNotebookItem s -> s.notebook.getId();
+            case NotebookCatalogGroupItem g -> null;
+        };
+    }
+
+    boolean fromInstanceof(List<CatalogItem> items, Integer needle) {
+        return items.stream()
+            .anyMatch(item -> item instanceof NotebookCatalogSubscribedNotebookItem s
+                && s.notebook.getId().equals(needle));
+    }
+
+    List<Integer> fromCast(List<CatalogItem> items) {
+        return items.stream()
+            .filter(NotebookCatalogNotebookItem.class::isInstance)
+            .map(NotebookCatalogNotebookItem.class::cast)
+            .map(n -> n.notebook.getId())
+            .toList();
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const getIdCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Notebook.getId', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+
+    expect(getIdCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'PatternScope.fromSwitch',
+      callee: 'Notebook.getId',
+      resolution_kind: 'receiver-type-field',
+    }));
+    expect(getIdCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^PatternScope[.]fromInstanceof[.]lambda\d+_\d+$/),
+      callee: 'Notebook.getId',
+      resolution_kind: 'receiver-type-field',
+    }));
+    expect(getIdCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^PatternScope[.]fromCast[.]lambda\d+_\d+$/),
+      callee: 'Notebook.getId',
+      resolution_kind: 'receiver-type-field',
+    }));
+  });
+
   it('indexes TypeScript and Python callback references and inline callback bodies', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-script-callback-refs-');

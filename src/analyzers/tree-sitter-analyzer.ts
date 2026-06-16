@@ -1014,22 +1014,25 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     file: string,
     shadowedNames?: Set<string>,
   ): void {
+    const bindReceiverType = (typeName: string | null | undefined, nameNode: SyntaxNode | null | undefined): void => {
+      if (!typeName || !nameNode) return;
+      receiverTypes.set(nameNode.text, typeName);
+      shadowedNames?.add(nameNode.text);
+      if (this.isReferenceType(typeName)) {
+        this.parseTypeRefs.push({
+          file,
+          referencedType: typeName,
+          context: 'parameter',
+          line: node.startPosition.row + 1,
+        });
+      }
+    };
+
     if (node.type === 'enhanced_for_statement') {
       const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
       const nameNode = node.childForFieldName('name')
         ?? [...node.namedChildren].find(child => child.type === 'identifier');
-      if (typeName && nameNode) {
-        receiverTypes.set(nameNode.text, typeName);
-        shadowedNames?.add(nameNode.text);
-        if (this.isReferenceType(typeName)) {
-          this.parseTypeRefs.push({
-            file,
-            referencedType: typeName,
-            context: 'parameter',
-            line: node.startPosition.row + 1,
-          });
-        }
-      }
+      bindReceiverType(typeName, nameNode);
     }
 
     if (node.type === 'catch_formal_parameter') {
@@ -1039,18 +1042,27 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         : undefined;
       const nameNode = node.childForFieldName('name')
         ?? [...node.namedChildren].reverse().find(child => child.type === 'identifier');
-      if (typeName && nameNode) {
-        receiverTypes.set(nameNode.text, typeName);
-        shadowedNames?.add(nameNode.text);
-        if (this.isReferenceType(typeName)) {
-          this.parseTypeRefs.push({
-            file,
-            referencedType: typeName,
-            context: 'parameter',
-            line: node.startPosition.row + 1,
-          });
-        }
-      }
+      bindReceiverType(typeName, nameNode);
+    }
+
+    if (node.type === 'type_pattern') {
+      const typeName = this.extractJavaTypeName(node.childForFieldName('type') ?? node.namedChildren[0]);
+      const nameNode = node.childForFieldName('name')
+        ?? [...node.namedChildren].reverse().find(child => child.type === 'identifier');
+      bindReceiverType(typeName, nameNode);
+    }
+
+    if (node.type === 'instanceof_expression') {
+      const typeIndex = node.namedChildren.findIndex(child =>
+        child.type === 'type_identifier'
+        || child.type === 'generic_type'
+        || child.type === 'scoped_type_identifier'
+      );
+      const typeNode = typeIndex >= 0 ? node.namedChildren[typeIndex] : undefined;
+      const nameNode = typeIndex >= 0
+        ? node.namedChildren.slice(typeIndex + 1).find(child => child.type === 'identifier')
+        : undefined;
+      bindReceiverType(this.extractJavaTypeName(typeNode), nameNode);
     }
 
     if (node.type === 'local_variable_declaration' || node.type === 'resource') {
@@ -1539,6 +1551,14 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
 
     if (node.type === 'lambda_expression') {
       const callbackName = `${callerName}.lambda${node.startPosition.row + 1}_${node.startPosition.column + 1}`;
+      const lambdaReceiverTypes = this.extendJavaLambdaReceiverTypes(node, receiverTypes);
+      const lambdaFieldUsageContext = fieldUsageContext
+        ? {
+          ...fieldUsageContext,
+          receiverTypes: lambdaReceiverTypes ?? fieldUsageContext.receiverTypes,
+          shadowedNames: this.extendJavaLambdaShadowedNames(node, fieldUsageContext.shadowedNames),
+        }
+        : fieldUsageContext;
       calls.push({
         caller: callerName,
         callee: callbackName,
@@ -1556,7 +1576,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         symbolName: callbackName,
       });
       for (const child of node.children) {
-        this.extractCallsFromNode(child, file, lines, calls, references, callbackName, receiverTypes, fieldUsageContext, enclosingClass);
+        this.extractCallsFromNode(child, file, lines, calls, references, callbackName, lambdaReceiverTypes, lambdaFieldUsageContext, enclosingClass);
       }
       return;
     }
@@ -1753,6 +1773,89 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     enclosingClass?: string,
   ): string | undefined {
     return this.resolveScriptCallCallee(node, enclosingClass);
+  }
+
+  private extendJavaLambdaReceiverTypes(
+    node: SyntaxNode,
+    receiverTypes?: Map<string, string>,
+  ): Map<string, string> | undefined {
+    const paramTypes = this.extractJavaLambdaParamTypeMap(node);
+    if (paramTypes.size === 0) return receiverTypes;
+    const scoped = new Map(receiverTypes ?? []);
+    for (const [name, type] of paramTypes) scoped.set(name, type);
+    return scoped;
+  }
+
+  private extendJavaLambdaShadowedNames(
+    node: SyntaxNode,
+    shadowedNames: Set<string>,
+  ): Set<string> {
+    const scoped = new Set(shadowedNames);
+    for (const name of this.extractJavaLambdaParamNames(node)) scoped.add(name);
+    return scoped;
+  }
+
+  private extractJavaLambdaParamTypeMap(node: SyntaxNode): Map<string, string> {
+    const types = new Map<string, string>();
+    if (node.type !== 'lambda_expression') return types;
+
+    const paramsNode = node.namedChildren[0];
+    if (!paramsNode) return types;
+    if (paramsNode.type === 'formal_parameters') {
+      for (const child of paramsNode.namedChildren) {
+        if (child.type !== 'formal_parameter' && child.type !== 'spread_parameter') continue;
+        const typeName = this.extractJavaTypeName(child.childForFieldName('type'));
+        const nameNode = child.childForFieldName('name')
+          ?? [...child.namedChildren].reverse().find(param => param.type === 'identifier');
+        if (typeName && nameNode) types.set(nameNode.text, typeName);
+      }
+      return types;
+    }
+
+    const inferredType = this.inferJavaLambdaCastParamType(node);
+    const names = this.extractJavaLambdaParamNames(node);
+    if (inferredType && names.length === 1) types.set(names[0]!, inferredType);
+    return types;
+  }
+
+  private extractJavaLambdaParamNames(node: SyntaxNode): string[] {
+    if (node.type !== 'lambda_expression') return [];
+    const paramsNode = node.namedChildren[0];
+    if (!paramsNode) return [];
+    if (paramsNode.type === 'identifier') return [paramsNode.text];
+    if (paramsNode.type === 'inferred_parameters') {
+      return paramsNode.namedChildren
+        .filter(child => child.type === 'identifier')
+        .map(child => child.text);
+    }
+    if (paramsNode.type === 'formal_parameters') {
+      return paramsNode.namedChildren
+        .filter(child => child.type === 'formal_parameter' || child.type === 'spread_parameter')
+        .map(child =>
+          child.childForFieldName('name')
+            ?? [...child.namedChildren].reverse().find(param => param.type === 'identifier')
+        )
+        .filter((child): child is SyntaxNode => Boolean(child))
+        .map(child => child.text);
+    }
+    return [];
+  }
+
+  private inferJavaLambdaCastParamType(node: SyntaxNode): string | undefined {
+    if (node.type !== 'lambda_expression') return undefined;
+    const argumentList = node.parent;
+    if (!argumentList || argumentList.type !== 'argument_list') return undefined;
+    const invocation = argumentList.parent;
+    if (!invocation || invocation.type !== 'method_invocation') return undefined;
+    const previous = invocation.childForFieldName('object');
+    if (!previous || previous.type !== 'method_invocation') return undefined;
+    const previousName = previous.childForFieldName('name');
+    if (!previousName || previousName.text !== 'map') return undefined;
+    const previousArgs = previous.childForFieldName('arguments');
+    const mapper = previousArgs?.namedChildren[0];
+    if (!mapper || mapper.type !== 'method_reference') return undefined;
+    const match = mapper.text.match(/^([A-Z][A-Za-z0-9_$.]*)\.class::cast$/);
+    return match?.[1] ? simpleTypeName(match[1]) : undefined;
   }
 
   private collectJavaStaticImport(node: SyntaxNode): void {

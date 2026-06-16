@@ -332,12 +332,23 @@ Java typed-receiver field-chain probes:
   - total primary Java `name-only` calls dropped from `630` to `597`
   - `4` Java call edges now resolve as explicit `receiver-type-field` or `receiver-type-chain`
   - `view.catalogItems.stream` fell from `10` unresolved edges to `0`
-  - `n.notebook.getId` remained at `5`, which suggests a separate lambda/inferred-parameter frontier instead of a plain local/parameter typed chain
 - `D:/Personal/Projects/hadoop/hadoop-common-project`
   - total primary Java `name-only` calls dropped from `5117` to `4449`
   - `513` Java call edges now resolve as explicit `receiver-type-field` or `receiver-type-chain`
   - `item.stat.isDirectory` fell from `20` unresolved edges to `0`
   - `item.stat.isSymlink` fell from `3` unresolved edges to `0`
+
+Java pattern-variable and cast-inferred lambda probes:
+
+- `D:/Personal/Projects/doughnut/backend`
+  - total primary Java `name-only` calls dropped again from `597` to `544`
+  - `receiver-type-field` edges increased from `4` to `17`
+  - `n.notebook.getId` fell from `5` unresolved edges to `0`
+  - `s.notebook.getId` fell from `2` unresolved edges to `0`
+  - recovered cases include:
+    - `case NotebookCatalogNotebookItem n -> n.notebook.getId()`
+    - `item instanceof NotebookCatalogSubscribedNotebookItem s && s.notebook.getId()...`
+    - `.map(NotebookCatalogNotebookItem.class::cast).map(n -> n.notebook.getId())`
 
 Interpretation:
 
@@ -352,6 +363,7 @@ Interpretation:
 - Java field-chain resolution closes another real test-helper gap, especially where builder/test harness objects expose service fields that are called repeatedly.
 - Java method-reference resolution now also handles explicit outer-instance receivers like `OuterClass.this::method` and inherited `this::baseMethod` ownership.
 - Java typed-receiver field-chain resolution closes a larger cross-file gap where the first receiver segment is a typed local/parameter and later segments are project fields.
+- Java pattern variables and narrow class-cast lambda inference close another practical Java 17/test-heavy gap without attempting a broad generic stream-type solver.
 
 ## Quality Evidence
 
@@ -518,6 +530,7 @@ Status:
 - Java receiver-type calls now cover enhanced-for variables and catch variables in addition to parameters and plain locals.
 - Java chained field receivers now resolve through nested field types instead of staying as raw dotted names.
 - Java typed local/parameter receiver chains now resolve through project field types, with especially large wins on Hadoop-style `item.stat.*` access patterns.
+- Java pattern variables and `.map(Type.class::cast)` lambda params now contribute receiver typing as well, which materially helps Doughnut's catalog/test code.
 - Added TS/JS and Python callback reference coverage for `this/self` registrations and inline callback bodies.
 - Cache invalidation now preserves that improvement in real runs.
 - Largest remaining quality gap versus external is generalized callback/function-as-value capture breadth across more positions and languages.
