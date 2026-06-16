@@ -106,6 +106,16 @@ The current worktree flips Java field usage extraction from opt-in to default-on
 - `CODEGRAPH_ENABLE_FIELD_USAGES=0` disables those facts when needed
 - provider versions now separate default-on versus explicit opt-out snapshots so parse cache reuse stays correct
 
+### 6. Manifest scanning now respects git visibility while keeping embedded repos
+
+The current worktree also ports a scoped version of external's repository-boundary handling into manifest scan:
+
+- ordinary `.gitignore`d source files are no longer indexed just because they exist on disk
+- gitignored embedded repos are still scanned when they are real nested repos rather than ordinary ignored directories
+- linked worktrees discovered as nested `.git` pointers are skipped rather than duplicated
+
+This improves correctness for multi-repo workspaces without pulling in the full watcher/sync complexity from external.
+
 ## Benchmark Evidence
 
 ### A/B: lightweight maintenance vs full ANALYZE
@@ -170,6 +180,7 @@ Interpretation:
 - The main remaining speed issue on large clean repos was not SQLite itself; it was git-freshness invalidation caused by `.codegraph*` artifact directories showing up as untracked repo dirt.
 - Fixing that restored the intended warm-index fast path on a large Java-heavy target.
 - Field usage facts add measurable but bounded cold-index cost on the larger Java repos tested, and the quality gain is large enough to justify default-on behavior.
+- Manifest scan correctness now lines up better with git-visible project scope instead of raw filesystem scope.
 
 ## Quality Evidence
 
@@ -221,7 +232,9 @@ The git-freshness path now also has direct regression coverage for warm reindex 
   - worktree mismatch detection
   - watcher fallback policies
   - git hook sync fallback
-  - This repo did close one important gap here: `.codegraph*` index artifacts are now ignored by git-freshness checks so they do not force false reindexing on clean repos.
+  - This repo has now closed two important parts of that gap:
+    - `.codegraph*` index artifacts are ignored by git-freshness checks so they do not force false reindexing on clean repos
+    - manifest scan respects `.gitignore` while still discovering gitignored embedded repos
 - SQLite operational hardening is more mature.
   - connection PRAGMAs
   - maintenance/checkpoint habits
@@ -280,14 +293,13 @@ Reason:
 
 Port selected ideas from external:
 
-- embedded repo detection
-- gitignored nested repo handling
 - worktree mismatch warning
+- watcher parity for embedded-repo scope changes
 
 Reason:
 
-- These are correctness issues, not just ergonomics.
-- They matter for monorepos, nested worktrees, and AI-driven multi-checkout workflows.
+- The manifest-side embedded repo / gitignored nested repo gap is now addressed here.
+- The remaining boundary gaps are mostly around warnings/sync ergonomics rather than base indexing scope.
 
 ### P3: broaden language coverage only when justified
 
@@ -316,6 +328,7 @@ Status:
 - Measured speed improvement is proven in two places:
   - post-index maintenance tail on larger synthetic workloads
   - restored warm-index fast-path behavior on large real git repos by ignoring `.codegraph*` artifacts in git freshness checks
+- Repository scope correctness also improved by aligning manifest scan with git-visible files instead of raw filesystem walk.
 
 ### 2. Improve index quality
 
@@ -333,6 +346,6 @@ Status:
 
 - Comparison is complete enough to drive selective porting.
 - The best ideas to port next are:
-  - workspace boundary/worktree handling
   - snapshot-level extraction version visibility
   - broader function-reference capture for gated bare identifiers / extra languages
+  - worktree mismatch warning / watcher parity for boundary handling

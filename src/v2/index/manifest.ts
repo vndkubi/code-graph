@@ -59,6 +59,10 @@ interface GitHashLookup {
   entriesByPath: Map<string, GitIndexEntry>;
 }
 
+interface GitVisibleFilesLookup {
+  files: Set<string>;
+}
+
 interface GitIndexEntry {
   blobHash: string;
   mtimeSec: number;
@@ -86,6 +90,9 @@ const DEFAULT_SKIP_DIRS = new Set([
   '__pycache__',
 ]);
 
+const EMBEDDED_REPO_SEARCH_DEPTH = 4;
+const EMBEDDED_REPO_SEARCH_ENTRIES = 2000;
+
 export function scanManifest(root: string, options: ManifestScanOptions = {}): ManifestScanResult {
   const start = Date.now();
   const rootDir = path.resolve(root);
@@ -93,6 +100,7 @@ export function scanManifest(root: string, options: ManifestScanOptions = {}): M
   const files: ManifestFile[] = [];
   const previousByPath = new Map((options.previousFiles ?? []).map(file => [file.path, file]));
   const gitHashes = loadGitHashLookup(rootDir);
+  const gitVisibleFiles = loadGitVisibleFiles(rootDir);
   const stats = { filesHashed: 0, hashCacheHits: 0, lastProgressAt: start };
 
   options.progress?.({
@@ -104,7 +112,11 @@ export function scanManifest(root: string, options: ManifestScanOptions = {}): M
     elapsedMs: 0,
   });
 
-  walk(rootDir, rootDir, files, maxFileSizeBytes, previousByPath, gitHashes, stats, start, options.progress);
+  if (gitVisibleFiles) {
+    collectManifestFilesFromGit(rootDir, [...gitVisibleFiles.files].sort(), files, maxFileSizeBytes, previousByPath, gitHashes, stats, start, options.progress);
+  } else {
+    walk(rootDir, rootDir, files, maxFileSizeBytes, previousByPath, gitHashes, stats, start, options.progress);
+  }
 
   options.progress?.({
     phase: 'manifest',
@@ -131,6 +143,7 @@ export function scanManifestPaths(root: string, changedPaths: string[], options:
   const maxFileSizeBytes = options.maxFileSizeBytes ?? 5 * 1024 * 1024;
   const previousByPath = new Map((options.previousFiles ?? []).map(file => [file.path, file]));
   const gitHashes = loadGitHashLookup(rootDir);
+  const gitVisibleFiles = loadGitVisibleFiles(rootDir);
   const stats = { filesHashed: 0, hashCacheHits: 0 };
   const files: ManifestFile[] = [];
   const deletedPaths: string[] = [];
@@ -142,6 +155,11 @@ export function scanManifestPaths(root: string, changedPaths: string[], options:
     if (!relPath || seen.has(relPath)) continue;
     seen.add(relPath);
     const absPath = path.join(rootDir, relPath);
+    if (gitVisibleFiles && !gitVisibleFiles.files.has(relPath)) {
+      if (previousByPath.has(relPath)) deletedPaths.push(relPath);
+      else skippedPaths.push(relPath);
+      continue;
+    }
     let stat: fs.Stats | undefined;
     try {
       stat = fs.statSync(absPath);
@@ -208,6 +226,46 @@ function walk(
     } catch {
       continue;
     }
+    const file = manifestFileForPath(root, absPath, relPath, stat, maxFileSizeBytes, previousByPath, gitHashes, stats);
+    if (!file) continue;
+    files.push(file);
+
+    const now = Date.now();
+    if (progress && (files.length % 500 === 0 || now - stats.lastProgressAt >= 5_000)) {
+      stats.lastProgressAt = now;
+      progress({
+        phase: 'manifest',
+        status: 'progress',
+        currentPath: relPath,
+        filesFound: files.length,
+        filesHashed: stats.filesHashed,
+        hashCacheHits: stats.hashCacheHits,
+        elapsedMs: now - start,
+      });
+    }
+  }
+}
+
+function collectManifestFilesFromGit(
+  root: string,
+  relPaths: string[],
+  files: ManifestFile[],
+  maxFileSizeBytes: number,
+  previousByPath: Map<string, ManifestPreviousFile>,
+  gitHashes: GitHashLookup | undefined,
+  stats: { filesHashed: number; hashCacheHits: number; lastProgressAt: number },
+  start: number,
+  progress?: (event: ManifestScanProgressEvent) => void,
+): void {
+  for (const relPath of relPaths) {
+    const absPath = path.join(root, relPath);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(absPath);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
     const file = manifestFileForPath(root, absPath, relPath, stat, maxFileSizeBytes, previousByPath, gitHashes, stats);
     if (!file) continue;
     files.push(file);
@@ -312,6 +370,132 @@ function loadGitHashLookup(root: string): GitHashLookup | undefined {
   };
 }
 
+function loadGitVisibleFiles(root: string): GitVisibleFilesLookup | undefined {
+  const topLevel = git(root, ['rev-parse', '--show-toplevel'])?.trim();
+  if (!topLevel) return undefined;
+  const gitRoot = path.resolve(topLevel);
+  if (gitRoot !== root && isGitIgnoredByParent(root)) return undefined;
+
+  const files = new Set<string>();
+  collectGitVisibleFiles(root, '', files);
+  return { files };
+}
+
+function collectGitVisibleFiles(repoDir: string, prefix: string, files: Set<string>): void {
+  const tracked = git(repoDir, ['ls-files', '-z', '-c'], 60_000) ?? '';
+  for (const rel of tracked.split('\0')) {
+    if (!rel) continue;
+    files.add(normalizePath(prefix + rel));
+  }
+
+  const untracked = git(repoDir, ['ls-files', '-z', '-o', '--exclude-standard'], 60_000) ?? '';
+  for (const rel of untracked.split('\0')) {
+    if (!rel) continue;
+    if (rel.endsWith('/')) {
+      const childDir = path.join(repoDir, rel);
+      const gitDirKind = classifyGitDir(childDir);
+      if (gitDirKind === 'embedded' && !shouldSkipDirByDefault(rel.split('/').filter(Boolean).at(-1) ?? '')) {
+        collectGitVisibleFiles(childDir, prefix + rel, files);
+      }
+      continue;
+    }
+    files.add(normalizePath(prefix + rel));
+  }
+
+  for (const rel of findIgnoredEmbeddedRepos(repoDir)) {
+    collectGitVisibleFiles(path.join(repoDir, rel), prefix + rel, files);
+  }
+}
+
+function listIgnoredDirs(repoDir: string): string[] {
+  const output = git(repoDir, ['ls-files', '-z', '-o', '-i', '--exclude-standard', '--directory'], 60_000) ?? '';
+  return output.split('\0').filter(entry => entry.endsWith('/'));
+}
+
+function findIgnoredEmbeddedRepos(repoDir: string): string[] {
+  const repos: string[] = [];
+  for (const dir of listIgnoredDirs(repoDir)) {
+    const tail = dir.split('/').filter(Boolean).at(-1) ?? '';
+    if (shouldSkipDirByDefault(tail)) continue;
+    repos.push(...findNestedGitRepos(path.join(repoDir, dir), dir));
+  }
+  return repos;
+}
+
+function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
+  const found: string[] = [];
+  const queue: Array<{ abs: string; rel: string; depth: number }> = [{ abs: absDir, rel: relPrefix, depth: 0 }];
+  let examined = 0;
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (++examined > EMBEDDED_REPO_SEARCH_ENTRIES) break;
+    const kind = classifyGitDir(current.abs);
+    if (kind === 'worktree') continue;
+    if (kind === 'embedded') {
+      found.push(current.rel);
+      continue;
+    }
+    if (current.depth >= EMBEDDED_REPO_SEARCH_DEPTH) continue;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current.abs, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === '.git' || shouldSkipDirByDefault(entry.name)) continue;
+      queue.push({
+        abs: path.join(current.abs, entry.name),
+        rel: normalizeRepoDir(current.rel + entry.name + '/'),
+        depth: current.depth + 1,
+      });
+    }
+  }
+  return found;
+}
+
+function classifyGitDir(absDir: string): 'embedded' | 'worktree' | 'none' {
+  const gitPath = path.join(absDir, '.git');
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(gitPath);
+  } catch {
+    return 'none';
+  }
+  if (stat.isDirectory()) return 'embedded';
+  if (!stat.isFile()) return 'none';
+  try {
+    const gitdir = fs.readFileSync(gitPath, 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+    if (gitdir && /(^|[\\/])\.git[\\/]worktrees[\\/]/.test(gitdir)) return 'worktree';
+  } catch {
+    // Keep prior behavior on unreadable pointers.
+  }
+  return 'embedded';
+}
+
+function isGitIgnoredByParent(root: string): boolean {
+  try {
+    execFileSync('git', ['check-ignore', '-q', path.resolve(root)], {
+      cwd: root,
+      stdio: 'ignore',
+      timeout: 5_000,
+      windowsHide: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function shouldSkipDirByDefault(name: string): boolean {
+  return DEFAULT_SKIP_DIRS.has(name) || name.startsWith('.tmp');
+}
+
+function normalizeRepoDir(value: string): string {
+  return normalizePath(value).replace(/\/?$/, '/');
+}
+
 function parseGitIndexEntries(output: string): Map<string, GitIndexEntry> {
   const entries = new Map<string, GitIndexEntry>();
   let current: Partial<GitIndexEntry> & { path?: string } | undefined;
@@ -388,4 +572,8 @@ function pathspec(rootPrefix: string): string {
 
 function toPosixPath(value: string): string {
   return value.replace(/\\/g, '/');
+}
+
+function normalizePath(value: string): string {
+  return value.replace(/\\/g, '/').replace(/^\/+/, '');
 }
