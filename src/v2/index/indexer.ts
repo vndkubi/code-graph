@@ -4230,6 +4230,9 @@ function resolveReceiverExpressionType(args: {
   if (qualifiedOuter) {
     currentType = qualifiedOuter.type;
     index = qualifiedOuter.index;
+  } else if (parts.length > 1 && /^[A-Z]/.test(parts[0] ?? '')) {
+    currentType = simpleTypeName(parts[0] ?? '');
+    index = 1;
   } else if (parts[0] === 'this') {
     currentType = enclosingClassFromCaller(args.caller);
     index = 1;
@@ -4355,10 +4358,17 @@ function resolveMethodOwnerCall(args: {
     outerClassByClass: args.outerClassByClass,
   });
   if (receiverType) {
+    const resolutionKind = args.resolutionKind === 'receiver-type'
+      ? receiverType.fieldDepth > 1
+        ? 'receiver-type-chain'
+        : 'receiver-type-field'
+      : receiverType.fieldDepth > 1
+        ? 'receiver-field-chain'
+        : 'receiver-field';
     return {
       callee: `${receiverType.type}.${method}`,
       confidence: 0.8,
-      resolutionKind: receiverType.fieldDepth > 1 ? 'receiver-field-chain' : 'receiver-field',
+      resolutionKind,
       method,
       receiverTypeForImplementations: receiverType.type,
     };

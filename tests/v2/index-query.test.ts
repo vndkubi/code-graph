@@ -3244,6 +3244,80 @@ public class BuilderTest extends BaseBuilder {
     }));
   });
 
+  it('resolves Java typed receiver field chains through local and parameter types', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-java-typed-receiver-chain-');
+    writeFile(repo, 'src/test/java/com/example/CatalogItems.java', `package com.example;
+
+public class CatalogItems {
+    public void stream() {
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/CatalogView.java', `package com.example;
+
+public class CatalogView {
+    CatalogItems catalogItems = new CatalogItems();
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/Notebook.java', `package com.example;
+
+public class Notebook {
+    public int getId() {
+        return 0;
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/NotebookBox.java', `package com.example;
+
+public class NotebookBox {
+    Notebook note = new Notebook();
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/ViewContainer.java', `package com.example;
+
+public class ViewContainer {
+    NotebookBox wrap = new NotebookBox();
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/ViewRenderer.java', `package com.example;
+
+public class ViewRenderer {
+    void render(CatalogView view, ViewContainer container) {
+        view.catalogItems.stream();
+        container.wrap.note.getId();
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const streamCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'CatalogItems.stream', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(streamCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'ViewRenderer.render',
+      callee: 'CatalogItems.stream',
+      resolution_kind: 'receiver-type-field',
+    }));
+
+    const getIdCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Notebook.getId', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(getIdCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'ViewRenderer.render',
+      callee: 'Notebook.getId',
+      resolution_kind: 'receiver-type-chain',
+    }));
+  });
+
   it('indexes TypeScript and Python callback references and inline callback bodies', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-script-callback-refs-');

@@ -1615,7 +1615,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         let resolutionKind: string | undefined;
         const objectNode = node.childForFieldName('object');
         if (objectNode) {
-          const receiverType = resolveReceiverType(objectNode.text, receiverTypes);
+          const receiverType = resolveJavaInvocationReceiver(objectNode.text, receiverTypes);
           calleeName = `${receiverType ?? objectNode.text}.${funcNode.text}`;
           if (receiverType) resolutionKind = 'receiver-type';
         } else {
@@ -1859,6 +1859,17 @@ function resolveReceiverType(receiver: string, receiverTypes?: Map<string, strin
   if (receiverTypes.has(receiver)) return receiverTypes.get(receiver);
   const lastSegment = receiver.split('.').pop();
   return lastSegment ? receiverTypes.get(lastSegment) : undefined;
+}
+
+function resolveJavaInvocationReceiver(receiver: string, receiverTypes?: Map<string, string>): string | undefined {
+  const direct = resolveReceiverType(receiver, receiverTypes);
+  if (direct) return direct;
+  if (!receiverTypes) return undefined;
+  const parts = receiver.split('.');
+  if (parts.length < 2 || parts.some(part => !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(part))) return undefined;
+  const headType = receiverTypes.get(parts[0] ?? '');
+  if (!headType) return undefined;
+  return `${simpleTypeName(headType)}.${parts.slice(1).join('.')}`;
 }
 
 function simpleTypeName(typeName: string): string {

@@ -7079,6 +7079,8 @@ function researchCallEdgeScore(edge: CallEdgeRow): number {
   if (
     edge.resolution_kind === 'receiver-field'
     || edge.resolution_kind === 'receiver-field-chain'
+    || edge.resolution_kind === 'receiver-type-field'
+    || edge.resolution_kind === 'receiver-type-chain'
     || edge.resolution_kind === 'interface-implementation'
     || edge.resolution_kind === 'enclosing-method'
     || edge.resolution_kind === 'super-method'
