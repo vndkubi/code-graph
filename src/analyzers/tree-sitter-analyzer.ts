@@ -70,6 +70,12 @@ interface JavaFieldUsageContext {
   seen: Set<string>;
 }
 
+interface ScriptCallbackContext {
+  callableSymbols: Set<string>;
+  importedSymbols: Set<string>;
+  classMethods: Map<string, Set<string>>;
+}
+
 function getGrammar(lang: SupportedLanguage): unknown | undefined {
   if (loadedGrammars.has(lang)) return loadedGrammars.get(lang);
   const loader = grammarLoaders[lang];
@@ -107,6 +113,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   private currentJavaRootDir: string | undefined;
   private currentJavaImports: string[] = [];
   private currentJavaSourceRoots: string[] = [];
+  private scriptCallbackContext: ScriptCallbackContext | undefined;
 
   parse(filePath: string, content: string, rootDir: string): ParseResult {
     const lang = detectLanguage(filePath);
@@ -155,6 +162,14 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     this.currentJavaRootDir = lang === 'java' ? rootDir : undefined;
     this.currentJavaImports = [];
     this.currentJavaSourceRoots = lang === 'java' ? this.javaSourceRootsFor(filePath, rootDir) : [];
+    this.scriptCallbackContext = undefined;
+    if (lang === 'typescript' || lang === 'javascript' || lang === 'python') {
+      this.scriptCallbackContext = {
+        callableSymbols: new Set<string>(),
+        importedSymbols: new Set<string>(),
+        classMethods: new Map<string, Set<string>>(),
+      };
+    }
     if (lang === 'java') {
       this.javaStringConstants = this.collectJavaStringConstants(tree.rootNode);
       this.currentJavaImports = this.collectJavaImportPaths(tree.rootNode);
@@ -1401,6 +1416,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
               line: child.startPosition.row + 1,
               isExternal: !source.startsWith('.') && !source.startsWith('/'),
             });
+            for (const symbolName of importedSymbols) {
+              this.scriptCallbackContext?.importedSymbols.add(symbolName);
+            }
           }
           break;
         }
@@ -1450,6 +1468,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           const nameNode = child.childForFieldName('name');
           if (nameNode) {
             const funcName = parentClass ? `${parentClass}.${nameNode.text}` : nameNode.text;
+            this.registerScriptCallableSymbol(nameNode.text, parentClass);
             symbols.push({
               name: nameNode.text,
               kind: child.type === 'method_definition' ? 'method' : 'function',
@@ -1464,7 +1483,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             });
             const body = child.childForFieldName('body');
             if (body) {
-              this.extractCallsFromNode(body, file, lines, calls, references, funcName, undefined, undefined, parentClass);
+              this.extractCallsFromNode(body, file, lines, calls, references, funcName, undefined, undefined, parentClass, this.scriptCallbackContext);
             }
           }
           break;
@@ -1478,6 +1497,10 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
               const value = declarator.childForFieldName('value');
               if (nameNode) {
                 const isArrowFunction = value?.type === 'arrow_function';
+                const isFunctionExpression = value?.type === 'function_expression';
+                if (isArrowFunction || isFunctionExpression) {
+                  this.registerScriptCallableSymbol(nameNode.text, parentClass);
+                }
                 symbols.push({
                   name: nameNode.text,
                   kind: isArrowFunction ? 'function' : 'variable',
@@ -1492,7 +1515,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
                 });
                 if (isArrowFunction && value) {
                   const funcName = parentClass ? `${parentClass}.${nameNode.text}` : nameNode.text;
-                  this.extractCallsFromNode(value, file, lines, calls, references, funcName, undefined, undefined, parentClass);
+                  this.extractCallsFromNode(value, file, lines, calls, references, funcName, undefined, undefined, parentClass, this.scriptCallbackContext);
                 }
                 if (value?.type === 'object') {
                   this.extractTypeScriptObjectPropertySymbols(value, file, lines, symbols, nameNode.text);
@@ -1606,6 +1629,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
               line: child.startPosition.row + 1,
               isExternal: !nameNode.text.startsWith('.'),
             });
+            this.scriptCallbackContext?.importedSymbols.add(nameNode.text);
           }
           break;
         }
@@ -1629,6 +1653,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
               line: child.startPosition.row + 1,
               isExternal: !moduleNode.text.startsWith('.'),
             });
+            for (const symbolName of importedNames) {
+              this.scriptCallbackContext?.importedSymbols.add(symbolName);
+            }
           }
           break;
         }
@@ -1659,6 +1686,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           if (nameNode) {
             const kind: SymbolKind = parentClass ? 'method' : 'function';
             const funcName = parentClass ? `${parentClass}.${nameNode.text}` : nameNode.text;
+            this.registerScriptCallableSymbol(nameNode.text, parentClass);
             symbols.push({
               name: nameNode.text,
               kind,
@@ -1674,7 +1702,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             });
             const body = child.childForFieldName('body');
             if (body) {
-              this.extractCallsFromNode(body, file, lines, calls, references, funcName, undefined, undefined, parentClass);
+              this.extractCallsFromNode(body, file, lines, calls, references, funcName, undefined, undefined, parentClass, this.scriptCallbackContext);
             }
           }
           break;
@@ -1779,12 +1807,13 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     receiverTypes?: Map<string, string>,
     fieldUsageContext?: JavaFieldUsageContext,
     enclosingClass?: string,
+    callbackContext?: ScriptCallbackContext,
   ): void {
     if (this.maybeExtractJavaFieldUsageFromNode(node, file, lines, fieldUsageContext)) {
       return;
     }
 
-    const callbackReference = this.resolveCallbackReferenceCallee(node, enclosingClass);
+    const callbackReference = this.resolveCallbackReferenceCallee(node, enclosingClass, callbackContext);
     if (callbackReference && isCallbackValuePosition(node)) {
       calls.push({
         caller: callerName,
@@ -1832,7 +1861,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         symbolName: callbackName,
       });
       for (const child of node.children) {
-        this.extractCallsFromNode(child, file, lines, calls, references, callbackName, lambdaReceiverTypes, lambdaFieldUsageContext, enclosingClass);
+        this.extractCallsFromNode(child, file, lines, calls, references, callbackName, lambdaReceiverTypes, lambdaFieldUsageContext, enclosingClass, callbackContext);
       }
       return;
     }
@@ -1856,7 +1885,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         symbolName: callbackName,
       });
       for (const child of node.children) {
-        this.extractCallsFromNode(child, file, lines, calls, references, callbackName, receiverTypes, fieldUsageContext, enclosingClass);
+        this.extractCallsFromNode(child, file, lines, calls, references, callbackName, receiverTypes, fieldUsageContext, enclosingClass, callbackContext);
       }
       return;
     }
@@ -1986,7 +2015,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     }
 
     for (const child of node.children) {
-      this.extractCallsFromNode(child, file, lines, calls, references, callerName, receiverTypes, fieldUsageContext, enclosingClass);
+      this.extractCallsFromNode(child, file, lines, calls, references, callerName, receiverTypes, fieldUsageContext, enclosingClass, callbackContext);
     }
   }
 
@@ -2029,8 +2058,35 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   private resolveCallbackReferenceCallee(
     node: SyntaxNode,
     enclosingClass?: string,
+    callbackContext?: ScriptCallbackContext,
   ): string | undefined {
-    return this.resolveScriptCallCallee(node, enclosingClass);
+    const memberReference = this.resolveScriptCallCallee(node, enclosingClass);
+    if (memberReference) return memberReference;
+    if (!callbackContext || node.type !== 'identifier' || !this.isValidCallbackIdentifier(node.text)) return undefined;
+
+    const classMethods = enclosingClass ? callbackContext.classMethods.get(enclosingClass) : undefined;
+    if (classMethods?.has(node.text)) {
+      return `${enclosingClass}.${node.text}`;
+    }
+
+    if (callbackContext.callableSymbols.has(node.text) || callbackContext.importedSymbols.has(node.text)) {
+      return node.text;
+    }
+    return undefined;
+  }
+
+  private registerScriptCallableSymbol(name: string, enclosingClass?: string): void {
+    if (!this.scriptCallbackContext) return;
+    this.scriptCallbackContext.callableSymbols.add(name);
+    if (enclosingClass) {
+      const methods = this.scriptCallbackContext.classMethods.get(enclosingClass) ?? new Set<string>();
+      methods.add(name);
+      this.scriptCallbackContext.classMethods.set(enclosingClass, methods);
+    }
+  }
+
+  private isValidCallbackIdentifier(name: string): boolean {
+    return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name);
   }
 
   private extendJavaLambdaReceiverTypes(
@@ -2281,6 +2337,7 @@ function isCallbackValuePosition(node: SyntaxNode): boolean {
   if (parent.type === 'argument' || parent.type === 'value_argument' || parent.type === 'parenthesized_expression') {
     return isCallbackValuePosition(parent);
   }
+  if (parent.type === 'pair') return true;
   if (parent.type === 'keyword_argument') return sameSyntaxNode(parent.childForFieldName('value'), node);
   return false;
 }

@@ -3803,6 +3803,88 @@ class Worker:
     }));
   });
 
+  it('indexes bare callable identifiers used as callback values', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-script-bare-callback-');
+    writeFile(repo, 'src/handlers.ts', `export function sharedHandler(payload: string) {}
+`);
+    writeFile(repo, 'src/ui.ts', `import { sharedHandler } from './handlers';
+
+class EventBus {
+  on(name: string, callback: (payload: string) => void) {}
+}
+
+function localHandler(payload: string) {}
+
+class UiController {
+  mount(bus: EventBus) {
+    bus.on('submit', localHandler);
+    bus.on('import', sharedHandler);
+  }
+}`);
+    writeFile(repo, 'src/worker.py', `from typing import Any
+
+def top_handler(event: Any):
+    pass
+
+from hooks import external_handler
+
+class Worker:
+    def register(self, scheduler: Any):
+        scheduler.on_done(top_handler)
+        scheduler.on_done(external=external_handler)
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const tsLocalCallbackCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'localHandler', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(tsLocalCallbackCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'UiController.mount',
+      callee: 'localHandler',
+      resolution_kind: 'callback-reference',
+    }));
+
+    const tsImportedCallbackCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'sharedHandler', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(tsImportedCallbackCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'UiController.mount',
+      callee: 'sharedHandler',
+      resolution_kind: 'callback-reference',
+    }));
+
+    const pyLocalCallbackCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'top_handler', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(pyLocalCallbackCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'Worker.register',
+      callee: 'top_handler',
+      resolution_kind: 'callback-reference',
+    }));
+
+    const pyImportedCallbackCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'external_handler', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(pyImportedCallbackCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'Worker.register',
+      callee: 'external_handler',
+      resolution_kind: 'callback-reference',
+    }));
+  });
+
   it('writes parse context and empty-safe fact shards when result spooling is disabled', () => {
     const repo = tempDir('codegraph-shard-files-');
     writeFile(repo, 'src/main/java/com/example/One.java', `package com.example;
