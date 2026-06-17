@@ -2339,6 +2339,9 @@ function isCallbackValuePosition(node: SyntaxNode): boolean {
   }
   if (parent.type === 'pair') return true;
   if (parent.type === 'keyword_argument') return sameSyntaxNode(parent.childForFieldName('value'), node);
+  if (parent.type === 'assignment_expression' || parent.type === 'assignment') {
+    return sameSyntaxNode(parent.childForFieldName('right'), node);
+  }
   return false;
 }
 

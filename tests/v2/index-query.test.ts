@@ -3708,11 +3708,14 @@ class UiController {
     bus.on('click', this.handleClick);
     bus.on('hover', () => this.handleHover());
     bus.on('focus', function () { console.log('noop'); });
+    this.callback = this.handleAssigned;
   }
 
   handleClick() {}
 
   handleHover() {}
+
+  handleAssigned() {}
 }
 `);
     writeFile(repo, 'src/worker.py', `class Scheduler:
@@ -3727,8 +3730,12 @@ class Worker:
     def register(self, scheduler: Scheduler):
         scheduler.on_done(self.handle_done)
         scheduler.run_async(lambda: self.handle_inline())
+        self.callback = self.handle_assigned
 
     def handle_done(self):
+        pass
+
+    def handle_assigned(self):
         pass
 
     def handle_inline(self):
@@ -3761,6 +3768,17 @@ class Worker:
       callee: 'UiController.handleHover',
     }));
 
+    const tsAssignedCallbackCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'UiController.handleAssigned', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(tsAssignedCallbackCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'UiController.mount',
+      callee: 'UiController.handleAssigned',
+      resolution_kind: 'callback-reference',
+    }));
+
     const tsCallbackEdges = await queries.query({
       workspaceId: result.workspaceId,
       toolName: 'get_callees',
@@ -3790,6 +3808,17 @@ class Worker:
     expect(pyInlineCallbackCallers.callers).toContainEqual(expect.objectContaining({
       caller: expect.stringMatching(/^Worker[.]register[.]lambda\d+_\d+$/),
       callee: 'Worker.handle_inline',
+    }));
+
+    const pyAssignedCallbackCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'Worker.handle_assigned', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(pyAssignedCallbackCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'Worker.register',
+      callee: 'Worker.handle_assigned',
+      resolution_kind: 'callback-reference',
     }));
 
     const pyCallbackEdges = await queries.query({
