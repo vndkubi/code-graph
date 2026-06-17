@@ -54,6 +54,13 @@ describe('MCP full tool mode', () => {
     });
 
     expect(routeCodeGraphContext({
+      task: 'Analyze PBI 123 acceptance criteria and related code',
+    })).toMatchObject({
+      toolName: 'compile_evidence',
+      args: { task: 'Analyze PBI 123 acceptance criteria and related code' },
+    });
+
+    expect(routeCodeGraphContext({
       task: 'Explain the repository architecture',
     })).toMatchObject({
       toolName: 'get_research_pack',
@@ -63,8 +70,10 @@ describe('MCP full tool mode', () => {
   it('infers context mode from task shape', () => {
     expect(inferCodeGraphContextMode('Review this patch', {})).toBe('review');
     expect(inferCodeGraphContextMode('Trace POST /checkout flow', {})).toBe('flow');
+    expect(inferCodeGraphContextMode('Trace PATCH /checkout flow', {})).toBe('flow');
     expect(inferCodeGraphContextMode('Debug duplicate refund timeout', {})).toBe('change');
     expect(inferCodeGraphContextMode('Collect evidence with rubric coverage', {})).toBe('evidence');
+    expect(inferCodeGraphContextMode('Analyze PBI acceptance criteria against code', {})).toBe('evidence');
     expect(inferCodeGraphContextMode('Understand the architecture', {})).toBe('research');
   });
 
@@ -90,6 +99,9 @@ describe('MCP full tool mode', () => {
 
     expect(compact.map(tool => tool.name)).toEqual(normal.map(tool => tool.name));
     expect(compact.map(tool => tool.inputSchema)).toEqual(normal.map(tool => tool.inputSchema));
+    expect(compact.find(tool => tool.name === 'codegraph_context')?.description).toContain('PRIMARY TOOL - call FIRST');
+    expect(compact.find(tool => tool.name === 'codegraph_slice')?.description).toContain('FOLLOW-UP ONLY');
+    expect(compact.find(tool => tool.name === 'compile_evidence')?.description).toContain('TokenOpt-style');
     expect(estimatedSchemaTokens(compact)).toBeLessThan(estimatedSchemaTokens(normal));
   });
 });

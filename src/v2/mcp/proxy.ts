@@ -380,10 +380,10 @@ export function inferCodeGraphContextMode(task: string, args: Record<string, unk
   }
   const text = `${task}\n${typeof args.diff === 'string' ? args.diff.slice(0, 2000) : ''}`.toLowerCase();
   if (typeof args.diff === 'string' && args.diff.trim().length > 0) return 'review';
-  if (/\b(review|patch|diff|pr|regression|risk|finding)\b/.test(text)) return 'review';
+  if (/\b(review|diff|pr|regression|risk|finding)\b|\bpatch\b(?!\s*\/)/.test(text)) return 'review';
   if (/\b(get|post|put|delete|patch)\s+\/|\b(endpoint|api|route|request flow|trace|flow)\b/.test(text)) return 'flow';
+  if (/\b(evidence|answerable|rubric|coverage|pbi|ticket|story|acceptance criteria)\b/.test(text)) return 'evidence';
   if (/\b(implement|fix|debug|refactor|change|modify|test|add|remove|update)\b/.test(text)) return 'change';
-  if (/\b(evidence|answerable|rubric|coverage)\b/.test(text)) return 'evidence';
   return 'research';
 }
 
@@ -501,33 +501,51 @@ function freshnessArgs(args: Record<string, unknown>): Record<string, unknown> {
 
 const MCP_SERVER_INSTRUCTIONS = `# CodeGraph usage
 
-CodeGraph is a pre-indexed local code graph. For architecture, "how does X work",
-request-flow, or codebase-research questions, use CodeGraph directly and answer
-from its returned evidence instead of starting a grep/read exploration loop.
+CodeGraph is the PRIMARY local repository context server. Call codegraph_context
+FIRST for almost any repo question or before an edit: investigate code, explain
+how X works, explore architecture, trace endpoint/request flows, debug bugs,
+plan changes, assess impact, review risk, or compile compact PBI evidence. It
+combines a pre-indexed SQLite code graph with TokenOpt-style evidence packets so
+you do not need to rediscover structure through grep/read loops.
 
-Primary flow:
-- Endpoint/API/request-flow/investigation questions: call get_flow_pack first.
-- Spec, implementation-plan, debug, refactor, or "what should I change" tasks:
-  call get_change_pack first, even when the user asks for read-only planning.
-- Code review tasks with a unified diff: call review_patch first. Code review
-  tasks without a concrete diff should use get_flow_pack or get_change_pack
-  for the mentioned endpoint/symbol before answering.
-- Use the user's full task text as the pack target/task. Do not strip HTTP
-  methods or endpoint paths such as "GET /ws/v1/cluster/apps".
-- Do not set autoRefresh=true for these pack tools unless the user explicitly
-  asks for a fresh index; they are optimized for a prewarmed index.
-- Do not set warnStale=true for these pack tools during exploration benchmarks;
-  stale checks can be more expensive than answering from the existing pack.
-- Treat evidenceSlices in that response as already-read source. They contain
-  file paths, line ranges, and capped source text.
-- Answer directly when sufficientForAnswer is true.
-- Use search_code/search_symbol/get_file_slice only for a specific missing fact
-  named in missingFacts, not as a broad follow-up search.
+## Tool selection by intent
 
-Anti-patterns:
-- Do not call many small slice/search tools after an answer-ready pack.
-- Do not use shell grep/read to rediscover files already listed in evidenceSlices.
-- Prefer one large, bounded context pack over dozens of tiny retrieval calls.`;
+- Almost any repository question or pre-edit investigation:
+  call codegraph_context first with the user's full task text.
+- Endpoint/API/route/request-flow/startup-flow questions:
+  codegraph_context routes to get_flow_pack; in full profile you may call
+  get_flow_pack first only when that flow intent is explicit.
+- Architecture, onboarding, "where/what is X", or "how does X work":
+  codegraph_context routes to get_research_pack.
+- Implement, fix, debug, refactor, test, modify, or "what should I change":
+  codegraph_context routes to get_change_pack before editing.
+- Review with a unified diff:
+  codegraph_context routes to review_patch.
+- Compact evidence, answerability, rubric, PBI, or coverage gate:
+  codegraph_context routes to compile_evidence.
+- Reading source:
+  use codegraph_slice/get_file_slice only after a pack identifies exact
+  file/line/symbol evidence or a specific missing fact.
+
+## Follow-up policy
+
+- Treat evidenceSlices as already-read source. They include file paths, line
+  ranges, and capped source text.
+- If sufficientForAnswer or answerable is true, answer from the packet and stop.
+- If the packet lists missingFacts or allowed follow-ups, use only the named
+  exact follow-up tools such as codegraph_slice, search_symbol, search_files, or
+  search_code.
+- Preserve HTTP methods and paths exactly, for example GET /ws/v1/cluster/apps.
+- Do not set autoRefresh=true unless the user explicitly asks for a fresh index.
+- Do not set warnStale=true during exploration benchmarks.
+
+## Anti-patterns
+
+- Do not grep/read first for broad repo investigation.
+- Do not call many small slice/search tools after an answer-ready packet.
+- Do not use shell search to rediscover files already listed in evidenceSlices.
+- Do not chain search_code, search_symbol, and slices as a substitute for the
+  primary context packet. Prefer one bounded packet, then exact follow-ups.`;
 
 function isAnswerPackTool(name: string): boolean {
   return name === 'get_flow_pack' || name === 'get_research_pack';

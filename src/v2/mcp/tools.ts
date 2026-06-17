@@ -358,39 +358,39 @@ function descriptionFor(name: V2ToolName, options: V2ToolDefinitionOptions = {})
   if (options.compactDescriptions) return compactDescriptionFor(name);
   switch (name) {
     case 'codegraph_status':
-      return 'Client-facing runtime status. Returns workspace SQLite readiness, artifact readiness, and optional DB diagnostics.';
+      return 'Diagnostic only. Returns workspace SQLite readiness, artifact readiness, and optional DB diagnostics. Do not use for normal code investigation.';
     case 'codegraph_context':
-      return 'Client-facing primary context facade. Given a task, routes to the best bounded CodeGraph packet for research, flow tracing, change planning, review, or evidence compilation.';
+      return 'PRIMARY TOOL - call FIRST for almost any repository question or before an edit: investigate code, understand how X works, explore architecture, trace endpoint/request flows, debug bugs, plan changes, assess impact, or review risk. Routes the full task to one bounded CodeGraph/TokenOpt-style packet with source evidence, stop rules, and exact follow-ups.';
     case 'codegraph_slice':
-      return 'Client-facing exact source-slice facade. Returns one or many bounded source slices after codegraph_context identifies missing exact evidence.';
+      return 'FOLLOW-UP ONLY after codegraph_context names exact missing evidence. Returns one or many bounded source slices for specific files, line ranges, or symbols; do not use as the first tool for broad repo questions.';
     case 'get_flow_pack':
-      return 'PRIMARY endpoint/API/investigation/request-flow tool. Default responseMode=agent returns ordered steps, ranked files/symbols, call evidence, capped source slices, taskOracle, and evidenceHandles. Use responseMode=answer for compact final-answer context. For implementation/debug/refactor/spec planning, use get_change_pack instead.';
+      return 'PRIMARY endpoint/API/investigation/request-flow tool - call FIRST when the task asks to trace a route, endpoint, API, request flow, startup flow, or how data reaches another layer. Default responseMode=agent returns ordered steps, ranked files/symbols, call evidence, capped source slices, taskOracle, and evidenceHandles. For implementation/debug/refactor/spec planning, use get_change_pack instead.';
     case 'get_research_pack':
-      return 'PRIMARY broad architecture/research tool when no concrete endpoint/API path is named. Default responseMode=agent returns ranked definitions, flow steps, related edges, top files, bounded evidence, budget metrics, and evidenceHandles. Use responseMode=answer for compact final-answer context. Do not use for edit/debug/spec tasks; use get_change_pack.';
+      return 'PRIMARY broad architecture/research tool - call FIRST for onboarding, surveying an area, "where/what is X", or "how does X work" when no concrete endpoint/API path or edit is named. Returns ranked definitions, flow steps, related edges, top files, bounded evidence, budget metrics, and evidenceHandles. For edit/debug/spec tasks, use get_change_pack.';
     case 'get_context_packet':
-      return 'Compact implementation/debug router. Returns ranked files/symbols, slice/tool hints, likely tests, validation, and next action. For edits, prefer get_change_pack first.';
+      return 'Compact implementation/debug router for internal or legacy clients. Returns ranked files/symbols, slice/tool hints, likely tests, validation, and next action. For new edit planning, prefer codegraph_context or get_change_pack first.';
     case 'get_change_pack':
-      return 'PRIMARY spec/implementation-plan/edit/debug/refactor tool, including read-only planning. Default profile=compact returns scoped files/symbols, exact edit ranges, evidenceHandles, invariants, likely tests, validation commands, and optional patch impact before editing. Call once before using search_symbol/search_code.';
+      return 'PRIMARY change-planning tool - call FIRST before implementing, debugging, refactoring, testing, modifying files, or answering "what should I change". Default profile=compact returns scoped files/symbols, exact edit ranges, evidenceHandles, invariants, likely tests, validation commands, and optional patch impact before search_symbol/search_code.';
     case 'compile_evidence':
-      return 'PRIMARY one-shot evidence compiler. Given a full task, taskType, budget, and optional rubric/diff, returns an answerability certificate, compact evidence items, missing coverage, allowed exact follow-ups, disallowed broad follow-ups, and budget metadata. Use before search-style tools when the goal is to answer, investigate, review, or plan with minimal turns.';
+      return 'PRIMARY TokenOpt-style cost gate and evidence compiler - call FIRST when the goal is compact evidence for a repo task, PBI, investigation, review, or plan with minimal turns. Given a full task, taskType, budget, and optional rubric/diff, returns an answerability certificate, compact evidence, missing coverage, allowed exact follow-ups, disallowed broad follow-ups, and budget metadata.';
     case 'search_symbol':
-      return 'Targeted fallback symbol lookup after a pack names a missing symbol. Do not use as the first tool for endpoint/API/spec/implementation/review prompts. Supports intent-aware ranking, pagination, facets, and optional rank explanations.';
+      return 'FOLLOW-UP ONLY symbol lookup after codegraph_context or a pack names a missing symbol. Do not use as the first tool for endpoint/API/spec/implementation/review prompts. Supports intent-aware ranking, pagination, facets, and optional rank explanations.';
     case 'search_files':
-      return 'Find relevant files by path, symbols, endpoints, imports, dependency signal, and file role. Returns top symbols/endpoints per file, facets, pagination, and optional rank explanations.';
+      return 'FOLLOW-UP ONLY file lookup after a pack identifies a missing path, feature area, endpoint, import, dependency signal, or file role. Returns top symbols/endpoints per file, facets, pagination, and optional rank explanations; avoid as the first broad exploration tool.';
     case 'find_references':
-      return 'Find definitions, imports, call references, and Java field usages for a symbol with filters, pagination, and optional grouping by file, kind, caller, method, or class.';
+      return 'FOLLOW-UP ONLY exact-reference lookup for a known symbol. Finds definitions, imports, call references, and Java field usages with filters, pagination, and optional grouping by file, kind, caller, method, or class.';
     case 'get_file_summary':
       return 'Summarize a file using persistent symbols, imports, dependencies, and dependents.';
     case 'get_file_slice':
-      return 'Return bounded source slices with exact line numbers and truncation metadata. Supports one slice via file+lines or symbol, and batch mode via slices:[{file,lines|symbol,maxChars}] for multiple explicit ranges in ONE call. Use batch mode instead of looping when a prompt asks for several files/ranges.';
+      return 'FOLLOW-UP ONLY exact source reader after a pack names file/line/symbol evidence. Returns bounded source slices with line numbers and truncation metadata. Supports batch mode via slices:[{file,lines|symbol,maxChars}] for multiple explicit ranges in ONE call; do not use for broad repo discovery.';
     case 'get_dependencies':
       return 'Return direct dependency edges for a file or module.';
     case 'get_dependents':
       return 'Return direct dependent edges for a file or module.';
     case 'get_callers':
-      return 'Return call sites that call a symbol.';
+      return 'FOLLOW-UP ONLY for a known symbol. Return call sites that call the symbol.';
     case 'get_callees':
-      return 'Return symbols called by a caller symbol.';
+      return 'FOLLOW-UP ONLY for a known symbol. Return symbols called by the caller symbol.';
     case 'find_endpoints':
       return 'Find Java/Jakarta/Spring endpoint handlers with composed class+method paths and path resolution metadata.';
     case 'get_impact_radius':
@@ -408,7 +408,7 @@ function descriptionFor(name: V2ToolName, options: V2ToolDefinitionOptions = {})
     case 'find_tests_for':
       return 'Find tests likely relevant to a symbol using test file names, test symbols, and indexed call edges.';
     case 'search_code':
-      return 'Targeted capped fallback mixed retrieval for a specific missing fact after get_flow_pack/get_research_pack/get_change_pack. Returns ranked file, symbol, endpoint, reference, and dependency sections when they fit maxResponseTokens; avoid using it as a first step for architecture, spec, implementation, or review prompts.';
+      return 'FOLLOW-UP ONLY capped mixed retrieval for a specific missing fact after codegraph_context, get_flow_pack, get_research_pack, or get_change_pack. Returns ranked file, symbol, endpoint, reference, and dependency sections when they fit maxResponseTokens; avoid as a first step for architecture, spec, implementation, or review prompts.';
     case 'generate_repo_atlas':
       return 'Generate a deterministic whole-repo architecture atlas from indexed facts only: system summary, modules, entrypoints, feature flows, risk hotspots, validation hints, and next tool calls. Use after indexing instead of asking the model to scan source files.';
     case 'get_index_stats':
@@ -419,39 +419,39 @@ function descriptionFor(name: V2ToolName, options: V2ToolDefinitionOptions = {})
 function compactDescriptionFor(name: V2ToolName): string {
   switch (name) {
     case 'codegraph_status':
-      return 'Runtime/index readiness and optional SQLite diagnostics.';
+      return 'Diagnostic only: runtime/index readiness and optional SQLite diagnostics.';
     case 'codegraph_context':
-      return 'Primary client facade: route one task to a bounded research/flow/change/review/evidence packet.';
+      return 'PRIMARY TOOL - call FIRST for repo questions or before edits: investigate code, architecture, bugs, flows, impact, plan/review. One bounded evidence packet.';
     case 'codegraph_slice':
-      return 'Exact bounded source slice(s), batch via slices[].';
+      return 'FOLLOW-UP ONLY after codegraph_context names exact missing file/line/symbol evidence. Exact bounded slice(s), batch via slices[].';
     case 'get_flow_pack':
-      return 'Primary API/endpoint/request-flow pack. Use responseMode=answer for compact final answers. For edit/debug/spec use get_change_pack.';
+      return 'PRIMARY API/endpoint/request-flow pack - call FIRST to trace routes, APIs, flows, or how data reaches another layer. For edit/debug/spec use get_change_pack.';
     case 'get_research_pack':
-      return 'Primary architecture/research pack; default agent mode includes budget metrics and evidenceHandles. For edit/debug/spec use get_change_pack.';
+      return 'PRIMARY architecture/research pack - call FIRST for onboarding, surveying an area, where/what is X, or how X works. For edit/debug/spec use get_change_pack.';
     case 'get_context_packet':
       return 'Compact implementation/debug router: ranked files/symbols, slices, tests, validation, next action.';
     case 'get_change_pack':
-      return 'Primary compact spec/implement/debug/refactor pack. Returns scoped files/symbols, edit handles, risks, tests, validation.';
+      return 'PRIMARY change pack - call FIRST before implement/debug/refactor/test/edit tasks. Returns scoped files/symbols, edit handles, risks, tests, validation.';
     case 'compile_evidence':
-      return 'One-shot evidence compiler: answerability, coverage certificate, compact evidence, exact follow-ups, stop rules.';
+      return 'PRIMARY TokenOpt-style evidence compiler/cost gate for repo tasks and PBIs: answerability, compact evidence, exact follow-ups, stop rules.';
     case 'search_symbol':
-      return 'Targeted symbol lookup after a pack names a missing symbol. Includes ranking, facets, pagination.';
+      return 'FOLLOW-UP ONLY symbol lookup after a pack names a missing symbol. Includes ranking, facets, pagination.';
     case 'search_files':
-      return 'Find files by path, symbols, endpoints, imports, dependencies, file role. Includes facets/pagination.';
+      return 'FOLLOW-UP ONLY file lookup for a missing path/area/endpoint/import/dependency/file role. Includes facets/pagination.';
     case 'find_references':
-      return 'Find definitions, imports, calls, Java field usages. Optional grouping by file/kind/caller/method/class.';
+      return 'FOLLOW-UP ONLY exact symbol references: definitions, imports, calls, Java field usages. Optional grouping.';
     case 'get_file_summary':
       return 'Summarize one file from indexed symbols, imports, dependencies, dependents.';
     case 'get_file_slice':
-      return 'Return exact bounded source slice(s). Batch explicit ranges via slices[] instead of looping.';
+      return 'FOLLOW-UP ONLY exact source slice(s) after file/line/symbol evidence is known. Batch explicit ranges via slices[] instead of looping.';
     case 'get_dependencies':
       return 'Direct dependency edges for file/module.';
     case 'get_dependents':
       return 'Direct dependent edges for file/module.';
     case 'get_callers':
-      return 'Call sites that call a symbol.';
+      return 'FOLLOW-UP ONLY call sites for a known symbol.';
     case 'get_callees':
-      return 'Symbols called by a caller symbol.';
+      return 'FOLLOW-UP ONLY callees for a known caller symbol.';
     case 'find_endpoints':
       return 'Find Java/Jakarta/Spring endpoint handlers with composed paths and resolution metadata.';
     case 'get_impact_radius':
@@ -469,7 +469,7 @@ function compactDescriptionFor(name: V2ToolName): string {
     case 'find_tests_for':
       return 'Find tests relevant to a symbol using names, test symbols, call edges.';
     case 'search_code':
-      return 'Capped targeted fallback mixed retrieval for one missing fact after pack tools.';
+      return 'FOLLOW-UP ONLY capped mixed retrieval for one missing fact after codegraph_context or pack tools.';
     case 'generate_repo_atlas':
       return 'Deterministic whole-repo atlas from indexed facts: modules, entrypoints, feature flows, hotspots, validation.';
     case 'get_index_stats':

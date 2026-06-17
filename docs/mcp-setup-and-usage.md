@@ -105,13 +105,17 @@ node dist/cli.js logs --root "D:\path\to\repo" --tail 50
 
 ## Recommended Tool Flow
 
-Start broad, then drill down:
+Use the facade first, then drill down only when the packet asks for exact
+follow-up evidence:
 
-1. `get_research_pack` for architecture or feature questions.
-2. `get_change_pack` before edits.
-3. `review_patch` before accepting a diff.
-4. `get_file_slice` only for exact source evidence.
-5. `get_index_stats` when results look stale or incomplete.
+1. `codegraph_context` first for repository questions, investigations, PBI
+   evidence, planning, changes, request-flow tracing, or review.
+2. Answer directly when the packet says it is sufficient or answerable.
+3. `codegraph_slice` / `get_file_slice` only for exact file, line, or symbol
+   evidence named by the packet.
+4. `search_symbol`, `search_files`, or `search_code` only for specific missing
+   facts named by the packet.
+5. `codegraph_status` / `get_index_stats` when results look stale or incomplete.
 
 ## Troubleshooting
 
