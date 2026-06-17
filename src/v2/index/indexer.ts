@@ -35,6 +35,7 @@ import {
   rebuildGraphOverlay as rebuildGraphOverlaySnapshot,
   type GraphOverlayCallFileEdge,
 } from '../graph/overlay.js';
+import { decodeParseCachePayload, encodeParseCachePayload } from './parse-cache-codec.js';
 
 export interface IndexWorkspaceOptions {
   root: string;
@@ -1313,7 +1314,7 @@ export class V2Indexer {
 
       const cached = cachedByBlobHash.get(file.blobHash);
       if (cached) {
-        const result = JSON.parse(cached) as ParseResult;
+        const result = decodeParseCachePayload(cached);
         parseCacheHits++;
         addPlan({
           file,
@@ -1658,7 +1659,7 @@ export class V2Indexer {
         for (const blobHash of blobHashBatch) {
           const parseJson = parseJsonByBlob.get(blobHash);
           if (!parseJson) throw new Error(`Missing parse_cache row for cached blob ${blobHash}.`);
-          const result = JSON.parse(parseJson) as ParseResult;
+          const result = decodeParseCachePayload(parseJson);
           for (const file of filesByBlob.get(blobHash) ?? []) {
             fs.writeSync(contextFd, `${JSON.stringify(parseContextForResult(file.relPath, result))}\n`);
             writeFactShardResult(factWriter, {
@@ -1746,7 +1747,7 @@ export class V2Indexer {
         providerSet.version,
         item.file.blobHash,
         item.file.language,
-        JSON.stringify(item.result),
+        encodeParseCachePayload(item.result),
         item.result.hasParseErrors ? 1 : 0,
         item.result.parseConfidence,
         now,

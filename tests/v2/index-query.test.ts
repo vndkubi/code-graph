@@ -4336,6 +4336,65 @@ public class PaymentService {
     }));
   });
 
+  it('hydrates sharded full facts from compressed parse cache rows', async () => {
+    const previousThreshold = process.env.CODEGRAPH_PARSE_CACHE_COMPRESSION_MIN_CHARS;
+    process.env.CODEGRAPH_PARSE_CACHE_COMPRESSION_MIN_CHARS = '0';
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-compressed-cache-hydrate-');
+    writeFile(repo, 'src/main/java/com/example/CompressedGateway.java', `package com.example;
+
+public class CompressedGateway {
+    public void processPayment() {
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/CompressedService.java', `package com.example;
+
+public class CompressedService {
+    private final CompressedGateway gateway = new CompressedGateway();
+
+    public void submit() {
+        gateway.processPayment();
+    }
+}
+`);
+
+    try {
+      const { db } = await openDb(home);
+      const indexer = new V2Indexer(db);
+      const first = await indexer.indexWorkspace({ root: repo, workspaceKey: 'compressed-cache-a' });
+      const compressedRows = await db.prepare(`
+        SELECT parse_json
+        FROM parse_cache
+      `).all() as Array<{ parse_json: string }>;
+      expect(compressedRows.length).toBeGreaterThan(0);
+      expect(compressedRows.every(row => row.parse_json.startsWith('gz64:'))).toBe(true);
+
+      const second = await indexer.indexWorkspace({ root: repo, workspaceKey: 'compressed-cache-b' });
+      const queries = new V2QueryService(db);
+
+      expect(first.filesParsed).toBeGreaterThan(0);
+      expect(second.parseCacheHits).toBeGreaterThan(0);
+      expect(second.filesParsed).toBe(0);
+
+      const callers = await queries.query({
+        workspaceId: second.workspaceId,
+        toolName: 'get_callers',
+        args: { symbol: 'CompressedGateway.processPayment' },
+      }) as { callers: Array<{ caller: string; resolution_kind: string }> };
+      expect(callers.callers).toContainEqual(expect.objectContaining({
+        caller: 'CompressedService.submit',
+        resolution_kind: 'receiver-field',
+      }));
+    } finally {
+      if (previousThreshold === undefined) {
+        delete process.env.CODEGRAPH_PARSE_CACHE_COMPRESSION_MIN_CHARS;
+      } else {
+        process.env.CODEGRAPH_PARSE_CACHE_COMPRESSION_MIN_CHARS = previousThreshold;
+      }
+    }
+  });
+
   it('imports SCIP provider facts and scopes parse cache by provider metadata', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-scip-provider-');

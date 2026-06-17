@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import type { CallInfo, ParseResult, SymbolInfo } from '../../analyzers/base-analyzer.js';
+import { encodeParseCachePayload } from './parse-cache-codec.js';
 
 export interface FactShardPaths {
   parseCache: string;
@@ -262,7 +263,7 @@ export function writeParseResultFactRows(
       config.providerVersion,
       file.blobHash,
       file.language,
-      JSON.stringify(result),
+      encodeParseCachePayload(result),
       result.hasParseErrors ? 1 : 0,
       result.parseConfidence,
       config.createdAt,

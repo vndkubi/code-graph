@@ -607,7 +607,16 @@ Status:
      - `CODEGRAPH_SQLITE_TEXT_COPY_CHUNK_CHARS`
      - `CODEGRAPH_SQLITE_PARSE_CACHE_COPY_CHUNK_CHARS`
 
-3. Improved Java receiver typing for try-with-resources.
+3. Added backwards-compatible parse-cache payload compression.
+   - New rows store large parse payloads as `gz64:<base64 gzip>` inside the existing `parse_json` column.
+   - Existing plain JSON cache rows still decode normally.
+   - This avoids a schema migration while reducing SQLite write IO and DB size on Java-heavy repos.
+   - Tunables:
+     - `CODEGRAPH_DISABLE_PARSE_CACHE_COMPRESSION=1`
+     - `CODEGRAPH_PARSE_CACHE_COMPRESSION_MIN_CHARS`
+     - `CODEGRAPH_PARSE_CACHE_GZIP_LEVEL`
+
+4. Improved Java receiver typing for try-with-resources.
    - Tree-sitter Java parses `try (XContentBuilder b = ...)` as a `resource` node with direct `type`, `name`, and `value` fields.
    - The previous collector looked for `variable_declarator` children under `resource`, so resource variables were not bound.
    - This now resolves calls such as `b.field(...)` and `b.startObject(...)` when `b` is declared in a resource specification.
@@ -616,6 +625,7 @@ Status:
 
 - `npm.cmd test -- tests/v2/sqlite-backend.test.ts`: pass, 3 tests.
 - `npm.cmd test -- tests/v2/index-query.test.ts -t "try-with-resources|callback references"`: pass, 2 targeted tests.
+- `npm.cmd test -- tests/v2/parse-cache-codec.test.ts tests/v2/index-query.test.ts -t "compressed parse cache|parse cache rows"`: pass, codec + compressed cache hydrate.
 - `npm.cmd run build`: pass.
 
 ### Index benchmark evidence after v20
@@ -631,6 +641,27 @@ Interpretation:
 - Warm index behavior is healthy on all three target repos. The warm path short-circuits in about 0.9s to 2.0s.
 - The SQLite chunking change primarily reduces memory pressure. Hadoop cold peak RSS dropped from the prior v19 measurement of about 2166 MB to 937 MB. Doughnut dropped from about 603 MB to 387 MB. The large Elasticsearch cold run completed with 2252 MB peak instead of the earlier timed-out process observed at about 4108 MB RSS.
 - Cold Elasticsearch indexing is still too slow at about 19.4 minutes. The remaining bottleneck is not warm-cache SQLite freshness; it is cold parse plus huge fact materialization for roughly 1.18M call edges and about 197k field usages.
+
+### Parse-cache compression A/B
+
+Fresh graph-dir A/B on `D:/Personal/Projects/hadoop/hadoop-common-project`:
+
+| Mode | Wall/index time | `SUM(LENGTH(parse_json))` | DB file size |
+| --- | ---: | ---: | ---: |
+| compression disabled | 77469 ms / 77049 ms | 123791734 bytes | 347152384 bytes |
+| compression enabled | 70760 ms / 70653 ms | 18783799 bytes | 242044928 bytes |
+
+Measured effect:
+
+- Parse-cache payload size dropped by about `84.8%`.
+- SQLite DB file size dropped by about `30.3%`.
+- Index wall time improved by about `8.7%` in this A/B run.
+
+Tradeoff:
+
+- Cache-hit full rebuilds now pay gzip decode CPU for compressed rows.
+- Normal warm reindex is unaffected because it short-circuits before hydrating parse cache.
+- Compression is disabled via env if a workload is CPU-bound rather than IO/storage-bound.
 
 ### Java quality evidence after v20
 
