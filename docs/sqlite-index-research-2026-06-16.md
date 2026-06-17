@@ -712,3 +712,42 @@ Fresh source inspection of `D:/Personal/Projects/codegraph-external` still shows
 
 5. P3: broader language/function-ref parity.
    - Useful, but secondary while the main target remains Java quality and large Java repo indexing speed.
+
+## 2026-06-17 Continuation: Java callback receiver inference v24
+
+Implemented after the v20 try-with-resources work:
+
+- Bumped the tree-sitter provider cache key to `v24`.
+  - `v21-v22` covered Java callback lambda parameter inference and `XContentBuilder` fluent chains during the local iteration.
+  - `v23` added sibling-module Java source-root discovery for external superclass method signatures.
+  - `v24` also covers nested/anonymous Java method declarations with their own parameter receiver scope.
+- Java lambda parameters now infer receiver types from local or external method signatures such as `CheckedConsumer<XContentBuilder, IOException>`.
+- External superclass helper methods are resolved by discovering sibling Gradle/Maven Java source roots near a module root and reading cached class members.
+- `XContentBuilder` fluent calls are treated as returning `XContentBuilder` for the known builder method set, which resolves chains like `b.startObject(...).field(...).endObject()`.
+- Nested Java method declarations found inside method bodies get their own receiver type scope, fixing anonymous overrides like `write(XContentBuilder b)`.
+
+Scoped Elasticsearch mapper benchmark:
+
+| Root/scope | Files | Cold index | Warm index | Notes |
+| --- | ---: | ---: | ---: | --- |
+| copied `elasticsearch/server/src/test/java/org/elasticsearch/index/mapper` plus sibling `test/framework` base classes | 239 | 18121 ms index / 18989 ms wall | 748 ms index / 1694 ms wall | v24, `--parse-workers 2`, final code |
+
+Quality delta on that scoped Elasticsearch mapper copy:
+
+| Metric | Before lambda/signature work | v22 intermediate | v24 final |
+| --- | ---: | ---: | ---: |
+| `XContentBuilder.*` `receiver-type` call edges | 6693 | 10481 | 11214 |
+| `XContentBuilder.field` `receiver-type` | 2524 | 4549 | 4856 |
+| `XContentBuilder.startObject` `receiver-type` | 2349 | 2559 | 2748 |
+| `XContentBuilder.endObject` `receiver-type` | 0 in this scoped baseline | 2596 | 2785 |
+| unresolved `b.*` call edges | many chain/direct misses | 34 top-scope misses | 2 `b.field` misses |
+
+The two remaining scoped `b.field` misses are `ParameterChecker.registerConflictCheck(...)` calls where `ParameterChecker` is an inner class of an external superclass file. Resolving those would require inner-class owner-file lookup rather than another broad lambda heuristic.
+
+Full `D:/Personal/Projects/elasticsearch/server` cold v24 reindex was started but intentionally stopped at 3014/7978 parsed files after 8m03s because the process working set approached 10 GB on a 23.4 GB machine with about 6.4 GB free. The controlled scoped benchmark above was used for quality and performance evidence instead.
+
+Validation:
+
+- `npm.cmd test -- tests/v2/index-query.test.ts -t "callback lambda receiver calls"`: pass, 2 targeted tests.
+- `npm.cmd test`: pass, 91 tests.
+- `npm.cmd run lint`: pass.

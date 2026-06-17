@@ -41,7 +41,25 @@ const grammarLoaders: Partial<Record<SupportedLanguage, () => unknown>> = {
 };
 
 const loadedGrammars = new Map<SupportedLanguage, unknown>();
+const javaSourceRootDiscoveryCache = new Map<string, string[]>();
 const EXTERNAL_JAVA_ANNOTATION_CONSTANT_PATTERN = /@\w+(?:\s*\([\s\S]{0,300}\b[A-Z][A-Za-z0-9_]*\s*\.\s*[A-Z][A-Za-z0-9_]*\b)/;
+const XCONTENT_BUILDER_FLUENT_METHODS = new Set([
+  'array',
+  'copyCurrentStructure',
+  'endArray',
+  'endObject',
+  'field',
+  'flush',
+  'humanReadableField',
+  'nullValue',
+  'nullField',
+  'rawField',
+  'startArray',
+  'startObject',
+  'timestampFieldsFromUnixEpochMillis',
+  'utf8Value',
+  'value',
+]);
 
 interface JavaFieldInfo {
   name: string;
@@ -53,6 +71,13 @@ interface JavaFieldInfo {
 interface JavaTypeMembers {
   accessorsByClass: Map<string, Map<string, string>>;
   fieldsByClass: Map<string, Map<string, string>>;
+  functionalParamTypesByClass: Map<string, Map<string, JavaMethodFunctionalSignature[]>>;
+  superClassByClass: Map<string, string>;
+}
+
+interface JavaMethodFunctionalSignature {
+  parameterCount: number;
+  parameterTypes: Array<string[] | undefined>;
 }
 
 function javaFieldUsagesEnabled(): boolean {
@@ -103,12 +128,14 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   private javaFieldsByClass = new Map<string, Map<string, JavaFieldInfo>>();
   private javaRawFieldTypesByClass = new Map<string, Map<string, string>>();
   private javaAccessorReturnsByClass = new Map<string, Map<string, string>>();
+  private javaFunctionalParamTypesByClass = new Map<string, Map<string, JavaMethodFunctionalSignature[]>>();
   private javaOuterClassByClass = new Map<string, string>();
   private javaSuperClassByClass = new Map<string, string>();
   private javaStaticImports = new Map<string, Set<string>>();
   private javaStringConstants = new Map<string, string>();
   private externalJavaConstantCache = new Map<string, Map<string, string> | undefined>();
   private externalJavaTypeMembersCache = new Map<string, JavaTypeMembers | undefined>();
+  private externalJavaClassLookupCache = new Map<string, JavaTypeMembers | undefined>();
   private currentJavaFilePath: string | undefined;
   private currentJavaRootDir: string | undefined;
   private currentJavaImports: string[] = [];
@@ -154,6 +181,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     this.javaFieldsByClass = new Map();
     this.javaRawFieldTypesByClass = new Map();
     this.javaAccessorReturnsByClass = new Map();
+    this.javaFunctionalParamTypesByClass = new Map();
     this.javaOuterClassByClass = new Map();
     this.javaSuperClassByClass = new Map();
     this.javaStaticImports = new Map();
@@ -494,6 +522,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     className: string,
   ): void {
     const accessors = new Map<string, string>();
+    const functionalParamTypes = new Map<string, JavaMethodFunctionalSignature[]>();
     const classAnnotations = new Set(this.getJavaAnnotations(classNode));
     const classHasGetter = classAnnotations.has('Getter') || classAnnotations.has('Data');
 
@@ -503,6 +532,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           const nameNode = child.childForFieldName('name') ?? child.children.find(c => c.type === 'identifier');
           const returnType = this.extractJavaTypeText(child.childForFieldName('type'));
           if (nameNode && returnType) accessors.set(nameNode.text, returnType);
+          if (nameNode) this.addJavaMethodFunctionalSignature(functionalParamTypes, nameNode.text, child.childForFieldName('parameters'));
         }
 
         if (child.type === 'field_declaration') {
@@ -535,6 +565,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     }
 
     this.javaAccessorReturnsByClass.set(className, accessors);
+    this.javaFunctionalParamTypesByClass.set(className, functionalParamTypes);
   }
 
   private extractJavaParameterNames(paramsNode: SyntaxNode | null | undefined): Set<string> {
@@ -846,6 +877,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   private javaSourceRootsFor(filePath: string, rootDir: string): string[] {
     const roots = new Set<string>();
     const normalized = filePath.replace(/\\/g, '/');
+    const moduleRoots = new Set<string>();
     const markers = [
       '/src/main/java/',
       '/src/test/java/',
@@ -856,11 +888,17 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       const index = normalized.indexOf(marker);
       if (index >= 0) {
         const moduleRoot = filePath.slice(0, index);
+        moduleRoots.add(moduleRoot);
         for (const siblingMarker of markers) {
           const candidateRoot = path.join(moduleRoot, ...siblingMarker.split('/').filter(Boolean));
           if (fs.existsSync(candidateRoot)) roots.add(candidateRoot);
         }
       }
+    }
+    for (const moduleRoot of moduleRoots) {
+      const repoRoot = path.dirname(moduleRoot);
+      if (!isLikelyJavaRepoRoot(repoRoot)) continue;
+      for (const discoveredRoot of discoverJavaSourceRootsUnder(repoRoot, 2)) roots.add(discoveredRoot);
     }
     roots.add(rootDir);
     return [...roots];
@@ -942,6 +980,8 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   private collectJavaTypeMembers(root: SyntaxNode): JavaTypeMembers {
     const accessorsByClass = new Map<string, Map<string, string>>();
     const fieldsByClass = new Map<string, Map<string, string>>();
+    const functionalParamTypesByClass = new Map<string, Map<string, JavaMethodFunctionalSignature[]>>();
+    const superClassByClass = new Map<string, string>();
 
     const visit = (node: SyntaxNode): void => {
       for (const child of node.children) {
@@ -953,8 +993,14 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           const nameNode = child.childForFieldName('name');
           if (!nameNode) continue;
           const className = nameNode.text;
+          const superclassNode = child.type === 'class_declaration'
+            ? child.childForFieldName('superclass')
+            : undefined;
+          const superclassName = this.extractJavaTypeName(superclassNode);
+          if (superclassName) superClassByClass.set(className, superclassName);
           const fields = new Map<string, string>();
           const accessors = new Map<string, string>();
+          const functionalParamTypes = new Map<string, JavaMethodFunctionalSignature[]>();
           const classAnnotations = new Set(this.getJavaAnnotations(child));
           const classHasGetter = classAnnotations.has('Getter') || classAnnotations.has('Data');
           const body = child.childForFieldName('body');
@@ -978,6 +1024,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
                   ?? member.children.find(c => c.type === 'identifier')?.text;
                 const returnType = this.extractJavaTypeText(member.childForFieldName('type'));
                 if (methodName && returnType) accessors.set(methodName, returnType);
+                if (methodName) this.addJavaMethodFunctionalSignature(functionalParamTypes, methodName, member.childForFieldName('parameters'));
               }
             }
           }
@@ -1000,6 +1047,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
 
           fieldsByClass.set(className, fields);
           accessorsByClass.set(className, accessors);
+          functionalParamTypesByClass.set(className, functionalParamTypes);
           if (body) visit(body);
           continue;
         }
@@ -1008,7 +1056,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     };
 
     visit(root);
-    return { accessorsByClass, fieldsByClass };
+    return { accessorsByClass, fieldsByClass, functionalParamTypesByClass, superClassByClass };
   }
 
   private resolveJavaAccessorReturnType(receiverType: string, methodName: string): string | undefined {
@@ -1059,17 +1107,32 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     const currentFilePath = this.currentJavaFilePath;
     if (!currentFilePath) return undefined;
     const currentDir = path.dirname(currentFilePath);
-    for (const candidatePath of this.javaConstantCandidatePaths(
+    const cacheKey = [
+      currentDir,
+      this.parsePackageName ?? '',
+      className,
+      this.currentJavaSourceRoots.join('|'),
+      this.currentJavaImports.join('|'),
+    ].join('\0');
+    if (this.externalJavaClassLookupCache.has(cacheKey)) {
+      const cached = this.externalJavaClassLookupCache.get(cacheKey);
+      return cached ? pick(cached) : undefined;
+    }
+
+    const candidatePaths = this.javaConstantCandidatePaths(
       className,
       currentDir,
       this.currentJavaSourceRoots,
       this.currentJavaImports,
-    )) {
+    );
+    for (const candidatePath of candidatePaths) {
       if (path.resolve(candidatePath) === path.resolve(currentFilePath)) continue;
       const members = this.readJavaTypeMembersFromFile(candidatePath);
-      const resolved = members ? pick(members) : undefined;
-      if (resolved) return resolved;
+      if (!members || !javaTypeMembersContainClass(members, className)) continue;
+      this.externalJavaClassLookupCache.set(cacheKey, members);
+      return pick(members);
     }
+    this.externalJavaClassLookupCache.set(cacheKey, undefined);
     return undefined;
   }
 
@@ -1270,6 +1333,80 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       if (typeName && nameNode) types.set(nameNode.text, typeName);
     }
     return types;
+  }
+
+  private addJavaMethodFunctionalSignature(
+    signaturesByMethod: Map<string, JavaMethodFunctionalSignature[]>,
+    methodName: string,
+    paramsNode: SyntaxNode | null | undefined,
+  ): void {
+    const signature = this.extractJavaMethodFunctionalSignature(paramsNode);
+    if (!signature) return;
+    const signatures = signaturesByMethod.get(methodName) ?? [];
+    signatures.push(signature);
+    signaturesByMethod.set(methodName, signatures);
+  }
+
+  private extractJavaMethodFunctionalSignature(
+    paramsNode: SyntaxNode | null | undefined,
+  ): JavaMethodFunctionalSignature | undefined {
+    if (!paramsNode) return undefined;
+    const parameterTypes: Array<string[] | undefined> = [];
+    let hasFunctionalParam = false;
+    for (const child of paramsNode.children) {
+      if (child.type !== 'formal_parameter' && child.type !== 'spread_parameter') continue;
+      const typeText = this.extractJavaTypeText(child.childForFieldName('type'));
+      const functionalTypes = this.extractJavaFunctionalParamTypes(typeText);
+      parameterTypes.push(functionalTypes.length > 0 ? functionalTypes : undefined);
+      if (functionalTypes.length > 0) hasFunctionalParam = true;
+    }
+    if (!hasFunctionalParam) return undefined;
+    return {
+      parameterCount: parameterTypes.length,
+      parameterTypes,
+    };
+  }
+
+  private extractJavaFunctionalParamTypes(typeText: string | undefined): string[] {
+    if (!typeText) return [];
+    const normalized = normalizeJavaTypeText(typeText);
+    const genericStart = normalized.indexOf('<');
+    if (genericStart < 0) return [];
+    const rawType = simpleTypeName(normalized.slice(0, genericStart));
+    const genericArgs = splitTopLevelJavaGenericArgs(normalized.slice(genericStart + 1, normalized.lastIndexOf('>')))
+      .map(javaGenericArgumentSimpleType)
+      .filter((arg): arg is string => Boolean(arg));
+    if (genericArgs.length === 0) return [];
+
+    const oneParamInterfaces = new Set([
+      'Consumer',
+      'Predicate',
+      'Function',
+      'UnaryOperator',
+      'CheckedConsumer',
+      'CheckedFunction',
+      'CheckedPredicate',
+      'ThrowingConsumer',
+      'ThrowingFunction',
+      'ThrowingPredicate',
+    ]);
+    if (oneParamInterfaces.has(rawType)) return genericArgs.slice(0, 1);
+
+    const twoParamInterfaces = new Set([
+      'BiConsumer',
+      'BiFunction',
+      'BinaryOperator',
+      'BiPredicate',
+      'CheckedBiConsumer',
+      'CheckedBiFunction',
+      'CheckedBiPredicate',
+      'ThrowingBiConsumer',
+      'ThrowingBiFunction',
+      'ThrowingBiPredicate',
+    ]);
+    if (twoParamInterfaces.has(rawType)) return genericArgs.slice(0, 2);
+
+    return [];
   }
 
   /** Add local Java variable declarations to the receiver type scope. */
@@ -1857,6 +1994,28 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       return;
     }
 
+    if (node.type === 'method_declaration' || node.type === 'constructor_declaration') {
+      const nameNode = node.childForFieldName('name') ?? node.children.find(child => child.type === 'identifier');
+      const body = node.childForFieldName('body');
+      if (nameNode && body) {
+        const paramsNode = node.childForFieldName('parameters');
+        const nestedReceiverTypes = new Map(receiverTypes ?? []);
+        for (const [name, type] of this.extractMethodParamTypeMap(paramsNode)) nestedReceiverTypes.set(name, type);
+        const nestedShadowedNames = this.extractJavaParameterNames(paramsNode);
+        this.collectJavaLocalVariableTypes(body, nestedReceiverTypes, file, nestedShadowedNames, enclosingClass);
+        const nestedCallerName = `${callerName}.${nameNode.text}`;
+        const nestedFieldUsageContext = fieldUsageContext
+          ? {
+            ...fieldUsageContext,
+            receiverTypes: nestedReceiverTypes,
+            shadowedNames: new Set([...fieldUsageContext.shadowedNames, ...nestedShadowedNames]),
+          }
+          : fieldUsageContext;
+        this.extractCallsFromNode(body, file, lines, calls, references, nestedCallerName, nestedReceiverTypes, nestedFieldUsageContext, enclosingClass, callbackContext);
+        return;
+      }
+    }
+
     if (node.type === 'lambda_expression') {
       const callbackName = `${callerName}.lambda${node.startPosition.row + 1}_${node.startPosition.column + 1}`;
       const lambdaReceiverTypes = this.extendJavaLambdaReceiverTypes(node, receiverTypes, enclosingClass);
@@ -2154,10 +2313,25 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       return types;
     }
 
-    const inferredType = this.inferJavaLambdaCastParamType(node)
-      ?? this.inferJavaStreamLambdaParamType(node, receiverTypes, enclosingClass);
     const names = this.extractJavaLambdaParamNames(node);
-    if (inferredType && names.length === 1) types.set(names[0]!, inferredType);
+    if (names.length === 0) return types;
+
+    const inferredTypes = this.inferJavaFunctionalArgumentLambdaParamTypes(node, receiverTypes, enclosingClass, names.length)
+      ?? (
+        names.length === 1
+          ? [
+            this.inferJavaLambdaCastParamType(node)
+              ?? this.inferJavaStreamLambdaParamType(node, receiverTypes, enclosingClass)
+              ?? this.inferJavaKnownBuilderLambdaParamType(node, names[0]!)
+          ].filter((type): type is string => Boolean(type))
+          : undefined
+      );
+    if (!inferredTypes || inferredTypes.length === 0) return types;
+    for (let index = 0; index < Math.min(names.length, inferredTypes.length); index++) {
+      const name = names[index];
+      const type = inferredTypes[index];
+      if (name && type) types.set(name, type);
+    }
     return types;
   }
 
@@ -2182,6 +2356,159 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         .map(child => child.text);
     }
     return [];
+  }
+
+  private inferJavaFunctionalArgumentLambdaParamTypes(
+    node: SyntaxNode,
+    receiverTypes: Map<string, string> | undefined,
+    enclosingClass: string | undefined,
+    lambdaParamCount: number,
+  ): string[] | undefined {
+    if (node.type !== 'lambda_expression') return undefined;
+    const context = this.javaLambdaArgumentInvocationContext(node);
+    if (!context) return undefined;
+    const signatures = this.resolveJavaFunctionalMethodSignatures(context.invocation, receiverTypes, enclosingClass);
+    return this.pickJavaLambdaFunctionalParamTypes(signatures, context.argumentIndex, context.argumentCount, lambdaParamCount);
+  }
+
+  private javaLambdaArgumentInvocationContext(
+    node: SyntaxNode,
+  ): { invocation: SyntaxNode; argumentIndex: number; argumentCount: number } | undefined {
+    let argumentNode: SyntaxNode = node;
+    let argumentList = node.parent;
+    while (argumentList?.type === 'parenthesized_expression') {
+      argumentNode = argumentList;
+      argumentList = argumentList.parent;
+    }
+    if (!argumentList || argumentList.type !== 'argument_list') return undefined;
+    const invocation = argumentList.parent;
+    if (!invocation || invocation.type !== 'method_invocation') return undefined;
+    const args = argumentList.namedChildren;
+    const argumentIndex = args.findIndex(arg => sameSyntaxNode(arg, argumentNode) || syntaxNodeContains(arg, node));
+    if (argumentIndex < 0) return undefined;
+    return {
+      invocation,
+      argumentIndex,
+      argumentCount: args.length,
+    };
+  }
+
+  private resolveJavaFunctionalMethodSignatures(
+    invocation: SyntaxNode,
+    receiverTypes: Map<string, string> | undefined,
+    enclosingClass: string | undefined,
+  ): JavaMethodFunctionalSignature[] {
+    const methodName = invocation.childForFieldName('name')?.text;
+    if (!methodName) return [];
+
+    const objectNode = invocation.childForFieldName('object');
+    if (objectNode) {
+      const receiverType = objectNode.type === 'method_invocation'
+        ? this.resolveJavaExpressionTypeText(objectNode, receiverTypes, enclosingClass)
+        : resolveJavaInvocationReceiver(objectNode.text, receiverTypes);
+      const ownerClass = receiverType
+        ? simpleTypeName(receiverType)
+        : /^[A-Z]/.test(objectNode.text)
+          ? simpleTypeName(objectNode.text)
+          : undefined;
+      return ownerClass
+        ? this.resolveJavaFunctionalMethodSignaturesFromHierarchy(ownerClass, methodName)
+        : [];
+    }
+
+    const staticCallee = this.resolveJavaStaticImportCallee(methodName);
+    if (staticCallee) {
+      const owner = staticCallee.slice(0, staticCallee.lastIndexOf('.'));
+      const signatures = this.resolveJavaFunctionalMethodSignaturesFromHierarchy(owner, methodName);
+      if (signatures.length > 0) return signatures;
+    }
+
+    return this.resolveJavaFunctionalMethodSignaturesFromHierarchy(enclosingClass, methodName);
+  }
+
+  private resolveJavaFunctionalMethodSignaturesFromHierarchy(
+    className: string | undefined,
+    methodName: string,
+    seenClasses = new Set<string>(),
+  ): JavaMethodFunctionalSignature[] {
+    const simpleClassName = className ? simpleTypeName(className) : undefined;
+    if (!simpleClassName || seenClasses.has(simpleClassName)) return [];
+    seenClasses.add(simpleClassName);
+
+    const local = this.javaFunctionalParamTypesByClass.get(simpleClassName)?.get(methodName) ?? [];
+    const external = this.resolveExternalJavaClassMembers(simpleClassName, members =>
+      members.functionalParamTypesByClass.get(simpleClassName)?.get(methodName)
+    ) ?? [];
+    const externalSuperClass = this.resolveExternalJavaClassMembers(simpleClassName, members =>
+      members.superClassByClass.get(simpleClassName)
+    );
+    const superClass = this.javaSuperClassByClass.get(simpleClassName) ?? externalSuperClass;
+    const inherited = [
+      ...this.resolveJavaFunctionalMethodSignaturesFromHierarchy(superClass, methodName, seenClasses),
+      ...this.resolveJavaFunctionalMethodSignaturesFromHierarchy(this.javaOuterClassByClass.get(simpleClassName), methodName, seenClasses),
+    ];
+    return [...local, ...external, ...inherited];
+  }
+
+  private pickJavaLambdaFunctionalParamTypes(
+    signatures: JavaMethodFunctionalSignature[],
+    argumentIndex: number,
+    argumentCount: number,
+    lambdaParamCount: number,
+  ): string[] | undefined {
+    const pick = (candidates: JavaMethodFunctionalSignature[]): string[] | undefined => {
+      const matched = new Map<string, string[]>();
+      for (const signature of candidates) {
+        const inferred = signature.parameterTypes[argumentIndex];
+        if (!inferred || inferred.length < lambdaParamCount) continue;
+        const types = inferred.slice(0, lambdaParamCount);
+        matched.set(types.join('\0'), types);
+      }
+      return matched.size === 1 ? [...matched.values()][0] : undefined;
+    };
+
+    return pick(signatures.filter(signature => signature.parameterCount === argumentCount))
+      ?? pick(signatures);
+  }
+
+  private inferJavaKnownBuilderLambdaParamType(node: SyntaxNode, paramName: string): string | undefined {
+    if (!this.isJavaTypeVisible('XContentBuilder')) return undefined;
+    return this.javaLambdaBodyUsesReceiverMethods(node, paramName, XCONTENT_BUILDER_FLUENT_METHODS)
+      ? 'XContentBuilder'
+      : undefined;
+  }
+
+  private javaLambdaBodyUsesReceiverMethods(
+    node: SyntaxNode,
+    receiverName: string,
+    methodNames: Set<string>,
+  ): boolean {
+    const visit = (candidate: SyntaxNode): boolean => {
+      if (candidate.type === 'method_invocation') {
+        const objectNode = candidate.childForFieldName('object');
+        const methodName = candidate.childForFieldName('name')?.text;
+        if (objectNode?.text === receiverName && methodName && methodNames.has(methodName)) return true;
+      }
+      return candidate.children.some(child => visit(child));
+    };
+    return visit(node);
+  }
+
+  private isJavaTypeVisible(typeName: string): boolean {
+    if (this.currentJavaImports.some(importPath => importPath === typeName || importPath.endsWith(`.${typeName}`))) return true;
+    if (this.javaFieldsByClass.has(typeName) || this.javaAccessorReturnsByClass.has(typeName)) return true;
+    const currentFilePath = this.currentJavaFilePath;
+    if (!currentFilePath) return false;
+    const currentDir = path.dirname(currentFilePath);
+    return this.javaConstantCandidatePaths(typeName, currentDir, this.currentJavaSourceRoots, this.currentJavaImports)
+      .some(candidatePath => {
+        try {
+          const stat = fs.statSync(candidatePath);
+          return stat.isFile();
+        } catch {
+          return false;
+        }
+      });
   }
 
   private inferJavaLambdaCastParamType(node: SyntaxNode): string | undefined {
@@ -2286,6 +2613,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         : staticReceiver && /^[A-Z]/.test(staticReceiver)
           ? simpleTypeName(staticReceiver)
           : undefined;
+      if (receiverClass === 'XContentBuilder' && XCONTENT_BUILDER_FLUENT_METHODS.has(methodName)) return 'XContentBuilder';
       return receiverClass ? this.resolveJavaAccessorReturnType(receiverClass, methodName) : undefined;
     }
     return undefined;
@@ -2425,6 +2753,101 @@ function extractJavaCollectionElementType(typeName: string | undefined): string 
   if (comma >= 0) firstArg = firstArg.slice(0, comma).trim();
   firstArg = firstArg.replace(/^\?\s*(?:extends|super)\s+/, '').trim();
   return firstArg ? simpleTypeName(firstArg) : undefined;
+}
+
+function splitTopLevelJavaGenericArgs(value: string): string[] {
+  const args: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index];
+    if (char === '<') depth++;
+    if (char === '>') depth = Math.max(0, depth - 1);
+    if (char === ',' && depth === 0) {
+      args.push(value.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  const last = value.slice(start).trim();
+  if (last) args.push(last);
+  return args;
+}
+
+function javaGenericArgumentSimpleType(value: string): string | undefined {
+  const normalized = normalizeJavaTypeText(value)
+    .replace(/^\?\s*(?:extends|super)\s+/, '')
+    .trim();
+  if (!normalized || normalized === '?') return undefined;
+  return simpleTypeName(normalized);
+}
+
+function javaTypeMembersContainClass(members: JavaTypeMembers, className: string): boolean {
+  const simpleClassName = simpleTypeName(className);
+  return members.accessorsByClass.has(simpleClassName)
+    || members.fieldsByClass.has(simpleClassName)
+    || members.functionalParamTypesByClass.has(simpleClassName)
+    || members.superClassByClass.has(simpleClassName);
+}
+
+function isLikelyJavaRepoRoot(dir: string): boolean {
+  return [
+    '.git',
+    'settings.gradle',
+    'settings.gradle.kts',
+    'pom.xml',
+    'build.gradle',
+    'build.gradle.kts',
+  ].some(name => fs.existsSync(path.join(dir, name)));
+}
+
+function discoverJavaSourceRootsUnder(baseDir: string, maxDepth: number): string[] {
+  const cacheKey = `${path.resolve(baseDir)}\0${maxDepth}`;
+  const cached = javaSourceRootDiscoveryCache.get(cacheKey);
+  if (cached) return cached;
+
+  const roots = new Set<string>();
+  const skippedDirs = new Set([
+    '.codegraph',
+    '.git',
+    '.gradle',
+    '.idea',
+    '.tmp',
+    'build',
+    'dist',
+    'node_modules',
+    'out',
+    'target',
+  ]);
+  const javaSourceSuffixes = [
+    ['src', 'main', 'java'],
+    ['src', 'test', 'java'],
+    ['src', 'integration-test', 'java'],
+    ['src', 'java'],
+  ];
+
+  const visit = (dir: string, depth: number): void => {
+    for (const suffix of javaSourceSuffixes) {
+      const sourceRoot = path.join(dir, ...suffix);
+      if (fs.existsSync(sourceRoot)) roots.add(sourceRoot);
+    }
+    if (depth <= 0) return;
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || skippedDirs.has(entry.name)) continue;
+      visit(path.join(dir, entry.name), depth - 1);
+    }
+  };
+
+  visit(baseDir, maxDepth);
+  const result = [...roots];
+  javaSourceRootDiscoveryCache.set(cacheKey, result);
+  return result;
 }
 
 function resolveJavaInvocationReceiver(receiver: string, receiverTypes?: Map<string, string>): string | undefined {

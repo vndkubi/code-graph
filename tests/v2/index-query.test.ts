@@ -3246,6 +3246,214 @@ public class XContentBuilder implements AutoCloseable {
     }));
   });
 
+  it('resolves Java callback lambda receiver calls from functional signatures and visible builder APIs', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-java-builder-lambda-types-');
+    writeFile(repo, 'src/main/java/com/example/BuilderLambdaReceiver.java', `package com.example;
+
+import com.example.builder.XContentBuilder;
+import com.example.util.CheckedConsumer;
+
+public class BuilderLambdaReceiver {
+    void writeWithLocalSignatures() throws Exception {
+        mapping(b -> {
+            b.startObject("field").field("type", "keyword").endObject();
+        });
+        source("1", b -> b.field("name", "value"), null);
+    }
+
+    void writeWithVisibleBuilderFallback() throws Exception {
+        externalSource(b -> b.field("external", "value"));
+    }
+
+    XContentBuilder mapping(CheckedConsumer<XContentBuilder, Exception> build) throws Exception {
+        return null;
+    }
+
+    Source source(String id, CheckedConsumer<XContentBuilder, Exception> build, String routing) throws Exception {
+        return null;
+    }
+}
+
+class Source {
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/ExternalBuilderLambda.java', `package com.example;
+
+import org.elasticsearch.xcontent.XContentBuilder;
+
+public class ExternalBuilderLambda {
+    void writeWithExternalBuilderImport() throws Exception {
+        externalSource(b -> b.startObject("field").field("type", "keyword").endObject());
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/AnonymousBuilderWriter.java', `package com.example;
+
+import org.elasticsearch.xcontent.XContentBuilder;
+
+public class AnonymousBuilderWriter {
+    void register() {
+        new Writer() {
+            @Override
+            void write(XContentBuilder b) throws Exception {
+                b.value("payload");
+            }
+        };
+    }
+}
+
+abstract class Writer {
+    abstract void write(XContentBuilder b) throws Exception;
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/util/CheckedConsumer.java', `package com.example.util;
+
+public interface CheckedConsumer<T, E extends Exception> {
+    void accept(T value) throws E;
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/builder/XContentBuilder.java', `package com.example.builder;
+
+public class XContentBuilder {
+    public XContentBuilder startObject(String name) {
+        return this;
+    }
+
+    public XContentBuilder field(String name, String value) {
+        return this;
+    }
+
+    public XContentBuilder endObject() {
+        return this;
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const fieldCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'XContentBuilder.field', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(fieldCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^BuilderLambdaReceiver[.]writeWithLocalSignatures[.]lambda\d+_\d+$/),
+      callee: 'XContentBuilder.field',
+      resolution_kind: 'receiver-type',
+    }));
+    expect(fieldCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^BuilderLambdaReceiver[.]writeWithVisibleBuilderFallback[.]lambda\d+_\d+$/),
+      callee: 'XContentBuilder.field',
+      resolution_kind: 'receiver-type',
+    }));
+    expect(fieldCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^ExternalBuilderLambda[.]writeWithExternalBuilderImport[.]lambda\d+_\d+$/),
+      callee: 'XContentBuilder.field',
+      resolution_kind: 'receiver-type',
+    }));
+
+    const startObjectCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'XContentBuilder.startObject', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(startObjectCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^BuilderLambdaReceiver[.]writeWithLocalSignatures[.]lambda\d+_\d+$/),
+      callee: 'XContentBuilder.startObject',
+      resolution_kind: 'receiver-type',
+    }));
+
+    const endObjectCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'XContentBuilder.endObject', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(endObjectCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^ExternalBuilderLambda[.]writeWithExternalBuilderImport[.]lambda\d+_\d+$/),
+      callee: 'XContentBuilder.endObject',
+      resolution_kind: 'receiver-type',
+    }));
+
+    const valueCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'XContentBuilder.value', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(valueCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'AnonymousBuilderWriter.register.write',
+      callee: 'XContentBuilder.value',
+      resolution_kind: 'receiver-type',
+    }));
+  });
+
+  it('resolves Java callback lambda receiver calls through external superclass signatures', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-java-external-superclass-lambda-types-');
+    writeFile(repo, 'settings.gradle', `pluginManagement {}
+`);
+    writeFile(repo, 'server/src/test/java/com/example/InheritedBuilderLambda.java', `package com.example;
+
+public class InheritedBuilderLambda extends MetadataMapperTestCase {
+    void writeWithInheritedHelper() throws Exception {
+        mapping(b -> b.startObject("field").field("type", "keyword").endObject());
+    }
+}
+`);
+    writeFile(repo, 'test/framework/src/main/java/com/example/MetadataMapperTestCase.java', `package com.example;
+
+public abstract class MetadataMapperTestCase extends MapperServiceTestCase {
+}
+`);
+    writeFile(repo, 'test/framework/src/main/java/com/example/MapperServiceTestCase.java', `package com.example;
+
+import org.elasticsearch.core.CheckedConsumer;
+import org.elasticsearch.xcontent.XContentBuilder;
+
+public abstract class MapperServiceTestCase {
+    protected XContentBuilder mapping(CheckedConsumer<XContentBuilder, Exception> build) throws Exception {
+        return null;
+    }
+}
+`);
+    writeFile(repo, 'test/framework/src/main/java/org/elasticsearch/core/CheckedConsumer.java', `package org.elasticsearch.core;
+
+public interface CheckedConsumer<T, E extends Exception> {
+    void accept(T value) throws E;
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: path.join(repo, 'server') });
+    const queries = new V2QueryService(db);
+
+    const fieldCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'XContentBuilder.field', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(fieldCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^InheritedBuilderLambda[.]writeWithInheritedHelper[.]lambda\d+_\d+$/),
+      callee: 'XContentBuilder.field',
+      resolution_kind: 'receiver-type',
+    }));
+
+    const endObjectCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'XContentBuilder.endObject', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(endObjectCallers.callers).toContainEqual(expect.objectContaining({
+      caller: expect.stringMatching(/^InheritedBuilderLambda[.]writeWithInheritedHelper[.]lambda\d+_\d+$/),
+      callee: 'XContentBuilder.endObject',
+      resolution_kind: 'receiver-type',
+    }));
+  });
+
   it('resolves chained Java field receiver calls through nested field types', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-java-field-chain-');
