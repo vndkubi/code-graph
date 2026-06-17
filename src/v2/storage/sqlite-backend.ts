@@ -16,6 +16,10 @@ import type {
 
 const SCHEMA_VERSION = 4;
 const SQLITE_MAX_BATCH_PARAMS = 24_000;
+const SQLITE_TEXT_COPY_DEFAULT_CHUNK_ROWS = boundedEnvInt(process.env.CODEGRAPH_SQLITE_TEXT_COPY_CHUNK_ROWS, 1_000, 1, 10_000);
+const SQLITE_TEXT_COPY_PARSE_CACHE_CHUNK_ROWS = boundedEnvInt(process.env.CODEGRAPH_SQLITE_PARSE_CACHE_COPY_CHUNK_ROWS, 25, 1, 1_000);
+const SQLITE_TEXT_COPY_DEFAULT_CHUNK_CHARS = boundedEnvInt(process.env.CODEGRAPH_SQLITE_TEXT_COPY_CHUNK_CHARS, 8 * 1024 * 1024, 64 * 1024, 64 * 1024 * 1024);
+const SQLITE_TEXT_COPY_PARSE_CACHE_CHUNK_CHARS = boundedEnvInt(process.env.CODEGRAPH_SQLITE_PARSE_CACHE_COPY_CHUNK_CHARS, 4 * 1024 * 1024, 64 * 1024, 64 * 1024 * 1024);
 
 export class SQLiteGraphBackend implements GraphBackend {
   readonly db: SQLiteCodeGraphDb;
@@ -125,9 +129,14 @@ export class SQLiteCodeGraphDb implements CodeGraphDb {
   ): Promise<boolean> {
     if (filePaths.length === 0) return true;
     const chunk: unknown[][] = [];
+    let chunkChars = 0;
+    const maxChunkRows = textCopyChunkRowsForTable(table);
+    const maxChunkChars = textCopyChunkCharsForTable(table);
     const flush = async (): Promise<void> => {
       if (chunk.length === 0) return;
-      const copied = await this.copyFromRows(table, columns, chunk.splice(0), options);
+      const batch = chunk.splice(0);
+      chunkChars = 0;
+      const copied = await this.copyFromRows(table, columns, batch, options);
       if (!copied) throw new Error(`SQLite bulk insert failed for ${table}.`);
     };
 
@@ -138,8 +147,12 @@ export class SQLiteCodeGraphDb implements CodeGraphDb {
       });
       for await (const line of reader) {
         if (line.length === 0) continue;
+        if (chunk.length > 0 && (chunk.length >= maxChunkRows || chunkChars + line.length > maxChunkChars)) {
+          await flush();
+        }
         chunk.push(parseCopyTextLine(line));
-        if (chunk.length >= 1000) await flush();
+        chunkChars += line.length;
+        if (chunk.length >= maxChunkRows || chunkChars >= maxChunkChars) await flush();
       }
     }
     await flush();
@@ -604,6 +617,20 @@ function sqliteValue(value: unknown): SqliteValue {
 
 function quoteIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
+}
+
+function textCopyChunkRowsForTable(table: string): number {
+  return table === 'parse_cache' ? SQLITE_TEXT_COPY_PARSE_CACHE_CHUNK_ROWS : SQLITE_TEXT_COPY_DEFAULT_CHUNK_ROWS;
+}
+
+function textCopyChunkCharsForTable(table: string): number {
+  return table === 'parse_cache' ? SQLITE_TEXT_COPY_PARSE_CACHE_CHUNK_CHARS : SQLITE_TEXT_COPY_DEFAULT_CHUNK_CHARS;
+}
+
+function boundedEnvInt(value: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
 }
 
 function parseCopyTextLine(line: string): unknown[] {

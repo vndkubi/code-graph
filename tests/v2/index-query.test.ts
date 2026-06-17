@@ -3184,6 +3184,68 @@ public class LoopReceiver {
     }));
   });
 
+  it('resolves Java try-with-resources receiver calls through resource declarations', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-java-resource-types-');
+    writeFile(repo, 'src/main/java/com/example/ResourceReceiver.java', `package com.example;
+
+public class ResourceReceiver {
+    void write() throws Exception {
+        try (XContentBuilder b = XContentBuilder.builder()) {
+            b.startObject();
+            b.field("name", "value");
+        }
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/XContentBuilder.java', `package com.example;
+
+public class XContentBuilder implements AutoCloseable {
+    static XContentBuilder builder() {
+        return new XContentBuilder();
+    }
+
+    XContentBuilder startObject() {
+        return this;
+    }
+
+    XContentBuilder field(String name, String value) {
+        return this;
+    }
+
+    public void close() {
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const fieldCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'XContentBuilder.field', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(fieldCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'ResourceReceiver.write',
+      callee: 'XContentBuilder.field',
+      resolution_kind: 'receiver-type',
+    }));
+
+    const startObjectCallers = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_callers',
+      args: { symbol: 'XContentBuilder.startObject', includeLowSignal: true },
+    }) as { callers: Array<{ caller: string; callee: string; resolution_kind: string }> };
+    expect(startObjectCallers.callers).toContainEqual(expect.objectContaining({
+      caller: 'ResourceReceiver.write',
+      callee: 'XContentBuilder.startObject',
+      resolution_kind: 'receiver-type',
+    }));
+  });
+
   it('resolves chained Java field receiver calls through nested field types', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-java-field-chain-');

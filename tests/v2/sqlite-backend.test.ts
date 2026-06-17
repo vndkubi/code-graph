@@ -53,10 +53,64 @@ describe('SQLite graph backend', () => {
       await db.close();
     }
   });
+
+  it('copies large parse_cache text shards in bounded chunks', async () => {
+    const root = tempDir('codegraph-sqlite-copy-shard-');
+    const { db } = await openCodeGraphDb(root);
+    const shardPath = path.join(root, 'parse-cache.copy');
+    try {
+      const now = '2026-01-01T00:00:00.000Z';
+      const largeParseJson = JSON.stringify({
+        symbols: [],
+        calls: [],
+        payload: 'x'.repeat(200_000),
+      });
+      const rows = Array.from({ length: 30 }, (_, index) => [
+        'tree-sitter',
+        'tree-sitter-analyzer-test',
+        `blob-${index}`,
+        'java',
+        largeParseJson,
+        0,
+        0.95,
+        now,
+      ]);
+      fs.writeFileSync(shardPath, rows.map(row => `${row.map(copyTextValue).join('\t')}\n`).join(''));
+
+      await db.copyFromTextFiles('parse_cache', [
+        'provider_id',
+        'provider_version',
+        'blob_hash',
+        'language',
+        'parse_json',
+        'has_parse_errors',
+        'parse_confidence',
+        'created_at',
+      ], [shardPath]);
+
+      expect(await db.scalar('SELECT COUNT(*) FROM parse_cache WHERE provider_version = ?', 'tree-sitter-analyzer-test')).toBe(30);
+      const sample = await db.get<{ parse_json: string }>(
+        'SELECT parse_json FROM parse_cache WHERE blob_hash = ?',
+        'blob-29',
+      );
+      expect(sample?.parse_json).toBe(largeParseJson);
+    } finally {
+      await db.close();
+    }
+  });
 });
 
 function tempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   tempDirs.push(dir);
   return dir;
+}
+
+function copyTextValue(value: unknown): string {
+  if (value === null || value === undefined) return '\\N';
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/\t/g, '\\t')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r');
 }

@@ -1331,7 +1331,30 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       bindReceiverType(this.extractJavaTypeName(typeNode), nameNode);
     }
 
-    if (node.type === 'local_variable_declaration' || node.type === 'resource') {
+    if (node.type === 'resource') {
+      const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
+      const rawTypeName = this.extractJavaTypeText(node.childForFieldName('type'));
+      const nameNode = node.childForFieldName('name');
+      if (typeName && nameNode) {
+        const inferredType = typeName === 'var'
+          ? this.resolveJavaExpressionTypeText(node.childForFieldName('value'), receiverTypes, enclosingClass)
+          : typeName;
+        if (inferredType) {
+          receiverTypes.set(nameNode.text, inferredType);
+          shadowedNames?.add(nameNode.text);
+        }
+        if (typeName !== 'var' && this.isReferenceType(typeName)) {
+          this.parseTypeRefs.push({
+            file,
+            referencedType: rawTypeName ?? typeName,
+            context: 'parameter',
+            line: node.startPosition.row + 1,
+          });
+        }
+      }
+    }
+
+    if (node.type === 'local_variable_declaration') {
       const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
       const rawTypeName = this.extractJavaTypeText(node.childForFieldName('type'));
       if (typeName) {

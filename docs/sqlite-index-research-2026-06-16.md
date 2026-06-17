@@ -209,7 +209,7 @@ Covered cases now include:
 - nested `@Nested`/inner test classes that read outer or inherited controller/service fields before chaining into method-return typing
 
 To keep parse-cache reuse correct for these analyzer changes, the tree-sitter provider version was
-bumped again and now uses the `v18` provider cache key.
+bumped again and now uses the `v20` provider cache key.
 
 ## Benchmark Evidence
 
@@ -587,3 +587,97 @@ Status:
   - snapshot-level extraction version visibility
   - broader function-reference capture for gated bare identifiers / extra languages
   - worktree mismatch warning / watcher parity for boundary handling
+
+## 2026-06-17 Continuation: Java v20, Large-Repo Evidence, and External Recheck
+
+### Changes made
+
+1. Bumped the tree-sitter provider cache key from `v18` to `v20`.
+   - `v19` covered assignment-position callback references.
+   - `v20` also covers Java try-with-resources receiver typing.
+   - This is required because parse cache is keyed by provider version and blob hash.
+
+2. Reduced SQLite text-copy batch pressure for large `parse_cache` shards.
+   - Before: `copyFromTextFiles()` flushed every 1000 rows for every table.
+   - Problem: `parse_cache.parse_json` rows can be hundreds of KB on Java-heavy repos, so 1000-row batches can create very large SQL statements and parameter arrays.
+   - Now: text-copy has per-table row and character limits, with `parse_cache` defaulting to smaller chunks.
+   - Tunables:
+     - `CODEGRAPH_SQLITE_TEXT_COPY_CHUNK_ROWS`
+     - `CODEGRAPH_SQLITE_PARSE_CACHE_COPY_CHUNK_ROWS`
+     - `CODEGRAPH_SQLITE_TEXT_COPY_CHUNK_CHARS`
+     - `CODEGRAPH_SQLITE_PARSE_CACHE_COPY_CHUNK_CHARS`
+
+3. Improved Java receiver typing for try-with-resources.
+   - Tree-sitter Java parses `try (XContentBuilder b = ...)` as a `resource` node with direct `type`, `name`, and `value` fields.
+   - The previous collector looked for `variable_declarator` children under `resource`, so resource variables were not bound.
+   - This now resolves calls such as `b.field(...)` and `b.startObject(...)` when `b` is declared in a resource specification.
+
+### Validation
+
+- `npm.cmd test -- tests/v2/sqlite-backend.test.ts`: pass, 3 tests.
+- `npm.cmd test -- tests/v2/index-query.test.ts -t "try-with-resources|callback references"`: pass, 2 targeted tests.
+- `npm.cmd run build`: pass.
+
+### Index benchmark evidence after v20
+
+| Repo root | Files indexed | Cold index | Cold peak RSS | Warm index | Warm peak RSS | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `D:/Personal/Projects/doughnut/backend` | 542 | 11153 ms | 387 MB | 872 ms | 77 MB | v20 cold, no parse-cache hits |
+| `D:/Personal/Projects/hadoop/hadoop-common-project` | 2335 | 78835 ms | 937 MB | 1264 ms | 93 MB | v20 cold, no parse-cache hits |
+| `D:/Personal/Projects/elasticsearch/server` | 7979 | 1166508 ms | 2252 MB | 1952 ms | 113 MB | v20 cold, no parse-cache hits |
+
+Interpretation:
+
+- Warm index behavior is healthy on all three target repos. The warm path short-circuits in about 0.9s to 2.0s.
+- The SQLite chunking change primarily reduces memory pressure. Hadoop cold peak RSS dropped from the prior v19 measurement of about 2166 MB to 937 MB. Doughnut dropped from about 603 MB to 387 MB. The large Elasticsearch cold run completed with 2252 MB peak instead of the earlier timed-out process observed at about 4108 MB RSS.
+- Cold Elasticsearch indexing is still too slow at about 19.4 minutes. The remaining bottleneck is not warm-cache SQLite freshness; it is cold parse plus huge fact materialization for roughly 1.18M call edges and about 197k field usages.
+
+### Java quality evidence after v20
+
+| Repo root | Primary `name-only` calls | `receiver-type` edges | `static-import` edges | `lambda-callback` | `method-reference` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `doughnut/backend` | 475 | 6637 | 2694 | 555 | 140 |
+| `hadoop/hadoop-common-project` | 3972 | 37996 | 15237 | 1013 | 173 |
+| `elasticsearch/server` | 93738 | 259691 | 68578 | 27290 | 9298 |
+
+Try-with-resources effect:
+
+- Elasticsearch now has `XContentBuilder.field`: 3050 `receiver-type` edges.
+- Elasticsearch now has `XContentBuilder.startObject`: 1804 `receiver-type` edges.
+- The remaining top unresolved `b.field` / `b.startObject` cases are mostly lambda parameters such as `mapping(b -> b.field(...))`, not resource declarations.
+
+Remaining Java quality gaps seen in Elasticsearch:
+
+- Lambda parameter type inference from local helper methods or functional interfaces, for example `mapping(b -> ...)`.
+- External/inherited test helper methods, for example `internalCluster`, `prepareSearch`, `client`, `indicesAdmin`.
+- External receiver field types, for example inherited/logging fields such as `logger.info`.
+- Common JDK/static output calls such as `System.out.println` and `System.err.println`.
+
+### External recheck
+
+Fresh source inspection of `D:/Personal/Projects/codegraph-external` still shows these useful contrasts:
+
+- `src/extraction/function-ref.ts` has a broad, table-driven function-as-value capture model across many languages. Current repo has now closed the high-confidence Java, TS/JS, and Python slices needed by the active target, but external remains broader.
+- `src/extraction/extraction-version.ts` uses a separate `EXTRACTION_VERSION = 24` signal for stale-index user visibility. Current repo relies on provider-version cache keys and snapshot provider metadata, which is correct for cache invalidation but less user-facing.
+- `src/sync/worktree.ts` has explicit worktree mismatch warnings for borrowed indexes. Current repo has stronger per-repo SQLite isolation but still should add warning UX for unusual nested worktree layouts.
+- `src/db/sqlite-adapter.ts` uses Node built-in `node:sqlite` and exposes `iterate()` to avoid materializing large result sets. Current repo uses `better-sqlite3`; the useful lesson is not the adapter swap, but the memory discipline around large scans and batches.
+
+### Updated priority order
+
+1. P1: cold Elasticsearch speed.
+   - Measure phase-level time on the v20 cold path.
+   - Likely next candidates: reduce parse-cache JSON payload size, make parse cache optional/compact for very large repos, stream/copy facts with lower duplication, or split large snapshot materialization phases.
+
+2. P1: Java lambda parameter type inference for local helper APIs.
+   - Target real shapes like `mapping(b -> b.field(...))`.
+   - Keep this gated to local method signatures or known functional interfaces to avoid false edges.
+
+3. P2: snapshot-level extraction version visibility.
+   - Add a user-facing extraction version separate from provider cache key.
+   - Expose in `doctor` and stale snapshot warnings.
+
+4. P2: worktree mismatch warnings.
+   - Selectively port external's warning model without adding a daemon/session model.
+
+5. P3: broader language/function-ref parity.
+   - Useful, but secondary while the main target remains Java quality and large Java repo indexing speed.
