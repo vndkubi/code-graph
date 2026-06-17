@@ -2580,14 +2580,17 @@ public class NoisyOrder${i} {
   });
 
   it('uses a single full MCP tool mode and treats legacy profiles as aliases', () => {
-    expect(mcpToolNamesForProfile('minimal')).toBeUndefined();
-    expect(mcpToolNamesForProfile('research')).toBeUndefined();
-    expect(mcpToolNamesForProfile('change')).toBeUndefined();
-    expect(mcpToolNamesForProfile('review')).toBeUndefined();
-    expect(mcpToolNamesForProfile('client')).toBeUndefined();
-    expect(mcpToolNamesForProfile('full')).toBeUndefined();
-    expect(V2_TOOL_PROFILES.full).toEqual(V2_TOOL_DEFINITIONS.map(tool => tool.name));
-    expect(() => mcpToolNamesForProfile('unknown')).toThrow(/full MCP toolset/);
+    expect(mcpToolNamesForProfile('client')).toEqual(new Set(V2_TOOL_PROFILES.client));
+    expect(mcpToolNamesForProfile('minimal')).toEqual(new Set(V2_TOOL_PROFILES.minimal));
+    expect(mcpToolNamesForProfile('research')).toEqual(new Set(V2_TOOL_PROFILES.research));
+    expect(mcpToolNamesForProfile('change')).toEqual(new Set(V2_TOOL_PROFILES.change));
+    expect(mcpToolNamesForProfile('review')).toEqual(new Set(V2_TOOL_PROFILES.review));
+    expect(mcpToolNamesForProfile('full')).toEqual(new Set(V2_TOOL_PROFILES.full));
+    expect(V2_TOOL_PROFILES.minimal).toEqual(V2_TOOL_PROFILES.client);
+    expect(V2_TOOL_PROFILES.research).toEqual(V2_TOOL_PROFILES.client);
+    expect(V2_TOOL_PROFILES.change).toEqual(V2_TOOL_PROFILES.client);
+    expect(V2_TOOL_PROFILES.review).toEqual(V2_TOOL_PROFILES.client);
+    expect(() => mcpToolNamesForProfile('unknown')).toThrow(/Unknown MCP tool profile/);
   });
 
   it('resolves Java parameter and local-variable receiver calls through sharded full indexing', async () => {

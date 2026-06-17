@@ -58,6 +58,20 @@ describe('manifest scan', () => {
     expect(paths).not.toContain('ignored-src/main/java/example/Ignored.java');
   });
 
+  it('skips benchmark result worktree artifacts even when tracked', () => {
+    const repo = tempGitRepo();
+    writeFile(repo, 'src/main/java/example/App.java', 'class App {}\n');
+    writeFile(repo, 'benchmark-results/workflow-ab-noise/worktrees/baseline/src/main/java/example/App.java', 'class NoisyArtifact {}\n');
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-m', 'initial']);
+
+    const manifest = scanManifest(repo);
+    const paths = manifest.files.map(file => file.relPath).sort();
+
+    expect(paths).toContain('src/main/java/example/App.java');
+    expect(paths).not.toContain('benchmark-results/workflow-ab-noise/worktrees/baseline/src/main/java/example/App.java');
+  });
+
   it('includes source files from gitignored embedded repos', () => {
     const repo = tempGitRepo();
     writeFile(repo, '.gitignore', 'embedded-repo/\n');

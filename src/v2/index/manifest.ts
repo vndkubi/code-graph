@@ -73,6 +73,7 @@ interface GitIndexEntry {
 const DEFAULT_SKIP_DIRS = new Set([
   '.git',
   '.codegraph',
+  'benchmark-results',
   '.tmp',
   '.idea',
   '.vscode',
@@ -258,6 +259,7 @@ function collectManifestFilesFromGit(
   progress?: (event: ManifestScanProgressEvent) => void,
 ): void {
   for (const relPath of relPaths) {
+    if (shouldSkipPathByDefault(relPath)) continue;
     const absPath = path.join(root, relPath);
     let stat: fs.Stats;
     try {
@@ -385,7 +387,9 @@ function collectGitVisibleFiles(repoDir: string, prefix: string, files: Set<stri
   const tracked = git(repoDir, ['ls-files', '-z', '-c'], 60_000) ?? '';
   for (const rel of tracked.split('\0')) {
     if (!rel) continue;
-    files.add(normalizePath(prefix + rel));
+    const normalized = normalizePath(prefix + rel);
+    if (shouldSkipPathByDefault(normalized)) continue;
+    files.add(normalized);
   }
 
   const untracked = git(repoDir, ['ls-files', '-z', '-o', '--exclude-standard'], 60_000) ?? '';
@@ -399,7 +403,9 @@ function collectGitVisibleFiles(repoDir: string, prefix: string, files: Set<stri
       }
       continue;
     }
-    files.add(normalizePath(prefix + rel));
+    const normalized = normalizePath(prefix + rel);
+    if (shouldSkipPathByDefault(normalized)) continue;
+    files.add(normalized);
   }
 
   for (const rel of findIgnoredEmbeddedRepos(repoDir)) {
@@ -490,6 +496,10 @@ function isGitIgnoredByParent(root: string): boolean {
 
 function shouldSkipDirByDefault(name: string): boolean {
   return DEFAULT_SKIP_DIRS.has(name) || name.startsWith('.tmp');
+}
+
+function shouldSkipPathByDefault(relPath: string): boolean {
+  return normalizePath(relPath).split('/').some(part => shouldSkipDirByDefault(part));
 }
 
 function normalizeRepoDir(value: string): string {

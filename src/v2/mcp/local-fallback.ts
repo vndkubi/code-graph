@@ -101,6 +101,7 @@ export interface LocalMcpFallbackOptions {}
 
 const SKIP_DIRS = new Set([
   '.codegraph',
+  'benchmark-results',
   '.git',
   '.idea',
   '.vscode',

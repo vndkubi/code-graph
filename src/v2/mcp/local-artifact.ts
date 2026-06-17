@@ -131,6 +131,7 @@ const ARTIFACT_VERSION = 1;
 
 const SKIP_DIRS = new Set([
   '.codegraph',
+  'benchmark-results',
   '.git',
   '.idea',
   '.vscode',

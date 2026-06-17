@@ -107,6 +107,36 @@ public class RealProxy {
     expect(JSON.stringify(result)).not.toContain('.tmp-debug-home');
   });
 
+  it('skips benchmark result worktree artifacts during artifact setup', async () => {
+    const repo = tempDir('codegraph-local-artifact-benchmark-skip-repo-');
+    writeFile(repo, 'src/main/java/com/example/RealProxy.java', `package com.example;
+
+public class RealProxy {
+  public void setupArtifact() {
+  }
+}
+`);
+    writeFile(repo, 'benchmark-results/workflow-ab-noise/worktrees/baseline/src/main/java/com/example/NoisyProxy.java', `package com.example;
+
+public class NoisyProxy {
+  public void setupArtifact() {
+  }
+}
+`);
+
+    const setup = await buildLocalArtifactIndex(repo);
+    expect(setup.filesIndexed).toBe(1);
+
+    const result = await localCodeGraphContext(repo, {
+      task: 'Find setupArtifact proxy implementation.',
+      profile: 'compact',
+    }, { error: { code: 'runtime_unavailable' } });
+
+    expect(result.topFiles).toEqual(['src/main/java/com/example/RealProxy.java']);
+    expect(JSON.stringify(result)).not.toContain('benchmark-results');
+    expect(JSON.stringify(result)).not.toContain('NoisyProxy');
+  });
+
   it('prioritizes explicit diff paths from the embedded artifact', async () => {
     const repo = tempDir('codegraph-local-artifact-diff-repo-');
     writeFile(repo, 'src/main/java/com/example/TargetService.java', `package com.example;
