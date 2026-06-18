@@ -14,7 +14,7 @@ import type {
   SqliteValue,
 } from './graph-backend.js';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const SQLITE_MAX_BATCH_PARAMS = 24_000;
 const SQLITE_TEXT_COPY_DEFAULT_CHUNK_ROWS = boundedEnvInt(process.env.CODEGRAPH_SQLITE_TEXT_COPY_CHUNK_ROWS, 1_000, 1, 10_000);
 const SQLITE_TEXT_COPY_PARSE_CACHE_CHUNK_ROWS = boundedEnvInt(process.env.CODEGRAPH_SQLITE_PARSE_CACHE_COPY_CHUNK_ROWS, 25, 1, 1_000);
@@ -543,8 +543,10 @@ function createSchema(db: DatabaseType): void {
     CREATE INDEX IF NOT EXISTS idx_snapshots_workspace_created ON snapshots(workspace_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_files_snapshot_hash ON files(snapshot_id, blob_hash);
     CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(snapshot_id, simple_name, kind);
+    CREATE INDEX IF NOT EXISTS idx_symbols_name_nocase ON symbols(snapshot_id, simple_name COLLATE NOCASE, kind);
     CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(snapshot_id, file);
     CREATE INDEX IF NOT EXISTS idx_symbols_fq ON symbols(snapshot_id, fq_name);
+    CREATE INDEX IF NOT EXISTS idx_symbols_fq_nocase ON symbols(snapshot_id, fq_name COLLATE NOCASE);
     CREATE INDEX IF NOT EXISTS idx_symbols_framework_role ON symbols(snapshot_id, framework_role);
     CREATE INDEX IF NOT EXISTS idx_imports_source ON imports(snapshot_id, source);
     CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(snapshot_id, file);
@@ -569,6 +571,7 @@ function createSchema(db: DatabaseType): void {
     CREATE INDEX IF NOT EXISTS idx_beans_type ON beans(snapshot_id, bean_type);
     CREATE INDEX IF NOT EXISTS idx_inheritance_parent ON inheritance(snapshot_id, parent_type);
   `);
+  createSearchSchema(db);
 
   ensureColumn(db, 'snapshots', 'index_provider_ids', "TEXT NOT NULL DEFAULT 'tree-sitter'");
   ensureColumn(db, 'snapshots', 'index_provider_versions_json', "TEXT NOT NULL DEFAULT '{}'");
@@ -584,6 +587,25 @@ function createSchema(db: DatabaseType): void {
   ensureColumn(db, 'call_edges', 'signal_reasons_json', "TEXT NOT NULL DEFAULT '[]'");
 
   db.prepare('INSERT OR IGNORE INTO codegraph_schema(version, applied_at) VALUES (?, ?)').run(SCHEMA_VERSION, new Date().toISOString());
+}
+
+function createSearchSchema(db: DatabaseType): void {
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS codegraph_search_fts USING fts5(
+        snapshot_id UNINDEXED,
+        entity_type UNINDEXED,
+        entity_id UNINDEXED,
+        file UNINDEXED,
+        name,
+        content,
+        tokenize = 'unicode61'
+      );
+    `);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`SQLite FTS5 is required for CodeGraph search index, but creating codegraph_search_fts failed: ${message}`);
+  }
 }
 
 function ensureColumn(db: DatabaseType, table: string, column: string, definition: string): void {

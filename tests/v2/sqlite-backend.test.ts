@@ -54,6 +54,35 @@ describe('SQLite graph backend', () => {
     }
   });
 
+  it('creates search FTS table and case-insensitive symbol indexes idempotently', async () => {
+    const root = tempDir('codegraph-sqlite-search-schema-');
+    const first = await openCodeGraphDb(root);
+    try {
+      const objects = await first.db.prepare(`
+        SELECT name, type
+        FROM sqlite_master
+        WHERE name IN ('codegraph_search_fts', 'idx_symbols_name_nocase', 'idx_symbols_fq_nocase')
+        ORDER BY name
+      `).all() as Array<{ name: string; type: string }>;
+      expect(objects).toContainEqual({ name: 'codegraph_search_fts', type: 'table' });
+      expect(objects).toContainEqual({ name: 'idx_symbols_fq_nocase', type: 'index' });
+      expect(objects).toContainEqual({ name: 'idx_symbols_name_nocase', type: 'index' });
+    } finally {
+      await first.db.close();
+    }
+
+    const reopened = await openCodeGraphDb(root);
+    try {
+      expect(await reopened.db.scalar(`
+        SELECT COUNT(*)
+        FROM sqlite_master
+        WHERE name IN ('codegraph_search_fts', 'idx_symbols_name_nocase', 'idx_symbols_fq_nocase')
+      `)).toBe(3);
+    } finally {
+      await reopened.db.close();
+    }
+  });
+
   it('copies large parse_cache text shards in bounded chunks', async () => {
     const root = tempDir('codegraph-sqlite-copy-shard-');
     const { db } = await openCodeGraphDb(root);

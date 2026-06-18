@@ -47,6 +47,22 @@ describe('v2 SQLite index and query service', () => {
     }) as { symbols: Array<{ name: string; file: string }> };
 
     expect(search.symbols.some(symbol => symbol.name === 'PaymentService')).toBe(true);
+    expect(await db.scalar('SELECT COUNT(*) FROM codegraph_search_fts WHERE snapshot_id = ?', result.snapshotId)).toBeGreaterThan(0);
+
+    const caseInsensitiveSearch = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'paymentservice', kind: 'class' },
+    }) as { symbols: Array<{ name: string; file: string }> };
+    expect(caseInsensitiveSearch.symbols.some(symbol => symbol.name === 'PaymentService')).toBe(true);
+
+    const exactPlan = await db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT fq_name
+      FROM symbols
+      WHERE snapshot_id = ? AND simple_name = ? COLLATE NOCASE AND kind = ?
+    `).all(result.snapshotId, 'paymentservice', 'class') as Array<{ detail: string }>;
+    expect(exactPlan.map(row => row.detail).join('\n')).toContain('idx_symbols_name_nocase');
 
     const callers = await queries.query({
       workspaceId: result.workspaceId,
@@ -797,6 +813,14 @@ class Order {
     expect(fileSearch.files[0]?.path).toContain('PaymentGateway.java');
     expect(fileSearch.files[0]?.topSymbols.some(symbol => symbol.name === 'PaymentGateway')).toBe(true);
     expect(fileSearch.files[0]?.rankExplanation?.length).toBeGreaterThan(0);
+    const ftsFiles = await db.prepare(`
+      SELECT DISTINCT file
+      FROM codegraph_search_fts
+      WHERE codegraph_search_fts MATCH ?
+        AND snapshot_id = ?
+        AND entity_type IN ('file', 'symbol')
+    `).all('payment* OR gateway*', result.snapshotId) as Array<{ file: string }>;
+    expect(ftsFiles.some(row => row.file.endsWith('PaymentGateway.java'))).toBe(true);
 
     const references = await queries.query({
       workspaceId: result.workspaceId,
@@ -4763,6 +4787,12 @@ public class ChangedFeature {
       args: { query: 'ChangedFeature', limit: 5 },
     }) as { symbols: Array<{ name: string }> };
     expect(changedSearch.symbols.some(symbol => symbol.name === 'ChangedFeature')).toBe(true);
+    expect(await db.scalar(`
+      SELECT COUNT(*)
+      FROM codegraph_search_fts
+      WHERE codegraph_search_fts MATCH ?
+        AND snapshot_id = ?
+    `, 'changedfeature*', second.snapshotId)).toBeGreaterThan(0);
 
     const originalSearch = await queries.query({
       workspaceId: second.workspaceId,
@@ -4770,6 +4800,12 @@ public class ChangedFeature {
       args: { query: 'OriginalFeature', limit: 5 },
     }) as { symbols: Array<{ name: string }> };
     expect(originalSearch.symbols.some(symbol => symbol.name === 'OriginalFeature')).toBe(false);
+    expect(await db.scalar(`
+      SELECT COUNT(*)
+      FROM codegraph_search_fts
+      WHERE codegraph_search_fts MATCH ?
+        AND snapshot_id = ?
+    `, 'originalfeature*', second.snapshotId)).toBe(0);
 
     fs.rmSync(path.join(repo, 'src/main/java/com/example/Keep.java'));
     const third = await indexer.indexWorkspace({ root: repo });
@@ -4784,6 +4820,57 @@ public class ChangedFeature {
       args: { query: 'Keep', limit: 5 },
     }) as { symbols: Array<{ name: string }> };
     expect(deletedSearch.symbols.some(symbol => symbol.name === 'Keep')).toBe(false);
+    expect(await db.scalar(
+      'SELECT COUNT(*) FROM codegraph_search_fts WHERE snapshot_id = ? AND file = ?',
+      third.snapshotId,
+      'src/main/java/com/example/Keep.java',
+    )).toBe(0);
+  });
+
+  it('retains only the configured number of ready snapshots and prunes their FTS rows', async () => {
+    const previousRetention = process.env.CODEGRAPH_SNAPSHOT_RETENTION;
+    process.env.CODEGRAPH_SNAPSHOT_RETENTION = '3';
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-retention-');
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const results: Array<{ workspaceId: string; snapshotId: string }> = [];
+
+    try {
+      for (let index = 0; index < 4; index++) {
+        writeFile(repo, 'src/main/java/com/example/Retained.java', `package com.example;
+
+public class Retained${index} {
+}
+`);
+        results.push(await indexer.indexWorkspace({ root: repo, force: true }));
+        await new Promise(resolve => setTimeout(resolve, 2));
+      }
+
+      const keptSnapshots = await db.prepare(`
+        SELECT id, status
+        FROM snapshots
+        WHERE workspace_id = ?
+        ORDER BY created_at DESC, id DESC
+      `).all(results[3]!.workspaceId) as Array<{ id: string; status: string }>;
+      expect(keptSnapshots).toHaveLength(3);
+      expect(keptSnapshots.every(row => row.status === 'ready')).toBe(true);
+      expect(keptSnapshots.map(row => row.id)).toContain(results[3]!.snapshotId);
+
+      const keptIds = new Set(keptSnapshots.map(row => row.id));
+      const prunedIds = results.map(result => result.snapshotId).filter(id => !keptIds.has(id));
+      expect(prunedIds.length).toBe(1);
+      for (const snapshotId of prunedIds) {
+        expect(await db.scalar('SELECT COUNT(*) FROM snapshots WHERE id = ?', snapshotId)).toBe(0);
+        expect(await db.scalar('SELECT COUNT(*) FROM codegraph_search_fts WHERE snapshot_id = ?', snapshotId)).toBe(0);
+      }
+    } finally {
+      if (previousRetention === undefined) {
+        delete process.env.CODEGRAPH_SNAPSHOT_RETENTION;
+      } else {
+        process.env.CODEGRAPH_SNAPSHOT_RETENTION = previousRetention;
+      }
+    }
   });
 
   it('refreshes specific changed paths without a full manifest scan', async () => {
@@ -4828,6 +4915,14 @@ public class PathDeltaFeature {
       args: { query: 'PathDeltaFeature', limit: 5 },
     }) as { symbols: Array<{ name: string }> };
     expect(changedSearch.symbols.some(symbol => symbol.name === 'PathDeltaFeature')).toBe(true);
+    const changedFtsRows = await db.prepare(`
+      SELECT name
+      FROM codegraph_search_fts
+      WHERE codegraph_search_fts MATCH ?
+        AND snapshot_id = ?
+        AND file = ?
+    `).all('pathdeltafeature*', second.snapshotId, 'src/main/java/com/example/Feature.java') as Array<{ name: string }>;
+    expect(changedFtsRows.some(row => row.name === 'PathDeltaFeature')).toBe(true);
 
     fs.rmSync(path.join(repo, 'src/main/java/com/example/Keep.java'));
     const third = await indexer.refreshWorkspacePaths({
@@ -4844,6 +4939,11 @@ public class PathDeltaFeature {
       args: { query: 'Keep', limit: 5 },
     }) as { symbols: Array<{ name: string }> };
     expect(deletedSearch.symbols.some(symbol => symbol.name === 'Keep')).toBe(false);
+    expect(await db.scalar(
+      'SELECT COUNT(*) FROM codegraph_search_fts WHERE snapshot_id = ? AND file = ?',
+      third.snapshotId,
+      'src/main/java/com/example/Keep.java',
+    )).toBe(0);
   });
 
   it('discovers synthetic Jakarta endpoints', async () => {

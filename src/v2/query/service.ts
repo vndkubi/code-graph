@@ -398,51 +398,11 @@ export class V2QueryService {
     }
     const candidateLimit = Math.min(Math.max((cursorOffset + limit) * 50, 500), 5000);
 
-    const exactRows = await this.db.prepare(`
-      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
-             package_name, return_type, parameter_types_json, annotations_json,
-             framework_role, framework_meta_json, file_role
-      FROM symbols
-      WHERE ${baseWhere}
-        AND (
-          LOWER(simple_name) = LOWER(?)
-          OR LOWER(fq_name) = LOWER(?)
-          OR simple_name LIKE ? ESCAPE '\\'
-          OR fq_name LIKE ? ESCAPE '\\'
-        )
-      ORDER BY
-        CASE
-          WHEN LOWER(simple_name) = LOWER(?) THEN 0
-          WHEN LOWER(fq_name) = LOWER(?) THEN 1
-          WHEN simple_name LIKE ? ESCAPE '\\' THEN 2
-          WHEN fq_name LIKE ? ESCAPE '\\' THEN 3
-          ELSE 4
-        END,
-        CASE file_role
-          WHEN 'main_source' THEN 0
-          WHEN 'resource_config' THEN 1
-          WHEN 'build_config' THEN 2
-          WHEN 'test_source' THEN 3
-          WHEN 'mock_source' THEN 4
-          WHEN 'generated' THEN 5
-          ELSE 6
-        END,
-        simple_name
-      LIMIT ?
-    `).all(
-      ...baseParams,
-      query,
-      query,
-      phrasePattern,
-      phrasePattern,
-      query,
-      query,
-      phrasePattern,
-      phrasePattern,
-      100,
-    ) as SymbolRow[];
-
-    const broadRows = await this.db.prepare(`
+    const exactRows = await this.exactSymbolSearchRows(baseWhere, baseParams, query, phrasePattern, 100);
+    const ftsBroadRows = await this.symbolSearchCandidateRowsFromFts(snapshotId, baseWhere, baseParams, tokens, candidateLimit);
+    const broadRows = ftsBroadRows.length > 0
+      ? ftsBroadRows
+      : await this.db.prepare(`
       SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
              package_name, return_type, parameter_types_json, annotations_json,
              framework_role, framework_meta_json, file_role
@@ -646,6 +606,9 @@ export class V2QueryService {
     includeConfigEvidence: boolean,
     includeEndpointEvidence: boolean,
   ): Promise<FileRow[]> {
+    const ftsRows = await this.fileSearchCandidateRowsFromFts(snapshotId, baseWhere, baseParams, terms, candidateLimit);
+    if (ftsRows.length > 0) return ftsRows;
+
     const candidates = new Map<string, FileRow>();
     const addRows = (rows: FileRow[]) => {
       for (const row of rows) {
@@ -722,6 +685,175 @@ export class V2QueryService {
     }
 
     return [...candidates.values()].slice(0, candidateLimit);
+  }
+
+  private async exactSymbolSearchRows(
+    baseWhere: string,
+    baseParams: unknown[],
+    query: string,
+    phrasePattern: string,
+    limit: number,
+  ): Promise<SymbolRow[]> {
+    const exactBySimpleName = await this.db.prepare(`
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+             package_name, return_type, parameter_types_json, annotations_json,
+             framework_role, framework_meta_json, file_role
+      FROM symbols
+      WHERE ${baseWhere}
+        AND simple_name = ? COLLATE NOCASE
+      ORDER BY
+        CASE file_role
+          WHEN 'main_source' THEN 0
+          WHEN 'resource_config' THEN 1
+          WHEN 'build_config' THEN 2
+          WHEN 'test_source' THEN 3
+          WHEN 'mock_source' THEN 4
+          WHEN 'generated' THEN 5
+          ELSE 6
+        END,
+        simple_name
+      LIMIT ?
+    `).all(...baseParams, query, limit) as SymbolRow[];
+    const exactByFqName = await this.db.prepare(`
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+             package_name, return_type, parameter_types_json, annotations_json,
+             framework_role, framework_meta_json, file_role
+      FROM symbols
+      WHERE ${baseWhere}
+        AND fq_name = ? COLLATE NOCASE
+      ORDER BY
+        CASE file_role
+          WHEN 'main_source' THEN 0
+          WHEN 'resource_config' THEN 1
+          WHEN 'build_config' THEN 2
+          WHEN 'test_source' THEN 3
+          WHEN 'mock_source' THEN 4
+          WHEN 'generated' THEN 5
+          ELSE 6
+        END,
+        simple_name
+      LIMIT ?
+    `).all(...baseParams, query, limit) as SymbolRow[];
+    const phraseRows = await this.db.prepare(`
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+             package_name, return_type, parameter_types_json, annotations_json,
+             framework_role, framework_meta_json, file_role
+      FROM symbols
+      WHERE ${baseWhere}
+        AND (
+          simple_name LIKE ? ESCAPE '\\'
+          OR fq_name LIKE ? ESCAPE '\\'
+        )
+      ORDER BY
+        CASE
+          WHEN simple_name LIKE ? ESCAPE '\\' THEN 0
+          WHEN fq_name LIKE ? ESCAPE '\\' THEN 1
+          ELSE 2
+        END,
+        CASE file_role
+          WHEN 'main_source' THEN 0
+          WHEN 'resource_config' THEN 1
+          WHEN 'build_config' THEN 2
+          WHEN 'test_source' THEN 3
+          WHEN 'mock_source' THEN 4
+          WHEN 'generated' THEN 5
+          ELSE 6
+        END,
+        simple_name
+      LIMIT ?
+    `).all(...baseParams, phrasePattern, phrasePattern, phrasePattern, phrasePattern, limit) as SymbolRow[];
+    return mergeSymbolRows(exactBySimpleName, exactByFqName, phraseRows).slice(0, limit);
+  }
+
+  private async symbolSearchCandidateRowsFromFts(
+    snapshotId: string,
+    baseWhere: string,
+    baseParams: unknown[],
+    tokens: string[],
+    candidateLimit: number,
+  ): Promise<SymbolRow[]> {
+    const matchQuery = ftsPrefixQuery(tokens);
+    if (!matchQuery) return [];
+    const idRows = await this.db.prepare(`
+      SELECT entity_id
+      FROM codegraph_search_fts
+      WHERE codegraph_search_fts MATCH ?
+        AND snapshot_id = ?
+        AND entity_type = 'symbol'
+      LIMIT ?
+    `).all(matchQuery, snapshotId, candidateLimit) as Array<{ entity_id: string }>;
+    const keys = uniqueRecordsBy(
+      idRows
+        .map(row => parseSymbolSearchEntityId(row.entity_id))
+        .filter((row): row is SymbolSearchEntityKey => Boolean(row)),
+      row => `${row.fqName}\0${row.file}\0${row.line}`,
+    );
+    if (keys.length === 0) return [];
+
+    const rows: SymbolRow[] = [];
+    for (const batch of chunksOf(keys, 250)) {
+      if (rows.length >= candidateLimit) break;
+      const disjunction = batch.map(() => '(fq_name = ? AND file = ? AND line = ?)').join(' OR ');
+      const params = batch.flatMap(key => [key.fqName, key.file, key.line]);
+      rows.push(...await this.db.prepare(`
+        SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+               package_name, return_type, parameter_types_json, annotations_json,
+               framework_role, framework_meta_json, file_role
+        FROM symbols
+        WHERE ${baseWhere}
+          AND (${disjunction})
+        LIMIT ?
+      `).all(...baseParams, ...params, candidateLimit - rows.length) as SymbolRow[]);
+    }
+    return mergeSymbolRows(rows).slice(0, candidateLimit);
+  }
+
+  private async fileSearchCandidateRowsFromFts(
+    snapshotId: string,
+    baseWhere: string,
+    baseParams: unknown[],
+    terms: string[],
+    candidateLimit: number,
+  ): Promise<FileRow[]> {
+    const matchQuery = ftsPrefixQuery(terms);
+    if (!matchQuery) return [];
+    const fileRows = await this.db.prepare(`
+      SELECT file
+      FROM codegraph_search_fts
+      WHERE codegraph_search_fts MATCH ?
+        AND snapshot_id = ?
+        AND entity_type IN ('file', 'symbol')
+      GROUP BY file
+      LIMIT ?
+    `).all(matchQuery, snapshotId, candidateLimit) as Array<{ file: string }>;
+    const files = uniqueStrings(fileRows.map(row => row.file)).slice(0, candidateLimit);
+    if (files.length === 0) return [];
+
+    const rows: FileRow[] = [];
+    for (const batch of chunksOf(files, 500)) {
+      if (rows.length >= candidateLimit) break;
+      const placeholders = batch.map(() => '?').join(', ');
+      rows.push(...await this.db.prepare(`
+        SELECT f.path, f.language, f.file_role, f.parse_status, f.size
+        FROM files f
+        WHERE ${baseWhere}
+          AND f.path IN (${placeholders})
+        ORDER BY
+          CASE f.file_role
+            WHEN 'main_source' THEN 0
+            WHEN 'resource_config' THEN 1
+            WHEN 'build_config' THEN 2
+            WHEN 'test_source' THEN 3
+            WHEN 'mock_source' THEN 4
+            WHEN 'generated' THEN 5
+            ELSE 6
+          END,
+          LENGTH(f.path),
+          f.path
+        LIMIT ?
+      `).all(...baseParams, ...batch, candidateLimit - rows.length) as FileRow[]);
+    }
+    return uniqueRecordsBy(rows, row => row.path).slice(0, candidateLimit);
   }
 
   private async findReferences(snapshotId: string, args: Record<string, unknown>) {
@@ -1578,15 +1710,15 @@ export class V2QueryService {
         FROM symbols
         WHERE snapshot_id = ? AND kind = 'field'
           AND (
-            LOWER(simple_name) = LOWER(?)
-            OR LOWER(fq_name) = LOWER(?)
+            simple_name = ? COLLATE NOCASE
+            OR fq_name = ? COLLATE NOCASE
             OR simple_name LIKE ? ESCAPE '\\'
             OR fq_name LIKE ? ESCAPE '\\'
           )
         ORDER BY
           CASE
-            WHEN LOWER(fq_name) = LOWER(?) THEN 0
-            WHEN LOWER(simple_name) = LOWER(?) THEN 1
+            WHEN fq_name = ? COLLATE NOCASE THEN 0
+            WHEN simple_name = ? COLLATE NOCASE THEN 1
             WHEN fq_name LIKE ? ESCAPE '\\' THEN 2
             ELSE 3
           END,
@@ -4650,6 +4782,12 @@ interface SymbolRow {
   framework_role?: string;
   framework_meta_json?: string;
   file_role: FileRole;
+}
+
+interface SymbolSearchEntityKey {
+  fqName: string;
+  file: string;
+  line: number;
 }
 
 interface RepoAtlasSnapshotRow {
@@ -9021,6 +9159,31 @@ function fileSearchCandidateTerms(query: string, tokens: string[]): string[] {
     .filter(term => term.length >= 3 && !isBroadSearchTerm(term)))
     .slice(0, 10);
   return fallbackTerms.length > 0 ? fallbackTerms : tokens.slice(0, 6);
+}
+
+function ftsPrefixQuery(terms: string[]): string | undefined {
+  const tokens = uniqueStrings(terms
+    .flatMap(term => tokenizeSearchQuery(term))
+    .filter(token => /^[a-z0-9]+$/.test(token)))
+    .slice(0, 12);
+  if (tokens.length === 0) return undefined;
+  return tokens.map(token => `${token}*`).join(' OR ');
+}
+
+function parseSymbolSearchEntityId(value: string): SymbolSearchEntityKey | undefined {
+  const [fqName, file, lineText] = value.split('\t');
+  const line = Number(lineText);
+  if (!fqName || !file || !Number.isFinite(line)) return undefined;
+  return { fqName, file, line };
+}
+
+function chunksOf<T>(values: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  const safeSize = Math.max(1, size);
+  for (let index = 0; index < values.length; index += safeSize) {
+    chunks.push(values.slice(index, index + safeSize));
+  }
+  return chunks;
 }
 
 function isBroadExplicitRef(value: string): boolean {

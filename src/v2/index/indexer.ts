@@ -264,6 +264,7 @@ const SHARDED_FULL_INDEX_MIN_FILES = boundedInt(process.env.CODEGRAPH_SHARDED_FU
 const PARSE_CACHE_COPY_PARALLELISM = boundedInt(process.env.CODEGRAPH_PARSE_CACHE_COPY_PARALLELISM, 1, 1, 8);
 const OVERLAP_PARSE_CACHE_COPY = envFlag(process.env.CODEGRAPH_OVERLAP_PARSE_CACHE_COPY);
 const BULK_REBUILD_CALL_INDEX_MIN_FILES = boundedInt(process.env.CODEGRAPH_BULK_REBUILD_CALL_INDEX_MIN_FILES, 2_000, 0, 100_000);
+const DEFAULT_SNAPSHOT_RETENTION = 3;
 const COPY_INSERT_TABLES = new Set([
   'files',
   'parse_cache',
@@ -365,8 +366,10 @@ const BEAN_ANNOTATIONS = new Set([
 const FULL_BULK_LOAD_INDEXES: BulkLoadIndexSpec[] = [
   { name: 'idx_files_snapshot_hash', createSql: 'CREATE INDEX IF NOT EXISTS idx_files_snapshot_hash ON files(snapshot_id, blob_hash)' },
   { name: 'idx_symbols_name', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(snapshot_id, simple_name, kind)' },
+  { name: 'idx_symbols_name_nocase', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_name_nocase ON symbols(snapshot_id, simple_name COLLATE NOCASE, kind)' },
   { name: 'idx_symbols_file', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(snapshot_id, file)' },
   { name: 'idx_symbols_fq', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_fq ON symbols(snapshot_id, fq_name)' },
+  { name: 'idx_symbols_fq_nocase', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_fq_nocase ON symbols(snapshot_id, fq_name COLLATE NOCASE)' },
   { name: 'idx_symbols_framework_role', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_framework_role ON symbols(snapshot_id, framework_role)' },
   { name: 'idx_imports_source', createSql: 'CREATE INDEX IF NOT EXISTS idx_imports_source ON imports(snapshot_id, source)' },
   { name: 'idx_imports_file', createSql: 'CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(snapshot_id, file)' },
@@ -494,6 +497,7 @@ export class V2Indexer {
         SET last_seen_at = ?
         WHERE id = ?
       `).run(new Date().toISOString(), workspace.workspaceId);
+      await this.pruneOldSnapshots(workspace.workspaceId, latestSnapshotId);
 
       options.progress?.({
         phase: 'complete',
@@ -811,6 +815,7 @@ export class V2Indexer {
       if (!options.skipSnapshotStats) {
         await this.refreshSnapshotStats(snapshotId);
       }
+      await this.rebuildSearchIndexForSnapshot(snapshotId);
       await this.db.prepare(`
         UPDATE snapshots
         SET status = 'ready',
@@ -824,6 +829,7 @@ export class V2Indexer {
         SET current_snapshot_id = ?, last_indexed_head = ?, last_seen_at = ?
         WHERE id = ?
       `).run(snapshotId, git.headCommit, now, workspace.workspaceId);
+      await this.pruneOldSnapshots(workspace.workspaceId, snapshotId);
     });
 
     await tx();
@@ -2087,6 +2093,7 @@ export class V2Indexer {
         if (!args.skipSnapshotStats) {
           await this.refreshSnapshotStats(args.snapshotId);
         }
+        await this.rebuildSearchIndexForSnapshot(args.snapshotId);
         await this.db.prepare(`
           UPDATE snapshots
           SET status = 'ready',
@@ -2100,6 +2107,7 @@ export class V2Indexer {
           SET current_snapshot_id = ?, last_indexed_head = ?, last_seen_at = ?
           WHERE id = ?
         `).run(args.snapshotId, args.git.headCommit, args.now, args.workspaceId);
+        await this.pruneOldSnapshots(args.workspaceId, args.snapshotId);
       });
 
       await tx();
@@ -2313,6 +2321,7 @@ export class V2Indexer {
       if (!args.skipSnapshotStats) {
         await this.refreshSnapshotStats(args.snapshotId);
       }
+      await this.rebuildSearchIndexForSnapshot(args.snapshotId);
       await this.db.prepare(`
         UPDATE snapshots
         SET status = 'ready',
@@ -2326,6 +2335,7 @@ export class V2Indexer {
         SET current_snapshot_id = ?, last_indexed_head = ?, last_seen_at = ?
         WHERE id = ?
       `).run(args.snapshotId, args.git.headCommit, args.now, args.workspaceId);
+      await this.pruneOldSnapshots(args.workspaceId, args.snapshotId);
     });
 
     await tx();
@@ -2504,6 +2514,7 @@ export class V2Indexer {
         details: { phaseElapsedMs: Date.now() - dependencyRebuildStart },
       });
       await this.rebuildGraphOverlay(args.snapshotId, args.progress, args.start);
+      await this.refreshSearchIndexForFiles(args.snapshotId, affectedPaths);
 
       if (!args.skipSnapshotStats) {
         await this.refreshSnapshotStats(args.snapshotId);
@@ -2521,6 +2532,7 @@ export class V2Indexer {
         SET current_snapshot_id = ?, last_indexed_head = ?, last_seen_at = ?
         WHERE id = ?
       `).run(args.snapshotId, args.git.headCommit, now, args.workspaceId);
+      await this.pruneOldSnapshots(args.workspaceId, args.snapshotId);
     });
 
     await tx();
@@ -2568,6 +2580,108 @@ export class V2Indexer {
       DELETE FROM files
       WHERE snapshot_id = ? AND path IN (${placeholders})
     `).run(snapshotId, ...values);
+  }
+
+  private async rebuildSearchIndexForSnapshot(snapshotId: string): Promise<void> {
+    await this.db.prepare('DELETE FROM codegraph_search_fts WHERE snapshot_id = ?').run(snapshotId);
+    await this.insertFileSearchRows(snapshotId);
+    await this.insertSymbolSearchRows(snapshotId);
+  }
+
+  private async refreshSearchIndexForFiles(snapshotId: string, files: Set<string>): Promise<void> {
+    if (files.size === 0) return;
+    const values = [...files];
+    for (const batch of chunkArray(values, Math.max(1, MAX_QUERY_BATCH_PARAMS - 1))) {
+      const placeholders = batch.map(() => '?').join(', ');
+      await this.db.prepare(`
+        DELETE FROM codegraph_search_fts
+        WHERE snapshot_id = ? AND file IN (${placeholders})
+      `).run(snapshotId, ...batch);
+      await this.insertFileSearchRows(snapshotId, batch);
+      await this.insertSymbolSearchRows(snapshotId, batch);
+    }
+  }
+
+  private async insertFileSearchRows(snapshotId: string, files?: string[]): Promise<void> {
+    const filter = files && files.length > 0 ? `AND path IN (${files.map(() => '?').join(', ')})` : '';
+    await this.db.prepare(`
+      INSERT INTO codegraph_search_fts (snapshot_id, entity_type, entity_id, file, name, content)
+      SELECT
+        snapshot_id,
+        'file',
+        path,
+        path,
+        path,
+        path || ' ' || COALESCE(language, '') || ' ' || file_role || ' ' || parse_status
+      FROM files
+      WHERE snapshot_id = ?
+        ${filter}
+    `).run(snapshotId, ...(files ?? []));
+  }
+
+  private async insertSymbolSearchRows(snapshotId: string, files?: string[]): Promise<void> {
+    const filter = files && files.length > 0 ? `AND file IN (${files.map(() => '?').join(', ')})` : '';
+    await this.db.prepare(`
+      INSERT INTO codegraph_search_fts (snapshot_id, entity_type, entity_id, file, name, content)
+      SELECT
+        snapshot_id,
+        'symbol',
+        fq_name || char(9) || file || char(9) || CAST(line AS TEXT),
+        file,
+        simple_name,
+        fq_name
+          || ' ' || simple_name
+          || ' ' || file
+          || ' ' || kind
+          || ' ' || COALESCE(package_name, '')
+          || ' ' || COALESCE(framework_role, '')
+          || ' ' || COALESCE(signature, '')
+      FROM symbols
+      WHERE snapshot_id = ?
+        ${filter}
+    `).run(snapshotId, ...(files ?? []));
+  }
+
+  private async pruneOldSnapshots(workspaceId: string, currentSnapshotId: string): Promise<void> {
+    const retention = snapshotRetentionLimit();
+    const readySnapshots = await this.db.prepare(`
+      SELECT id
+      FROM snapshots
+      WHERE workspace_id = ? AND status = 'ready'
+      ORDER BY
+        CASE WHEN id = ? THEN 0 ELSE 1 END,
+        created_at DESC,
+        id DESC
+    `).all(workspaceId, currentSnapshotId) as Array<{ id: string }>;
+
+    const keep = new Set<string>([currentSnapshotId]);
+    for (const row of readySnapshots) {
+      if (keep.size >= retention) break;
+      keep.add(row.id);
+    }
+    const stale = readySnapshots
+      .map(row => row.id)
+      .filter(id => !keep.has(id));
+    if (stale.length === 0) return;
+
+    await this.deleteSearchRowsForSnapshots(stale);
+    for (const batch of chunkArray(stale, Math.max(1, MAX_QUERY_BATCH_PARAMS - 1))) {
+      const placeholders = batch.map(() => '?').join(', ');
+      await this.db.prepare(`
+        DELETE FROM snapshots
+        WHERE workspace_id = ? AND id IN (${placeholders})
+      `).run(workspaceId, ...batch);
+    }
+  }
+
+  private async deleteSearchRowsForSnapshots(snapshotIds: string[]): Promise<void> {
+    for (const batch of chunkArray(snapshotIds, MAX_QUERY_BATCH_PARAMS)) {
+      const placeholders = batch.map(() => '?').join(', ');
+      await this.db.prepare(`
+        DELETE FROM codegraph_search_fts
+        WHERE snapshot_id IN (${placeholders})
+      `).run(...batch);
+    }
   }
 
   private async affectedDependencySources(snapshotId: string, changedOrDeletedFiles: Set<string>): Promise<Set<string>> {
@@ -3757,6 +3871,10 @@ function boundedInt(value: string | undefined, fallback: number, min: number, ma
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+function snapshotRetentionLimit(): number {
+  return boundedInt(process.env.CODEGRAPH_SNAPSHOT_RETENTION, DEFAULT_SNAPSHOT_RETENTION, 1, 1_000);
 }
 
 function envFlag(value: string | undefined): boolean {
