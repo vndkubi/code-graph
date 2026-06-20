@@ -97,19 +97,19 @@
   },
   {
     "id": "endpoint-list-users",
-    "question": "Which handler serves GET /users?",
+    "question": "Which handler serves GET /orders?",
     "codegraphTool": "find_endpoints",
-    "codegraphArgs": { "method": "GET", "path": "/users", "limit": 20, "explainRank": true, "includeSnippets": true },
-    "baselineSearchTerms": ["/users", "GetMapping", "GET"],
-    "expectedContains": ["users"]
+    "codegraphArgs": { "method": "GET", "path": "/orders", "limit": 20, "explainRank": true, "includeSnippets": true },
+    "baselineSearchTerms": ["/orders", "Path", "GET"],
+    "expectedContains": ["orders"]
   },
   {
-    "id": "endpoint-update-user",
-    "question": "Which handler serves PUT /users/{id}?",
+    "id": "endpoint-get-order-by-id",
+    "question": "Which handler serves GET /orders/{id}?",
     "codegraphTool": "find_endpoints",
-    "codegraphArgs": { "method": "PUT", "path": "/users", "limit": 20, "explainRank": true, "includeSnippets": true },
-    "baselineSearchTerms": ["/users", "PutMapping", "PUT"],
-    "expectedContains": ["users"]
+    "codegraphArgs": { "method": "GET", "path": "/orders/{id}", "limit": 20, "explainRank": true, "includeSnippets": true },
+    "baselineSearchTerms": ["/orders", "Path", "GET"],
+    "expectedContains": ["orders"]
   },
   {
     "id": "dto-impact",

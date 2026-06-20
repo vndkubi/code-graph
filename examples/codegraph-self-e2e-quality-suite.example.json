@@ -5,7 +5,7 @@
     {
       "id": "route-inspector-gate",
       "type": "investigation",
-      "prompt": "Explain how CodeGraph routes codegraph_context for PBI acceptance criteria and how the answerable gate prevents shell fallback. Return compact JSON with keys task,keyFiles,methods,flow,tests,risks,confidence.",
+      "prompt": "Explain how CodeGraph routes codegraph_context for PBI acceptance criteria and how the answerable gate prevents shell fallback. Include the helper methods inspectCodeGraphRoute, routeCodeGraphContext, and inferCodeGraphContextMode. Return compact JSON with keys task,keyFiles,methods,flow,tests,risks,confidence.",
       "expectedFiles": [
         "src/v2/mcp/proxy.ts",
         "tests/v2/mcp-client-profile.test.ts"
@@ -26,7 +26,8 @@
         "methods",
         "flow",
         "tests"
-      ]
+      ],
+      "requireJson": true
     }
   ]
 }

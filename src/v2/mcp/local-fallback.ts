@@ -530,7 +530,7 @@ function buildEvidenceSlices(candidates: RankedLocalFile[], plan: LocalSearchPla
     if (slices.length >= plan.maxEvidenceSlices) break;
     const content = candidate.content ?? readTextFile(candidate.absPath, localFallbackMaxContentBytes());
     if (content === undefined) continue;
-    const focusLine = candidate.lineHits[0] ?? 1;
+    const focusLine = bestLocalFocusLine(candidate);
     slices.push(sliceContent(candidate.relPath, content, focusLine, 6, maxChars, candidate.matchedTerms));
   }
   return slices;
@@ -560,7 +560,7 @@ function localSliceOne(
       if (candidateFromArtifact) {
         const contentFromArtifact = readTextFile(candidateFromArtifact.absPath, localFallbackMaxContentBytes());
         if (contentFromArtifact !== undefined) {
-          return sliceContent(candidateFromArtifact.relPath, contentFromArtifact, candidateFromArtifact.lineHits[0] ?? 1, 6, maxChars, candidateFromArtifact.matchedTerms);
+          return sliceContent(candidateFromArtifact.relPath, contentFromArtifact, bestLocalFocusLine(candidateFromArtifact), 6, maxChars, candidateFromArtifact.matchedTerms);
         }
       }
     }
@@ -569,9 +569,13 @@ function localSliceOne(
     if (!candidate) return undefined;
     const content = candidate.content ?? readTextFile(candidate.absPath, localFallbackMaxContentBytes());
     if (content === undefined) return undefined;
-    return sliceContent(candidate.relPath, content, candidate.lineHits[0] ?? 1, 6, maxChars, candidate.matchedTerms);
+    return sliceContent(candidate.relPath, content, bestLocalFocusLine(candidate), 6, maxChars, candidate.matchedTerms);
   }
   return undefined;
+}
+
+function bestLocalFocusLine(candidate: { lineHits: number[] }): number {
+  return candidate.lineHits.find(line => line > 1) ?? candidate.lineHits[0] ?? 1;
 }
 
 function sliceContent(

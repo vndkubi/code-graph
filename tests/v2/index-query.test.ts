@@ -2755,6 +2755,28 @@ public class NoisyOrder${i} {
     }, parsed.finalOutput);
     expect(quality.score).toBe(1);
     expect(quality.misses).toHaveLength(0);
+
+    const structuredQuality = scoreCodexOutput({
+      id: 'api-flow',
+      prompt: 'Trace app API',
+      expectedFiles: ['RMWebServices.java'],
+      expectedMethods: ['getApps'],
+      expectedTerms: ['applicationTags'],
+      requiredAnswerFields: ['task', 'keyFiles', 'methods', 'flow'],
+      requireJson: true,
+    }, `progress update\n${parsed.finalOutput}`);
+    expect(structuredQuality.score).toBe(1);
+    expect(structuredQuality.misses).toHaveLength(0);
+
+    const malformedQuality = scoreCodexOutput({
+      id: 'api-flow',
+      prompt: 'Trace app API',
+      requiredAnswerFields: ['task'],
+      requireJson: true,
+    }, 'task: api-flow');
+    expect(malformedQuality.hits).not.toContain('valid_json');
+    expect(malformedQuality.misses).toContain('valid_json');
+    expect(malformedQuality.misses).toContain('task');
   });
 
   it('builds compact MCP tool descriptions without changing tool schemas', () => {

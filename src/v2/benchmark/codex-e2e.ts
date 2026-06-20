@@ -16,6 +16,7 @@ export interface CodexE2eTask {
   expectedMethods?: string[];
   expectedTerms?: string[];
   requiredAnswerFields?: string[];
+  requireJson?: boolean;
 }
 
 export interface CodexE2eSuite {
@@ -305,15 +306,27 @@ export function parseCodexJsonEvents(jsonl: string, prompt = ''): CodexJsonMetri
 
 export function scoreCodexOutput(task: CodexE2eTask, output: string): QualityScore {
   const haystack = output.toLowerCase();
+  const parsedJson = task.requireJson ? extractJsonObject(output) : undefined;
   const expected = [
     ...(task.expectedFiles ?? []),
     ...(task.expectedMethods ?? []),
     ...(task.expectedTerms ?? []),
+    ...(task.requireJson ? ['valid_json'] : []),
     ...(task.requiredAnswerFields ?? []),
   ];
   const hits: string[] = [];
   const misses: string[] = [];
   for (const item of expected) {
+    if (item === 'valid_json') {
+      if (parsedJson) hits.push(item);
+      else misses.push(item);
+      continue;
+    }
+    if (task.requireJson && task.requiredAnswerFields?.includes(item)) {
+      if (parsedJson && Object.prototype.hasOwnProperty.call(parsedJson, item)) hits.push(item);
+      else misses.push(item);
+      continue;
+    }
     const normalized = item.toLowerCase();
     if (haystack.includes(normalized) || haystack.includes(path.basename(normalized))) {
       hits.push(item);
@@ -326,6 +339,42 @@ export function scoreCodexOutput(task: CodexE2eTask, output: string): QualitySco
     hits,
     misses,
   };
+}
+
+function extractJsonObject(output: string): Record<string, unknown> | undefined {
+  const start = output.indexOf('{');
+  if (start < 0) return undefined;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < output.length; index++) {
+    const char = output[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') depth++;
+    if (char === '}') depth--;
+    if (depth === 0) {
+      try {
+        const parsed = JSON.parse(output.slice(start, index + 1));
+        return isRecord(parsed) ? parsed : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+  }
+  return undefined;
 }
 
 function runCodexTask(options: {
