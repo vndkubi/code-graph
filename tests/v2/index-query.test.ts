@@ -1439,6 +1439,95 @@ public class PaymentService {
     expect(compiled.budget.sourceTool).toBe('get_research_pack');
   });
 
+  it('enriches route-gate compile evidence with exact methods and tests', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-route-gate-evidence-');
+    writeFile(repo, 'src/v2/mcp/proxy.ts', `export function routeCodeGraphContext(args: Record<string, unknown>) {
+  return { toolName: 'compile_evidence', args };
+}
+
+export function inspectCodeGraphRoute(args: Record<string, unknown>) {
+  const routed = routeCodeGraphContext(args);
+  return {
+    primaryTool: 'codegraph_context',
+    routedTool: routed.toolName,
+    expectedMaxAdditionalCalls: 0,
+    expectedAllowedFollowups: [],
+    expectedDisallowedFollowups: ['shell_rg'],
+  };
+}
+
+export function inferCodeGraphContextMode(task: string) {
+  return task.includes('PBI') ? 'evidence' : 'research';
+}
+`);
+    writeFile(repo, 'src/v2/query/service.ts', `export class V2QueryService {
+  private async compileEvidence() {
+    return { answerable: true, allowedFollowups: [], disallowedFollowups: ['shell_rg'] };
+  }
+}
+`);
+    writeFile(repo, 'src/v2/mcp/tools.ts', `export const V2ToolSchemas = {
+  codegraph_context: {},
+  compile_evidence: {},
+};
+`);
+    writeFile(repo, 'tests/v2/mcp-client-profile.test.ts', `import { expect, it } from 'vitest';
+import { inspectCodeGraphRoute, routeCodeGraphContext } from '../../src/v2/mcp/proxy';
+
+it('explains route gate policy for client facade calls', () => {
+  expect(routeCodeGraphContext({ task: 'Analyze PBI acceptance criteria against code' })).toMatchObject({
+    toolName: 'compile_evidence',
+  });
+  expect(inspectCodeGraphRoute({ task: 'Analyze PBI acceptance criteria against code' })).toMatchObject({
+    primaryTool: 'codegraph_context',
+    expectedMaxAdditionalCalls: 0,
+  });
+});
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+    const compiled = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'compile_evidence',
+      args: {
+        task: 'Explain how CodeGraph routes codegraph_context for PBI acceptance criteria and how the answerable gate prevents shell fallback.',
+        task_type: 'investigate',
+        quality_rubric: ['field:task', 'field:keyFiles', 'field:methods', 'field:flow', 'field:tests', 'task:investigation'],
+      },
+    }) as {
+      answerable: boolean;
+      coverageCertificate: { missing: string[]; partial: string[] };
+      packetSummary: { topFiles: string[]; topSymbols: string[]; tests: number };
+      evidence: Array<{ file?: string; symbol?: string; claim?: string }>;
+    };
+    const quality = scoreCodexOutput({
+      id: 'route-inspector-gate',
+      prompt: '',
+      expectedFiles: ['src/v2/mcp/proxy.ts', 'tests/v2/mcp-client-profile.test.ts'],
+      expectedMethods: ['inspectCodeGraphRoute', 'routeCodeGraphContext', 'inferCodeGraphContextMode'],
+      expectedTerms: ['compile_evidence', 'answerable', 'allowedFollowups'],
+      requiredAnswerFields: ['task', 'keyFiles', 'methods', 'flow', 'tests'],
+    }, JSON.stringify(compiled));
+
+    expect(compiled.answerable).toBe(true);
+    expect(compiled.coverageCertificate.missing).toHaveLength(0);
+    expect(compiled.coverageCertificate.partial).toHaveLength(0);
+    expect(compiled.packetSummary.tests).toBeGreaterThan(0);
+    expect(compiled.packetSummary.topFiles).toContain('tests/v2/mcp-client-profile.test.ts');
+    expect(compiled.packetSummary.topSymbols).toEqual(expect.arrayContaining([
+      'inspectCodeGraphRoute()',
+      'routeCodeGraphContext()',
+      'inferCodeGraphContextMode()',
+    ]));
+    expect(compiled.evidence.some(item => item.file === 'tests/v2/mcp-client-profile.test.ts')).toBe(true);
+    expect(quality.score).toBe(1);
+    expect(quality.misses).toEqual([]);
+  });
+
   it('promotes endpoint targets into flow pack handler evidence and callees', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-endpoint-flow-pack-');

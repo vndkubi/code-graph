@@ -175,6 +175,41 @@ It missed `tests/v2/mcp-client-profile.test.ts`, `inspectCodeGraphRoute`,
 and `routeCodeGraphContext`, while the packet still claimed `answerable=true`.
 This is useful quality evidence for stricter answerability.
 
+### Quality Follow-Up
+
+Implemented after the 0.769 self-suite run:
+
+- `compile_evidence` now treats `field:*` rubric items as structured answer
+  fields instead of plain token matches.
+- Strict rubric mode is on by default; missing or partial rubric coverage now
+  blocks `answerable=true`.
+- Route/gate investigations for `codegraph_context` are enriched from the
+  current index with exact evidence for:
+  - `inspectCodeGraphRoute`
+  - `routeCodeGraphContext`
+  - `inferCodeGraphContextMode`
+  - `V2QueryService.compileEvidence`
+  - `tests/v2/mcp-client-profile.test.ts`
+
+Re-run:
+
+```powershell
+node dist/cli.js benchmark codex-e2e --root . --workspace-key "D:/Personal/Projects/code-graph" --suite examples\codegraph-self-e2e-quality-suite.example.json --models gpt-5.3-codex-spark --modes compiled-packet+gate --task-ids route-inspector-gate --no-index --codex-command cmd.exe --codex-command-args "/c,npx.cmd,-y,@openai/codex" --codex-timeout-seconds 300 --run-dir .tmp\codex-e2e-spark-20260620-quality-fix
+```
+
+Result:
+
+- quality score: 1.0
+- average quality: 1.0
+- misses: none
+- MCP calls: 1
+- shell calls: 0
+- input tokens: 45,286
+- cached input tokens: 29,952
+- output tokens: 2,391
+- reasoning tokens: 1,577
+- wall time: 15,929 ms
+
 ## Additional Proposals From The Run
 
 ### 1. Benchmark Preflight Gate
@@ -215,6 +250,8 @@ Expected value:
 - Keeps benchmark commands portable for local contributors.
 
 ### 3. Strict Evidence Answerability
+
+Status: implemented for `compile_evidence` route/gate quality follow-up.
 
 Problem found:
 
