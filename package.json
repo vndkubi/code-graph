@@ -4,12 +4,32 @@
   "description": "CodeGraph v2 MCP proxy and persistent semantic indexer for Copilot/Codex agents",
   "type": "module",
   "main": "dist/cli.js",
+  "files": [
+    "dist/",
+    "docs/ARCHITECTURE.md",
+    "docs/MIGRATION.md",
+    "docs/benchmark-results.md",
+    "docs/mcp-setup-and-usage.md",
+    "docs/prompt-guide.md",
+    "docs/sqlite-index-research-2026-06-16.md",
+    "docs/system-design.md",
+    "docs/three-feature-build-plan-2026-06-20.md",
+    "docs/three-feature-implementation-report-2026-06-20.md",
+    "docs/ticket-driven-agent-workflow.md",
+    "docs/using-codegraph-mcp-correctly.md",
+    "examples/",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "mcp-code-graph": "dist/cli.js",
     "codegraph": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc",
+    "ci": "npm run lint && npm run build && npm test",
+    "prepack": "npm run build",
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
     "test": "vitest run",
@@ -24,6 +44,17 @@
     "tree-sitter"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vndkubi/code-graph.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vndkubi/code-graph/issues"
+  },
+  "homepage": "https://github.com/vndkubi/code-graph#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=20.0.0"
   },
@@ -32,6 +63,7 @@
     "better-sqlite3": "^12.10.0",
     "chokidar": "^4.0.3",
     "glob": "^11.0.1",
+    "js-tiktoken": "^1.0.21",
     "minimatch": "^10.2.4",
     "tree-sitter": "^0.21.1",
     "tree-sitter-java": "^0.23.5",

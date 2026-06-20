@@ -1,6 +1,14 @@
 {
   "name": "codegraph-self-quality-suite",
   "repoRoot": ".",
+  "rootProfile": {
+    "name": "codegraph-self",
+    "requiredFiles": [
+      "src/v2/benchmark/codex-e2e.ts",
+      "src/v2/mcp/proxy.ts",
+      "tests/v2/mcp-client-profile.test.ts"
+    ]
+  },
   "tasks": [
     {
       "id": "route-inspector-gate",

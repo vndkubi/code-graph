@@ -1,5 +1,7 @@
 # CodeGraph
 
+[![CI](https://github.com/vndkubi/code-graph/actions/workflows/ci.yml/badge.svg)](https://github.com/vndkubi/code-graph/actions/workflows/ci.yml)
+
 CodeGraph is a local MCP server and semantic indexer for coding agents. It stores each workspace in a per-repository SQLite database at `<repo>/.codegraph/graph.sqlite`; there is no daemon, no HTTP hop, no Docker, and no Postgres runtime dependency.
 
 The goal is to let agents start from compact graph-backed packets instead of repeatedly scanning raw files. The index is snapshot-based and supports Java/Jakarta, TypeScript/JavaScript, Python, JSON, YAML, XML, and properties evidence.
@@ -22,11 +24,18 @@ Prerequisites:
 - Node.js 20 or newer.
 - npm.
 
-Install and build:
+Install from a local checkout:
 
 ```powershell
 npm ci
 npm run build
+```
+
+The package is prepared for npm distribution. Until a release is published, use the local checkout commands above. After publication, the intended entrypoint is:
+
+```powershell
+npx mcp-code-graph@latest setup --root "<repo>"
+npx mcp-code-graph@latest mcp --root "<repo>"
 ```
 
 Set up a workspace:
@@ -51,18 +60,18 @@ Add `.codegraph/` to `.gitignore`; it is local generated state.
 
 ## Current Local Benchmark
 
-Run on this repository after the SQLite refactor:
+Run on this repository after the tokenizer/CI feedback pass. These are self-repo deterministic proof harnesses, not external multi-repo claims:
 
 | Benchmark | Result |
 | --- | ---: |
-| Cold index | 74 files, 3.18s, 148 MB RSS |
-| Setup warm path | 74 parse-cache hits, 584 ms |
-| Golden eval | 4/4 correct, 96.6% estimated token saving |
-| Context proof | 5/5 MCP correct, 83.5% estimated input-token saving, 74.3% file-open reduction, p95 workflow 512 ms |
-| Review proof | 5/5 MCP correct, 89.1% estimated input-token saving, 85.7% file-open reduction, p95 `review_patch` 198 ms |
-| Local fallback | 5/5 correct, p50 56 ms, p95 99 ms |
+| Index smoke | 84 files, 6.81s, 148 MB RSS |
+| Setup warm path | 84 parse-cache hits, 740 ms |
+| Golden eval | 4/4 correct, 96.0% estimated token saving |
+| Context proof | 5/5 MCP correct, 80.1% estimated input-token saving, 74.4% file-open reduction, p95 workflow 658 ms |
+| Review proof | 5/5 MCP correct, 85.4% estimated input-token saving, 87.2% file-open reduction, p95 `review_patch` 411 ms |
+| Local fallback | 5/5 correct, p50 19 ms, p95 632 ms |
 
-Token counts use the deterministic benchmark estimator `ceil(character_count / 4)`.
+Token counts use the shared `cl100k_base/js-tiktoken` text estimator. Actual model billing can differ because tools, files, cached input, and model runtime accounting are provider-specific.
 
 ## CLI Reference
 
@@ -113,6 +122,8 @@ npm run lint
 npm run build
 npm test
 ```
+
+See [Contributing](CONTRIBUTING.md) for CI-equivalent benchmark smoke commands and benchmark reporting expectations.
 
 ## More Docs
 

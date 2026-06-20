@@ -5,6 +5,7 @@ import { classifyFile } from '../index/file-role.js';
 import { scanManifest } from '../index/manifest.js';
 import { V2Indexer } from '../index/indexer.js';
 import { V2QueryService } from '../query/service.js';
+import { TEXT_TOKEN_ESTIMATOR, estimateTextTokens } from '../token-estimator.js';
 
 export interface ContextProofTask {
   id: string;
@@ -257,7 +258,7 @@ export async function runContextProofEval(
     workspaceId: index.workspaceId,
     snapshotId: index.snapshotId,
     tokenModel: {
-      estimator: 'ceil(character_count / 4)',
+      estimator: TEXT_TOKEN_ESTIMATOR,
       inputDefinition: 'Task text plus retrieved evidence that would be added to an agent/model context.',
       outputDefinition: 'Deterministic benchmark summary size, not real LLM completion usage.',
       actualModelUsage: false,
@@ -311,19 +312,19 @@ function runBaselineProof(manifest: BaselineManifest, task: ContextProofTask): B
     evidence += `\nFILE ${file.relPath}\n${clipped}`;
   }
   const correct = expectedPresent(evidence, task.expectedContains, task.expectedFiles, matchedFiles);
-  const estimatedInputTokens = estimateTokens(`${task.task}\n${terms.join('\n')}\n${evidence}`.length);
-  const estimatedOutputTokens = estimateTokens(JSON.stringify({
+  const estimatedInputTokens = estimateTextTokens(`${task.task}\n${terms.join('\n')}\n${evidence}`);
+  const estimatedOutputTokens = estimateTextTokens(JSON.stringify({
     id: task.id,
     matchedFiles: matchedFiles.slice(0, 10),
     correct,
-  }).length);
+  }));
 
   return {
     searchTerms: terms,
     filesOpened: matchedFiles.length,
     matchedFiles,
     responseChars,
-    estimatedTokens: estimateTokens(responseChars),
+    estimatedTokens: estimateTextTokens(evidence),
     estimatedInputTokens,
     estimatedOutputTokens,
     correct,
@@ -424,18 +425,18 @@ async function runMcpProof(
   }
 
   const responseChars = packetJson.length + sliceChars;
-  const estimatedInputTokens = estimateTokens(`${task.task}\n${packetJson}\n${JSON.stringify(slices)}`.length);
-  const estimatedOutputTokens = estimateTokens(JSON.stringify({
+  const estimatedInputTokens = estimateTextTokens(`${task.task}\n${packetJson}\n${JSON.stringify(slices)}`);
+  const estimatedOutputTokens = estimateTextTokens(JSON.stringify({
     id: task.id,
     topFiles: stringArray(packet.topFiles).slice(0, 10),
     slicedFiles: [...slicedFiles],
     confidence: typeof packet.confidence === 'number' ? packet.confidence : undefined,
-  }).length);
+  }));
   return {
     packetChars: packetJson.length,
     sliceChars,
     responseChars,
-    estimatedTokens: estimateTokens(responseChars),
+    estimatedTokens: estimateTextTokens(`${packetJson}\n${JSON.stringify(slices)}`),
     estimatedInputTokens,
     estimatedOutputTokens,
     contextPacketMs,
@@ -583,9 +584,6 @@ function percentile(values: number[], p: number): number {
   return sorted[index];
 }
 
-function estimateTokens(chars: number): number {
-  return Math.ceil(chars / 4);
-}
 
 function autoTaskFileScore(relPath: string, language: string | undefined, role: string): number {
   const normalized = relPath.replace(/\\/g, '/');

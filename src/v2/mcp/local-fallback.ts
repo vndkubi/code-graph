@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { classifyFile, roleRank, type FileRole } from '../index/file-role.js';
 import { loadLocalArtifactIndex, localArtifactIndexPath, rankLocalArtifactFiles } from './local-artifact.js';
+import { estimateTextTokens } from '../token-estimator.js';
 
 export interface LocalFallbackResult {
   degraded: true;
@@ -771,7 +772,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function estimateTokens(value: string): number {
-  return Math.ceil(value.length / 4);
+  return estimateTextTokens(value);
 }
 
 function localFallbackMaxFiles(): number {

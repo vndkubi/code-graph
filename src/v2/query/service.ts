@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { CodeGraphDb } from '../storage/database.js';
+import { estimateTextTokens } from '../token-estimator.js';
 import { V2Indexer, type IndexWorkspaceOptions } from '../index/indexer.js';
 import { roleRank, type FileRole } from '../index/file-role.js';
 import { scanManifest } from '../index/manifest.js';
@@ -6226,7 +6227,7 @@ function confidenceFromScore(value: unknown): number {
 }
 
 function estimateTokens(value: string): number {
-  return Math.ceil(value.length / 4);
+  return estimateTextTokens(value);
 }
 
 type PackProfile = 'micro' | 'compact' | 'full';

@@ -4,6 +4,7 @@ import type { CodeGraphDb } from '../storage/database.js';
 import { V2Indexer } from '../index/indexer.js';
 import { scanManifest } from '../index/manifest.js';
 import { V2QueryService } from '../query/service.js';
+import { estimateTextTokens } from '../token-estimator.js';
 
 export interface GoldenEvalTask {
   id: string;
@@ -89,7 +90,7 @@ async function runGoldenEvalAsync(
     const codegraph: CodeGraphEvalResult = {
       toolName: task.codegraphTool,
       responseChars: responseJson.length,
-      estimatedTokens: estimateTokens(responseJson.length),
+      estimatedTokens: estimateTextTokens(responseJson),
       durationMs: Date.now() - start,
     };
     const missingExpected = (task.expectedContains ?? [])
@@ -135,6 +136,7 @@ function runBaselineRetrieval(root: string, task: GoldenEvalTask): BaselineEvalR
   const manifest = scanManifest(root);
   const matchedFiles: string[] = [];
   let responseChars = 0;
+  let responseText = '';
 
   for (const file of manifest.files) {
     if (!file.parseable || matchedFiles.length >= 60) continue;
@@ -148,7 +150,9 @@ function runBaselineRetrieval(root: string, task: GoldenEvalTask): BaselineEvalR
     const pathLower = file.relPath.toLowerCase();
     if (!terms.some(term => lower.includes(term.toLowerCase()) || pathLower.includes(term.toLowerCase()))) continue;
     matchedFiles.push(file.relPath);
-    responseChars += Math.min(content.length, 16_000);
+    const clipped = content.slice(0, 16_000);
+    responseChars += clipped.length;
+    responseText += `\nFILE ${file.relPath}\n${clipped}`;
   }
 
   return {
@@ -156,7 +160,7 @@ function runBaselineRetrieval(root: string, task: GoldenEvalTask): BaselineEvalR
     filesOpened: matchedFiles.length,
     matchedFiles,
     responseChars,
-    estimatedTokens: estimateTokens(responseChars),
+    estimatedTokens: estimateTextTokens(responseText),
   };
 }
 
@@ -216,8 +220,4 @@ function tokenizeBaselineTerms(question: string): string[] {
     .map(term => term.trim())
     .filter(term => term.length >= 4)
     .slice(0, 8))];
-}
-
-function estimateTokens(chars: number): number {
-  return Math.ceil(chars / 4);
 }

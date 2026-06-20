@@ -2,8 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { openCodeGraphDb } from '../storage/database.js';
+import { openCodeGraphDb, type CodeGraphDb } from '../storage/database.js';
 import { V2Indexer, type IndexProgressEvent } from '../index/indexer.js';
+import { resolveCurrentGraphSnapshot } from '../graph/export.js';
+import { estimateTextTokens } from '../token-estimator.js';
 
 export type CodexBenchmarkMode = 'baseline' | 'terse-no-mcp' | 'mcp-first' | 'mcp-only' | 'compiled-packet' | 'compiled-packet+gate' | 'oracle-packet';
 
@@ -19,10 +21,16 @@ export interface CodexE2eTask {
   requireJson?: boolean;
 }
 
+export interface CodexE2eRootProfile {
+  name?: string;
+  requiredFiles?: string[];
+}
+
 export interface CodexE2eSuite {
   name?: string;
   repoRoot?: string;
   workspaceKey?: string;
+  rootProfile?: CodexE2eRootProfile;
   tasks: CodexE2eTask[];
 }
 
@@ -54,6 +62,7 @@ export interface CodexJsonMetrics {
   reasoningTokens: number;
   tokenSource: 'actual' | 'estimated-chars' | 'missing';
   finalOutput: string;
+  tokenLedger: CodexTokenLedger;
 }
 
 export interface CodexRunResult extends CodexJsonMetrics {
@@ -74,12 +83,64 @@ export interface QualityScore {
   misses: string[];
 }
 
+export interface CodexTokenLedger {
+  modelInputTokens: number;
+  modelCachedInputTokens: number;
+  modelFreshInputTokens: number;
+  modelOutputTokens: number;
+  modelReasoningTokens: number;
+  modelRawTotalTokens: number;
+  modelFreshTotalTokens: number;
+  fullPacketTokens: number;
+  compactPacketTokens: number;
+  exactFollowupTokens: number;
+  fallbackShellTokens: number;
+  grossSavedTokens: number;
+  netSavedTokens: number;
+  budgetedMcpCalls: number;
+  unbudgetedMcpCalls: number;
+  firstBudgetedMcpTool?: string;
+  source: 'budget-fields' | 'missing-budget';
+}
+
+export interface CodexE2ePreflightIssue {
+  code: 'root_missing' | 'workspace_not_indexed' | 'missing_required_file' | 'missing_compatibility_contract';
+  severity: 'error' | 'warning';
+  message: string;
+  taskId?: string;
+  expected?: string;
+  matched?: string[];
+}
+
+export interface CodexE2ePreflightReport {
+  status: 'passed' | 'failed';
+  canRun: boolean;
+  checkedAt: string;
+  root: string;
+  workspaceKey: string;
+  suiteRootProfile?: string;
+  snapshot?: {
+    workspaceId: string;
+    snapshotId: string;
+    files: number;
+  };
+  requiredFiles: Array<{
+    expected: string;
+    matched: string[];
+  }>;
+  missingRequiredFiles: string[];
+  issues: CodexE2ePreflightIssue[];
+  plannedRuns: number;
+  skippedRuns: number;
+}
+
 export interface CodexE2eBenchmarkReport {
   suite: string;
   root: string;
   workspaceKey: string;
   runDir: string;
   dryRun: boolean;
+  preflight: CodexE2ePreflightReport;
   index?: {
     result: Awaited<ReturnType<V2Indexer['indexWorkspace']>>;
     wallMs: number;
@@ -94,6 +155,18 @@ export interface CodexE2eBenchmarkReport {
     totalInputTokens: number;
     totalOutputTokens: number;
     averageQuality: number;
+    tokenLedger: {
+      modelRawTotalTokens: number;
+      modelFreshTotalTokens: number;
+      fullPacketTokens: number;
+      compactPacketTokens: number;
+      exactFollowupTokens: number;
+      fallbackShellTokens: number;
+      grossSavedTokens: number;
+      netSavedTokens: number;
+      budgetedMcpCalls: number;
+      unbudgetedMcpCalls: number;
+    };
   };
 }
 
@@ -144,6 +217,7 @@ export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): P
   const models = options.models?.length ? options.models : ['gpt-5.4-mini'];
   const modes: CodexBenchmarkMode[] = options.modes?.length ? options.modes : ['baseline', 'mcp-first'];
   const tasks = filterTasks(suite.tasks, options.taskIds);
+  const plannedRuns = models.length * modes.length * tasks.length;
 
   fs.mkdirSync(runDir, { recursive: true });
   writeJson(path.join(runDir, 'suite.resolved.json'), { ...suite, repoRoot: root, workspaceKey, tasks });
@@ -151,6 +225,13 @@ export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): P
   const index = options.skipIndex
     ? undefined
     : await runColdIndex(root, workspaceKey, options.parseWorkers);
+  const preflight = await runCodexE2ePreflight({
+    suite,
+    root,
+    workspaceKey,
+    tasks,
+    plannedRuns,
+  });
   const mcpConfig = writeCodexMcpConfig({
     runDir,
     root,
@@ -165,15 +246,17 @@ export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): P
       mcpConfigPath: mcpConfig.path,
       skipIndex: Boolean(options.skipIndex),
       dryRun: Boolean(options.dryRun),
+      preflight,
     };
     writeJson(path.join(runDir, 'plan.json'), plan);
-    if (options.dryRun) {
+    if (options.dryRun || !preflight.canRun) {
       const report = aggregateReport({
         suite: suite.name ?? path.basename(options.suitePath ?? 'inline-suite'),
         root,
         workspaceKey,
         runDir,
-        dryRun: true,
+        dryRun: Boolean(options.dryRun),
+        preflight,
         index,
         runs: [],
       });
@@ -207,6 +290,7 @@ export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): P
       workspaceKey,
       runDir,
       dryRun: false,
+      preflight,
       index,
       runs,
     });
@@ -224,9 +308,101 @@ export function loadCodexE2eSuite(suitePath?: string): CodexE2eSuite {
   return parsed;
 }
 
+export async function runCodexE2ePreflight(options: {
+  suite: CodexE2eSuite;
+  root: string;
+  workspaceKey: string;
+  tasks: CodexE2eTask[];
+  plannedRuns: number;
+}): Promise<CodexE2ePreflightReport> {
+  const issues: CodexE2ePreflightIssue[] = [];
+  const root = path.resolve(options.root);
+  const requiredFileSpecs = requiredFilesForPreflight(options.suite, options.tasks);
+  const requiredFiles: CodexE2ePreflightReport['requiredFiles'] = requiredFileSpecs.map(expected => ({
+    expected,
+    matched: [],
+  }));
+
+  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
+    issues.push({
+      code: 'root_missing',
+      severity: 'error',
+      message: `Codex E2E root does not exist or is not a directory: ${root}`,
+    });
+    return finalizePreflight({
+      root,
+      workspaceKey: options.workspaceKey,
+      suiteRootProfile: options.suite.rootProfile?.name,
+      requiredFiles,
+      issues,
+      plannedRuns: options.plannedRuns,
+    });
+  }
+
+  if (!options.suite.rootProfile?.requiredFiles?.length && requiredFileSpecs.length === 0) {
+    issues.push({
+      code: 'missing_compatibility_contract',
+      severity: 'warning',
+      message: 'Codex E2E suite has no rootProfile.requiredFiles or task expectedFiles, so root compatibility cannot be proven before a paid run.',
+    });
+  }
+
+  const { db } = await openCodeGraphDb(root);
+  try {
+    const snapshot = await resolveCurrentGraphSnapshot(db, root, options.workspaceKey);
+    if (!snapshot) {
+      issues.push({
+        code: 'workspace_not_indexed',
+        severity: 'error',
+        message: `Workspace key ${options.workspaceKey} has no current indexed snapshot for root ${root}. Run index/setup or omit --no-index.`,
+      });
+      return finalizePreflight({
+        root,
+        workspaceKey: options.workspaceKey,
+        suiteRootProfile: options.suite.rootProfile?.name,
+        requiredFiles,
+        issues,
+        plannedRuns: options.plannedRuns,
+      });
+    }
+
+    for (const entry of requiredFiles) {
+      entry.matched = await matchIndexedFiles(db, snapshot.snapshotId, entry.expected);
+      if (entry.matched.length === 0) {
+        issues.push({
+          code: 'missing_required_file',
+          severity: 'error',
+          message: `Required suite/task file was not found in the indexed snapshot: ${entry.expected}`,
+          expected: entry.expected,
+          matched: [],
+        });
+      }
+    }
+
+    const files = await db.scalar('SELECT COUNT(*) FROM files WHERE snapshot_id = ?', snapshot.snapshotId);
+    return finalizePreflight({
+      root,
+      workspaceKey: options.workspaceKey,
+      suiteRootProfile: options.suite.rootProfile?.name,
+      snapshot: {
+        workspaceId: snapshot.workspaceId,
+        snapshotId: snapshot.snapshotId,
+        files,
+      },
+      requiredFiles,
+      issues,
+      plannedRuns: options.plannedRuns,
+    });
+  } finally {
+    await db.close();
+  }
+}
+
 export function parseCodexJsonEvents(jsonl: string, prompt = ''): CodexJsonMetrics {
   const toolCallIds = new Set<string>();
+  const ledgeredToolResultIds = new Set<string>();
   const breakdown = new Map<string, number>();
+  const ledger = createTokenLedgerAccumulator();
   let mcpCalls = 0;
   let shellCalls = 0;
   let eventCount = 0;
@@ -262,13 +438,26 @@ export function parseCodexJsonEvents(jsonl: string, prompt = ''): CodexJsonMetri
     const toolName = inferToolName(event);
     if (!toolName || !isToolEvent(event, toolName)) continue;
     const callId = inferToolCallId(event) ?? `${eventCount}:${toolName}`;
-    if (toolCallIds.has(callId)) continue;
-    toolCallIds.add(callId);
-    breakdown.set(toolName, (breakdown.get(toolName) ?? 0) + 1);
-    if (DEFAULT_CODEGRAPH_TOOLS.has(toolName) || toolName.startsWith('codegraph.')) {
-      mcpCalls++;
-    } else if (SHELL_TOOL_PATTERNS.some(pattern => pattern.test(toolName))) {
-      shellCalls++;
+    const isMcpCall = DEFAULT_CODEGRAPH_TOOLS.has(toolName) || toolName.startsWith('codegraph.');
+    const isShellCall = SHELL_TOOL_PATTERNS.some(pattern => pattern.test(toolName));
+    if (!toolCallIds.has(callId)) {
+      toolCallIds.add(callId);
+      breakdown.set(toolName, (breakdown.get(toolName) ?? 0) + 1);
+      if (isMcpCall) {
+        mcpCalls++;
+      } else if (isShellCall) {
+        shellCalls++;
+      }
+    }
+
+    const resultText = extractToolResultText(event);
+    if (resultText && !ledgeredToolResultIds.has(callId)) {
+      ledgeredToolResultIds.add(callId);
+      if (isMcpCall) {
+        recordMcpToolResult(ledger, toolName, resultText);
+      } else if (isShellCall) {
+        recordShellToolResult(ledger, resultText);
+      }
     }
   }
 
@@ -286,6 +475,12 @@ export function parseCodexJsonEvents(jsonl: string, prompt = ''): CodexJsonMetri
       reasoningTokens: 0,
       tokenSource: 'estimated-chars',
       finalOutput,
+      tokenLedger: finalizeTokenLedger(ledger, {
+        inputTokens: estimateTokens(prompt),
+        cachedInputTokens: 0,
+        outputTokens: estimateTokens(finalOutput),
+        reasoningTokens: 0,
+      }),
     };
   }
 
@@ -301,6 +496,12 @@ export function parseCodexJsonEvents(jsonl: string, prompt = ''): CodexJsonMetri
     reasoningTokens,
     tokenSource: hasUsage ? 'actual' : 'missing',
     finalOutput,
+    tokenLedger: finalizeTokenLedger(ledger, {
+      inputTokens,
+      cachedInputTokens,
+      outputTokens,
+      reasoningTokens,
+    }),
   };
 }
 
@@ -339,6 +540,209 @@ export function scoreCodexOutput(task: CodexE2eTask, output: string): QualitySco
     hits,
     misses,
   };
+}
+
+function finalizePreflight(input: {
+  root: string;
+  workspaceKey: string;
+  suiteRootProfile?: string;
+  snapshot?: CodexE2ePreflightReport['snapshot'];
+  requiredFiles: CodexE2ePreflightReport['requiredFiles'];
+  issues: CodexE2ePreflightIssue[];
+  plannedRuns: number;
+}): CodexE2ePreflightReport {
+  const hasErrors = input.issues.some(issue => issue.severity === 'error');
+  const missingRequiredFiles = input.requiredFiles
+    .filter(entry => entry.matched.length === 0)
+    .map(entry => entry.expected);
+  return {
+    status: hasErrors ? 'failed' : 'passed',
+    canRun: !hasErrors,
+    checkedAt: new Date().toISOString(),
+    root: input.root,
+    workspaceKey: input.workspaceKey,
+    suiteRootProfile: input.suiteRootProfile,
+    snapshot: input.snapshot,
+    requiredFiles: input.requiredFiles,
+    missingRequiredFiles,
+    issues: input.issues,
+    plannedRuns: input.plannedRuns,
+    skippedRuns: hasErrors ? input.plannedRuns : 0,
+  };
+}
+
+function requiredFilesForPreflight(suite: CodexE2eSuite, tasks: CodexE2eTask[]): string[] {
+  return uniqueStrings([
+    ...(suite.rootProfile?.requiredFiles ?? []),
+    ...tasks.flatMap(task => task.expectedFiles ?? []),
+  ].map(normalizeFileSpec).filter(Boolean));
+}
+
+async function matchIndexedFiles(db: CodeGraphDb, snapshotId: string, expected: string): Promise<string[]> {
+  const normalized = normalizeFileSpec(expected);
+  if (!normalized) return [];
+  const basename = path.posix.basename(normalized);
+  const hasPath = normalized.includes('/');
+  const rows = hasPath
+    ? await db.prepare(`
+      SELECT path
+      FROM files
+      WHERE snapshot_id = ?
+        AND (path = ? OR path LIKE ? ESCAPE '\\')
+      ORDER BY path
+      LIMIT 5
+    `).all(snapshotId, normalized, `%/${escapeLikePattern(normalized)}`) as Array<{ path: string }>
+    : await db.prepare(`
+      SELECT path
+      FROM files
+      WHERE snapshot_id = ?
+        AND (path = ? OR path LIKE ? ESCAPE '\\')
+      ORDER BY path
+      LIMIT 5
+    `).all(snapshotId, basename, `%/${escapeLikePattern(basename)}`) as Array<{ path: string }>;
+  return rows.map(row => row.path);
+}
+
+function normalizeFileSpec(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/[%_]/g, char => `\\${char}`);
+}
+
+interface TokenLedgerAccumulator {
+  fullPacketTokens: number;
+  compactPacketTokens: number;
+  exactFollowupTokens: number;
+  fallbackShellTokens: number;
+  grossSavedTokens: number;
+  budgetedMcpCalls: number;
+  unbudgetedMcpCalls: number;
+  firstBudgetedMcpTool?: string;
+}
+
+interface ResponseBudgetObservation {
+  responseTokens: number;
+  fullResponseTokens: number;
+}
+
+function createTokenLedgerAccumulator(): TokenLedgerAccumulator {
+  return {
+    fullPacketTokens: 0,
+    compactPacketTokens: 0,
+    exactFollowupTokens: 0,
+    fallbackShellTokens: 0,
+    grossSavedTokens: 0,
+    budgetedMcpCalls: 0,
+    unbudgetedMcpCalls: 0,
+  };
+}
+
+function recordMcpToolResult(ledger: TokenLedgerAccumulator, toolName: string, resultText: string): void {
+  const budgets = extractResponseBudgetObservations(resultText);
+  if (budgets.length === 0) {
+    ledger.unbudgetedMcpCalls++;
+    if (ledger.firstBudgetedMcpTool) ledger.exactFollowupTokens += estimateTokens(resultText);
+    return;
+  }
+
+  ledger.budgetedMcpCalls++;
+  const responseTokens = budgets.reduce((sum, budget) => sum + budget.responseTokens, 0);
+  const fullTokens = budgets.reduce((sum, budget) => sum + budget.fullResponseTokens, 0);
+  ledger.grossSavedTokens += Math.max(0, fullTokens - responseTokens);
+
+  if (!ledger.firstBudgetedMcpTool) {
+    ledger.firstBudgetedMcpTool = toolName;
+    ledger.fullPacketTokens += fullTokens;
+    ledger.compactPacketTokens += responseTokens;
+    return;
+  }
+
+  ledger.exactFollowupTokens += responseTokens;
+}
+
+function recordShellToolResult(ledger: TokenLedgerAccumulator, resultText: string): void {
+  ledger.fallbackShellTokens += estimateTokens(resultText);
+}
+
+function finalizeTokenLedger(
+  ledger: TokenLedgerAccumulator,
+  usage: {
+    inputTokens: number;
+    cachedInputTokens: number;
+    outputTokens: number;
+    reasoningTokens: number;
+  },
+): CodexTokenLedger {
+  const modelFreshInputTokens = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
+  const netSavedTokens = ledger.fullPacketTokens
+    - ledger.compactPacketTokens
+    - ledger.exactFollowupTokens
+    - ledger.fallbackShellTokens;
+  return {
+    modelInputTokens: usage.inputTokens,
+    modelCachedInputTokens: usage.cachedInputTokens,
+    modelFreshInputTokens,
+    modelOutputTokens: usage.outputTokens,
+    modelReasoningTokens: usage.reasoningTokens,
+    modelRawTotalTokens: usage.inputTokens + usage.outputTokens + usage.reasoningTokens,
+    modelFreshTotalTokens: modelFreshInputTokens + usage.outputTokens + usage.reasoningTokens,
+    fullPacketTokens: ledger.fullPacketTokens,
+    compactPacketTokens: ledger.compactPacketTokens,
+    exactFollowupTokens: ledger.exactFollowupTokens,
+    fallbackShellTokens: ledger.fallbackShellTokens,
+    grossSavedTokens: ledger.grossSavedTokens,
+    netSavedTokens,
+    budgetedMcpCalls: ledger.budgetedMcpCalls,
+    unbudgetedMcpCalls: ledger.unbudgetedMcpCalls,
+    firstBudgetedMcpTool: ledger.firstBudgetedMcpTool,
+    source: ledger.firstBudgetedMcpTool ? 'budget-fields' : 'missing-budget',
+  };
+}
+
+function extractResponseBudgetObservations(text: string): ResponseBudgetObservation[] {
+  const parsed = parseJsonText(text);
+  if (!parsed) return [];
+  const observations: ResponseBudgetObservation[] = [];
+  collectResponseBudgetObservations(parsed, observations);
+  return observations;
+}
+
+function collectResponseBudgetObservations(value: unknown, observations: ResponseBudgetObservation[]): void {
+  if (Array.isArray(value)) {
+    for (const item of value) collectResponseBudgetObservations(item, observations);
+    return;
+  }
+  if (!isRecord(value)) return;
+
+  const responseTokens = positiveNumber(value.estimatedResponseTokens);
+  const fullResponseTokens = positiveNumber(value.estimatedFullResponseTokens);
+  if (responseTokens !== undefined && fullResponseTokens !== undefined) {
+    observations.push({
+      responseTokens,
+      fullResponseTokens: Math.max(fullResponseTokens, responseTokens),
+    });
+  }
+
+  for (const child of Object.values(value)) collectResponseBudgetObservations(child, observations);
+}
+
+function parseJsonText(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function positiveNumber(value: unknown): number | undefined {
+  const number = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : undefined;
 }
 
 function extractJsonObject(output: string): Record<string, unknown> | undefined {
@@ -575,16 +979,22 @@ function compiledPacketTaskHints(task: CodexE2eTask, includeOracleRubric: boolea
   ].join('\n');
 }
 
-function compileBenchmarkTaskType(task: CodexE2eTask): string {
+export function compileBenchmarkTaskType(task: CodexE2eTask): string {
   const type = String(task.type ?? '').toLowerCase();
   const prompt = task.prompt;
-  if (type.includes('review') || /\bdiff\b|\bpatch\b|\breview\b/i.test(prompt)) return 'review_diff';
-  if (type.includes('api') || /\b(GET|POST|PUT|PATCH|DELETE)\s+\//.test(prompt) || /\bendpoint|api|route\b/i.test(prompt)) return 'api_flow';
-  if (type.includes('field') || /\bfield\b|\busages?\b|\binitialized\b/i.test(prompt)) return 'field_impact';
-  if (/\bstartup|handshake|proxy|watchdog\b/i.test(prompt)) return 'startup_flow';
-  if (type.includes('test') || /\bunit\s+test|testcase|write\s+tests?\b/i.test(prompt)) return 'test';
-  if (type.includes('implement') || /\bimplement|fix|debug|refactor\b/i.test(prompt)) return 'implement';
   if (type.includes('investigat')) return 'investigate';
+  if (type.includes('review')) return 'review_diff';
+  if (type.includes('api')) return 'api_flow';
+  if (type.includes('field')) return 'field_impact';
+  if (type.includes('startup')) return 'startup_flow';
+  if (type.includes('test')) return 'test';
+  if (type.includes('implement') || type.includes('debug') || type.includes('refactor')) return 'implement';
+  if (/\bdiff\b|\bpatch\b|\breview\b/i.test(prompt)) return 'review_diff';
+  if (/\b(GET|POST|PUT|PATCH|DELETE)\s+\//.test(prompt) || /\bendpoint|api|route\b/i.test(prompt)) return 'api_flow';
+  if (/\bfield\b|\busages?\b|\binitialized\b/i.test(prompt)) return 'field_impact';
+  if (/\bstartup|handshake|proxy|watchdog\b/i.test(prompt)) return 'startup_flow';
+  if (/\bunit\s+test|testcase|write\s+tests?\b/i.test(prompt)) return 'test';
+  if (/\bimplement|fix|debug|refactor\b/i.test(prompt)) return 'implement';
   return 'unknown';
 }
 
@@ -597,6 +1007,18 @@ function aggregateReport(input: Omit<CodexE2eBenchmarkReport, 'aggregate'>): Cod
   const averageQuality = input.runs.length === 0
     ? 0
     : input.runs.reduce((sum, run) => sum + run.quality.score, 0) / input.runs.length;
+  const tokenLedger = {
+    modelRawTotalTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.modelRawTotalTokens, 0),
+    modelFreshTotalTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.modelFreshTotalTokens, 0),
+    fullPacketTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.fullPacketTokens, 0),
+    compactPacketTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.compactPacketTokens, 0),
+    exactFollowupTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.exactFollowupTokens, 0),
+    fallbackShellTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.fallbackShellTokens, 0),
+    grossSavedTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.grossSavedTokens, 0),
+    netSavedTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.netSavedTokens, 0),
+    budgetedMcpCalls: input.runs.reduce((sum, run) => sum + run.tokenLedger.budgetedMcpCalls, 0),
+    unbudgetedMcpCalls: input.runs.reduce((sum, run) => sum + run.tokenLedger.unbudgetedMcpCalls, 0),
+  };
   return {
     ...input,
     aggregate: {
@@ -607,6 +1029,7 @@ function aggregateReport(input: Omit<CodexE2eBenchmarkReport, 'aggregate'>): Cod
       totalInputTokens,
       totalOutputTokens,
       averageQuality,
+      tokenLedger,
     },
   };
 }
@@ -626,6 +1049,13 @@ function defaultHadoopSuite(): CodexE2eSuite {
     name: 'hadoop-hard-tasks',
     repoRoot: '<hadoop-project>',
     workspaceKey: 'hadoop-project',
+    rootProfile: {
+      name: 'apache-hadoop-yarn-hdfs',
+      requiredFiles: [
+        'hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java',
+        'hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java',
+      ],
+    },
     tasks: [
       {
         id: 'api-flow-yarn-apps',
@@ -737,6 +1167,24 @@ function extractAssistantText(event: unknown): string | undefined {
   return undefined;
 }
 
+function extractToolResultText(event: unknown): string | undefined {
+  const result = pathValue(event, ['item', 'result'])
+    ?? pathValue(event, ['data', 'result'])
+    ?? pathValue(event, ['result']);
+  if (!result) return undefined;
+  if (typeof result === 'string') return result;
+
+  const content = pathValue(result, ['content']);
+  const contentText = contentArrayToText(content);
+  if (contentText) return contentText;
+
+  try {
+    return JSON.stringify(result);
+  } catch {
+    return undefined;
+  }
+}
+
 function inferToolName(event: unknown): string | undefined {
   const direct = stringValue(
     pathValue(event, ['tool_name']),
@@ -828,7 +1276,7 @@ function writeJson(file: string, value: unknown): void {
 }
 
 function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
+  return estimateTextTokens(text);
 }
 
 function envFlag(value: string | undefined): boolean {

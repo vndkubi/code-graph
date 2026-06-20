@@ -5,6 +5,7 @@ import { classifyFile } from '../index/file-role.js';
 import { scanManifest } from '../index/manifest.js';
 import { V2Indexer } from '../index/indexer.js';
 import { V2QueryService } from '../query/service.js';
+import { TEXT_TOKEN_ESTIMATOR, estimateTextTokens } from '../token-estimator.js';
 
 export interface ReviewProofTask {
   id: string;
@@ -226,7 +227,7 @@ export async function runReviewProofEval(
     workspaceId: index.workspaceId,
     snapshotId: index.snapshotId,
     tokenModel: {
-      estimator: 'ceil(character_count / 4)',
+      estimator: TEXT_TOKEN_ESTIMATOR,
       inputDefinition: 'Review request plus diff and retrieved evidence that would be added to an agent/model context.',
       outputDefinition: 'Deterministic benchmark summary size, not real LLM completion usage.',
       actualModelUsage: false,
@@ -275,12 +276,12 @@ function runBaselineReviewProof(manifest: BaselineManifest, task: ReviewProofTas
   }
 
   const correct = expectedPresent(evidence, task.expectedContains, task.expectedFiles, matchedFiles);
-  const estimatedInputTokens = estimateTokens(`${task.title}\n${terms.join('\n')}\n${evidence}`.length);
-  const estimatedOutputTokens = estimateTokens(JSON.stringify({
+  const estimatedInputTokens = estimateTextTokens(`${task.title}\n${terms.join('\n')}\n${evidence}`);
+  const estimatedOutputTokens = estimateTextTokens(JSON.stringify({
     id: task.id,
     matchedFiles: matchedFiles.slice(0, 10),
     correct,
-  }).length);
+  }));
 
   return {
     searchTerms: terms,
@@ -355,13 +356,13 @@ async function runMcpReviewProof(
     toolName: 'review_patch',
     durationMs,
     responseChars: responseJson.length,
-    estimatedInputTokens: estimateTokens(`${task.title}\n${JSON.stringify(args)}\n${responseJson}`.length),
-    estimatedOutputTokens: estimateTokens(JSON.stringify({
+    estimatedInputTokens: estimateTextTokens(`${task.title}\n${JSON.stringify(args)}\n${responseJson}`),
+    estimatedOutputTokens: estimateTextTokens(JSON.stringify({
       id: task.id,
       reviewStatus: stringValue(response.reviewStatus),
       changedFiles: changedFiles.slice(0, 10),
       findingCount: findings.length,
-    }).length),
+    })),
     toolCalls: 1,
     reviewStatus: stringValue(response.reviewStatus),
     changedFiles,
@@ -451,9 +452,6 @@ function percentile(values: number[], p: number): number {
   return sorted[index];
 }
 
-function estimateTokens(chars: number): number {
-  return Math.ceil(chars / 4);
-}
 
 function reviewTaskFileScore(relPath: string, language: string | undefined, role: string): number {
   const normalized = relPath.replace(/\\/g, '/');

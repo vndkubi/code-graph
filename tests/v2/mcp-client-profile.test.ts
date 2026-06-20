@@ -2,9 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { buildV2ToolDefinitions, mcpToolNamesForProfile, parseToolArgs, V2_TOOL_DEFINITIONS, V2_TOOL_PROFILES } from '../../src/v2/mcp/tools.js';
 import { inferCodeGraphContextMode, inspectCodeGraphRoute, routeCodeGraphContext } from '../../src/v2/mcp/proxy.js';
 import { runRouteGateBenchmark } from '../../src/v2/benchmark/route-gate.js';
+import { estimateTextTokens } from '../../src/v2/token-estimator.js';
 
 function estimatedSchemaTokens(tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>): number {
-  return Math.ceil(JSON.stringify(tools).length / 4);
+  return estimateTextTokens(JSON.stringify(tools));
 }
 
 describe('MCP full tool mode', () => {
