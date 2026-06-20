@@ -862,6 +862,8 @@ export class V2QueryService {
     const limit = Math.min(Number(args.limit ?? 100), 500);
     const cursorOffset = parseCursor(args.cursor);
     const groupBy = String(args.groupBy ?? 'none');
+    const outputMode = normalizeGraphOutputMode(args.outputMode);
+    const maxResponseTokens = responseTokenCap(args, outputMode === 'full' ? 16000 : 6000);
     const like = `%${escapeLike(symbol)}%`;
     const fieldAccess = String(args.fieldAccess ?? 'all');
     const filters = referenceFiltersFor(args, symbol);
@@ -976,7 +978,7 @@ export class V2QueryService {
       totalCount += await scalar(this.db, query.sql, ...query.params);
     }
 
-    return {
+    const fullResult = {
       symbol,
       references,
       groups: groupBy === 'none' ? undefined : groupReferences(references, groupBy),
@@ -988,6 +990,63 @@ export class V2QueryService {
       fieldAccess,
       confidence: 0.75,
     };
+    if (outputMode === 'full') {
+      return withResponseCapBudget(fullResult, {
+        fullPayload: fullResult,
+        maxResponseTokens,
+        capped: false,
+        policy: 'full references returned; use compact mode for grouped counts and exact follow-up handles',
+      });
+    }
+
+    const compactLimit = Math.min(references.length, compactLimitForResponseCap(maxResponseTokens));
+    const compactReferences = references.slice(0, compactLimit).map(slimReferenceForBudget);
+    const omittedCount = Math.max(0, totalCount - cursorOffset - compactReferences.length);
+    const compactResult = {
+      symbol,
+      outputMode: omittedCount > 0 ? 'compact-capped' : 'compact',
+      references: compactReferences,
+      groups: groupBy === 'none' ? groupReferences(compactReferences, 'kind') : groupReferences(compactReferences, groupBy),
+      groupBy: groupBy === 'none' ? 'kind' : groupBy,
+      totalCount,
+      shownCount: compactReferences.length,
+      omitted: omittedCount > 0
+        ? [{
+          kind: 'references',
+          count: omittedCount,
+          reason: 'default compact response returns representative references plus counts; expand the exact cursor only when needed',
+          cursor: String(cursorOffset + compactReferences.length),
+        }]
+        : [],
+      allowedFollowups: omittedCount > 0
+        ? [{
+          tool: 'find_references',
+          args: {
+            ...copyDefined({
+              symbol,
+              kind,
+              fieldAccess,
+              groupBy,
+              cursor: String(cursorOffset + compactReferences.length),
+              limit,
+              outputMode: 'full',
+            }),
+          },
+          reason: 'Expand the next exact reference page only if the compact groups do not cover the required impact.',
+        }]
+        : [],
+      truncated: cursorOffset + compactReferences.length < totalCount,
+      nextCursor: cursorOffset + compactReferences.length < totalCount ? String(cursorOffset + compactReferences.length) : undefined,
+      filters: filters.effective,
+      fieldAccess,
+      confidence: 0.75,
+    };
+    return withResponseCapBudget(compactResult, {
+      fullPayload: fullResult,
+      maxResponseTokens,
+      capped: omittedCount > 0,
+      policy: 'compact references return representative rows, group counts, omitted counts, and exact follow-up handles instead of a broad flat list',
+    });
   }
 
   private async getFileSummary(snapshotId: string, args: Record<string, unknown>) {
@@ -1283,6 +1342,9 @@ export class V2QueryService {
     const direction = normalizeDependencyDirection(String(args.direction ?? 'both'));
     const maxDepth = Math.max(1, Math.min(Number(args.depth ?? 2), 5));
     const limit = Math.min(Number(args.limit ?? 200), 1000);
+    const cursorOffset = parseCursor(args.cursor);
+    const outputMode = normalizeGraphOutputMode(args.outputMode);
+    const maxResponseTokens = responseTokenCap(args, outputMode === 'full' ? 16000 : 6000);
     const filters = fileFiltersFor(args, target);
     const fileRoles = await this.fileRoleMap(snapshotId);
     const seedFiles = (await this.seedFilesForDependencyTrace(snapshotId, target, filters))
@@ -1322,7 +1384,7 @@ export class V2QueryService {
       ? await dependencyTraceDiagnostics(this.db, snapshotId, seedFiles, 12)
       : undefined;
 
-    return {
+    const fullResult = {
       target,
       resolvedAs: seedFiles.length === 1 && await this.resolveFile(snapshotId, target) ? 'file' : seedFiles.length > 0 ? 'file-pattern' : 'none',
       direction,
@@ -1347,6 +1409,77 @@ export class V2QueryService {
         'Use depth 1 for direct dependencies/dependents and depth 2-5 for transitive impact.',
       ],
     };
+    if (outputMode === 'full') {
+      return withResponseCapBudget(fullResult, {
+        fullPayload: fullResult,
+        maxResponseTokens,
+        capped: false,
+        policy: 'full dependency trace returned; use compact mode for grouped counts and exact expansion handles',
+      });
+    }
+
+    const compactLimit = Math.min(edges.length, compactLimitForResponseCap(maxResponseTokens));
+    const compactEdges = edges.slice(cursorOffset, cursorOffset + compactLimit).map(slimDependencyTraceEdge);
+    const omittedCount = Math.max(0, edges.length - cursorOffset - compactEdges.length);
+    const compactResult = {
+      target,
+      outputMode: omittedCount > 0 ? 'compact-capped' : 'compact',
+      resolvedAs: fullResult.resolvedAs,
+      direction,
+      depth: maxDepth,
+      seedFiles,
+      edges: compactEdges,
+      edgeGroups: dependencyTraceGroups(edges),
+      edgeCount: edges.length,
+      shownCount: compactEdges.length,
+      dependencies: dependencies.slice(0, compactLimit).map(slimDependencyTraceEdge),
+      dependents: dependents.slice(0, compactLimit).map(slimDependencyTraceEdge),
+      transitiveFiles: transitiveFiles.slice(0, Math.max(compactLimit * 2, 8)),
+      transitiveFileCount: transitiveFiles.length,
+      topFiles: rankFiles([
+        ...edges.map(edge => edge.fromFile),
+        ...edges.map(edge => edge.toFile),
+      ]).slice(0, Math.max(compactLimit * 2, 8)),
+      impactedEndpoints: arrayRecords(await this.impactedEndpoints(snapshotId, [...seedFiles, ...transitiveFiles]))
+        .slice(0, compactLimit),
+      cycleHints: cycleHints.slice(0, compactLimit).map(slimDependencyTraceEdge),
+      graphDiagnostics,
+      omitted: omittedCount > 0
+        ? [{
+          kind: 'dependency_edges',
+          count: omittedCount,
+          reason: 'default compact response returns representative dependency edges plus grouped counts',
+          cursor: String(cursorOffset + compactEdges.length),
+        }]
+        : [],
+      allowedFollowups: omittedCount > 0
+        ? [{
+          tool: 'trace_dependencies',
+          args: copyDefined({
+            target,
+            direction,
+            depth: maxDepth,
+            limit,
+            cursor: String(cursorOffset + compactEdges.length),
+            outputMode: 'full',
+          }),
+          reason: 'Expand the next exact dependency trace page only if compact edge groups are insufficient.',
+        }]
+        : [],
+      truncated: cursorOffset + compactEdges.length < edges.length || edges.length >= limit,
+      nextCursor: cursorOffset + compactEdges.length < edges.length ? String(cursorOffset + compactEdges.length) : undefined,
+      filters: filters.effective,
+      confidence: seedFiles.length > 0 ? 0.75 : 0.35,
+      confidenceNotes: [
+        'Compact dependency tracing returns representative edges, counts, and exact expansion handles; set outputMode=full for expanded rows.',
+      ],
+    };
+    return withResponseCapBudget(compactResult, {
+      fullPayload: fullResult,
+      maxResponseTokens,
+      capped: omittedCount > 0,
+      policy: 'compact dependency trace returns grouped counts, representative edges, and exact follow-up handles instead of broad flat graph rows',
+    });
   }
 
   private async explainEndpoint(snapshotId: string, args: Record<string, unknown>) {
@@ -1539,9 +1672,34 @@ export class V2QueryService {
       [...requestedSymbols, ...requestedFiles].join(' '),
       Math.min(limit, 20),
     );
+    const riskMode = normalizeRiskMode(args.riskMode, [
+      String(args.task ?? args.target ?? ''),
+      ...requestedSymbols,
+      ...requestedFiles,
+      diffFiles.join(' '),
+    ].join(' '));
+    const calculationImpact = riskMode === 'calculation_sensitive'
+      ? calculationImpactForPatch({
+        changedFiles,
+        requestedSymbols,
+        touchedSymbols,
+        dependencyRows,
+        dependentRows,
+        callers,
+        callees,
+        fieldImpact: isPlainObject(fieldImpact) ? fieldImpact : undefined,
+        impactedEndpoints,
+        tests,
+        taskText: String(args.task ?? args.target ?? ''),
+      }, limit)
+      : undefined;
+    const calculationImpactCoverage = calculationImpact && isPlainObject(calculationImpact.impactCoverage)
+      ? calculationImpact.impactCoverage
+      : {};
 
     const fullResult = {
       outputMode: 'full',
+      riskMode,
       inputs: {
         files: requestedFiles,
         diffFiles,
@@ -1568,6 +1726,7 @@ export class V2QueryService {
         calleeCount: callees.length,
       },
       fieldImpact,
+      calculationImpact,
       architectureContext,
       impactedFiles,
       impactedEndpoints,
@@ -1581,6 +1740,8 @@ export class V2QueryService {
         directDependentCount: dependentRows.length,
         callerCount: callers.length,
         fieldUsageCount: fieldImpact ? Number(fieldImpact.usageCount ?? 0) : 0,
+        calculationOutputGroupCount: calculationImpact ? arrayRecords(calculationImpact.outputGroups).length : 0,
+        unclassifiedCalculationSinkCount: calculationImpact ? Number(calculationImpactCoverage.unclassifiedCalculationSinks ?? 0) : 0,
         impactedEndpointCount: impactedEndpoints.length,
         likelyTestCount: tests.length,
         unresolvedInputCount: unresolvedFiles.length + unresolvedSymbols.length,
@@ -3160,18 +3321,25 @@ export class V2QueryService {
     const shouldSimulatePatch = requestedFiles.length > 0 || requestedSymbols.length > 0 || Boolean(diff);
     const patchImpact = shouldSimulatePatch
       ? await this.simulatePatchImpact(snapshotId, {
+        task,
         files: requestedFiles,
         symbols: requestedSymbols,
         diff,
+        riskMode: args.riskMode,
         limit: Math.max(20, Number(args.maxFiles ?? 8) * 4),
       }) as Record<string, unknown>
       : undefined;
-    const fieldImpact = await this.fieldImpactForInputs(snapshotId, {
-      ...args,
-      task,
-      symbols: requestedSymbols,
-      diff,
-    }, Math.max(20, Number(args.maxFiles ?? 8) * 4));
+    const fieldImpact = patchImpact && isPlainObject(patchImpact.fieldImpact)
+      ? patchImpact.fieldImpact
+      : await this.fieldImpactForInputs(snapshotId, {
+        ...args,
+        task,
+        symbols: requestedSymbols,
+        diff,
+      }, Math.max(20, Number(args.maxFiles ?? 8) * 4));
+    const calculationImpact = patchImpact && isPlainObject(patchImpact.calculationImpact)
+      ? patchImpact.calculationImpact
+      : undefined;
     const commands = stringArray(validation.suggestedCommands);
     const editRanges = sliceHints
       .slice(0, packProfileValue(profile, 4, 6, 8))
@@ -3211,6 +3379,7 @@ export class V2QueryService {
       taskOracle: packedTaskOracle,
       patchImpact: packedPatchImpact,
       fieldImpact: packedFieldImpact,
+      calculationImpact,
       architectureContext: packedArchitectureContext,
     };
     const fullPayloadForBudget = {
@@ -3222,12 +3391,15 @@ export class V2QueryService {
       taskOracle,
       patchImpact,
       fieldImpact,
+      calculationImpact,
       architectureContext,
     };
+    const calculationAnswerable = !calculationImpact || calculationImpact.answerable !== false;
 
     return {
       task,
       changeType,
+      answerable: calculationAnswerable,
       routing: {
         intendedUse: 'edit-ready implementation/debug/refactor packet',
         expectedToolCallsBeforeEdit: editRanges.length > 0 ? 1 : 0,
@@ -3250,10 +3422,13 @@ export class V2QueryService {
       taskOracle: packedTaskOracle,
       patchImpact: packedPatchImpact,
       fieldImpact: packedFieldImpact,
+      calculationImpact,
       architectureContext: packedArchitectureContext,
       topFiles,
       nextAction: editRanges.length > 0
-        ? 'Call get_file_slice once with routing.firstToolCall.args, then make the smallest scoped edit.'
+        ? calculationAnswerable
+          ? 'Call get_file_slice once with routing.firstToolCall.args, then make the smallest scoped edit.'
+          : 'Resolve the unclassified calculation sinks before editing; use calculationImpact.allowedFollowups.'
         : 'Resolve a concrete file/symbol first with search_symbol or search_files before editing.',
       confidence: context.confidence ?? 0.4,
       budget: {
@@ -5790,6 +5965,8 @@ function estimateTokens(value: string): number {
 type PackProfile = 'micro' | 'compact' | 'full';
 type PatchImpactOutputMode = 'compact' | 'full';
 type PackResponseMode = 'answer' | 'agent' | 'full';
+type GraphOutputMode = 'compact' | 'full';
+type RiskMode = 'normal' | 'calculation_sensitive';
 
 function normalizePatchImpactOutputMode(value: unknown): PatchImpactOutputMode {
   return String(value ?? '').trim().toLowerCase() === 'full' ? 'full' : 'compact';
@@ -5799,6 +5976,19 @@ function normalizePackResponseMode(value: unknown, fallback: PackResponseMode = 
   const mode = String(value ?? '').trim().toLowerCase();
   if (mode === 'answer' || mode === 'agent' || mode === 'full') return mode;
   return fallback;
+}
+
+function normalizeGraphOutputMode(value: unknown): GraphOutputMode {
+  return String(value ?? '').trim().toLowerCase() === 'full' ? 'full' : 'compact';
+}
+
+function normalizeRiskMode(value: unknown, text: string): RiskMode {
+  const mode = String(value ?? '').trim().toLowerCase();
+  if (mode === 'calculation_sensitive' || mode === 'calculation-sensitive' || mode === 'calculation') {
+    return 'calculation_sensitive';
+  }
+  if (mode && mode !== 'auto') return 'normal';
+  return hasCalculationSignals(text) ? 'calculation_sensitive' : 'normal';
 }
 
 function responseTokenCap(args: Record<string, unknown>, fallback: number): number {
@@ -6567,6 +6757,8 @@ function compileEvidenceAnswerable(
       && (arrayRecords(packet.reviewTargets).length > 0 || arrayRecords(packet.lineFocus).length > 0 || arrayRecords(packet.reviewFindings).length > 0);
   }
   if (sourceTool === 'get_change_pack') {
+    const calculationImpact = isPlainObject(packet.calculationImpact) ? packet.calculationImpact : undefined;
+    if (calculationImpact?.answerable === false) return false;
     return arrayRecords(packet.editRanges).length > 0 || arrayRecords(packet.files).length > 0 || arrayRecords(packet.symbols).length > 0;
   }
   return evidence.length > 0;
@@ -8222,6 +8414,7 @@ function compactPatchImpactResult(result: Record<string, unknown>, maxItems: num
   const dependencyImpact = isPlainObject(result.dependencyImpact) ? result.dependencyImpact : {};
   const callImpact = isPlainObject(result.callImpact) ? result.callImpact : {};
   const fieldImpact = isPlainObject(result.fieldImpact) ? result.fieldImpact : undefined;
+  const calculationImpact = isPlainObject(result.calculationImpact) ? result.calculationImpact : undefined;
   const architectureContext = isPlainObject(result.architectureContext) ? result.architectureContext : undefined;
   const changedFiles = stringArray(result.changedFiles);
   const touchedSymbols = arrayRecords(result.touchedSymbols);
@@ -8241,6 +8434,7 @@ function compactPatchImpactResult(result: Record<string, unknown>, maxItems: num
 
   const compacted: Record<string, unknown> = {
     outputMode: options.outputMode,
+    riskMode: result.riskMode,
     inputs: compactReviewObject(result.inputs, itemLimit, depth),
     changedFiles: changedFiles.slice(0, listLimit),
     touchedSymbols: compactReviewObject(touchedSymbols.slice(0, itemLimit), itemLimit, depth),
@@ -8260,6 +8454,7 @@ function compactPatchImpactResult(result: Record<string, unknown>, maxItems: num
     },
     impactedFiles: impactedFiles.slice(0, listLimit),
     impactedEndpoints: compactReviewObject(impactedEndpoints.slice(0, itemLimit), itemLimit, depth),
+    calculationImpact: calculationImpact ? compactReviewObject(calculationImpact, itemLimit, depth + 1) : undefined,
     testsLikelyRelevant: compactReviewObject(tests.slice(0, itemLimit), itemLimit, depth),
     validation: compactReviewObject(result.validation, itemLimit, depth),
     riskFlags: compactReviewObject(riskFlags.slice(0, itemLimit), itemLimit, depth),
@@ -9064,6 +9259,322 @@ function groupReferences(references: Array<Record<string, unknown>>, groupBy: st
       references: rows.slice(0, 10),
     }))
     .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
+}
+
+function slimReferenceForBudget(reference: Record<string, unknown>): Record<string, unknown> {
+  return copyDefined({
+    file: reference.file,
+    line: reference.line,
+    column: reference.column,
+    kind: reference.kind,
+    symbolName: reference.symbolName,
+    source: reference.source,
+    caller: reference.caller,
+    callee: reference.callee,
+    confidence: reference.confidence,
+    resolutionKind: reference.resolutionKind,
+    signalTier: reference.signalTier,
+    fieldAccess: reference.fieldAccess,
+    enclosingClass: reference.enclosingClass,
+    enclosingSymbol: reference.enclosingSymbol,
+    ownerClass: reference.ownerClass,
+    receiverText: reference.receiverText,
+    fileRole: reference.fileRole,
+    context: truncateOptional(reference.context, 160),
+  });
+}
+
+function slimDependencyTraceEdge(edge: DependencyTraceEdge): Record<string, unknown> {
+  return {
+    fromFile: edge.fromFile,
+    toFile: edge.toFile,
+    kind: edge.kind,
+    confidence: edge.confidence,
+    resolutionKind: edge.resolutionKind,
+    depth: edge.depth,
+  };
+}
+
+function dependencyTraceGroups(edges: DependencyTraceEdge[]): Array<Record<string, unknown>> {
+  const groups = new Map<string, DependencyTraceEdge[]>();
+  for (const edge of edges) {
+    const key = `${edge.kind}:${edge.depth}`;
+    const bucket = groups.get(key) ?? [];
+    bucket.push(edge);
+    groups.set(key, bucket);
+  }
+  return [...groups.entries()]
+    .map(([key, rows]) => ({
+      key,
+      kind: key.split(':')[0],
+      depth: Number(key.split(':')[1] ?? 0),
+      count: rows.length,
+      files: rankFiles(rows.flatMap(row => [row.fromFile, row.toFile])).slice(0, 8),
+      representativeEdges: rows.slice(0, 3).map(slimDependencyTraceEdge),
+    }))
+    .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
+}
+
+function copyDefined<T extends Record<string, unknown>>(value: T): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(value).filter(([, child]) => child !== undefined));
+}
+
+function calculationImpactForPatch(input: {
+  changedFiles: string[];
+  requestedSymbols: string[];
+  touchedSymbols: Array<Record<string, unknown>>;
+  dependencyRows: Array<Record<string, unknown>>;
+  dependentRows: Array<Record<string, unknown>>;
+  callers: CallEdgeRow[];
+  callees: CallEdgeRow[];
+  fieldImpact?: Record<string, unknown>;
+  impactedEndpoints: Array<Record<string, unknown>>;
+  tests: Array<Record<string, unknown>>;
+  taskText: string;
+}, limit: number): Record<string, unknown> {
+  const changedSymbolNames = uniqueStrings([
+    ...input.requestedSymbols,
+    ...input.touchedSymbols.flatMap(symbol => [
+      String(symbol.symbol ?? ''),
+      String(symbol.name ?? ''),
+    ]),
+    ...input.callers.flatMap(edge => [edge.caller, edge.callee]),
+    ...input.callees.flatMap(edge => [edge.caller, edge.callee]),
+  ].filter(Boolean)).slice(0, 40);
+  const contractText = [
+    input.taskText,
+    ...changedSymbolNames,
+    ...input.changedFiles,
+  ].join(' ');
+  const invariants = calculationInvariantsFor(contractText);
+  const sinks: Array<Record<string, unknown>> = [];
+  for (const symbol of input.requestedSymbols) {
+    sinks.push({
+      source: 'requested_symbol',
+      text: `${symbol} ${input.taskText}`,
+      symbol,
+      path: [symbol],
+      confidence: 0.6,
+    });
+  }
+  for (const symbol of input.touchedSymbols) {
+    sinks.push({
+      source: 'changed_symbol',
+      text: `${symbol.symbol ?? ''} ${symbol.name ?? ''} ${symbol.file ?? ''} ${input.taskText}`,
+      file: symbol.file,
+      symbol: symbol.symbol ?? symbol.name,
+      line: symbol.line,
+      path: [symbol.symbol, symbol.name].filter(Boolean),
+      confidence: symbol.confidence,
+    });
+  }
+  for (const edge of input.callers) {
+    sinks.push({
+      source: 'caller',
+      text: `${edge.caller} ${edge.callee} ${edge.file}`,
+      file: edge.file,
+      symbol: edge.caller,
+      line: edge.line,
+      path: [edge.callee, edge.caller].filter(Boolean),
+      confidence: edge.confidence,
+    });
+  }
+  for (const edge of input.callees) {
+    sinks.push({
+      source: 'callee',
+      text: `${edge.caller} ${edge.callee} ${edge.file}`,
+      file: edge.file,
+      symbol: edge.callee,
+      line: edge.line,
+      path: [edge.caller, edge.callee].filter(Boolean),
+      confidence: edge.confidence,
+    });
+  }
+  for (const usage of arrayRecords(input.fieldImpact?.usages)) {
+    sinks.push({
+      source: 'field_usage',
+      text: `${usage.enclosingSymbol ?? ''} ${usage.enclosingClass ?? ''} ${usage.context ?? ''} ${usage.file ?? ''}`,
+      file: usage.file,
+      symbol: usage.enclosingSymbol ?? usage.fieldName,
+      line: usage.line,
+      path: [usage.fieldName, usage.enclosingSymbol].filter(Boolean),
+      confidence: usage.confidence,
+    });
+  }
+  for (const row of input.dependentRows) {
+    sinks.push({
+      source: 'dependent_file',
+      text: `${row.file ?? row.modulePath ?? ''} ${row.type ?? ''} ${row.resolutionKind ?? ''}`,
+      file: row.file ?? row.modulePath,
+      symbol: row.type,
+      path: [row.modulePath ?? row.file].filter(Boolean),
+      confidence: row.confidence,
+    });
+  }
+  for (const endpoint of input.impactedEndpoints) {
+    sinks.push({
+      source: 'endpoint',
+      text: `${endpoint.method ?? ''} ${endpoint.path ?? ''} ${endpoint.handlerSymbol ?? ''} ${endpoint.controller ?? ''} ${endpoint.file ?? ''}`,
+      file: endpoint.file,
+      symbol: endpoint.handlerSymbol ?? endpoint.controller,
+      line: endpoint.line,
+      path: [endpoint.handlerSymbol, `${endpoint.method ?? ''} ${endpoint.path ?? ''}`].filter(Boolean),
+      confidence: endpoint.confidence,
+    });
+  }
+
+  const calculationSinks = sinks.filter(sink => hasCalculationSignals(String(sink.text ?? '')) || sink.source === 'endpoint');
+  const unknownSinks = sinks.filter(sink => !calculationSinks.includes(sink) && maybeRuntimeSink(String(sink.file ?? sink.text ?? '')));
+  const groupsByOutput = new Map<string, Array<Record<string, unknown>>>();
+  for (const sink of calculationSinks) {
+    const output = calculationOutputGroup(String(sink.text ?? ''));
+    const bucket = groupsByOutput.get(output) ?? [];
+    bucket.push(sink);
+    groupsByOutput.set(output, bucket);
+  }
+  if (unknownSinks.length > 0) groupsByOutput.set('unknown_runtime_calculation_sink', unknownSinks.slice(0, limit));
+  const outputGroups = [...groupsByOutput.entries()]
+    .map(([output, rows]) => ({
+      output,
+      risk: output === 'unknown_runtime_calculation_sink' ? 'unknown' : calculationRiskForOutput(output, rows),
+      usageCount: rows.length,
+      path: representativeCalculationPath(changedSymbolNames, rows[0]),
+      representativeEvidence: rows.slice(0, 3).map(row => copyDefined({
+        file: row.file,
+        symbol: row.symbol,
+        line: row.line,
+        source: row.source,
+        confidence: row.confidence,
+      })),
+      requiredTests: calculationTestObligations(output, contractText),
+    }))
+    .sort((a, b) => calculationRiskRank(b.risk) - calculationRiskRank(a.risk) || b.usageCount - a.usageCount)
+    .slice(0, Math.max(1, Math.min(limit, 20)));
+  const unclassifiedCalculationSinks = unknownSinks.length;
+  const answerable = unclassifiedCalculationSinks === 0;
+  return {
+    riskMode: 'calculation_sensitive',
+    answerable,
+    changedContract: {
+      symbols: changedSymbolNames.slice(0, 12),
+      meaning: calculationMeaningFor(contractText),
+      invariants,
+    },
+    calculationContract: {
+      meaning: calculationMeaningFor(contractText),
+      invariants,
+    },
+    impactCoverage: {
+      totalUsages: sinks.length,
+      calculationUsages: calculationSinks.length,
+      classifiedCalculationSinks: calculationSinks.length,
+      unclassifiedCalculationSinks,
+      outputGroupCount: outputGroups.length,
+    },
+    outputGroups,
+    omitted: {
+      sinksOmitted: Math.max(0, sinks.length - calculationSinks.length - unknownSinks.length),
+      outputGroupsOmitted: Math.max(0, groupsByOutput.size - outputGroups.length),
+    },
+    testsLikelyRelevant: input.tests.slice(0, 8),
+    requiredTestObligations: uniqueStrings(outputGroups.flatMap(group => stringArray(group.requiredTests))).slice(0, 12),
+    allowedFollowups: answerable
+      ? []
+      : [{
+        tool: 'trace_dependencies',
+        args: copyDefined({
+          target: input.changedFiles[0] ?? changedSymbolNames[0],
+          direction: 'both',
+          depth: 2,
+          outputMode: 'full',
+        }),
+        reason: 'Classify remaining runtime calculation sinks before editing calculation-sensitive code.',
+      }],
+    stopRule: answerable
+      ? 'All high-risk calculation sinks in the current graph packet are classified; inspect representative evidence and required tests before editing.'
+      : 'Do not implement until critical, high, or unknown calculation sinks are classified.',
+  };
+}
+
+function hasCalculationSignals(text: string): boolean {
+  return /\b(calc\w*|calculate\w*|compute\w*|score\w*|rank\w*|rating|priority|quota|limit\w*|threshold|quantity|capacity|total\w*|subtotal|amount|price|tax|fee|discount|rate|ratio|percent|aggregate\w*|metric|duration|timeout|window|allocation|forecast|estimate|normalize\w*|convert\w*|precision|rounding|unit|boundary|validation|eligible|balance|refund|invoice|payment)\b/i.test(text);
+}
+
+function maybeRuntimeSink(text: string): boolean {
+  return !/\b(test|spec|mock|fixture|docs?|readme|generated|target|build)\b/i.test(text);
+}
+
+function calculationOutputGroup(text: string): string {
+  if (/\b(rank\w*|rating|score\w*|priority)\b/i.test(text)) return 'score_or_ranking';
+  if (/\b(limit\w*|threshold|quota|eligible|validation|validat\w*)\b/i.test(text)) return 'threshold_or_validation_decision';
+  if (/\b(quantity|capacity|inventory|count)\b/i.test(text)) return 'quantity_or_capacity';
+  if (/\b(total\w*|subtotal|amount|price|tax|fee|discount|balance|refund|invoice|payment)\b/i.test(text)) return 'amount_or_total';
+  if (/\b(rate|ratio|percent|conversion)\b/i.test(text)) return 'rate_or_ratio';
+  if (/\b(aggregate\w*|metric|report|dashboard|analytics)\b/i.test(text)) return 'aggregate_metric';
+  if (/\b(duration|timeout|window|sla|latency|date|time)\b/i.test(text)) return 'time_or_duration';
+  if (/\b(allocation|distribution|forecast|estimate)\b/i.test(text)) return 'allocation_or_forecast';
+  if (/\b(get|post|put|delete|patch)\s+\//i.test(text)) return 'api_visible_output';
+  return 'generic_calculation_output';
+}
+
+function calculationRiskForOutput(output: string, rows: Array<Record<string, unknown>>): 'critical' | 'high' | 'medium' | 'low' {
+  if (output === 'amount_or_total' || output === 'threshold_or_validation_decision' || output === 'score_or_ranking' || output === 'api_visible_output') return 'critical';
+  if (output === 'quantity_or_capacity' || output === 'time_or_duration' || output === 'rate_or_ratio') return 'high';
+  if (output === 'aggregate_metric' || output === 'allocation_or_forecast') return 'medium';
+  return rows.length >= 10 ? 'high' : 'medium';
+}
+
+function calculationRiskRank(risk: unknown): number {
+  switch (risk) {
+    case 'unknown':
+      return 5;
+    case 'critical':
+      return 4;
+    case 'high':
+      return 3;
+    case 'medium':
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function representativeCalculationPath(changedSymbols: string[], sink: Record<string, unknown> | undefined): string[] {
+  return uniqueStrings([
+    ...changedSymbols.slice(0, 1),
+    ...stringArray(sink?.path),
+    String(sink?.symbol ?? ''),
+  ].filter(Boolean)).slice(0, 5);
+}
+
+function calculationMeaningFor(text: string): string {
+  const group = calculationOutputGroup(text);
+  return group.replace(/_/g, ' ');
+}
+
+function calculationInvariantsFor(text: string): string[] {
+  const invariants = [
+    'input and output units must remain explicit',
+    'null, zero, negative, and boundary behavior must be known',
+    'precision and rounding behavior must not change accidentally',
+  ];
+  if (/\b(rank\w*|score\w*|priority)\b/i.test(text)) invariants.push('relative ordering must remain intentional and tested');
+  if (/\b(duration|timeout|window|date|time)\b/i.test(text)) invariants.push('time window boundaries and timezone assumptions must be explicit');
+  if (/\b(aggregate|metric|report|ratio|rate|percent)\b/i.test(text)) invariants.push('aggregation grouping and denominator semantics must be preserved');
+  if (/\b(limit|threshold|quota|eligible|validation)\b/i.test(text)) invariants.push('threshold inclusivity and eligibility boundaries must be tested');
+  if (/\b(total|amount|price|tax|fee|discount|quantity|capacity)\b/i.test(text)) invariants.push('scale, unit conversion, and overflow behavior must be tested');
+  return uniqueStrings(invariants).slice(0, 8);
+}
+
+function calculationTestObligations(output: string, text: string): string[] {
+  const tests = ['boundary values', 'zero/null/negative values'];
+  if (/\b(round|precision|amount|total|rate|ratio|percent)\b/i.test(`${output} ${text}`)) tests.push('precision and rounding');
+  if (/\b(unit|convert|quantity|capacity)\b/i.test(`${output} ${text}`)) tests.push('unit conversion');
+  if (output === 'score_or_ranking' || /\b(rank\w*|score\w*|priority)\b/i.test(`${output} ${text}`)) tests.push('ordering or ranking stability');
+  if (/\b(aggregate|metric|report)\b/i.test(`${output} ${text}`)) tests.push('aggregation and grouping behavior');
+  if (/\b(limit|threshold|quota|validation|eligible)\b/i.test(`${output} ${text}`)) tests.push('threshold inclusivity');
+  if (/\b(duration|timeout|window|date|time)\b/i.test(`${output} ${text}`)) tests.push('time-window boundary behavior');
+  return uniqueStrings(tests).slice(0, 8);
 }
 
 function groupFieldUsages(usages: Array<Record<string, unknown>>, keyName: string): Array<Record<string, unknown>> {

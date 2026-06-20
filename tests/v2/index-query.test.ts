@@ -273,6 +273,77 @@ public class FieldImpactSubjectTest {
     expect(Number(warmRows?.count ?? 0)).toBeGreaterThan(0);
   });
 
+  it('classifies calculation-sensitive impact by output behavior instead of flat references', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-calculation-impact-');
+    writeFile(repo, 'src/main/java/com/example/ScoreCalculator.java', `package com.example;
+
+public class ScoreCalculator {
+    public int computeScore(int base, int bonus) {
+        return Math.max(0, base + bonus);
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/RankingService.java', `package com.example;
+
+public class RankingService {
+    private final ScoreCalculator calculator = new ScoreCalculator();
+
+    public int rankResult(int base, int bonus) {
+        int finalScore = calculator.computeScore(base, bonus);
+        return finalScore >= 100 ? 1 : 2;
+    }
+}
+`);
+    writeFile(repo, 'src/test/java/com/example/RankingServiceTest.java', `package com.example;
+
+public class RankingServiceTest {
+    public void keepsRankingOrder() {
+        new RankingService().rankResult(90, 10);
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const impact = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'simulate_patch_impact',
+      args: {
+        symbols: ['ScoreCalculator.computeScore'],
+        riskMode: 'calculation_sensitive',
+        limit: 20,
+      },
+    }) as {
+      riskMode?: string;
+      calculationImpact?: {
+        riskMode: string;
+        impactCoverage: { calculationUsages: number };
+        outputGroups: Array<{ output: string; requiredTests: string[] }>;
+      };
+    };
+
+    expect(impact.riskMode).toBe('calculation_sensitive');
+    expect(impact.calculationImpact?.riskMode).toBe('calculation_sensitive');
+    expect(Number(impact.calculationImpact?.impactCoverage.calculationUsages ?? 0)).toBeGreaterThan(0);
+    expect(impact.calculationImpact?.outputGroups.some(group => group.output === 'score_or_ranking')).toBe(true);
+    expect(impact.calculationImpact?.outputGroups.flatMap(group => group.requiredTests)).toContain('ordering or ranking stability');
+
+    const changePack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_change_pack',
+      args: {
+        task: 'Modify computeScore ranking calculation without changing output order accidentally',
+        symbols: ['ScoreCalculator.computeScore'],
+        riskMode: 'calculation_sensitive',
+      },
+    }) as { calculationImpact?: { outputGroups: Array<{ output: string }> } };
+    expect(changePack.calculationImpact?.outputGroups.some(group => group.output === 'score_or_ranking')).toBe(true);
+  });
+
   it('can explicitly disable Java field usage facts for colder large-repo runs', async () => {
     const previousFieldUsageFlag = process.env.CODEGRAPH_ENABLE_FIELD_USAGES;
     process.env.CODEGRAPH_ENABLE_FIELD_USAGES = '0';
@@ -832,6 +903,8 @@ class Order {
       totalCount: number;
       truncated: boolean;
       nextCursor?: string;
+      budget?: { responseCap?: { estimatedTokensSaved?: number } };
+      allowedFollowups?: Array<{ tool: string; args: { cursor?: string; outputMode?: string } }>;
     };
 
     expect(references.totalCount).toBeGreaterThan(1);
@@ -839,6 +912,11 @@ class Order {
     expect(references.truncated).toBe(true);
     expect(references.nextCursor).toBe('1');
     expect(references.groups.length).toBeGreaterThan(0);
+    expect(references.budget?.responseCap?.estimatedTokensSaved).toBeGreaterThanOrEqual(0);
+    expect(references.allowedFollowups?.[0]).toMatchObject({
+      tool: 'find_references',
+      args: { cursor: '1', outputMode: 'full' },
+    });
 
     const deps = await queries.query({
       workspaceId: result.workspaceId,
@@ -851,11 +929,15 @@ class Order {
     }) as {
       seedFiles: string[];
       edges: Array<{ toFile: string }>;
+      edgeGroups?: Array<{ count: number }>;
+      budget?: { responseCap?: { estimatedResponseTokens: number } };
       transitiveFiles: string[];
     };
 
     expect(deps.seedFiles[0]).toContain('PaymentService.java');
     expect(deps.edges.some(edge => edge.toFile.includes('PaymentGateway.java'))).toBe(true);
+    expect(deps.edgeGroups?.length).toBeGreaterThan(0);
+    expect(deps.budget?.responseCap?.estimatedResponseTokens).toBeGreaterThan(0);
     expect(deps.transitiveFiles.some(file => file.includes('PaymentGateway.java'))).toBe(true);
 
     const mixed = await queries.query({

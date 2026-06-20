@@ -18,6 +18,11 @@ const PackProfileOption = {
   profile: z.enum(['micro', 'compact', 'full']).default('compact'),
 };
 
+const ResponseBudgetOptions = {
+  outputMode: z.enum(['compact', 'full']).optional(),
+  maxResponseTokens: z.number().min(500).max(30000).optional(),
+};
+
 const CallSignalOption = {
   includeLowSignal: z.boolean().optional(),
 };
@@ -34,6 +39,7 @@ export const V2ToolSchemas = {
     files: z.array(z.string()).optional(),
     symbols: z.array(z.string()).optional(),
     budgetTokens: z.number().min(1000).max(30000).default(6000),
+    riskMode: z.enum(['auto', 'calculation_sensitive']).optional(),
     ...PackProfileOption,
     ...SnippetOptions,
     ...FreshnessOptions,
@@ -91,6 +97,7 @@ export const V2ToolSchemas = {
     includeGenerated: z.boolean().optional(),
     includeFixtures: z.boolean().optional(),
     ...CallSignalOption,
+    ...ResponseBudgetOptions,
     ...FreshnessOptions,
   }),
   get_file_summary: z.object({
@@ -155,6 +162,7 @@ export const V2ToolSchemas = {
     includeFixtures: z.boolean().optional(),
     fileRole: z.string().optional(),
     language: z.string().optional(),
+    ...ResponseBudgetOptions,
     ...FreshnessOptions,
   }),
   explain_endpoint: z.object({
@@ -179,6 +187,7 @@ export const V2ToolSchemas = {
     maxResponseTokens: z.number().min(500).max(30000).optional(),
     skipLikelyTests: z.boolean().optional(),
     callSeedLimit: z.number().min(0).max(30).optional(),
+    riskMode: z.enum(['auto', 'calculation_sensitive']).optional(),
     ...FreshnessOptions,
   }),
   review_patch: z.object({
@@ -243,6 +252,7 @@ export const V2ToolSchemas = {
     maxFiles: z.number().min(1).max(20).default(8),
     maxSymbols: z.number().min(1).max(50).default(12),
     includeTests: z.boolean().default(true),
+    riskMode: z.enum(['auto', 'calculation_sensitive']).optional(),
     ...PackProfileOption,
     ...SnippetOptions,
     ...FreshnessOptions,

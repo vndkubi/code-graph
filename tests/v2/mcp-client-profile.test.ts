@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildV2ToolDefinitions, mcpToolNamesForProfile, parseToolArgs, V2_TOOL_DEFINITIONS, V2_TOOL_PROFILES } from '../../src/v2/mcp/tools.js';
-import { inferCodeGraphContextMode, routeCodeGraphContext } from '../../src/v2/mcp/proxy.js';
+import { inferCodeGraphContextMode, inspectCodeGraphRoute, routeCodeGraphContext } from '../../src/v2/mcp/proxy.js';
+import { runRouteGateBenchmark } from '../../src/v2/benchmark/route-gate.js';
 
 function estimatedSchemaTokens(tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>): number {
   return Math.ceil(JSON.stringify(tools).length / 4);
@@ -75,6 +76,33 @@ describe('MCP full tool mode', () => {
     expect(inferCodeGraphContextMode('Collect evidence with rubric coverage', {})).toBe('evidence');
     expect(inferCodeGraphContextMode('Analyze PBI acceptance criteria against code', {})).toBe('evidence');
     expect(inferCodeGraphContextMode('Understand the architecture', {})).toBe('research');
+  });
+
+  it('explains route gate policy for client facade calls', () => {
+    expect(inspectCodeGraphRoute({
+      task: 'Analyze PBI acceptance criteria against code',
+    })).toMatchObject({
+      inferredMode: 'evidence',
+      primaryTool: 'codegraph_context',
+      routedTool: 'compile_evidence',
+      expectedMaxAdditionalCalls: 0,
+      packetContract: {
+        requiresAnswerable: true,
+        denyBroadShellAfterAnswerable: true,
+      },
+    });
+  });
+
+  it('runs deterministic route-gate checks for broad task classes', () => {
+    const report = runRouteGateBenchmark();
+    expect(report.totals.failed).toBe(0);
+    expect(report.tasks.map(task => task.actualTool)).toEqual(expect.arrayContaining([
+      'compile_evidence',
+      'get_change_pack',
+      'get_flow_pack',
+      'review_patch',
+      'get_research_pack',
+    ]));
   });
 
   it('rejects unknown MCP profile names', () => {

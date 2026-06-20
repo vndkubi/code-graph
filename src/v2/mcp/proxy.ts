@@ -303,6 +303,7 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
     includeSnippets: args.includeSnippets,
     snippetLines: args.snippetLines,
     snippetTokenBudget: args.snippetTokenBudget,
+    riskMode: args.riskMode,
     autoRefresh: args.autoRefresh,
     warnStale: args.warnStale,
   });
@@ -373,7 +374,63 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
   };
 }
 
-export function inferCodeGraphContextMode(task: string, args: Record<string, unknown>): 'research' | 'flow' | 'change' | 'review' | 'evidence' {
+export type CodeGraphContextMode = 'research' | 'flow' | 'change' | 'review' | 'evidence';
+
+export function inspectCodeGraphRoute(args: Record<string, unknown>): Record<string, unknown> {
+  const task = String(args.task ?? args.target ?? '').trim();
+  const mode = inferCodeGraphContextMode(task, args);
+  const routed = routeCodeGraphContext(args);
+  const answerReady = routed.toolName === 'compile_evidence';
+  const exactSliceFirst = routed.toolName === 'get_change_pack';
+  const expectedMaxAdditionalCalls = answerReady ? 0 : exactSliceFirst ? 1 : 0;
+  const allowedFollowupTools = answerReady
+    ? []
+    : exactSliceFirst
+      ? ['get_file_slice', 'codegraph_slice']
+      : ['codegraph_slice', 'get_file_slice', 'search_symbol', 'search_files', 'search_code'];
+  return {
+    task,
+    inferredMode: mode,
+    primaryTool: 'codegraph_context',
+    routedTool: routed.toolName,
+    routedArgs: routed.args,
+    packetContract: {
+      requiresAnswerable: routed.toolName === 'compile_evidence',
+      requiresAllowedFollowups: true,
+      denyBroadShellAfterAnswerable: true,
+      denyUnboundedMcpExploration: true,
+    },
+    expectedStopRule: answerReady
+      ? 'answer_from_packet'
+      : exactSliceFirst
+        ? 'open_exact_slice_once'
+        : 'answer_or_expand_exact_followup',
+    expectedMaxAdditionalCalls,
+    expectedAllowedFollowups: allowedFollowupTools,
+    expectedDisallowedFollowups: [
+      'shell_rg',
+      'shell_read_loop',
+      'broad_shell_search',
+      'unbounded_file_reads',
+      'unbounded_mcp_exploration',
+    ],
+    gatePolicy: {
+      passWhen: [
+        'codegraph_context is the first repository-context tool',
+        'routed tool matches inferred intent',
+        'answerable packets cause zero broad shell/search/read fallback',
+        'partial packets use only listed exact follow-ups',
+      ],
+      failureSignals: [
+        'shell/read/search after answerable=true',
+        'lower-level search/slice called before codegraph_context for broad tasks',
+        'more follow-up calls than expectedMaxAdditionalCalls without an allowed follow-up reason',
+      ],
+    },
+  };
+}
+
+export function inferCodeGraphContextMode(task: string, args: Record<string, unknown>): CodeGraphContextMode {
   const explicit = typeof args.mode === 'string' ? args.mode : 'auto';
   if (explicit === 'research' || explicit === 'flow' || explicit === 'change' || explicit === 'review' || explicit === 'evidence') {
     return explicit;

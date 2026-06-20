@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { openCodeGraphDb } from './v2/storage/database.js';
 import { V2Indexer, type IndexProgressEvent } from './v2/index/indexer.js';
 import { V2QueryService } from './v2/query/service.js';
-import { runMcpProxy } from './v2/mcp/proxy.js';
+import { inspectCodeGraphRoute, runMcpProxy } from './v2/mcp/proxy.js';
 import { getWorkspacePaths } from './v2/paths.js';
 import { generateSyntheticJavaRepo } from './v2/benchmark/synthetic-java.js';
 import { runIndexBenchmark } from './v2/benchmark/run.js';
@@ -16,6 +16,7 @@ import { deriveContextProofTasks, loadContextProofTasks, runContextProofEval } f
 import { runLocalFallbackBenchmark } from './v2/benchmark/local-fallback.js';
 import { deriveReviewProofTasks, loadReviewProofTasks, runReviewProofEval } from './v2/benchmark/review-proof.js';
 import { runCodexE2eBenchmark, type CodexBenchmarkMode } from './v2/benchmark/codex-e2e.js';
+import { runRouteGateBenchmark } from './v2/benchmark/route-gate.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 import { buildLocalArtifactIndex, localArtifactStatus } from './v2/mcp/local-artifact.js';
 import { isWorkspaceIndexed } from './v2/storage/sqlite-backend.js';
@@ -63,6 +64,9 @@ async function main(): Promise<void> {
       return;
     case 'logs':
       await runLogsCommand(parsed);
+      return;
+    case 'route-inspect':
+      runRouteInspectCommand(parsed);
       return;
     case 'benchmark':
       await runBenchmarkCommand(subcommand, parsed);
@@ -142,6 +146,9 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       console.log(JSON.stringify(await runLocalFallbackBenchmark(root, tasks), null, 2));
       return;
     }
+    case 'route-gate':
+      console.log(JSON.stringify(runRouteGateBenchmark(getFlag(parsed, 'suite') ?? getFlag(parsed, 'tasks')), null, 2));
+      return;
     case 'copilot-e2e':
       runCopilotE2eBenchmark(parsed);
       return;
@@ -163,7 +170,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }), null, 2));
       return;
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|copilot-e2e|codex-e2e');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|copilot-e2e|codex-e2e');
   }
 }
 
@@ -458,6 +465,21 @@ async function runLogsCommand(parsed: ParsedArgs): Promise<void> {
   console.log(lines.join('\n'));
 }
 
+function runRouteInspectCommand(parsed: ParsedArgs): void {
+  const task = getFlag(parsed, 'task') ?? getFlag(parsed, 'target');
+  if (!task) throw new Error('Usage: codegraph route-inspect --task "<task text>"');
+  console.log(JSON.stringify(inspectCodeGraphRoute({
+    task,
+    target: getFlag(parsed, 'target'),
+    mode: getFlag(parsed, 'mode') ?? 'auto',
+    diff: getFlag(parsed, 'diff'),
+    files: splitCsv(getFlag(parsed, 'files')),
+    symbols: splitCsv(getFlag(parsed, 'symbols')),
+    budgetTokens: getNumberFlag(parsed, 'budget-tokens'),
+    profile: getFlag(parsed, 'profile'),
+  }), null, 2));
+}
+
 function parseArgs(argv: string[]): ParsedArgs {
   const command: string[] = [];
   const flags = new Map<string, string | boolean>();
@@ -551,13 +573,16 @@ Usage:
   codegraph doctor --root <workspace>    Inspect workspace graph configuration
   codegraph logs --root <workspace> --tail <number>
                                              Print recent workspace query events
-  codegraph benchmark generate|index|eval|proof|review|fallback|copilot-e2e|codex-e2e
+  codegraph route-inspect --task <text>  Explain codegraph_context routing and stop/follow-up gate policy
+  codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|copilot-e2e|codex-e2e
                                              Generate synthetic repos, measure indexing, run evals, or prove context/review savings
 
 Options:
   --root <path>                          Workspace root
   --tasks <path>                         Golden eval task JSON file
   --tasks auto                           Derive proof/review tasks from indexed-looking source files
+  --suite <path>                         Route-gate or E2E suite JSON file
+  --task <text|id>                       Route-inspect task text or benchmark task id
   --task-count <number>                  Number of auto-derived proof/review tasks
   --no-index                             Reuse the current proof/review/graph snapshot instead of refreshing first
   --out <path>                           Output path for graph HTML export
