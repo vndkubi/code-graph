@@ -7,7 +7,7 @@ import { V2Indexer, type IndexProgressEvent } from '../index/indexer.js';
 import { resolveCurrentGraphSnapshot } from '../graph/export.js';
 import { estimateTextTokens } from '../token-estimator.js';
 
-export type CodexBenchmarkMode = 'baseline' | 'terse-no-mcp' | 'mcp-first' | 'mcp-only' | 'compiled-packet' | 'compiled-packet+gate' | 'oracle-packet';
+export type CodexBenchmarkMode = 'baseline' | 'terse-no-mcp' | 'natural-tool-use' | 'mcp-first' | 'mcp-only' | 'compiled-packet' | 'compiled-packet+gate' | 'oracle-packet';
 
 export interface CodexE2eTask {
   id: string;
@@ -46,8 +46,13 @@ export interface CodexE2eBenchmarkOptions {
   parseWorkers?: number;
   codexCommand?: string;
   codexCommandArgs?: string[];
+  useUserConfig?: boolean;
+  mcpServerName?: string;
+  mcpCommand?: string;
+  mcpCommandArgs?: string[];
   timeoutSeconds?: number;
   skipIndex?: boolean;
+  skipPreflight?: boolean;
   dryRun?: boolean;
 }
 
@@ -112,7 +117,7 @@ export interface CodexTokenLedger {
 }
 
 export interface CodexE2ePreflightIssue {
-  code: 'root_missing' | 'workspace_not_indexed' | 'missing_required_file' | 'missing_required_method' | 'missing_compatibility_contract';
+  code: 'root_missing' | 'workspace_not_indexed' | 'missing_required_file' | 'missing_required_method' | 'missing_compatibility_contract' | 'preflight_skipped';
   severity: 'error' | 'warning';
   message: string;
   taskId?: string;
@@ -259,17 +264,22 @@ export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): P
   const index = options.skipIndex
     ? undefined
     : await runColdIndex(root, workspaceKey, options.parseWorkers);
-  const preflight = await runCodexE2ePreflight({
-    suite,
-    root,
-    workspaceKey,
-    tasks,
-    plannedRuns,
-  });
+  const preflight = options.skipPreflight
+    ? skippedCodexE2ePreflight({ suite, root, workspaceKey, tasks, plannedRuns })
+    : await runCodexE2ePreflight({
+      suite,
+      root,
+      workspaceKey,
+      tasks,
+      plannedRuns,
+    });
   const mcpConfig = writeCodexMcpConfig({
     runDir,
     root,
     workspaceKey,
+    serverName: options.mcpServerName,
+    command: options.mcpCommand,
+    args: options.mcpCommandArgs,
   });
     const plan = {
       root,
@@ -277,7 +287,10 @@ export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): P
       models,
       modes,
       tasks: tasks.map(task => task.id),
+      mcpServerName: mcpConfig.serverName,
       mcpConfigPath: mcpConfig.path,
+      mcpCommand: mcpConfig.command,
+      mcpCommandArgs: mcpConfig.args,
       skipIndex: Boolean(options.skipIndex),
       dryRun: Boolean(options.dryRun),
       preflight,
@@ -312,6 +325,7 @@ export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): P
             mcpConfigOverrides: mcpConfig.overrides,
             codexCommand: options.codexCommand ?? 'codex',
             codexCommandArgs: options.codexCommandArgs ?? [],
+            useUserConfig: options.useUserConfig ?? false,
             timeoutSeconds: options.timeoutSeconds ?? 900,
           }));
         }
@@ -340,6 +354,36 @@ export function loadCodexE2eSuite(suitePath?: string): CodexE2eSuite {
     throw new Error(`Codex benchmark suite has no tasks: ${resolved}`);
   }
   return parsed;
+}
+
+function skippedCodexE2ePreflight(input: {
+  suite: CodexE2eSuite;
+  root: string;
+  workspaceKey: string;
+  tasks: CodexE2eTask[];
+  plannedRuns: number;
+}): CodexE2ePreflightReport {
+  const requiredFiles = requiredFilesForPreflight(input.suite, input.tasks).map(expected => ({ expected, matched: [] }));
+  const requiredMethods = requiredMethodsForPreflight(input.suite, input.tasks).map(spec => ({ expected: spec.raw, matched: [] }));
+  return {
+    status: 'passed',
+    canRun: true,
+    checkedAt: new Date().toISOString(),
+    root: input.root,
+    workspaceKey: input.workspaceKey,
+    suiteRootProfile: input.suite.rootProfile?.name,
+    requiredFiles,
+    requiredMethods,
+    missingRequiredFiles: [],
+    missingRequiredMethods: [],
+    issues: [{
+      code: 'preflight_skipped',
+      severity: 'warning',
+      message: 'Codex E2E preflight was skipped because this run uses an external MCP server or an external index.',
+    }],
+    plannedRuns: input.plannedRuns,
+    skippedRuns: 0,
+  };
 }
 
 export async function runCodexE2ePreflight(options: {
@@ -710,35 +754,40 @@ function normalizeMethodSpec(value: string): string {
 async function findSimilarMethodCandidates(db: CodeGraphDb, snapshotId: string, expected: string): Promise<string[]> {
   const trimmed = expected.trim().toLowerCase();
   if (trimmed.length < 3) return [];
-  const seed = escapeLikePattern(trimmed.slice(0, Math.min(3, trimmed.length)));
-  const pattern = `%${seed}%`;
+  const seed = escapeLikePattern(trimmed.slice(0, 3));
   const rows = await db.prepare(`
     SELECT simple_name, fq_name, kind
     FROM symbols
     WHERE snapshot_id = ?
-      AND (
-        lower(simple_name) LIKE ? ESCAPE '\\' OR
-        lower(fq_name) LIKE ? ESCAPE '\\'
-      )
-  `).all(snapshotId, pattern, pattern) as Array<{
+  `).all(snapshotId) as Array<{
     simple_name: string;
     fq_name: string;
     kind: string;
   }>;
+  const scoreByLabel = new Map<string, number>();
+  const seedLengthBudget = Math.max(3, Math.ceil(trimmed.length * 0.45));
 
-  const scoredCandidates = rows
-    .map(row => {
-      const names = uniqueStrings([row.simple_name ?? '', row.fq_name ?? '']).filter(Boolean).map(value => value.toLowerCase());
-      const bestDistance = Math.min(...names.map(name => levenshteinDistance(trimmed, name)));
-      if (bestDistance > Math.max(3, Math.ceil(Math.max(trimmed.length, Math.max(row.simple_name.length, row.fq_name.length)) * 0.35))) {
-        return null;
+  for (const row of rows) {
+    const names = uniqueStrings([row.simple_name ?? '', row.fq_name ?? '']).filter(Boolean);
+    for (const candidateName of names) {
+      const candidate = candidateName.toLowerCase();
+      if (!candidate.includes(seed)) continue;
+      const distance = levenshteinDistance(trimmed, candidate);
+      const maxDistance = Math.max(seedLengthBudget, Math.ceil(Math.max(trimmed.length, candidate.length) * 0.35));
+      if (distance > maxDistance) continue;
+
+      const label = `${row.kind}: ${row.fq_name || row.simple_name}`;
+      const existing = scoreByLabel.get(label);
+      if (existing === undefined || distance < existing) {
+        scoreByLabel.set(label, distance);
       }
-      const labelName = row.fq_name && row.fq_name !== row.simple_name ? row.fq_name : row.simple_name;
-      return { label: `${row.kind}: ${labelName}`, distance: bestDistance };
-    })
-    .filter((entry): entry is { label: string; distance: number } => entry !== null);
-  scoredCandidates.sort((a, b) => (a.distance - b.distance) || a.label.localeCompare(b.label));
-  return [...new Set(scoredCandidates.map(candidate => candidate.label))].slice(0, 8);
+    }
+  }
+
+  return [...scoreByLabel.entries()]
+    .sort((a, b) => (a[1] - b[1]) || a[0].localeCompare(b[0]))
+    .slice(0, 8)
+    .map(([label]) => label);
 }
 
 function levenshteinDistance(a: string, b: string): number {
@@ -948,35 +997,35 @@ function positiveNumber(value: unknown): number | undefined {
 }
 
 function extractJsonObject(output: string): Record<string, unknown> | undefined {
-  const start = output.indexOf('{');
-  if (start < 0) return undefined;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = start; index < output.length; index++) {
-    const char = output[index];
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === '\\') {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
+  for (let start = output.indexOf('{'); start >= 0; start = output.indexOf('{', start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < output.length; index++) {
+      const char = output[index];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === '\\') {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        continue;
       }
-      continue;
-    }
-    if (char === '"') {
-      inString = true;
-      continue;
-    }
-    if (char === '{') depth++;
-    if (char === '}') depth--;
-    if (depth === 0) {
-      try {
-        const parsed = JSON.parse(output.slice(start, index + 1));
-        return isRecord(parsed) ? parsed : undefined;
-      } catch {
-        return undefined;
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === '{') depth++;
+      if (char === '}') depth--;
+      if (depth === 0) {
+        try {
+          const parsed = JSON.parse(output.slice(start, index + 1));
+          if (isRecord(parsed)) return parsed;
+        } catch {
+          break;
+        }
       }
     }
   }
@@ -993,6 +1042,7 @@ function runCodexTask(options: {
   mcpConfigOverrides: string[];
   codexCommand: string;
   codexCommandArgs: string[];
+  useUserConfig: boolean;
   timeoutSeconds: number;
 }): CodexRunResult {
   const prompt = promptForMode(options.task, options.mode);
@@ -1000,21 +1050,12 @@ function runCodexTask(options: {
   fs.mkdirSync(taskDir, { recursive: true });
   fs.writeFileSync(path.join(taskDir, 'prompt.txt'), prompt, 'utf-8');
 
-  const args = [
-    'exec',
-    '--json',
-    '--ephemeral',
-    '--ignore-user-config',
-    '--ignore-rules',
-    '--dangerously-bypass-approvals-and-sandbox',
-    '--model',
-    options.model,
-    '-',
-  ];
+  const args = buildCodexExecArgs({
+    model: options.model,
+    useUserConfig: options.useUserConfig,
+    mcpConfigOverrides: modeUsesMcp(options.mode) ? options.mcpConfigOverrides : [],
+  });
   const env = { ...process.env };
-  if (modeUsesMcp(options.mode)) {
-    args.splice(args.indexOf('--model'), 0, ...options.mcpConfigOverrides);
-  }
 
   const started = Date.now();
   const invocation = buildCodexSpawnInvocation(options.codexCommand, [...options.codexCommandArgs, ...args]);
@@ -1065,6 +1106,30 @@ export function buildCodexSpawnInvocation(
   };
 }
 
+export function buildCodexExecArgs(options: {
+  model: string;
+  useUserConfig?: boolean;
+  mcpConfigOverrides?: string[];
+}): string[] {
+  const args = [
+    'exec',
+    '--json',
+    '--ephemeral',
+  ];
+  if (!options.useUserConfig) {
+    args.push('--ignore-user-config');
+  }
+  args.push(
+    '--ignore-rules',
+    '--dangerously-bypass-approvals-and-sandbox',
+    ...(options.mcpConfigOverrides ?? []),
+    '--model',
+    options.model,
+    '-',
+  );
+  return args;
+}
+
 async function runColdIndex(
   root: string,
   workspaceKey: string,
@@ -1095,22 +1160,30 @@ function writeCodexMcpConfig(options: {
   runDir: string;
   root: string;
   workspaceKey: string;
-}): { path: string; overrides: string[] } {
+  serverName?: string;
+  command?: string;
+  args?: string[];
+}): { path: string; overrides: string[]; serverName: string; command: string; args: string[] } {
   const codexHome = path.join(options.runDir, 'codex-home');
   fs.mkdirSync(codexHome, { recursive: true });
-  const cli = resolveCliEntrypoint();
-  const args = [
-    ...cli.args,
-    'mcp',
-    '--root',
-    options.root,
-    '--workspace-key',
-    options.workspaceKey,
-    '--no-prewarm',
-  ];
+  const serverName = options.serverName ?? 'codegraph_bench';
+  const cli = options.command
+    ? { command: options.command, args: options.args ?? [] }
+    : resolveCliEntrypoint();
+  const args = options.command
+    ? [...(options.args ?? [])]
+    : [
+      ...cli.args,
+      'mcp',
+      '--root',
+      options.root,
+      '--workspace-key',
+      options.workspaceKey,
+      '--no-prewarm',
+    ];
   if (envFlag('CODEGRAPH_CODEX_BENCH_AUTO_REFRESH')) args.push('--auto-refresh');
-  args.push('--mcp-profile', 'full');
-  const config = `[mcp_servers.codegraph_bench]
+  if (!options.command) args.push('--mcp-profile', 'full');
+  const config = `[mcp_servers.${serverName}]
 command = ${tomlString(cli.command)}
 args = [
 ${args.map(arg => `  ${tomlString(arg)},`).join('\n')}
@@ -1120,11 +1193,11 @@ ${args.map(arg => `  ${tomlString(arg)},`).join('\n')}
   fs.writeFileSync(configPath, config, 'utf-8');
   const overrides = [
     '--config',
-    `mcp_servers.codegraph_bench.command=${tomlString(cli.command)}`,
+    `mcp_servers.${serverName}.command=${tomlString(cli.command)}`,
     '--config',
-    `mcp_servers.codegraph_bench.args=${tomlArray(args)}`,
+    `mcp_servers.${serverName}.args=${tomlArray(args)}`,
   ];
-  return { path: configPath, overrides };
+  return { path: configPath, overrides, serverName, command: cli.command, args };
 }
 
 const POST_SLICE_STOP_RULE = 'After codegraph_slice/get_file_slice returns source, treat it as the terminal exact follow-up: do not call shell, do not call rg, do not call search/read tools, and answer from the returned slice plus prior packet.';
@@ -1140,6 +1213,11 @@ export function promptForMode(task: CodexE2eTask, mode: CodexBenchmarkMode): str
     case 'terse-no-mcp':
       return [
         'Do not use CodeGraph MCP. Use shell/search/read commands only if needed. Be terse: answer with compact evidence-first JSON or bullets, avoid narration, and keep file/line/symbol names exact. Do not modify files.',
+        prompt,
+      ].join('\n\n');
+    case 'natural-tool-use':
+      return [
+        'Answer as a senior engineer. Start from available project context before broad shell/search/read when possible. Use shell/search/read only when the available context is missing evidence. For implementation requests in this benchmark, return the smallest code and unit-test change plan instead of editing files. Keep the final answer compact and evidence-first.',
         prompt,
       ].join('\n\n');
     case 'mcp-only':
@@ -1179,7 +1257,8 @@ export function promptForMode(task: CodexE2eTask, mode: CodexBenchmarkMode): str
 }
 
 function modeUsesMcp(mode: CodexBenchmarkMode): boolean {
-  return mode === 'mcp-first'
+  return mode === 'natural-tool-use'
+    || mode === 'mcp-first'
     || mode === 'mcp-only'
     || mode === 'compiled-packet'
     || mode === 'compiled-packet+gate'

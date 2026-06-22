@@ -1235,36 +1235,96 @@ export class V2QueryService {
 
   private async getCallers(snapshotId: string, args: Record<string, unknown>) {
     const symbol = String(args.symbol ?? args.target ?? '');
-    const signalFilter = callSignalFilter(args);
-    const terms = callEdgeLookupTerms(symbol);
-    if (terms.length === 0) return { symbol, callers: [], totalCount: 0 };
-    const clauses = terms.map(() => "callee LIKE ? ESCAPE '\\'").join(' OR ');
-    const rows = await this.db.prepare(`
-      SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
-      FROM call_edges
-      WHERE snapshot_id = ? AND (${clauses})
-        ${signalFilter}
-      ORDER BY ${callSignalOrder()}, confidence DESC, file, line
-      LIMIT ?
-    `).all(snapshotId, ...terms.map(term => `%${escapeLike(term)}%`), Number(args.limit ?? 100)) as CallEdgeRow[];
-    return { symbol, callers: rows, totalCount: rows.length };
+    const result = await this.lookupCallEdges(snapshotId, args, {
+      symbol,
+      indexedColumn: 'callee',
+      resultKey: 'callers',
+    });
+    return { symbol, callers: result.rows, totalCount: result.rows.length, lookup: result.lookup };
   }
 
   private async getCallees(snapshotId: string, args: Record<string, unknown>) {
     const symbol = String(args.symbol ?? args.source ?? '');
+    const result = await this.lookupCallEdges(snapshotId, args, {
+      symbol,
+      indexedColumn: 'caller',
+      resultKey: 'callees',
+    });
+    return { symbol, callees: result.rows, totalCount: result.rows.length, lookup: result.lookup };
+  }
+
+  private async lookupCallEdges(
+    snapshotId: string,
+    args: Record<string, unknown>,
+    options: {
+      symbol: string;
+      indexedColumn: 'caller' | 'callee';
+      resultKey: 'callers' | 'callees';
+    },
+  ): Promise<{
+    rows: CallEdgeRow[];
+    lookup: Record<string, unknown>;
+  }> {
+    const { symbol, indexedColumn, resultKey } = options;
     const signalFilter = callSignalFilter(args);
     const terms = callEdgeLookupTerms(symbol);
-    if (terms.length === 0) return { symbol, callees: [], totalCount: 0 };
-    const clauses = terms.map(() => "caller LIKE ? ESCAPE '\\'").join(' OR ');
-    const rows = await this.db.prepare(`
+    const limit = clampInt(Number(args.limit ?? 100), 1, 500);
+    if (terms.length === 0) {
+      return {
+        rows: [],
+        lookup: {
+          strategy: 'exact-first',
+          resultKey,
+          terms: [],
+          exactCount: 0,
+          fuzzyCount: 0,
+          limit,
+        },
+      };
+    }
+
+    const exactClauses = terms.map(() => `${indexedColumn} = ?`).join(' OR ');
+    const exactRows = await this.db.prepare(`
       SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
       FROM call_edges
-      WHERE snapshot_id = ? AND (${clauses})
+      WHERE snapshot_id = ? AND (${exactClauses})
         ${signalFilter}
       ORDER BY ${callSignalOrder()}, confidence DESC, file, line
       LIMIT ?
-    `).all(snapshotId, ...terms.map(term => `%${escapeLike(term)}%`), Number(args.limit ?? 100)) as CallEdgeRow[];
-    return { symbol, callees: rows, totalCount: rows.length };
+    `).all(snapshotId, ...terms, limit) as CallEdgeRow[];
+
+    const remaining = Math.max(0, limit - exactRows.length);
+    const fuzzyRows = remaining > 0
+      ? await this.db.prepare(`
+        SELECT caller, callee, file, line, confidence, resolution_kind, signal_tier, signal_reasons_json
+        FROM call_edges
+        WHERE snapshot_id = ?
+          AND (${terms.map(() => `${indexedColumn} LIKE ? ESCAPE '\\'`).join(' OR ')})
+          AND NOT (${exactClauses})
+          ${signalFilter}
+        ORDER BY ${callSignalOrder()}, confidence DESC, file, line
+        LIMIT ?
+      `).all(
+        snapshotId,
+        ...terms.map(term => `%${escapeLike(term)}%`),
+        ...terms,
+        remaining,
+      ) as CallEdgeRow[]
+      : [];
+
+    const rows = uniqueCallEdges([...exactRows, ...fuzzyRows]).slice(0, limit);
+    return {
+      rows,
+      lookup: {
+        strategy: 'exact-first',
+        resultKey,
+        indexedColumn,
+        terms,
+        exactCount: exactRows.length,
+        fuzzyCount: fuzzyRows.length,
+        limit,
+      },
+    };
   }
 
   private async findEndpoints(snapshotId: string, args: Record<string, unknown>) {
@@ -1565,6 +1625,7 @@ export class V2QueryService {
   }
 
   private async simulatePatchImpact(snapshotId: string, args: Record<string, unknown>) {
+    const timing = createDebugTiming(args);
     const limit = clampInt(Number(args.limit ?? 50), 1, 200);
     const outputMode = normalizePatchImpactOutputMode(args.outputMode);
     const maxResponseTokens = responseTokenCap(args, outputMode === 'full' ? 16000 : 8000);
@@ -1592,6 +1653,7 @@ export class V2QueryService {
       symbolRows.push(row);
       resolvedSymbols.push(compactSymbolCandidate(symbolDto(row), `explicit patch symbol input: ${symbol}`));
     }
+    timing.checkpoint('resolve_inputs');
 
     const changedFiles = uniqueFilesInOrder([
       ...resolvedFileInputs.map(input => input.file),
@@ -1602,6 +1664,7 @@ export class V2QueryService {
         .map(symbol => compactSymbolCandidate(symbol, 'symbol declared in a changed file')),
     ).slice(0, limit);
     const changedEndpoints = compactEndpointCandidates(await this.impactedEndpoints(snapshotId, changedFiles));
+    timing.checkpoint('symbols_for_files');
 
     const dependencyRows = uniqueRecordsBy(
       (await Promise.all(changedFiles.map(file => this.dependencyRows(snapshotId, file, 'from_file')))).flat(),
@@ -1611,6 +1674,7 @@ export class V2QueryService {
       (await Promise.all(changedFiles.map(file => this.dependencyRows(snapshotId, file, 'to_file')))).flat(),
       row => `${row.file}:${row.type}:${row.resolutionKind}`,
     );
+    timing.checkpoint('dependency_rows');
 
     const callSeedLimit = clampInt(Number(args.callSeedLimit ?? Math.min(12, limit)), 0, 30);
     const callSeeds = uniqueStrings([
@@ -1624,12 +1688,14 @@ export class V2QueryService {
     const callees = uniqueCallEdges(
       (await Promise.all(callSeeds.map(async symbol => ((await this.getCallees(snapshotId, { symbol, limit: 25 })) as { callees: CallEdgeRow[] }).callees))).flat(),
     ).slice(0, limit * 2);
+    timing.checkpoint('call_expansion');
     const fieldImpact = await this.fieldImpactForInputs(snapshotId, {
       ...args,
       symbols: requestedSymbols,
       files: changedFiles,
     }, limit);
     const fieldImpactFiles = fieldImpact ? stringArray(fieldImpact.files) : [];
+    timing.checkpoint('field_impact');
 
     const impactedFiles = rankFiles([
       ...changedFiles,
@@ -1647,6 +1713,7 @@ export class V2QueryService {
     ]).slice(0, 32);
     const tests = args.skipLikelyTests === true ? [] : await this.findRelevantTestsForSeeds(snapshotId, testSeeds, limit);
     const validation = await this.validationHints(snapshotId, tests, impactedFiles.length > 0 ? impactedFiles : changedFiles);
+    timing.checkpoint('relevant_tests');
     const riskFlags = patchRiskFlags({
       changedFiles,
       touchedSymbols,
@@ -1673,6 +1740,7 @@ export class V2QueryService {
       [...requestedSymbols, ...requestedFiles].join(' '),
       Math.min(limit, 20),
     );
+    timing.checkpoint('architecture_context');
     const riskMode = normalizeRiskMode(args.riskMode, [
       String(args.task ?? args.target ?? ''),
       ...requestedSymbols,
@@ -1763,7 +1831,7 @@ export class V2QueryService {
       });
     const requestedTokens = estimateTokens(JSON.stringify(requestedResult));
     if (requestedTokens <= maxResponseTokens) {
-      return withResponseCapBudget(requestedResult, {
+      const result = withResponseCapBudget(requestedResult, {
         fullPayload: fullResult,
         maxResponseTokens,
         capped: false,
@@ -1771,6 +1839,8 @@ export class V2QueryService {
           ? 'full patch impact returned within response cap'
           : 'compact patch impact returns ranked evidence and counts; expand exact files with get_file_slice',
       });
+      timing.checkpoint('response_budget');
+      return withDebugTiming(result, timing);
     }
 
     let cappedResult = compactPatchImpactResult(fullResult, compactLimitForResponseCap(maxResponseTokens), {
@@ -1788,12 +1858,14 @@ export class V2QueryService {
         cappedReason: 'response-token-cap',
       });
     }
-    return withResponseCapBudget(cappedResult, {
+    const result = withResponseCapBudget(cappedResult, {
       fullPayload: fullResult,
       maxResponseTokens,
       capped: true,
       policy: 'response exceeded maxResponseTokens; returned compact ranked impact, counts, and follow-up handles instead of expanded graph rows',
     });
+    timing.checkpoint('response_budget');
+    return withDebugTiming(result, timing);
   }
 
   private async fieldImpactForInputs(
@@ -2444,7 +2516,34 @@ export class V2QueryService {
     const candidateFileSet = new Set(candidateFiles.map(file => file.file));
     const includeLowSignal = args.includeLowSignal === true;
     const callersRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callers', packProfileValue(profile, 6, 8, 12), includeLowSignal) : [];
-    const calleesRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callees', packProfileValue(profile, 10, 16, 24), includeLowSignal) : [];
+    const directCalleesRaw = edgeSeeds.length > 0 ? await this.researchCallEdges(snapshotId, edgeSeeds, 'callees', packProfileValue(profile, 10, 16, 24), includeLowSignal) : [];
+    const endpointSeedFiles = new Set(endpointSymbolCandidates.map(symbol => symbol.file).filter(Boolean));
+    const scopedDirectCalleesRaw = hasEndpointSeed && endpointSeedFiles.size > 0
+      ? directCalleesRaw.filter(edge => endpointSeedFiles.has(edge.file))
+      : directCalleesRaw;
+    const downstreamCalleesRaw = hasEndpointSeed && scopedDirectCalleesRaw.length > 0
+      ? await this.researchCallEdges(
+        snapshotId,
+        callEdgesAsResearchSymbols(scopedDirectCalleesRaw).slice(0, packProfileValue(profile, 2, 3, 4)),
+        'callees',
+        packProfileValue(profile, 6, 10, 14),
+        includeLowSignal,
+      )
+      : [];
+    const calleesRaw = uniqueCallEdges([...scopedDirectCalleesRaw, ...downstreamCalleesRaw])
+      .sort((a, b) => researchCallEdgeScore(b) - researchCallEdgeScore(a) || a.line - b.line || a.callee.localeCompare(b.callee));
+    const calleeDefinitions = hasEndpointSeed
+      ? await this.researchCalleeDefinitions(snapshotId, calleesRaw, packProfileValue(profile, 4, 6, 8))
+      : [];
+    const calleeFileCandidates: ResearchFileCandidate[] = calleeDefinitions.map(symbol => ({
+      file: symbol.file,
+      lines: symbol.lines,
+      whyRelevant: `downstream callee definition for endpoint flow: ${symbol.name}`,
+      confidence: Math.min(0.95, symbol.confidence + 0.05),
+      matchedTokens: symbol.matchedTokens,
+      topSymbols: [symbol as unknown as Record<string, unknown>],
+      endpoints: [],
+    }));
     const restrictEdgesToCandidateFiles = explicitFiles.length > 0 && endpointSymbolCandidates.length === 0;
     const callers = restrictEdgesToCandidateFiles
       ? callersRaw.filter(edge => candidateFileSet.has(edge.file)).slice(0, 8)
@@ -2452,27 +2551,43 @@ export class V2QueryService {
     const callees = restrictEdgesToCandidateFiles
       ? calleesRaw.filter(edge => candidateFileSet.has(edge.file)).slice(0, 8)
       : calleesRaw;
+    const flowCandidateFiles = uniqueFileCandidates([
+      ...candidateFiles,
+      ...calleeFileCandidates,
+    ]);
+    const flowRelevantSymbols = uniqueSymbolCandidates([
+      ...relevantSymbols,
+      ...calleeDefinitions,
+    ]);
     const topFiles = uniqueFilesInOrder([
       ...candidateFiles.map(file => file.file),
-      ...relevantSymbols.map(symbol => symbol.file),
+      ...calleeFileCandidates.map(file => file.file),
+      ...flowRelevantSymbols.map(symbol => symbol.file),
       ...callers.map(edge => edge.file),
       ...callees.map(edge => edge.file),
       ...impactedEndpoints.map(endpoint => endpoint.file),
     ]).slice(0, packProfileValue(profile, 5, 6, 8));
     const evidenceSlices = await this.researchEvidenceSlices(
       snapshotId,
-      relevantSymbols,
-      candidateFiles,
+      flowRelevantSymbols,
+      flowCandidateFiles,
       seedTerms,
       Math.max(1200, Math.min(packProfileValue(profile, 2200, 3200, 4500), Math.floor(tokenBudget * 4 * 0.22))),
     );
     const flowSteps = researchFlowSteps({
-      symbols: relevantSymbols,
+      symbols: flowRelevantSymbols,
       callers,
       callees,
       endpoints: impactedEndpoints,
-      files: candidateFiles,
+      files: flowCandidateFiles,
     });
+    const notCalledCandidates = hasEndpointSeed
+      ? await this.endpointNotCalledCandidates(
+        snapshotId,
+        flowCandidateFiles.map(file => file.file),
+        callees,
+      )
+      : [];
     const missingFacts = researchMissingFacts({
       target,
       relevantSymbols,
@@ -2482,7 +2597,7 @@ export class V2QueryService {
     });
     const sufficientForAnswer = missingFacts.length === 0;
     const returnedFlowSteps = flowSteps.slice(0, packProfileValue(profile, 5, 6, 8));
-    const returnedDefinitions = relevantSymbols.slice(0, packProfileValue(profile, 3, 4, 4));
+    const returnedDefinitions = flowRelevantSymbols.slice(0, packProfileValue(profile, 3, 5, 8));
     const returnedCallers = callers.slice(0, packProfileValue(profile, 3, 5, 8)).map(compactCallEdge);
     const returnedCallees = callees.slice(0, packProfileValue(profile, 6, 10, 14)).map(compactCallEdge);
     const returnedEndpoints = impactedEndpoints.slice(0, packProfileValue(profile, 3, 4, 4));
@@ -2501,7 +2616,7 @@ export class V2QueryService {
     const taskOracle = taskOracleFor({
       task: target,
       taskType: String(args.taskType ?? 'research'),
-      candidateFiles: candidateFiles.slice(0, packProfileValue(profile, 4, 5, 6)),
+      candidateFiles: flowCandidateFiles.slice(0, packProfileValue(profile, 4, 6, 8)),
       relevantSymbols: returnedDefinitions,
       testsLikelyRelevant: oracleTests,
       validation: oracleValidation,
@@ -2546,6 +2661,7 @@ export class V2QueryService {
       callers: returnedCallers,
       callees: returnedCallees,
       impactedEndpoints: returnedEndpoints,
+      notCalledCandidates,
       topFiles: returnedTopFiles,
       evidenceSlices: packedEvidenceSlices,
       evidenceHandles,
@@ -2608,6 +2724,7 @@ export class V2QueryService {
         callers: returnedCallers,
         callees: returnedCallees,
         impactedEndpoints: returnedEndpoints,
+        notCalledCandidates,
         topFiles: returnedTopFiles,
         evidenceSlices: packedEvidenceSlices,
         completeness,
@@ -2639,6 +2756,7 @@ export class V2QueryService {
         callers: returnedCallers,
         callees: returnedCallees,
         impactedEndpoints: returnedEndpoints,
+        notCalledCandidates,
         topFiles: returnedTopFiles,
         evidenceSlices: packedEvidenceSlices,
         completeness,
@@ -2688,6 +2806,7 @@ export class V2QueryService {
       callers: returnedCallers,
       callees: returnedCallees,
       impactedEndpoints: returnedEndpoints,
+      notCalledCandidates,
       topFiles: returnedTopFiles,
       evidenceSlices: packedEvidenceSlices,
       evidenceHandles,
@@ -2925,6 +3044,108 @@ export class V2QueryService {
     return uniqueCallEdges(rows)
       .sort((a, b) => researchCallEdgeScore(b) - researchCallEdgeScore(a) || a.line - b.line || a.callee.localeCompare(b.callee))
       .slice(0, limit);
+  }
+
+  private async researchCalleeDefinitions(
+    snapshotId: string,
+    edges: CallEdgeRow[],
+    limit: number,
+  ): Promise<ResearchSymbolCandidate[]> {
+    const resolved: ResearchSymbolCandidate[] = [];
+    const seen = new Set<string>();
+    for (const edge of edges) {
+      const row = await this.lookupBestCalleeSymbol(snapshotId, edge);
+      if (!row) continue;
+      const symbol = compactSymbolCandidate(
+        symbolDto(row),
+        `definition for downstream endpoint-flow callee ${edge.callee}`,
+      );
+      const key = `${symbol.symbol}\0${symbol.file}`;
+      if (!symbol.symbol || seen.has(key)) continue;
+      seen.add(key);
+      resolved.push(symbol);
+      if (resolved.length >= limit) break;
+    }
+    return resolved;
+  }
+
+  private async lookupBestCalleeSymbol(snapshotId: string, edge: CallEdgeRow): Promise<SymbolRow | undefined> {
+    const candidates: SymbolRow[] = [];
+    for (const term of callEdgeLookupTerms(edge.callee)) {
+      const query = term.trim();
+      if (!query) continue;
+      const pattern = `%${escapeLike(query)}%`;
+      const rows = await this.db.prepare(`
+        SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+               package_name, return_type, parameter_types_json, annotations_json,
+               framework_role, framework_meta_json, file_role
+        FROM symbols
+        WHERE snapshot_id = ?
+          AND (
+            fq_name = ?
+            OR simple_name = ?
+            OR fq_name LIKE ? ESCAPE '\\'
+            OR simple_name LIKE ? ESCAPE '\\'
+          )
+        ORDER BY
+          CASE
+            WHEN fq_name = ? THEN 0
+            WHEN simple_name = ? THEN 1
+            WHEN fq_name LIKE ? ESCAPE '\\' THEN 2
+            ELSE 3
+          END,
+          line
+        LIMIT 25
+      `).all(snapshotId, query, query, pattern, pattern, query, query, pattern) as SymbolRow[];
+      candidates.push(...rows);
+    }
+    return uniqueRecordsBy(candidates, row => `${row.fq_name}\0${row.file}`)
+      .sort((a, b) => calleeDefinitionScore(b, edge) - calleeDefinitionScore(a, edge) || a.line - b.line)
+      [0];
+  }
+
+  private async endpointNotCalledCandidates(
+    snapshotId: string,
+    files: string[],
+    callees: CallEdgeRow[],
+  ): Promise<Array<Record<string, unknown>>> {
+    const uniqueFiles = uniqueStrings(files.filter(Boolean)).slice(0, 20);
+    if (uniqueFiles.length === 0) return [];
+    const placeholders = uniqueFiles.map(() => '?').join(', ');
+    const rows = await this.db.prepare(`
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+             package_name, return_type, parameter_types_json, annotations_json,
+             framework_role, framework_meta_json, file_role
+      FROM symbols
+      WHERE snapshot_id = ?
+        AND file IN (${placeholders})
+        AND kind = 'field'
+      ORDER BY file, line
+      LIMIT 200
+    `).all(snapshotId, ...uniqueFiles) as SymbolRow[];
+    const calledText = callees
+      .flatMap(edge => [edge.callee, edge.caller])
+      .join('\n')
+      .toLowerCase();
+    const candidates: Array<Record<string, unknown>> = [];
+    for (const row of rows) {
+      const serviceName = serviceLikeFieldType(row);
+      if (!serviceName) continue;
+      const fieldName = row.simple_name;
+      const serviceNeedle = serviceName.toLowerCase();
+      const fieldNeedle = fieldName.toLowerCase();
+      if (calledText.includes(serviceNeedle) || calledText.includes(fieldNeedle)) continue;
+      candidates.push({
+        name: serviceName,
+        field: fieldName,
+        symbol: row.fq_name,
+        file: row.file,
+        line: row.line,
+        reason: 'service-like field in the endpoint flow files is not present in the resolved call chain',
+        confidence: 0.75,
+      });
+    }
+    return uniqueRecordsBy(candidates, row => `${row.name}\0${row.file}`).slice(0, 8);
   }
 
   private async researchEvidenceSlices(
@@ -3328,6 +3549,7 @@ export class V2QueryService {
   }
 
   private async getChangePack(snapshotId: string, args: Record<string, unknown>) {
+    const timing = createDebugTiming(args);
     const task = String(args.task ?? args.target ?? '').trim();
     if (!task) return { error: 'get_change_pack requires a non-empty task.' };
     const profile = normalizePackProfile(args.profile);
@@ -3342,6 +3564,7 @@ export class V2QueryService {
       includeTests: args.includeTests !== false,
       includeSnippets: args.includeSnippets ?? false,
     }) as Record<string, unknown>;
+    timing.checkpoint('context_packet');
     const taskOracle = isPlainObject(context.taskOracle) ? context.taskOracle : {};
     const validation = isPlainObject(context.validation) ? context.validation : {};
     const contextBudget = isPlainObject(context.budget) ? context.budget : {};
@@ -3364,6 +3587,7 @@ export class V2QueryService {
         limit: Math.max(20, Number(args.maxFiles ?? 8) * 4),
       }) as Record<string, unknown>
       : undefined;
+    timing.checkpoint('patch_impact');
     const fieldImpact = patchImpact && isPlainObject(patchImpact.fieldImpact)
       ? patchImpact.fieldImpact
       : await this.fieldImpactForInputs(snapshotId, {
@@ -3372,6 +3596,7 @@ export class V2QueryService {
         symbols: requestedSymbols,
         diff,
       }, Math.max(20, Number(args.maxFiles ?? 8) * 4));
+    timing.checkpoint('field_impact');
     const calculationImpact = patchImpact && isPlainObject(patchImpact.calculationImpact)
       ? patchImpact.calculationImpact
       : undefined;
@@ -3396,6 +3621,7 @@ export class V2QueryService {
       : undefined;
     const architectureContext = patchArchitectureContext
       ?? await architectureContextForFiles(this.db, snapshotId, topFiles, task, packProfileValue(profile, 6, 8, 10));
+    timing.checkpoint('architecture_context');
     const packedTestsLikelyRelevant = slimTestsForPack(testsLikelyRelevant, profile);
     const packedTaskOracle = slimTaskOracleForPack(taskOracle, profile);
     const packedPatchImpact = patchImpact ? compactReviewObject(patchImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined;
@@ -3431,7 +3657,7 @@ export class V2QueryService {
     };
     const calculationAnswerable = !calculationImpact || calculationImpact.answerable !== false;
 
-    return {
+    const result = {
       task,
       changeType,
       answerable: calculationAnswerable,
@@ -3477,6 +3703,8 @@ export class V2QueryService {
         }),
       },
     };
+    timing.checkpoint('response_budget');
+    return withDebugTiming(result, timing);
   }
 
   private async compileEvidence(snapshotId: string, args: Record<string, unknown>) {
@@ -6024,7 +6252,7 @@ function endpointNeedleFromText(text: string): string {
   const endpointIntent = /\b(api|endpoint|route|rest|http|handler|controller|request|response)\b/i.test(text);
   for (const match of text.matchAll(/\/[A-Za-z0-9_{}:$.-][A-Za-z0-9_{}:$/.-]*/g)) {
     const raw = match[0] ?? '';
-    const value = raw.replace(/[),.;]+$/g, '');
+    const value = raw.replace(/[),.;:]+$/g, '');
     if (!value || value === '/' || value.length < 2) continue;
     const index = match.index ?? 0;
     const before = text.slice(Math.max(0, index - 24), index);
@@ -6352,6 +6580,48 @@ function withResponseCapBudget<T extends Record<string, unknown>>(result: T, inp
       }),
     },
   };
+}
+
+interface DebugTimingCollector {
+  checkpoint(name: string): void;
+  finish(): Record<string, unknown> | undefined;
+}
+
+function createDebugTiming(args: Record<string, unknown>): DebugTimingCollector {
+  const enabled = args.debugTiming === true;
+  const startedAt = Date.now();
+  let lastAt = startedAt;
+  const phases: Array<{ name: string; durationMs: number }> = [];
+  return {
+    checkpoint(name: string): void {
+      if (!enabled) return;
+      const now = Date.now();
+      phases.push({
+        name,
+        durationMs: Math.max(0, now - lastAt),
+      });
+      lastAt = now;
+    },
+    finish(): Record<string, unknown> | undefined {
+      if (!enabled) return undefined;
+      const totalMs = Math.max(0, Date.now() - startedAt);
+      const topPhase = [...phases].sort((a, b) => b.durationMs - a.durationMs)[0];
+      return {
+        enabled: true,
+        totalMs,
+        phases,
+        topPhase,
+      };
+    },
+  };
+}
+
+function withDebugTiming<T extends Record<string, unknown>>(
+  result: T,
+  timing: DebugTimingCollector,
+): T & { debugTiming?: Record<string, unknown> } {
+  const debugTiming = timing.finish();
+  return debugTiming ? { ...result, debugTiming } : result;
 }
 
 function normalizePackProfile(value: unknown, fallback: PackProfile = 'compact'): PackProfile {
@@ -7778,6 +8048,68 @@ function compactCallEdge(edge: CallEdgeRow): Record<string, unknown> {
     signalTier: edge.signal_tier,
     signalReasons: edge.signal_reasons_json ? parseJson<string[]>(edge.signal_reasons_json, []) : undefined,
   };
+}
+
+function callEdgesAsResearchSymbols(edges: CallEdgeRow[]): ResearchSymbolCandidate[] {
+  return uniqueSymbolCandidates(edges.map(edge => {
+    const withoutParams = edge.callee.replace(/\([^)]*\)$/, '').trim();
+    const parts = withoutParams.split(/[.#]/g).filter(Boolean);
+    const name = parts[parts.length - 1] ?? withoutParams;
+    return {
+      symbol: edge.callee,
+      name,
+      kind: 'method',
+      file: edge.file,
+      lines: edge.line > 0 ? String(edge.line) : undefined,
+      whyRelevant: `direct endpoint-flow callee from ${edge.caller}`,
+      confidence: edge.confidence,
+      matchedTokens: callEdgeLookupTerms(edge.callee).slice(0, 3),
+    };
+  }));
+}
+
+function calleeDefinitionScore(row: SymbolRow, edge: CallEdgeRow): number {
+  const rowFile = row.file.replace(/\\/g, '/');
+  const edgeFile = edge.file.replace(/\\/g, '/');
+  const callee = edge.callee.replace(/\([^)]*\)$/, '').toLowerCase();
+  let score = 0;
+  if (path.extname(rowFile).toLowerCase() === path.extname(edgeFile).toLowerCase()) score += 80;
+  score += commonPathPrefixSegments(rowFile, edgeFile) * 8;
+  if (sameFixtureProject(rowFile, edgeFile)) score += 60;
+  if (row.file_role === 'main_source') score += 20;
+  else if (row.file_role === 'test_source') score -= 20;
+  if (row.kind === 'method' || row.kind === 'function') score += 20;
+  const fqName = row.fq_name.toLowerCase();
+  const simple = row.simple_name.toLowerCase();
+  if (fqName.includes(callee)) score += 35;
+  if (callee.endsWith(`.${simple}`) || callee === simple) score += 15;
+  if (rowFile === edgeFile) score += 5;
+  return score;
+}
+
+function commonPathPrefixSegments(left: string, right: string): number {
+  const leftParts = left.split('/').filter(Boolean);
+  const rightParts = right.split('/').filter(Boolean);
+  let count = 0;
+  for (let index = 0; index < Math.min(leftParts.length, rightParts.length); index++) {
+    if (leftParts[index] !== rightParts[index]) break;
+    count++;
+  }
+  return count;
+}
+
+function sameFixtureProject(left: string, right: string): boolean {
+  const leftMatch = left.match(/(?:^|\/)tests\/fixtures\/([^/]+)\//);
+  const rightMatch = right.match(/(?:^|\/)tests\/fixtures\/([^/]+)\//);
+  return Boolean(leftMatch?.[1] && leftMatch[1] === rightMatch?.[1]);
+}
+
+function serviceLikeFieldType(row: SymbolRow): string | undefined {
+  const type = String(row.return_type ?? '').replace(/<.*>$/, '').trim();
+  const field = row.simple_name.trim();
+  const candidate = type || field.replace(/^[a-z]/, char => char.toUpperCase());
+  if (/(Service|Client|Gateway|Repository|Dao|Manager)$/.test(candidate)) return candidate;
+  return undefined;
 }
 
 function researchCallEdgeScore(edge: CallEdgeRow): number {

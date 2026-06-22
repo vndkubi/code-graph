@@ -230,13 +230,55 @@ export function isWorkspaceIndexed(root: string, graphDirName?: string): boolean
 }
 
 export function getCurrentSnapshotId(root: string, graphDirName?: string): string | undefined {
+  return getCurrentSnapshotInfo(root, { graphDirName })?.snapshotId;
+}
+
+export interface CurrentSnapshotInfo {
+  workspaceId: string;
+  snapshotId: string;
+  createdAt?: string;
+  headCommit?: string;
+  dirtyHash?: string;
+}
+
+export function getCurrentSnapshotInfo(
+  root: string,
+  options: { graphDirName?: string; snapshotId?: string } = {},
+): CurrentSnapshotInfo | undefined {
+  const { graphDirName, snapshotId } = options;
   const paths = getWorkspacePaths(path.resolve(root), graphDirName);
   if (!fs.existsSync(paths.dbPath)) return undefined;
   const db = new Database(paths.dbPath, { readonly: true, fileMustExist: true });
   try {
-    const row = db.prepare('SELECT current_snapshot_id FROM workspaces LIMIT 1')
-      .get() as { current_snapshot_id?: string } | undefined;
-    return row?.current_snapshot_id;
+    const row = snapshotId
+      ? db.prepare(`
+        SELECT w.id AS workspace_id, s.id AS snapshot_id, s.created_at, s.head_commit, s.dirty_hash
+        FROM snapshots s
+        JOIN workspaces w ON w.id = s.workspace_id
+        WHERE s.id = ?
+        LIMIT 1
+      `).get(snapshotId)
+      : db.prepare(`
+        SELECT w.id AS workspace_id, s.id AS snapshot_id, s.created_at, s.head_commit, s.dirty_hash
+        FROM workspaces w
+        JOIN snapshots s ON s.id = w.current_snapshot_id
+        LIMIT 1
+      `).get();
+    const snapshot = row as {
+      workspace_id?: string;
+      snapshot_id?: string;
+      created_at?: string;
+      head_commit?: string;
+      dirty_hash?: string;
+    } | undefined;
+    if (!snapshot?.workspace_id || !snapshot.snapshot_id) return undefined;
+    return {
+      workspaceId: snapshot.workspace_id,
+      snapshotId: snapshot.snapshot_id,
+      createdAt: snapshot.created_at,
+      headCommit: snapshot.head_commit,
+      dirtyHash: snapshot.dirty_hash,
+    };
   } catch {
     return undefined;
   } finally {

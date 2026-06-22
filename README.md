@@ -11,7 +11,7 @@ The goal is to let agents start from compact graph-backed packets instead of rep
 | Capability | What it does |
 | --- | --- |
 | Per-repo SQLite graph | Stores files, symbols, imports, call edges, dependency edges, endpoints, and diagnostics in `.codegraph/graph.sqlite`. |
-| Local artifact index | `setup` also builds a compact artifact for fast facade tools and fallback context. |
+| Local artifact index | `setup` also builds a compact artifact for degraded fallback context when SQLite is unavailable. |
 | MCP stdio server | Opens SQLite directly inside the MCP process and handles tool calls in-process. |
 | Incremental refresh | Small edits and deletes can refresh by changed path instead of rebuilding the whole workspace. |
 | Agent-ready packets | `get_research_pack`, `get_flow_pack`, `get_change_pack`, and `review_patch` return ranked context with bounded evidence. |
@@ -82,11 +82,43 @@ codegraph index --root <workspace>     Build or refresh the SQLite graph index
 codegraph atlas --root <workspace>     Generate deterministic repo atlas JSON/Markdown
 codegraph graph --root <workspace> --out <graph.html>
                                       Export a self-contained graph viewer
-codegraph doctor --root <workspace>    Inspect workspace graph configuration
-codegraph logs --root <workspace> --tail <number>
-                                      Print recent workspace query events
+codegraph doctor --root <workspace>    Inspect readiness, freshness, and setup actions
+codegraph upgrade-audit --root <workspace> [--policy <path>] [--min-score <number>] [--min-grade <A+|A|B+|B|C|D|F>] [--max-slow-ms <ms>] [--max-slow-ms-p95 <ms>] [--max-invalid-lines <number>] [--max-stale-queries <number>] [--max-degraded-queries <number>] [--max-stale-ratio <percent>] [--max-degraded-ratio <percent>] [--tail <number>] [--since/--until/--tool/--event]
+                                      Run a readiness + query-log audit with a super-VIP grade
+codegraph status --root <workspace>    Human-readable status report with optional machine-readable --json
+codegraph logs --root <workspace> --tail <number> [--summary|--all|--since|--until|--tool|--event|--invalid]
+                                      Print recent workspace query events or a compact aggregate summary
 codegraph benchmark generate|index|eval|proof|review|fallback|copilot-e2e|codex-e2e
                                       Generate repos, measure indexing, or prove retrieval savings
+```
+
+### Codex E2E suite contract
+
+`codex-e2e` checks suite contracts before any paid task run.
+You can define required context by:
+
+- `rootProfile.requiredFiles`: repo-relative file paths that must exist in the indexed snapshot.
+- `rootProfile.requiredMethods`: symbol names that must exist in symbol indexing.
+- `task.expectedFiles` / `task.expectedMethods`: expected evidence from task-level prompts.
+
+If both file and method contracts are missing (at both root and task level), a warning is emitted (`missing_compatibility_contract`) instead of a hard block.
+
+```json
+{
+  "rootProfile": {
+    "name": "example-root",
+    "requiredFiles": ["src/index.ts"],
+    "requiredMethods": ["start", "stop(orderId)"]
+  },
+  "tasks": [
+    {
+      "id": "health-check",
+      "prompt": "Explain startup/shutdown flow.",
+      "expectedMethods": ["start", "shutdown"],
+      "requiredAnswerFields": ["flow", "risks"]
+    }
+  ]
+}
 ```
 
 Common options:
@@ -97,7 +129,7 @@ Common options:
 --auto-refresh                         Refresh stale snapshots before MCP tool calls when safe
 --refresh-on-start                     Queue a background refresh when MCP starts
 --watch                                Watch files and refresh changed paths in the background
---warn-stale                           Include freshness checks in MCP responses
+--warn-stale                           Include freshness checks in all MCP tool responses
 --prewarm                              Index missing snapshots inside MCP startup/runtime
 ```
 
@@ -114,6 +146,25 @@ Common options:
 | Check index health | `get_index_stats` | Shows snapshot counts, diagnostics, stale status, and warnings. |
 
 Prefer one pack tool before opening many files. Use granular tools when exact source slices or relationship checks are needed.
+`codegraph_context` includes stale-index warnings by default; pass `warnStale: false` only when you intentionally want the smallest possible packet.
+For composite latency diagnostics, pass `debugTiming: true` to `codegraph_context` change tasks, `simulate_patch_impact`, or `get_change_pack`; the default responses stay compact and omit timing noise.
+
+## Health Checks
+
+`codegraph doctor --root <workspace>` and MCP `codegraph_status` report a shared readiness contract:
+
+- `state`: `ready`, `artifact_only`, `unindexed`, `missing`, or `invalid`.
+- `capabilities`: whether graph queries, the embedded artifact, and facade context are usable.
+- `freshness`: whether the SQLite snapshot matches the current git head and dirty state.
+- `upgrade-audit`: when requested, an `overall` score plus `grade` (`A+` to `F`) and blocking reasons.
+- `nextActions`: exact setup or refresh commands when the workspace needs attention.
+
+For CI-style enforcement, `codegraph status --require-ready` exits non-zero when the workspace is not `ready`, while `codegraph status --require-fresh` also fails when the current snapshot is stale.
+Use `codegraph upgrade-audit --min-score <n>` or `--min-grade <grade>` for super-VIP quality gates that fail when quality is below threshold.
+You can also use `--policy <path>` (or `CODEGRAPH_UPGRADE_AUDIT_POLICY`) to define these checks in `.codegraph/upgrade-audit.json`.
+Set `--max-slow-ms` to enforce a hard latency ceiling for sampled windows, and `--max-slow-ms-p95` to enforce a rolling 95th-percentile ceiling (less sensitive to rare spikes).
+Add `--max-invalid-lines` to cap malformed JSON rows in the selected log window and keep your telemetry clean.
+Add `--max-stale-queries` / `--max-degraded-queries` to keep stale or degraded query counts bounded for the selected window. Add `--max-stale-ratio` / `--max-degraded-ratio` to enforce quality percent caps for low-volume as well as high-volume windows.
 
 ## Development
 
@@ -121,7 +172,12 @@ Prefer one pack tool before opening many files. Use granular tools when exact so
 npm run lint
 npm run build
 npm test
-```
+npm run quality-gate
+npm run verify
+npm run hooks:install
+``` 
+
+Recommended local guard: install once per clone and every `git push` will run `npm run verify` automatically.
 
 See [Contributing](CONTRIBUTING.md) for CI-equivalent benchmark smoke commands and benchmark reporting expectations.
 

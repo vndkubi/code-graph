@@ -114,7 +114,7 @@ codegraph benchmark ...           deterministic proof/eval/e2e harnesses
 2. Proxy optionally checks freshness and refreshes inline if configured.
 3. Proxy routes the request to `V2QueryService`.
 4. Query service runs bounded SQL and source-slice reads.
-5. Proxy logs query telemetry to `.codegraph/logs/query.jsonl` when tool calls pass through MCP.
+5. Proxy logs query telemetry and compact result summaries to `.codegraph/logs/query.jsonl` when tool calls pass through MCP.
 6. Proxy returns JSON content to the MCP client.
 
 ## Removed Components

@@ -6,11 +6,13 @@ import { openCodeGraphDb, type CodeGraphDb } from '../../src/v2/storage/database
 import { V2Indexer } from '../../src/v2/index/indexer.js';
 import {
   compileBenchmarkTaskType,
+  buildCodexExecArgs,
   buildCodexSpawnInvocation,
   parseCodexJsonEvents,
   promptForMode,
   runCodexE2eBenchmark,
   runCodexE2ePreflight,
+  scoreCodexOutput,
   type CodexE2eSuite,
 } from '../../src/v2/benchmark/codex-e2e.js';
 import { estimateTextTokens } from '../../src/v2/token-estimator.js';
@@ -163,6 +165,41 @@ describe('Codex E2E benchmark preflight and token ledger', () => {
     expect(prompt).toContain('do not call search');
   });
 
+  it('supports natural tool-use prompts without naming CodeGraph or MCP', () => {
+    const prompt = promptForMode({
+      id: 'natural-trace',
+      prompt: 'trace api "POST /orders" please',
+    }, 'natural-tool-use');
+
+    expect(prompt).toContain('trace api "POST /orders" please');
+    expect(prompt).not.toMatch(/\bMCP\b/i);
+    expect(prompt).not.toMatch(/\bCodeGraph\b/i);
+    expect(prompt).toContain('available project context');
+  });
+
+  it('scores fenced JSON after endpoint path braces in natural answers', () => {
+    const quality = scoreCodexOutput({
+      id: 'endpoint-json',
+      prompt: 'trace api "GET /orders/{id}" please',
+      requireJson: true,
+      expectedTerms: ['GET', '/orders/{id}'],
+      requiredAnswerFields: ['task', 'endpoint', 'flow'],
+    }, [
+      'I will trace GET /orders/{id} first.',
+      '```json',
+      '{',
+      '  "task": "trace",',
+      '  "endpoint": "GET /orders/{id}",',
+      '  "flow": ["handler -> service"]',
+      '}',
+      '```',
+    ].join('\n'));
+
+    expect(quality.hits).toContain('valid_json');
+    expect(quality.hits).toEqual(expect.arrayContaining(['task', 'endpoint', 'flow']));
+    expect(quality.misses).not.toContain('valid_json');
+  });
+
   it('wraps Windows .cmd commands for spawn', () => {
     const invocation = buildCodexSpawnInvocation('npx.cmd', ['-y', '@openai/codex'], 'win32');
     expect(invocation.command).toBe('cmd.exe');
@@ -179,6 +216,18 @@ describe('Codex E2E benchmark preflight and token ledger', () => {
     const invocation = buildCodexSpawnInvocation('cmd.exe', ['/c', 'npx.cmd', '-y', '@openai/codex'], 'win32');
     expect(invocation.command).toBe('cmd.exe');
     expect(invocation.args).toEqual(['/c', 'npx.cmd', '-y', '@openai/codex']);
+  });
+
+  it('can keep user config enabled for wrapper-based Codex providers', () => {
+    const args = buildCodexExecArgs({
+      model: 'gpt-5.3-codex-spark',
+      useUserConfig: true,
+      mcpConfigOverrides: ['-c', 'mcp_servers.headroom.command="headroom"'],
+    });
+
+    expect(args).not.toContain('--ignore-user-config');
+    expect(args).toContain('--ignore-rules');
+    expect(args).toContain('mcp_servers.headroom.command="headroom"');
   });
 
   it('uses the shared cl100k text tokenizer for fallback estimates', () => {
@@ -391,7 +440,6 @@ describe('Codex E2E benchmark preflight and token ledger', () => {
     const issue = report.issues.find(issue => issue.code === 'missing_required_method' && issue.expected === 'chageOrder');
     expect(issue).toBeDefined();
     expect(issue?.suggestions).toBeDefined();
-    console.log('similar method suggestions', issue?.suggestions);
     expect(issue?.suggestions?.some(item => item.includes('chargeOrder'))).toBe(true);
     expect(issue?.severity).toBe('error');
   });

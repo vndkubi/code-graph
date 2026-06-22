@@ -28,11 +28,16 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc",
-    "ci": "npm run lint && npm run build && npm test",
+    "ci": "npm run lint && npm run build && npm test && npm run quality-gate",
     "prepack": "npm run build",
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
-    "test": "vitest run",
+    "hooks:install": "node .githooks/install-hooks.js",
+    "quality-gate": "node dist/cli.js upgrade-audit --root . --require-ready --require-fresh --min-grade A --min-score 96 --max-slow-ms 5000",
+    "test": "vitest run --maxWorkers=1",
+    "test:local": "node .githooks/run-verification.js",
+    "verify": "npm run lint && npm run build && npm test && npm run quality-gate",
+    "verify:local": "node .githooks/run-verification.js",
     "test:watch": "vitest",
     "lint": "tsc --noEmit"
   },

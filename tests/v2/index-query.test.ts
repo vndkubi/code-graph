@@ -1637,6 +1637,228 @@ public class OrderService {
     expect(directCallees.callees.some(edge => edge.callee.includes('OrderService.listOrders'))).toBe(true);
   });
 
+  it('packs endpoint downstream service side effects into the first flow packet', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-endpoint-side-effects-');
+    writeFile(repo, 'src/main/java/com/example/order/OrderController.java', `package com.example.order;
+
+import javax.ws.rs.POST;
+import javax.ws.rs.Path;
+
+@Path("/orders")
+public class OrderController {
+    private final OrderService orderService = new OrderService(new InventoryService(), new PaymentService());
+
+    @POST
+    public OrderDto create(CreateOrderRequest request) {
+        return orderService.createOrder(request);
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/order/OrderService.java', `package com.example.order;
+
+public class OrderService {
+    private final InventoryService inventoryService;
+    private final PaymentService paymentService;
+
+    public OrderService(InventoryService inventoryService, PaymentService paymentService) {
+        this.inventoryService = inventoryService;
+        this.paymentService = paymentService;
+    }
+
+    public OrderDto createOrder(CreateOrderRequest request) {
+        inventoryService.checkAvailability(request.getItems());
+        paymentService.charge(request.getPaymentInfo());
+        return new OrderDto(request.getOrderId(), "CREATED");
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/order/InventoryService.java', `package com.example.order;
+
+public class InventoryService {
+    public void checkAvailability(String[] items) {
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/order/PaymentService.java', `package com.example.order;
+
+public class PaymentService {
+    public void charge(String paymentInfo) {
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/order/CreateOrderRequest.java', `package com.example.order;
+
+public class CreateOrderRequest {
+    public String[] getItems() { return new String[0]; }
+    public String getPaymentInfo() { return "card"; }
+    public String getOrderId() { return "order-1"; }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/order/OrderDto.java', `package com.example.order;
+
+public record OrderDto(String id, String status) {}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const flowPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_flow_pack',
+      args: {
+        target: 'trace api "POST /orders" please with service side effects',
+        profile: 'full',
+        tokenBudget: 8000,
+        includeLowSignal: true,
+      },
+    }) as {
+      callees: Array<{ callee: string; file: string }>;
+      topFiles: string[];
+      evidenceSlices: Array<{ file: string; text: string }>;
+    };
+
+    expect(flowPack.callees.some(edge => edge.callee.includes('OrderService.createOrder'))).toBe(true);
+    expect(flowPack.callees.some(edge => edge.callee.includes('InventoryService.checkAvailability'))).toBe(true);
+    expect(flowPack.callees.some(edge => edge.callee.includes('PaymentService.charge'))).toBe(true);
+    expect(flowPack.topFiles).toEqual(expect.arrayContaining([
+      'src/main/java/com/example/order/OrderController.java',
+      'src/main/java/com/example/order/OrderService.java',
+      'src/main/java/com/example/order/InventoryService.java',
+      'src/main/java/com/example/order/PaymentService.java',
+    ]));
+    expect(flowPack.evidenceSlices.some(slice =>
+      slice.file.endsWith('OrderService.java')
+      && slice.text.includes('checkAvailability')
+      && slice.text.includes('charge'))).toBe(true);
+
+    const colonPromptPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_flow_pack',
+      args: {
+        target: 'trace api POST /orders: explain request flow from handler to service side effects',
+        profile: 'full',
+        tokenBudget: 8000,
+        includeLowSignal: true,
+      },
+    }) as {
+      topFiles: string[];
+      definitionCandidates: Array<{ symbol: string; file: string }>;
+    };
+
+    expect(colonPromptPack.topFiles).toEqual(expect.arrayContaining([
+      'src/main/java/com/example/order/OrderController.java',
+      'src/main/java/com/example/order/OrderService.java',
+      'src/main/java/com/example/order/InventoryService.java',
+      'src/main/java/com/example/order/PaymentService.java',
+    ]));
+    expect(colonPromptPack.definitionCandidates.some(symbol =>
+      symbol.symbol.includes('OrderController.create'))).toBe(true);
+  });
+
+  it('reports service fields that an endpoint flow does not call', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-endpoint-not-called-');
+    writeFile(repo, 'src/main/java/com/example/order/OrderController.java', `package com.example.order;
+
+import javax.ws.rs.GET;
+import javax.ws.rs.POST;
+import javax.ws.rs.Path;
+
+@Path("/orders")
+public class OrderController {
+    private final OrderService orderService = new OrderService(new PaymentService(), new InventoryService());
+
+    @POST
+    public OrderDto create(CreateOrderRequest request) {
+        return orderService.createOrder(request);
+    }
+
+    @GET
+    @Path("/{id}")
+    public OrderDto get(String id) {
+        return orderService.getOrder(id);
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/order/OrderService.java', `package com.example.order;
+
+public class OrderService {
+    private final PaymentService paymentService;
+    private final InventoryService inventoryService;
+
+    public OrderService(PaymentService paymentService, InventoryService inventoryService) {
+        this.paymentService = paymentService;
+        this.inventoryService = inventoryService;
+    }
+
+    public OrderDto createOrder(CreateOrderRequest request) {
+        inventoryService.checkAvailability(request.getItems());
+        paymentService.charge(request.getPaymentInfo());
+        return new OrderDto(request.getOrderId(), "CREATED");
+    }
+
+    public OrderDto getOrder(String orderId) {
+        return new OrderDto(orderId, "FOUND");
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/order/PaymentService.java', `package com.example.order;
+
+public class PaymentService {
+    public void charge(String paymentInfo) {
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/order/InventoryService.java', `package com.example.order;
+
+public class InventoryService {
+    public void checkAvailability(String[] items) {
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/order/CreateOrderRequest.java', `package com.example.order;
+
+public class CreateOrderRequest {
+    public String[] getItems() { return new String[0]; }
+    public String getPaymentInfo() { return "card"; }
+    public String getOrderId() { return "order-1"; }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/order/OrderDto.java', `package com.example.order;
+
+public record OrderDto(String id, String status) {}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const flowPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_flow_pack',
+      args: {
+        target: 'trace api "GET /orders/{id}" please. Explain what it does not call.',
+        profile: 'compact',
+        tokenBudget: 6000,
+      },
+    }) as {
+      callees: Array<{ callee: string }>;
+      notCalledCandidates: Array<{ name: string; reason: string }>;
+    };
+
+    expect(flowPack.callees.some(edge => edge.callee.includes('OrderService.getOrder'))).toBe(true);
+    expect(flowPack.callees.some(edge => edge.callee.includes('PaymentService.charge'))).toBe(false);
+    expect(flowPack.callees.some(edge => edge.callee.includes('InventoryService.checkAvailability'))).toBe(false);
+    expect(flowPack.notCalledCandidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'PaymentService' }),
+      expect.objectContaining({ name: 'InventoryService' }),
+    ]));
+  });
+
   it('prioritizes exact TypeScript tool symbols in research packs', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-ts-tool-research-');

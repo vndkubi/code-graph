@@ -20,8 +20,21 @@ Run the same gates CI uses:
 npm run lint
 npm run build
 npm test
+node dist/cli.js upgrade-audit --root . --require-ready --require-fresh --min-grade A --min-score 96 --max-slow-ms 5000
 node dist/cli.js benchmark index --root .
 node dist/cli.js benchmark codex-e2e --root . --suite examples/codegraph-self-e2e-quality-suite.example.json --dry-run
+```
+
+Enable local verification-on-push (optional but recommended):
+
+```powershell
+npm run hooks:install
+```
+
+Then each `git push` runs:
+
+```powershell
+npm run verify
 ```
 
 For benchmark claims, include the command, repo size, indexed file count, token estimator, and whether the run used a real agent/model or a deterministic dry-run harness.

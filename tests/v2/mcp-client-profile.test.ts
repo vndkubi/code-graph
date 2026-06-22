@@ -40,6 +40,8 @@ describe('MCP full tool mode', () => {
     expect(MCP_SERVER_INSTRUCTIONS).toContain('do not call shell');
     expect(MCP_SERVER_INSTRUCTIONS).toContain('do not call rg');
     expect(MCP_SERVER_INSTRUCTIONS).toContain('After get_flow_pack or get_research_pack returns answerable=true');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('natural prompts');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('answer-mode by default');
   });
 
   it('keeps named MCP profiles on the facade surface to avoid duplicate low-level choices', () => {
@@ -63,7 +65,20 @@ describe('MCP full tool mode', () => {
       task: 'Trace GET /api/orders request flow',
     })).toMatchObject({
       toolName: 'get_flow_pack',
-      args: { target: 'Trace GET /api/orders request flow' },
+      args: {
+        target: 'Trace GET /api/orders request flow',
+        responseMode: 'answer',
+      },
+    });
+
+    expect(routeCodeGraphContext({
+      task: 'trace api "/a" please',
+    })).toMatchObject({
+      toolName: 'get_flow_pack',
+      args: {
+        target: 'trace api "/a" please',
+        responseMode: 'answer',
+      },
     });
 
     expect(routeCodeGraphContext({
@@ -90,6 +105,15 @@ describe('MCP full tool mode', () => {
       task: 'Explain the repository architecture',
     })).toMatchObject({
       toolName: 'get_research_pack',
+      args: { responseMode: 'answer' },
+    });
+
+    expect(routeCodeGraphContext({
+      task: 'Explain the repository architecture',
+      responseMode: 'agent',
+    })).toMatchObject({
+      toolName: 'get_research_pack',
+      args: { responseMode: 'agent' },
     });
   });
 

@@ -98,6 +98,11 @@ agent starts with `codegraph_context` and drills down only when a packet names a
 exact follow-up. Mention a first tool only when you want repeatable behavior or
 when running with `--mcp-profile full`.
 
+Natural prompts are expected. A prompt like `trace api "/a" please` should still
+start with `codegraph_context`; the facade routes API/flow and broad research
+tasks to answer-mode packets by default. If the packet returns `answerable=true`,
+the agent should answer from that packet and make zero extra tool calls.
+
 | Task | Default first tool | Internal/full-profile route | Why |
 | --- | --- | --- |
 | Answer-ready investigation, review, or planning | `codegraph_context` | `compile_evidence` | Returns an answerability certificate, compact evidence ids, missing coverage, allowed exact follow-ups, and stop rules. |
@@ -246,8 +251,23 @@ Then inspect logs:
 ```powershell
 node dist/cli.js logs --tail 50
 ```
+For audits beyond the recent window, add `--all` and your filters:
+`node dist/cli.js logs --all --event "query" --tool "codegraph_context"`
+If logs show no clear rows but you suspect partial writes, add `--invalid` to inspect corrupted lines.
+For incident windows, use `--summary --since "<ISO8601>" --until "<ISO8601>"`
+to inspect the busiest failures and stale/degraded calls within a bounded range. Add
+`--tool "<toolName>"`
+to focus a single route or facade, for example `codegraph_context`.
+When suspecting partial corruption during that window, add `--invalid`; the summary
+adds `invalidLines` and `invalidSamples` (sample bad rows with line numbers).
+Need call-level event filtering too: `--event "query"` can be paired with
+`--tool` and `--since` when you only want query/answerable attempts, not watcher
+or startup noise. Event filters support namespaces: `query`, `watch`, and
+`watch.refresh.failed` are all valid.
 
-A successful MCP query writes log entries with `toolName`, `durationMs`, and response-size telemetry.
+A successful MCP query writes log entries with `toolName`, `durationMs`,
+response-size telemetry, and a compact result summary for stale-index warnings,
+degraded fallback, answerability, and opt-in debug timing.
 
 ## Quality Checklist
 

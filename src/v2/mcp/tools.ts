@@ -27,6 +27,10 @@ const CallSignalOption = {
   includeLowSignal: z.boolean().optional(),
 };
 
+const DebugTimingOption = {
+  debugTiming: z.boolean().optional(),
+};
+
 export const V2ToolSchemas = {
   codegraph_status: z.object({
     includeDiagnostics: z.boolean().default(false),
@@ -34,6 +38,7 @@ export const V2ToolSchemas = {
   codegraph_context: z.object({
     task: z.string(),
     mode: z.enum(['auto', 'research', 'flow', 'change', 'review', 'evidence']).default('auto'),
+    responseMode: z.enum(['agent', 'answer']).optional(),
     target: z.string().optional(),
     diff: z.string().optional(),
     files: z.array(z.string()).optional(),
@@ -43,6 +48,7 @@ export const V2ToolSchemas = {
     ...PackProfileOption,
     ...SnippetOptions,
     ...FreshnessOptions,
+    ...DebugTimingOption,
   }),
   codegraph_slice: z.object({
     file: z.string().optional(),
@@ -188,6 +194,7 @@ export const V2ToolSchemas = {
     skipLikelyTests: z.boolean().optional(),
     callSeedLimit: z.number().min(0).max(30).optional(),
     riskMode: z.enum(['auto', 'calculation_sensitive']).optional(),
+    ...DebugTimingOption,
     ...FreshnessOptions,
   }),
   review_patch: z.object({
@@ -255,6 +262,7 @@ export const V2ToolSchemas = {
     riskMode: z.enum(['auto', 'calculation_sensitive']).optional(),
     ...PackProfileOption,
     ...SnippetOptions,
+    ...DebugTimingOption,
     ...FreshnessOptions,
   }),
   compile_evidence: z.object({
@@ -370,7 +378,7 @@ function descriptionFor(name: V2ToolName, options: V2ToolDefinitionOptions = {})
     case 'codegraph_status':
       return 'Diagnostic only. Returns workspace SQLite readiness, artifact readiness, and optional DB diagnostics. Do not use for normal code investigation.';
     case 'codegraph_context':
-      return 'PRIMARY TOOL - call FIRST for almost any repository question or before an edit: investigate code, understand how X works, explore architecture, trace endpoint/request flows, debug bugs, plan changes, assess impact, or review risk. Routes the full task to one bounded CodeGraph/TokenOpt-style packet with source evidence, stop rules, and exact follow-ups.';
+      return 'PRIMARY TOOL - call FIRST for almost any repository question or before an edit: investigate code, understand how X works, explore architecture, trace endpoint/request flows, debug bugs, plan changes, assess impact, or review risk. Routes the full task to one bounded CodeGraph/TokenOpt-style packet with source evidence, stop rules, and exact follow-ups. Natural prompt default is answer-mode for flow/research so answerable packets should terminate without extra search/slice calls.';
     case 'codegraph_slice':
       return 'FOLLOW-UP ONLY after codegraph_context names exact missing evidence. Returns one or many bounded source slices for specific files, line ranges, or symbols; do not use as the first tool for broad repo questions.';
     case 'get_flow_pack':
@@ -431,7 +439,7 @@ function compactDescriptionFor(name: V2ToolName): string {
     case 'codegraph_status':
       return 'Diagnostic only: runtime/index readiness and optional SQLite diagnostics.';
     case 'codegraph_context':
-      return 'PRIMARY TOOL - call FIRST for repo questions or before edits: investigate code, architecture, bugs, flows, impact, plan/review. One bounded evidence packet.';
+      return 'PRIMARY TOOL - call FIRST for repo questions or before edits: investigate code, architecture, bugs, flows, impact, plan/review. Natural flow/research prompts route to answer-mode bounded packets.';
     case 'codegraph_slice':
       return 'FOLLOW-UP ONLY after codegraph_context names exact missing file/line/symbol evidence. Exact bounded slice(s), batch via slices[].';
     case 'get_flow_pack':

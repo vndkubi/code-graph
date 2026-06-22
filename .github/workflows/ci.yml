@@ -43,5 +43,17 @@ jobs:
       - name: Index benchmark smoke
         run: node dist/cli.js benchmark index --root . --parse-workers 2
 
+      - name: Super VIP quality gate
+        run: |
+          mkdir -p .tmp/quality-gate
+          node dist/cli.js upgrade-audit --root . --require-ready --require-fresh --min-grade A --min-score 96 --max-slow-ms 5000 --json > .tmp/quality-gate/upgrade-audit.json
+
+      - name: Upload quality gate report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quality-gate-report
+          path: .tmp/quality-gate/upgrade-audit.json
+
       - name: Codex E2E dry-run smoke
         run: node dist/cli.js benchmark codex-e2e --root . --suite examples/codegraph-self-e2e-quality-suite.example.json --dry-run --parse-workers 2

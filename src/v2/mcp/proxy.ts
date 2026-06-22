@@ -5,10 +5,10 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { V2Indexer } from '../index/indexer.js';
 import { watchWorkspace, type WorkspaceWatchHandle } from '../index/watcher.js';
+import { getWorkspacePaths } from '../paths.js';
 import { V2QueryService } from '../query/service.js';
 import { openCodeGraphDb, type CodeGraphDb } from '../storage/database.js';
-import { isWorkspaceIndexed } from '../storage/sqlite-backend.js';
-import { localArtifactStatus } from './local-artifact.js';
+import { inspectWorkspaceReadiness } from '../workspace-health.js';
 import { isLocalMcpFallbackTool, runLocalMcpFallback } from './local-fallback.js';
 import { V2_TOOL_DEFINITIONS, mcpToolNamesForProfile, parseToolArgs } from './tools.js';
 
@@ -185,6 +185,16 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
       args = parseToolArgs(request.params.name, request.params.arguments);
       if (request.params.name === 'codegraph_status') {
         const result = await codegraphStatus(options.root, args, runtimeValue);
+        const serialized = JSON.stringify(result);
+        logQueryEvent(getWorkspacePaths(options.root).queryLogPath, {
+          event: 'query',
+          toolName: request.params.name,
+          routedToolName: request.params.name,
+          durationMs: Date.now() - startedAt,
+          responseChars: serialized.length,
+          args: summarizeArgs(args),
+          result: summarizeResult(result),
+        });
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
         };
@@ -194,14 +204,10 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
       } else if (options.autoRefresh && args.autoRefresh === undefined) {
         args.autoRefresh = true;
       }
-      if (options.warnStale !== true && args.warnStale === undefined) {
-        args.warnStale = false;
-      }
-      const embedded = await embeddedArtifactResult(options.root, request.params.name, args);
-      if (embedded) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(embedded, null, 2) }],
-        };
+      if (args.warnStale === undefined) {
+        args.warnStale = options.warnStale === true || request.params.name === 'codegraph_context'
+          ? true
+          : false;
       }
       const routed = routeMcpTool(request.params.name, args);
       const current = routed.requiresIndexedWorkspace === false
@@ -220,6 +226,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
         durationMs: Date.now() - startedAt,
         responseChars: JSON.stringify(result).length,
         args: summarizeArgs(args),
+        result: summarizeResult(result),
       });
       return {
         content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
@@ -235,6 +242,18 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
           },
         }));
         if (fallback && !('error' in fallback)) {
+          const routed = routeMcpTool(request.params.name, args);
+          const serialized = JSON.stringify(fallback);
+          logQueryEvent(getWorkspacePaths(options.root).queryLogPath, {
+            event: 'query',
+            toolName: request.params.name,
+            routedToolName: routed.toolName,
+            durationMs: Date.now() - startedAt,
+            responseChars: serialized.length,
+            args: summarizeArgs(args),
+            result: summarizeResult(fallback),
+            fallbackReason: summarizeErrorPayload(payload),
+          });
           return {
             content: [{ type: 'text' as const, text: JSON.stringify(fallback, null, 2) }],
           };
@@ -258,23 +277,6 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
   void runtime().catch(error => {
     process.stderr.write(`[codegraph] MCP runtime init failed: ${error instanceof Error ? error.message : String(error)}\n`);
   });
-}
-
-async function embeddedArtifactResult(
-  root: string,
-  toolName: string,
-  args: Record<string, unknown>,
-): Promise<Record<string, unknown> | undefined> {
-  if (!isLocalMcpFallbackTool(toolName)) return undefined;
-  const artifact = localArtifactStatus(root);
-  if (!artifact.ok) return undefined;
-  const result = await runLocalMcpFallback(root, toolName, args, {
-    error: {
-      code: 'embedded_artifact_default',
-      message: 'Using the embedded artifact index for this facade tool.',
-    },
-  });
-  return result as Record<string, unknown> | undefined;
 }
 
 export function routeMcpTool(name: string, args: Record<string, unknown>): {
@@ -307,6 +309,7 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
     riskMode: args.riskMode,
     autoRefresh: args.autoRefresh,
     warnStale: args.warnStale,
+    debugTiming: args.debugTiming,
   });
 
   if (mode === 'review') {
@@ -330,7 +333,7 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
         target,
         taskType: 'architecture',
         tokenBudget,
-        responseMode: 'agent',
+        responseMode: args.responseMode ?? 'answer',
         ...common,
       }),
     };
@@ -369,7 +372,7 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
       target,
       taskType: 'research',
       tokenBudget,
-      responseMode: 'agent',
+      responseMode: args.responseMode ?? 'answer',
       ...common,
     }),
   };
@@ -462,27 +465,23 @@ async function codegraphStatus(
   args: Record<string, unknown>,
   runtime: McpRuntime | undefined,
 ): Promise<Record<string, unknown>> {
-  const artifact = localArtifactStatus(root);
-  const indexed = runtime?.workspace.currentSnapshotId ? true : isWorkspaceIndexed(root);
-  const database = {
-    ok: indexed,
-    state: indexed ? 'ready' : 'missing_or_unindexed',
+  const readiness = inspectWorkspaceReadiness(root, {
     dbPath: runtime?.dbPath,
     workspaceId: runtime?.workspace.workspaceId,
     snapshotId: runtime?.workspace.currentSnapshotId,
-  };
+  });
   if (args.includeDiagnostics !== true) {
     return {
-      ok: indexed || artifact.ok,
-      database,
-      artifact,
+      ok: readiness.ok,
+      state: readiness.state,
+      database: readiness.database,
+      artifact: readiness.artifact,
+      capabilities: readiness.capabilities,
+      freshness: readiness.freshness,
+      nextActions: readiness.nextActions,
     };
   }
-  return {
-    ok: indexed || artifact.ok,
-    artifact,
-    database,
-  };
+  return { ...readiness };
 }
 
 function dependencyFailurePayload(error: unknown): Record<string, unknown> {
@@ -538,6 +537,99 @@ function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
     }
   }
   return summary;
+}
+
+function summarizeResult(result: unknown): Record<string, unknown> {
+  if (!isRecord(result)) return {};
+  return copyDefined({
+    ok: booleanOrUndefined(result.ok),
+    state: stringOrUndefined(result.state),
+    degraded: booleanOrUndefined(result.degraded),
+    source: stringOrUndefined(result.source),
+    answerable: booleanOrUndefined(result.answerable),
+    sufficientForAnswer: booleanOrUndefined(result.sufficientForAnswer),
+    capabilities: summarizeCapabilities(result.capabilities),
+    database: summarizeReadinessComponent(result.database),
+    artifact: summarizeReadinessComponent(result.artifact),
+    indexFreshness: summarizeIndexFreshness(result.indexFreshness),
+    freshness: summarizeIndexFreshness(result.freshness),
+    debugTiming: summarizeDebugTiming(result.debugTiming),
+  });
+}
+
+function summarizeCapabilities(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) return undefined;
+  return copyDefined({
+    graphQueries: booleanOrUndefined(value.graphQueries),
+    freshGraph: booleanOrUndefined(value.freshGraph),
+    embeddedArtifact: booleanOrUndefined(value.embeddedArtifact),
+    facadeContext: booleanOrUndefined(value.facadeContext),
+  });
+}
+
+function summarizeReadinessComponent(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) return undefined;
+  return copyDefined({
+    ok: booleanOrUndefined(value.ok),
+    state: stringOrUndefined(value.state),
+  });
+}
+
+function summarizeErrorPayload(payload: Record<string, unknown>): Record<string, unknown> | undefined {
+  const error = payload.error;
+  if (!isRecord(error)) return undefined;
+  return copyDefined({
+    code: stringOrUndefined(error.code),
+    message: stringOrUndefined(error.message),
+    next: stringOrUndefined(error.next),
+  });
+}
+
+function summarizeIndexFreshness(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) return undefined;
+  return copyDefined({
+    isStale: booleanOrUndefined(value.isStale),
+    warning: stringOrUndefined(value.warning),
+    autoRefreshSkipped: isRecord(value.autoRefreshSkipped)
+      ? copyDefined({
+        reason: stringOrUndefined(value.autoRefreshSkipped.reason),
+        indexedFileCount: numberOrUndefined(value.autoRefreshSkipped.indexedFileCount),
+        autoRefreshFileLimit: numberOrUndefined(value.autoRefreshSkipped.autoRefreshFileLimit),
+      })
+      : undefined,
+  });
+}
+
+function summarizeDebugTiming(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) return undefined;
+  const topPhase = isRecord(value.topPhase)
+    ? copyDefined({
+      name: stringOrUndefined(value.topPhase.name),
+      durationMs: numberOrUndefined(value.topPhase.durationMs),
+    })
+    : undefined;
+  const phaseCount = Array.isArray(value.phases) ? value.phases.length : undefined;
+  return copyDefined({
+    totalMs: numberOrUndefined(value.totalMs),
+    phaseCount,
+    topPhase,
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function booleanOrUndefined(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function stringOrUndefined(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
 }
 
 function structuredErrorMessage(payload: Record<string, unknown>): string {
@@ -606,7 +698,6 @@ same first-tool rules still apply.
 - Reading source:
   use codegraph_slice/get_file_slice only after a pack identifies exact
   file/line/symbol evidence or a specific missing fact.
-
 - FOLLOW-UP ONLY tools:
   search_symbol, search_files, search_code, find_references, get_callers,
   get_callees, get_dependencies, get_dependents, and get_file_slice are not
@@ -621,6 +712,9 @@ same first-tool rules still apply.
   sufficientForAnswer=true, answer from the packet; do not call rg, shell
   search, search_code, search_symbol, or read loops unless the user explicitly
   asks for more detail.
+- For natural prompts such as "trace api /a please", codegraph_context routes
+  flow/research to answer-mode by default. Treat answer-mode packets as terminal
+  when answerable=true.
 - After codegraph_slice/get_file_slice returns requested source, answer from
   that slice plus the prior packet; do not call shell, do not call rg, and do
   not start another search/read loop for the same file or symbol.
