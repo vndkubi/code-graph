@@ -253,7 +253,17 @@ export class V2QueryService {
     const gitDirty = git.available
       ? git.headCommit !== row.head_commit || git.dirtyHash !== row.dirty_hash
       : false;
-    const dirtyFiles = !git.available ? await this.computeDirtyFiles(snapshotId) : undefined;
+    // computeDirtyFiles() already branches internally on git availability
+    // (git-status when possible, manifest hash diff otherwise) and returns
+    // the same shape either way, so always call it — don't gate it behind
+    // !git.available. Gating it there meant the common case (a git repo)
+    // only ever got isStale:true with no file list, which is exactly the
+    // information an agent needs to decide whether to re-read specific
+    // files. Only skip the scan entirely when nothing is dirty, to avoid
+    // paying for it on the (much more common) fresh-index path.
+    const dirtyFiles = gitDirty || !git.available
+      ? await this.computeDirtyFiles(snapshotId)
+      : undefined;
     const dirtyCounts = (dirtyFiles ?? {}) as {
       addedCount?: number;
       modifiedCount?: number;

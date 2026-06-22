@@ -205,9 +205,13 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
         args.autoRefresh = true;
       }
       if (args.warnStale === undefined) {
-        args.warnStale = options.warnStale === true || request.params.name === 'codegraph_context'
-          ? true
-          : false;
+        // Freshness check is cheap (a couple of git calls, cached via
+        // freshnessCacheMs) and exists to protect the agent from answering
+        // off a stale index, so it is on by default for every tool — not
+        // just codegraph_context. The agent can still pass warnStale=false
+        // per-call to skip it; options.warnStale === false at server startup
+        // forces it off globally as an opt-out for benchmark/perf scenarios.
+        args.warnStale = options.warnStale !== false;
       }
       const routed = routeMcpTool(request.params.name, args);
       const current = routed.requiresIndexedWorkspace === false
@@ -229,7 +233,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
         result: summarizeResult(result),
       });
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
+        content: [{ type: 'text' as const, text: withFreshnessBanner(JSON.stringify(result, null, 2), result) }],
       };
     } catch (error) {
       const payload = errorPayload(error);
@@ -618,6 +622,23 @@ function summarizeDebugTiming(value: unknown): Record<string, unknown> | undefin
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function withFreshnessBanner(text: string, result: unknown): string {
+  if (!isRecord(result)) return text;
+  const freshness = result.indexFreshness;
+  if (!isRecord(freshness) || freshness.isStale !== true) return text;
+  const dirtyFiles = freshness.dirtyFiles;
+  const samples = isRecord(dirtyFiles) && isRecord(dirtyFiles.samples) ? dirtyFiles.samples : undefined;
+  const names = samples
+    ? [
+      ...(Array.isArray(samples.modified) ? samples.modified : []),
+      ...(Array.isArray(samples.added) ? samples.added : []),
+      ...(Array.isArray(samples.deleted) ? samples.deleted : []),
+    ].slice(0, 10)
+    : [];
+  const list = names.length ? `: ${names.join(', ')}` : '';
+  return `⚠️ Index may be stale${list}. Read these files directly if precision matters.\n\n${text}`;
 }
 
 function booleanOrUndefined(value: unknown): boolean | undefined {
