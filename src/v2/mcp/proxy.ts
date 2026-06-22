@@ -617,6 +617,9 @@ same first-tool rules still apply.
 
 - Treat evidenceSlices as already-read source. They include file paths, line
   ranges, and capped source text.
+- After codegraph_slice/get_file_slice returns requested source, answer from
+  that slice plus the prior packet; do not call shell, do not call rg, and do
+  not start another search/read loop for the same file or symbol.
 - If sufficientForAnswer or answerable is true, answer from the packet and stop.
 - If the packet lists missingFacts or allowed follow-ups, use only the named
   exact follow-up tools such as codegraph_slice, search_symbol, search_files, or

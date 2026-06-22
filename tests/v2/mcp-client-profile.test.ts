@@ -36,6 +36,9 @@ describe('MCP full tool mode', () => {
     expect(MCP_SERVER_INSTRUCTIONS).toContain('get_flow_pack only for explicit endpoint/API/request-flow tracing');
     expect(MCP_SERVER_INSTRUCTIONS).toContain('get_change_pack for implement/fix/debug/refactor/test/edit tasks');
     expect(MCP_SERVER_INSTRUCTIONS).toContain('FOLLOW-UP ONLY');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('After codegraph_slice/get_file_slice returns requested source');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('do not call shell');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('do not call rg');
   });
 
   it('keeps named MCP profiles on the facade surface to avoid duplicate low-level choices', () => {

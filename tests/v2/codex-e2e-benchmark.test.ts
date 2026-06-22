@@ -6,7 +6,9 @@ import { openCodeGraphDb, type CodeGraphDb } from '../../src/v2/storage/database
 import { V2Indexer } from '../../src/v2/index/indexer.js';
 import {
   compileBenchmarkTaskType,
+  buildCodexSpawnInvocation,
   parseCodexJsonEvents,
+  promptForMode,
   runCodexE2eBenchmark,
   runCodexE2ePreflight,
   type CodexE2eSuite,
@@ -93,6 +95,92 @@ describe('Codex E2E benchmark preflight and token ledger', () => {
     expect(metrics.tokenLedger.modelFreshTotalTokens).toBe(850);
   });
 
+  it('separates shell token waste after an exact file slice follow-up', () => {
+    const packet = {
+      answerable: false,
+      allowedFollowups: [{ tool: 'get_file_slice', file: 'src/order-service.ts', lines: '8-16' }],
+      budget: {
+        estimatedResponseTokens: 120,
+        estimatedFullResponseTokens: 600,
+      },
+    };
+    const sliceOutput = 'src/order-service.ts:10 await this.paymentService.charge(request.customerId, 100);';
+    const shellOutput = 'rg "charge" src/order-service.ts\n10: await this.paymentService.charge(request.customerId, 100);';
+    const jsonl = [
+      {
+        type: 'item.completed',
+        item: {
+          id: 'mcp-1',
+          type: 'mcp_tool_call',
+          server: 'codegraph_bench',
+          tool: 'compile_evidence',
+          result: { content: [{ type: 'text', text: JSON.stringify(packet) }] },
+          status: 'completed',
+        },
+      },
+      {
+        type: 'item.completed',
+        item: {
+          id: 'mcp-2',
+          type: 'mcp_tool_call',
+          server: 'codegraph_bench',
+          tool: 'get_file_slice',
+          result: { content: [{ type: 'text', text: sliceOutput }] },
+          status: 'completed',
+        },
+      },
+      {
+        type: 'item.completed',
+        item: {
+          id: 'shell-1',
+          type: 'command_execution',
+          result: { content: [{ type: 'text', text: shellOutput }] },
+          status: 'completed',
+        },
+      },
+    ].map(event => JSON.stringify(event)).join('\n');
+
+    const metrics = parseCodexJsonEvents(jsonl, 'prompt');
+    const sliceTokens = estimateTextTokens(sliceOutput);
+    const shellTokens = estimateTextTokens(shellOutput);
+
+    expect(metrics.tokenLedger.exactFollowupTokens).toBe(sliceTokens);
+    expect(metrics.tokenLedger.fallbackShellTokens).toBe(shellTokens);
+    expect(metrics.tokenLedger.shellAfterExactFollowupCalls).toBe(1);
+    expect(metrics.tokenLedger.shellAfterExactFollowupTokens).toBe(shellTokens);
+    expect(metrics.tokenLedger.netSavedTokens).toBe(600 - 120 - sliceTokens - shellTokens);
+  });
+
+  it('warns compiled-packet gate runs to stop after a returned file slice', () => {
+    const prompt = promptForMode({
+      id: 'slice-stop',
+      prompt: 'Explain OrderService.create.',
+    }, 'compiled-packet+gate');
+
+    expect(prompt).toContain('After codegraph_slice/get_file_slice returns source');
+    expect(prompt).toContain('do not call shell');
+    expect(prompt).toContain('do not call rg');
+    expect(prompt).toContain('do not call search');
+  });
+
+  it('wraps Windows .cmd commands for spawn', () => {
+    const invocation = buildCodexSpawnInvocation('npx.cmd', ['-y', '@openai/codex'], 'win32');
+    expect(invocation.command).toBe('cmd.exe');
+    expect(invocation.args).toEqual(['/c', 'npx.cmd', '-y', '@openai/codex']);
+  });
+
+  it('does not wrap non-Windows commands with cmd.exe /c', () => {
+    const invocation = buildCodexSpawnInvocation('npx.cmd', ['-y', '@openai/codex'], 'linux');
+    expect(invocation.command).toBe('npx.cmd');
+    expect(invocation.args).toEqual(['-y', '@openai/codex']);
+  });
+
+  it('keeps explicit cmd.exe command unchanged on Windows', () => {
+    const invocation = buildCodexSpawnInvocation('cmd.exe', ['/c', 'npx.cmd', '-y', '@openai/codex'], 'win32');
+    expect(invocation.command).toBe('cmd.exe');
+    expect(invocation.args).toEqual(['/c', 'npx.cmd', '-y', '@openai/codex']);
+  });
+
   it('uses the shared cl100k text tokenizer for fallback estimates', () => {
     expect(estimateTextTokens('hello')).toBe(1);
     expect(estimateTextTokens('2 + 2 = 4')).toBe(7);
@@ -131,6 +219,181 @@ describe('Codex E2E benchmark preflight and token ledger', () => {
     expect(report.canRun).toBe(true);
     expect(report.snapshot?.files).toBeGreaterThan(0);
     expect(report.requiredFiles.find(file => file.expected === 'src/main.ts')?.matched).toEqual(['src/main.ts']);
+  });
+
+  it('does not emit missing compatibility warning when a method contract exists', async () => {
+    const repo = tempDir('codegraph-codex-method-contract-only-');
+    writeFile(repo, 'src/order.ts', 'export function chargeOrder(orderId: string) { return orderId.length; }\n');
+    const { db } = await openCodeGraphDb(repo);
+    dbs.push(db);
+    const indexer = new V2Indexer(db);
+    await indexer.indexWorkspace({ root: repo, workspaceKey: 'method-contract-only' });
+
+    const suite: CodexE2eSuite = {
+      name: 'method-contract-only-suite',
+      rootProfile: {
+        name: 'method-contract-only',
+        requiredMethods: ['chargeOrder'],
+      },
+      tasks: [],
+    };
+
+    const report = await runCodexE2ePreflight({
+      suite,
+      root: repo,
+      workspaceKey: 'method-contract-only',
+      tasks: suite.tasks,
+      plannedRuns: 1,
+    });
+
+    expect(report.status).toBe('passed');
+    expect(report.canRun).toBe(true);
+    expect(report.issues.some(issue => issue.code === 'missing_compatibility_contract')).toBe(false);
+  });
+
+  it('passes preflight when required methods are present in indexed symbols', async () => {
+    const repo = tempDir('codegraph-codex-method-pass-');
+    writeFile(repo, 'src/order.ts', 'export function chargeOrder(orderId: string) { return orderId.length; }\n');
+    const { db } = await openCodeGraphDb(repo);
+    dbs.push(db);
+    const indexer = new V2Indexer(db);
+    await indexer.indexWorkspace({ root: repo, workspaceKey: 'method-pass' });
+
+    const suite: CodexE2eSuite = {
+      name: 'method-pass-suite',
+      rootProfile: {
+        name: 'method-suite',
+        requiredMethods: ['chargeOrder'],
+      },
+      tasks: [{
+        id: 'method-pass-task',
+        prompt: 'Find chargeOrder implementation.',
+        expectedMethods: ['chargeOrder'],
+      }],
+    };
+
+    const report = await runCodexE2ePreflight({
+      suite,
+      root: repo,
+      workspaceKey: 'method-pass',
+      tasks: suite.tasks,
+      plannedRuns: 1,
+    });
+
+    expect(report.status).toBe('passed');
+    expect(report.requiredMethods.find(method => method.expected === 'chargeOrder')?.matched.length).toBeGreaterThan(0);
+    expect(report.missingRequiredMethods).toHaveLength(0);
+  });
+
+  it('normalizes expected method signatures before matching', async () => {
+    const repo = tempDir('codegraph-codex-method-signature-');
+    writeFile(repo, 'src/order.ts', 'export function chargeOrder(orderId: string) { return orderId.length; }\n');
+    const { db } = await openCodeGraphDb(repo);
+    dbs.push(db);
+    const indexer = new V2Indexer(db);
+    await indexer.indexWorkspace({ root: repo, workspaceKey: 'method-signature' });
+
+    const suite: CodexE2eSuite = {
+      name: 'method-signature-suite',
+      rootProfile: {
+        name: 'method-suite',
+        requiredMethods: ['chargeOrder(orderId: string)'],
+      },
+      tasks: [{
+        id: 'method-signature-task',
+        prompt: 'Find chargeOrder implementation.',
+        expectedMethods: ['chargeOrder(orderId: string)'],
+      }],
+    };
+
+    const report = await runCodexE2ePreflight({
+      suite,
+      root: repo,
+      workspaceKey: 'method-signature',
+      tasks: suite.tasks,
+      plannedRuns: 1,
+    });
+
+    expect(report.status).toBe('passed');
+    expect(report.requiredMethods.find(method => method.expected === 'chargeOrder(orderId: string)')?.matched.length).toBeGreaterThan(0);
+  });
+
+  it('blocks preflight when required methods are absent from indexed snapshot', async () => {
+    const repo = tempDir('codegraph-codex-method-missing-');
+    writeFile(repo, 'src/order.ts', 'export function chargeOrder(orderId: string) { return orderId.length; }\n');
+    const { db } = await openCodeGraphDb(repo);
+    const indexer = new V2Indexer(db);
+    await indexer.indexWorkspace({ root: repo, workspaceKey: 'method-missing' });
+    await db.close();
+
+    const suite: CodexE2eSuite = {
+      name: 'method-missing-suite',
+      rootProfile: {
+        name: 'method-suite',
+        requiredMethods: ['refundOrder'],
+      },
+      tasks: [{
+        id: 'method-missing-task',
+        prompt: 'Find refundOrder implementation.',
+        expectedMethods: ['refundOrder'],
+      }],
+    };
+
+    const report = await runCodexE2ePreflight({
+      suite,
+      root: repo,
+      workspaceKey: 'method-missing',
+      tasks: suite.tasks,
+      plannedRuns: 1,
+    });
+
+    expect(report.status).toBe('failed');
+    expect(report.issues).toContainEqual(expect.objectContaining({
+      code: 'missing_required_method',
+      expected: 'refundOrder',
+    }));
+    expect(report.missingRequiredMethods).toContain('refundOrder');
+  });
+
+  it('suggests similar methods when a required method is absent', async () => {
+    const repo = tempDir('codegraph-codex-method-suggestions-');
+    writeFile(repo, 'src/order.ts', [
+      'export function chargeOrder(orderId: string) { return orderId.length; }',
+      'export function calculateOrder() { return 0; }',
+      'export function listOrders() { return []; }',
+    ].join('\n'));
+    const { db } = await openCodeGraphDb(repo);
+    const indexer = new V2Indexer(db);
+    await indexer.indexWorkspace({ root: repo, workspaceKey: 'method-suggestions' });
+    await db.close();
+
+    const suite: CodexE2eSuite = {
+      name: 'method-suggestions-suite',
+      rootProfile: {
+        name: 'method-suite',
+        requiredMethods: ['chageOrder'],
+      },
+      tasks: [{
+        id: 'method-suggestions-task',
+        prompt: 'Find the method.',
+        expectedMethods: ['chageOrder'],
+      }],
+    };
+
+    const report = await runCodexE2ePreflight({
+      suite,
+      root: repo,
+      workspaceKey: 'method-suggestions',
+      tasks: suite.tasks,
+      plannedRuns: 1,
+    });
+
+    const issue = report.issues.find(issue => issue.code === 'missing_required_method' && issue.expected === 'chageOrder');
+    expect(issue).toBeDefined();
+    expect(issue?.suggestions).toBeDefined();
+    console.log('similar method suggestions', issue?.suggestions);
+    expect(issue?.suggestions?.some(item => item.includes('chargeOrder'))).toBe(true);
+    expect(issue?.severity).toBe('error');
   });
 
   it('blocks non-dry-run Codex execution when required suite files are absent', async () => {

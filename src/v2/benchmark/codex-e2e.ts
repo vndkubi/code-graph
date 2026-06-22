@@ -24,6 +24,7 @@ export interface CodexE2eTask {
 export interface CodexE2eRootProfile {
   name?: string;
   requiredFiles?: string[];
+  requiredMethods?: string[];
 }
 
 export interface CodexE2eSuite {
@@ -48,6 +49,11 @@ export interface CodexE2eBenchmarkOptions {
   timeoutSeconds?: number;
   skipIndex?: boolean;
   dryRun?: boolean;
+}
+
+export interface CodexSpawnInvocation {
+  command: string;
+  args: string[];
 }
 
 export interface CodexJsonMetrics {
@@ -95,6 +101,8 @@ export interface CodexTokenLedger {
   compactPacketTokens: number;
   exactFollowupTokens: number;
   fallbackShellTokens: number;
+  shellAfterExactFollowupTokens: number;
+  shellAfterExactFollowupCalls: number;
   grossSavedTokens: number;
   netSavedTokens: number;
   budgetedMcpCalls: number;
@@ -104,12 +112,13 @@ export interface CodexTokenLedger {
 }
 
 export interface CodexE2ePreflightIssue {
-  code: 'root_missing' | 'workspace_not_indexed' | 'missing_required_file' | 'missing_compatibility_contract';
+  code: 'root_missing' | 'workspace_not_indexed' | 'missing_required_file' | 'missing_required_method' | 'missing_compatibility_contract';
   severity: 'error' | 'warning';
   message: string;
   taskId?: string;
   expected?: string;
   matched?: string[];
+  suggestions?: string[];
 }
 
 export interface CodexE2ePreflightReport {
@@ -128,7 +137,12 @@ export interface CodexE2ePreflightReport {
     expected: string;
     matched: string[];
   }>;
+  requiredMethods: Array<{
+    expected: string;
+    matched: string[];
+  }>;
   missingRequiredFiles: string[];
+  missingRequiredMethods: string[];
   issues: CodexE2ePreflightIssue[];
   plannedRuns: number;
   skippedRuns: number;
@@ -162,6 +176,8 @@ export interface CodexE2eBenchmarkReport {
       compactPacketTokens: number;
       exactFollowupTokens: number;
       fallbackShellTokens: number;
+      shellAfterExactFollowupTokens: number;
+      shellAfterExactFollowupCalls: number;
       grossSavedTokens: number;
       netSavedTokens: number;
       budgetedMcpCalls: number;
@@ -171,6 +187,9 @@ export interface CodexE2eBenchmarkReport {
 }
 
 const DEFAULT_CODEGRAPH_TOOLS = new Set([
+  'codegraph_status',
+  'codegraph_context',
+  'codegraph_slice',
   'search_symbol',
   'search_files',
   'find_references',
@@ -197,6 +216,11 @@ const DEFAULT_CODEGRAPH_TOOLS = new Set([
   'get_index_stats',
 ]);
 
+const EXACT_SOURCE_FOLLOWUP_TOOLS = new Set([
+  'codegraph_slice',
+  'get_file_slice',
+]);
+
 const SHELL_TOOL_PATTERNS = [
   /shell/i,
   /command_execution/i,
@@ -208,6 +232,16 @@ const SHELL_TOOL_PATTERNS = [
   /grep/i,
   /^rg$/i,
 ];
+
+type NormalizedMethodSpec = {
+  raw: string;
+  normalized: string;
+};
+
+type MethodMatchResult = {
+  matches: string[];
+  suggestions: string[];
+};
 
 export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): Promise<CodexE2eBenchmarkReport> {
   const suite = loadCodexE2eSuite(options.suitePath);
@@ -318,8 +352,13 @@ export async function runCodexE2ePreflight(options: {
   const issues: CodexE2ePreflightIssue[] = [];
   const root = path.resolve(options.root);
   const requiredFileSpecs = requiredFilesForPreflight(options.suite, options.tasks);
+  const requiredMethodSpecs = requiredMethodsForPreflight(options.suite, options.tasks);
   const requiredFiles: CodexE2ePreflightReport['requiredFiles'] = requiredFileSpecs.map(expected => ({
     expected,
+    matched: [],
+  }));
+  const requiredMethods: CodexE2ePreflightReport['requiredMethods'] = requiredMethodSpecs.map(expected => ({
+    expected: expected.raw,
     matched: [],
   }));
 
@@ -334,16 +373,20 @@ export async function runCodexE2ePreflight(options: {
       workspaceKey: options.workspaceKey,
       suiteRootProfile: options.suite.rootProfile?.name,
       requiredFiles,
+      requiredMethods,
       issues,
       plannedRuns: options.plannedRuns,
     });
   }
 
-  if (!options.suite.rootProfile?.requiredFiles?.length && requiredFileSpecs.length === 0) {
+  if (!options.suite.rootProfile?.requiredFiles?.length &&
+    !options.suite.rootProfile?.requiredMethods?.length &&
+    requiredFileSpecs.length === 0 &&
+    requiredMethodSpecs.length === 0) {
     issues.push({
       code: 'missing_compatibility_contract',
       severity: 'warning',
-      message: 'Codex E2E suite has no rootProfile.requiredFiles or task expectedFiles, so root compatibility cannot be proven before a paid run.',
+      message: 'Codex E2E suite has no rootProfile.requiredFiles/requiredMethods or task expectedFiles/expectedMethods, so root compatibility cannot be proven before a paid run.',
     });
   }
 
@@ -361,6 +404,7 @@ export async function runCodexE2ePreflight(options: {
         workspaceKey: options.workspaceKey,
         suiteRootProfile: options.suite.rootProfile?.name,
         requiredFiles,
+        requiredMethods,
         issues,
         plannedRuns: options.plannedRuns,
       });
@@ -378,6 +422,21 @@ export async function runCodexE2ePreflight(options: {
         });
       }
     }
+    for (const entry of requiredMethods) {
+      const normalized = requiredMethodSpecs.find(spec => spec.raw === entry.expected)?.normalized ?? entry.expected;
+      const methodMatch = await matchIndexedMethods(db, snapshot.snapshotId, normalized);
+      entry.matched = methodMatch.matches;
+      if (entry.matched.length === 0) {
+        issues.push({
+          code: 'missing_required_method',
+          severity: 'error',
+          message: `Required suite/task method was not found in the indexed snapshot: ${entry.expected}`,
+          expected: entry.expected,
+          matched: [],
+          suggestions: methodMatch.suggestions,
+        });
+      }
+    }
 
     const files = await db.scalar('SELECT COUNT(*) FROM files WHERE snapshot_id = ?', snapshot.snapshotId);
     return finalizePreflight({
@@ -390,6 +449,7 @@ export async function runCodexE2ePreflight(options: {
         files,
       },
       requiredFiles,
+      requiredMethods,
       issues,
       plannedRuns: options.plannedRuns,
     });
@@ -548,11 +608,15 @@ function finalizePreflight(input: {
   suiteRootProfile?: string;
   snapshot?: CodexE2ePreflightReport['snapshot'];
   requiredFiles: CodexE2ePreflightReport['requiredFiles'];
+  requiredMethods: CodexE2ePreflightReport['requiredMethods'];
   issues: CodexE2ePreflightIssue[];
   plannedRuns: number;
 }): CodexE2ePreflightReport {
   const hasErrors = input.issues.some(issue => issue.severity === 'error');
   const missingRequiredFiles = input.requiredFiles
+    .filter(entry => entry.matched.length === 0)
+    .map(entry => entry.expected);
+  const missingRequiredMethods = input.requiredMethods
     .filter(entry => entry.matched.length === 0)
     .map(entry => entry.expected);
   return {
@@ -564,7 +628,9 @@ function finalizePreflight(input: {
     suiteRootProfile: input.suiteRootProfile,
     snapshot: input.snapshot,
     requiredFiles: input.requiredFiles,
+    requiredMethods: input.requiredMethods,
     missingRequiredFiles,
+    missingRequiredMethods,
     issues: input.issues,
     plannedRuns: input.plannedRuns,
     skippedRuns: hasErrors ? input.plannedRuns : 0,
@@ -576,6 +642,126 @@ function requiredFilesForPreflight(suite: CodexE2eSuite, tasks: CodexE2eTask[]):
     ...(suite.rootProfile?.requiredFiles ?? []),
     ...tasks.flatMap(task => task.expectedFiles ?? []),
   ].map(normalizeFileSpec).filter(Boolean));
+}
+
+function requiredMethodsForPreflight(suite: CodexE2eSuite, tasks: CodexE2eTask[]): NormalizedMethodSpec[] {
+  const seen = new Set<string>();
+  const specs: NormalizedMethodSpec[] = [];
+  for (const raw of [
+    ...(suite.rootProfile?.requiredMethods ?? []),
+    ...tasks.flatMap(task => task.expectedMethods ?? []),
+  ]) {
+    const normalized = normalizeMethodSpec(raw);
+    if (!normalized) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    specs.push({ raw, normalized });
+  }
+  return specs;
+}
+
+async function matchIndexedMethods(db: CodeGraphDb, snapshotId: string, expected: string): Promise<MethodMatchResult> {
+  const method = normalizeMethodSpec(expected);
+  if (!method) return { matches: [], suggestions: [] };
+  const hasQualifier = method.includes('.') || method.includes('::');
+  const simpleName = method.split(/[.#]/).at(-1) ?? method;
+  const allMatches = new Map<string, string>();
+  const addMatches = (rows: Array<{ file: string; kind: string }>) => {
+    for (const row of rows) {
+      allMatches.set(`${row.kind}:${row.file}`, `${row.kind}: ${row.file}`);
+    }
+  };
+
+  if (hasQualifier) {
+    const rowsByFqName = await db.prepare(`
+      SELECT file, kind
+      FROM symbols
+      WHERE snapshot_id = ?
+        AND lower(fq_name) = ?
+      LIMIT 20
+    `).all(snapshotId, method.toLowerCase()) as Array<{ file: string; kind: string }>;
+    addMatches(rowsByFqName);
+  }
+
+  const rowsBySimpleName = await db.prepare(`
+    SELECT file, kind
+    FROM symbols
+    WHERE snapshot_id = ?
+      AND lower(simple_name) = ?
+    LIMIT 20
+  `).all(snapshotId, simpleName.toLowerCase()) as Array<{ file: string; kind: string }>;
+  addMatches(rowsBySimpleName);
+
+  const matches = [...allMatches.values()];
+  if (matches.length > 0) {
+    return { matches, suggestions: [] };
+  }
+
+  const suggestions = await findSimilarMethodCandidates(db, snapshotId, simpleName.toLowerCase());
+  return { matches, suggestions };
+}
+
+function normalizeMethodSpec(value: string): string {
+  const collapsed = value.trim().replace(/^["'`]|["'`]$/g, '').replace(/[;,]$/, '');
+  const withoutSignature = collapsed.replace(/\([^)]*\)$/g, '');
+  return withoutSignature.replace(/::/g, '.');
+}
+
+async function findSimilarMethodCandidates(db: CodeGraphDb, snapshotId: string, expected: string): Promise<string[]> {
+  const trimmed = expected.trim().toLowerCase();
+  if (trimmed.length < 3) return [];
+  const seed = escapeLikePattern(trimmed.slice(0, Math.min(3, trimmed.length)));
+  const pattern = `%${seed}%`;
+  const rows = await db.prepare(`
+    SELECT simple_name, fq_name, kind
+    FROM symbols
+    WHERE snapshot_id = ?
+      AND (
+        lower(simple_name) LIKE ? ESCAPE '\\' OR
+        lower(fq_name) LIKE ? ESCAPE '\\'
+      )
+  `).all(snapshotId, pattern, pattern) as Array<{
+    simple_name: string;
+    fq_name: string;
+    kind: string;
+  }>;
+
+  const scoredCandidates = rows
+    .map(row => {
+      const names = uniqueStrings([row.simple_name ?? '', row.fq_name ?? '']).filter(Boolean).map(value => value.toLowerCase());
+      const bestDistance = Math.min(...names.map(name => levenshteinDistance(trimmed, name)));
+      if (bestDistance > Math.max(3, Math.ceil(Math.max(trimmed.length, Math.max(row.simple_name.length, row.fq_name.length)) * 0.35))) {
+        return null;
+      }
+      const labelName = row.fq_name && row.fq_name !== row.simple_name ? row.fq_name : row.simple_name;
+      return { label: `${row.kind}: ${labelName}`, distance: bestDistance };
+    })
+    .filter((entry): entry is { label: string; distance: number } => entry !== null);
+  scoredCandidates.sort((a, b) => (a.distance - b.distance) || a.label.localeCompare(b.label));
+  return [...new Set(scoredCandidates.map(candidate => candidate.label))].slice(0, 8);
+}
+
+function levenshteinDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a) return b.length;
+  if (!b) return a.length;
+
+  const dp = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const temp = dp[j];
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[j] = Math.min(
+        dp[j] + 1,
+        dp[j - 1] + 1,
+        prev + cost,
+      );
+      prev = temp;
+    }
+  }
+  return dp[b.length];
 }
 
 async function matchIndexedFiles(db: CodeGraphDb, snapshotId: string, expected: string): Promise<string[]> {
@@ -620,10 +806,13 @@ interface TokenLedgerAccumulator {
   compactPacketTokens: number;
   exactFollowupTokens: number;
   fallbackShellTokens: number;
+  shellAfterExactFollowupTokens: number;
+  shellAfterExactFollowupCalls: number;
   grossSavedTokens: number;
   budgetedMcpCalls: number;
   unbudgetedMcpCalls: number;
   firstBudgetedMcpTool?: string;
+  sawExactSourceFollowup: boolean;
 }
 
 interface ResponseBudgetObservation {
@@ -637,17 +826,22 @@ function createTokenLedgerAccumulator(): TokenLedgerAccumulator {
     compactPacketTokens: 0,
     exactFollowupTokens: 0,
     fallbackShellTokens: 0,
+    shellAfterExactFollowupTokens: 0,
+    shellAfterExactFollowupCalls: 0,
     grossSavedTokens: 0,
     budgetedMcpCalls: 0,
     unbudgetedMcpCalls: 0,
+    sawExactSourceFollowup: false,
   };
 }
 
 function recordMcpToolResult(ledger: TokenLedgerAccumulator, toolName: string, resultText: string): void {
+  const isExactSourceFollowup = EXACT_SOURCE_FOLLOWUP_TOOLS.has(toolName);
   const budgets = extractResponseBudgetObservations(resultText);
   if (budgets.length === 0) {
     ledger.unbudgetedMcpCalls++;
     if (ledger.firstBudgetedMcpTool) ledger.exactFollowupTokens += estimateTokens(resultText);
+    if (isExactSourceFollowup) ledger.sawExactSourceFollowup = true;
     return;
   }
 
@@ -664,10 +858,16 @@ function recordMcpToolResult(ledger: TokenLedgerAccumulator, toolName: string, r
   }
 
   ledger.exactFollowupTokens += responseTokens;
+  if (isExactSourceFollowup) ledger.sawExactSourceFollowup = true;
 }
 
 function recordShellToolResult(ledger: TokenLedgerAccumulator, resultText: string): void {
-  ledger.fallbackShellTokens += estimateTokens(resultText);
+  const tokens = estimateTokens(resultText);
+  ledger.fallbackShellTokens += tokens;
+  if (ledger.sawExactSourceFollowup) {
+    ledger.shellAfterExactFollowupTokens += tokens;
+    ledger.shellAfterExactFollowupCalls++;
+  }
 }
 
 function finalizeTokenLedger(
@@ -696,6 +896,8 @@ function finalizeTokenLedger(
     compactPacketTokens: ledger.compactPacketTokens,
     exactFollowupTokens: ledger.exactFollowupTokens,
     fallbackShellTokens: ledger.fallbackShellTokens,
+    shellAfterExactFollowupTokens: ledger.shellAfterExactFollowupTokens,
+    shellAfterExactFollowupCalls: ledger.shellAfterExactFollowupCalls,
     grossSavedTokens: ledger.grossSavedTokens,
     netSavedTokens,
     budgetedMcpCalls: ledger.budgetedMcpCalls,
@@ -815,7 +1017,8 @@ function runCodexTask(options: {
   }
 
   const started = Date.now();
-  const result = spawnSync(options.codexCommand, [...options.codexCommandArgs, ...args], {
+  const invocation = buildCodexSpawnInvocation(options.codexCommand, [...options.codexCommandArgs, ...args]);
+  const result = spawnSync(invocation.command, invocation.args, {
     cwd: options.root,
     env,
     encoding: 'utf-8',
@@ -844,6 +1047,21 @@ function runCodexTask(options: {
     outputPath,
     errorPath,
     quality: scoreCodexOutput(options.task, parsed.finalOutput),
+  };
+}
+
+export function buildCodexSpawnInvocation(
+  command: string,
+  args: string[],
+  platform: string = process.platform,
+): CodexSpawnInvocation {
+  const basename = path.basename(command.replace(/^["']|["']$/g, ''));
+  const isWindows = platform === 'win32';
+  const isCmdOrBat = /\.cmd$/i.test(basename) || /\.bat$/i.test(basename);
+  if (!isWindows || !isCmdOrBat || /^cmd\.exe$/i.test(basename)) return { command, args };
+  return {
+    command: 'cmd.exe',
+    args: ['/c', command, ...args],
   };
 }
 
@@ -891,6 +1109,7 @@ function writeCodexMcpConfig(options: {
     '--no-prewarm',
   ];
   if (envFlag('CODEGRAPH_CODEX_BENCH_AUTO_REFRESH')) args.push('--auto-refresh');
+  args.push('--mcp-profile', 'full');
   const config = `[mcp_servers.codegraph_bench]
 command = ${tomlString(cli.command)}
 args = [
@@ -908,7 +1127,9 @@ ${args.map(arg => `  ${tomlString(arg)},`).join('\n')}
   return { path: configPath, overrides };
 }
 
-function promptForMode(task: CodexE2eTask, mode: CodexBenchmarkMode): string {
+const POST_SLICE_STOP_RULE = 'After codegraph_slice/get_file_slice returns source, treat it as the terminal exact follow-up: do not call shell, do not call rg, do not call search/read tools, and answer from the returned slice plus prior packet.';
+
+export function promptForMode(task: CodexE2eTask, mode: CodexBenchmarkMode): string {
   const prompt = task.prompt;
   switch (mode) {
     case 'baseline':
@@ -924,28 +1145,33 @@ function promptForMode(task: CodexE2eTask, mode: CodexBenchmarkMode): string {
     case 'mcp-only':
       return [
         'Use CodeGraph MCP server codegraph_bench only. Do not use shell/search/read fallback. Do not modify files.',
+        POST_SLICE_STOP_RULE,
         prompt,
       ].join('\n\n');
     case 'mcp-first':
       return [
         'Use CodeGraph MCP server codegraph_bench first. Use shell/search/read only if CodeGraph evidence is missing. Do not modify files.',
+        POST_SLICE_STOP_RULE,
         prompt,
       ].join('\n\n');
     case 'compiled-packet':
       return [
         'Use CodeGraph MCP server codegraph_bench only for context acquisition. Start with compile_evidence using the full task, inferred task_type, budget_tokens=5000, and required answer fields as quality_rubric. If compile_evidence returns answerable=true, answer immediately from its evidence ids. If it is not answerable, use only allowedFollowups from the packet. Do not use shell/search/read fallback unless compile_evidence explicitly returns a shell allowedFollowup.',
+        POST_SLICE_STOP_RULE,
         compiledPacketTaskHints(task, false),
         prompt,
       ].join('\n\n');
     case 'compiled-packet+gate':
       return [
         'Use CodeGraph MCP server codegraph_bench only. Hard gate: call compile_evidence first. When answerable=true, make zero additional tool calls and answer from the evidence packet. When answerable=false, make at most one listed allowedFollowup, then answer or report the missing rubric item. Do not use broad shell/search/read fallback.',
+        POST_SLICE_STOP_RULE,
         compiledPacketTaskHints(task, false),
         prompt,
       ].join('\n\n');
     case 'oracle-packet':
       return [
         'Use CodeGraph MCP server codegraph_bench only. Call compile_evidence once with the full task, inferred task_type, budget_tokens=5000, and the provided oracle quality_rubric. Then answer only from that packet. Do not call any other tool unless compile_evidence says answerable=false and lists exactly one allowedFollowup.',
+        POST_SLICE_STOP_RULE,
         compiledPacketTaskHints(task, true),
         prompt,
       ].join('\n\n');
@@ -1014,6 +1240,8 @@ function aggregateReport(input: Omit<CodexE2eBenchmarkReport, 'aggregate'>): Cod
     compactPacketTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.compactPacketTokens, 0),
     exactFollowupTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.exactFollowupTokens, 0),
     fallbackShellTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.fallbackShellTokens, 0),
+    shellAfterExactFollowupTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.shellAfterExactFollowupTokens, 0),
+    shellAfterExactFollowupCalls: input.runs.reduce((sum, run) => sum + run.tokenLedger.shellAfterExactFollowupCalls, 0),
     grossSavedTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.grossSavedTokens, 0),
     netSavedTokens: input.runs.reduce((sum, run) => sum + run.tokenLedger.netSavedTokens, 0),
     budgetedMcpCalls: input.runs.reduce((sum, run) => sum + run.tokenLedger.budgetedMcpCalls, 0),
@@ -1055,6 +1283,7 @@ function defaultHadoopSuite(): CodexE2eSuite {
         'hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java',
         'hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java',
       ],
+      requiredMethods: ['getApps', 'withApplicationTags', 'getDataNode'],
     },
     tasks: [
       {
