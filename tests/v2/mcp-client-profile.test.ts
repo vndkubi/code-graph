@@ -39,6 +39,7 @@ describe('MCP full tool mode', () => {
     expect(MCP_SERVER_INSTRUCTIONS).toContain('After codegraph_slice/get_file_slice returns requested source');
     expect(MCP_SERVER_INSTRUCTIONS).toContain('do not call shell');
     expect(MCP_SERVER_INSTRUCTIONS).toContain('do not call rg');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('After get_flow_pack or get_research_pack returns answerable=true');
   });
 
   it('keeps named MCP profiles on the facade surface to avoid duplicate low-level choices', () => {
@@ -184,6 +185,8 @@ describe('MCP full tool mode', () => {
     expect(compact.find(tool => tool.name === 'review_patch')?.description).toContain('call FIRST');
     expect(compact.find(tool => tool.name === 'get_flow_pack')?.description).toContain('ONLY for explicit');
     expect(compact.find(tool => tool.name === 'get_flow_pack')?.description).toContain('debug');
+    expect(compact.find(tool => tool.name === 'get_flow_pack')?.description).toContain('answerable');
+    expect(compact.find(tool => tool.name === 'get_flow_pack')?.description).toContain('rg/shell');
     expect(estimatedSchemaTokens(compact)).toBeLessThan(estimatedSchemaTokens(normal));
   });
 });

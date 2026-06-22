@@ -2522,6 +2522,24 @@ export class V2QueryService {
       ...returnedDefinitions,
       ...candidateFiles,
     ], profile);
+    const disallowedFollowups = [
+      'shell_rg',
+      'shell_search',
+      'shell_read_loop',
+      'broad_shell_search',
+      'unbounded_file_reads',
+      'unbounded_mcp_exploration',
+    ];
+    const allowedFollowups = sufficientForAnswer
+      ? []
+      : evidenceHandles.slice(0, 1).map(handle => ({
+        ...handle,
+        reason: `Only use this exact follow-up to resolve missing fact: ${missingFacts[0]}`,
+      }));
+    const maxAdditionalCalls = allowedFollowups.length;
+    const stopRule = sufficientForAnswer
+      ? 'Do not call rg, shell, search_code, search_symbol, get_file_slice, or broad file reads; answer from this get_flow_pack packet.'
+      : 'Do not call rg or shell search. Use only allowedFollowups for the listed missingFacts, then answer or report the missing fact.';
     const returnedPayloadForBudget = {
       flowSteps: returnedFlowSteps,
       definitionCandidates: returnedDefinitions,
@@ -2556,11 +2574,11 @@ export class V2QueryService {
       ? [
         'Answer directly from this pack.',
         'Treat evidenceSlices as already-read source; cite file and line ranges from them.',
-        'Do not call search_code, search_symbol, get_file_slice, grep, or Read unless the user asks for more detail.',
+        'Do not call rg, shell search, search_code, search_symbol, get_file_slice, grep, or Read unless the user asks for more detail.',
       ]
       : [
         'This pack is incomplete; perform only the targeted follow-up named in missingFacts.',
-        'Prefer one get_file_slice for a listed missing file/range over broad grep/read loops.',
+        'Prefer one allowedFollowup for a listed missing file/range over broad rg/shell/read loops.',
       ];
     const nextAction = sufficientForAnswer
       ? 'Answer the user directly from flowSteps and evidenceSlices.'
@@ -2602,11 +2620,19 @@ export class V2QueryService {
         responseMode,
         tokenBudget,
         profile,
+        answerable: sufficientForAnswer,
+        allowedFollowups,
+        disallowedFollowups,
+        maxAdditionalCalls,
+        stopRule,
         routing: {
           intendedUse: 'answer-ready architecture/research context',
           expectedToolCalls: sufficientForAnswer ? 1 : 2,
           answerDirectly: sufficientForAnswer,
-          followUpRule: 'Use get_file_slice only for a specific item listed in missingFacts.',
+          maxAdditionalCalls,
+          followUpRule: sufficientForAnswer
+            ? stopRule
+            : 'Do not call rg or shell search; use only allowedFollowups for specific items listed in missingFacts.',
         },
         flowSteps: returnedFlowSteps,
         definitionCandidates: returnedDefinitions,
@@ -2646,8 +2672,16 @@ export class V2QueryService {
         intendedUse: 'answer-ready architecture/research context',
         expectedToolCalls: sufficientForAnswer ? 1 : 2,
         answerDirectly: sufficientForAnswer,
-        followUpRule: 'Use search_code/search_symbol/get_file_slice only for a specific item listed in missingFacts.',
+        maxAdditionalCalls,
+        followUpRule: sufficientForAnswer
+          ? stopRule
+          : 'Do not call rg or shell search; use only allowedFollowups for specific items listed in missingFacts.',
       },
+      answerable: sufficientForAnswer,
+      allowedFollowups,
+      disallowedFollowups,
+      maxAdditionalCalls,
+      stopRule,
       seedTerms: returnedSeedTerms,
       flowSteps: returnedFlowSteps,
       definitionCandidates: returnedDefinitions,

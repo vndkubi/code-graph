@@ -374,7 +374,7 @@ function descriptionFor(name: V2ToolName, options: V2ToolDefinitionOptions = {})
     case 'codegraph_slice':
       return 'FOLLOW-UP ONLY after codegraph_context names exact missing evidence. Returns one or many bounded source slices for specific files, line ranges, or symbols; do not use as the first tool for broad repo questions.';
     case 'get_flow_pack':
-      return 'PRIMARY endpoint/API/request-flow tool - call FIRST ONLY for explicit route, endpoint, API, request-flow, startup-flow, or handler-flow tracing. Default responseMode=agent returns ordered steps, ranked files/symbols, call evidence, capped source slices, taskOracle, and evidenceHandles. For implementation, debug, refactor, bug, or spec planning prompts, use get_change_pack instead.';
+      return 'PRIMARY endpoint/API/request-flow tool - call FIRST ONLY for explicit route, endpoint, API, request-flow, startup-flow, or handler-flow tracing. Default responseMode=agent returns ordered steps, ranked files/symbols, call evidence, capped source slices, taskOracle, evidenceHandles, answerable, allowedFollowups, disallowedFollowups, and a stopRule. If answerable=true, answer from the packet and do not use rg/shell search. For implementation, debug, refactor, bug, or spec planning prompts, use get_change_pack instead.';
     case 'get_research_pack':
       return 'PRIMARY broad architecture/research tool - call FIRST for onboarding, surveying an area, "where/what is X", or "how does X work" when no concrete endpoint/API path or edit is named. Returns ranked definitions, flow steps, related edges, top files, bounded evidence, budget metrics, and evidenceHandles. For edit/debug/spec tasks, use get_change_pack.';
     case 'get_context_packet':
@@ -435,7 +435,7 @@ function compactDescriptionFor(name: V2ToolName): string {
     case 'codegraph_slice':
       return 'FOLLOW-UP ONLY after codegraph_context names exact missing file/line/symbol evidence. Exact bounded slice(s), batch via slices[].';
     case 'get_flow_pack':
-      return 'PRIMARY API/endpoint/request-flow pack - call FIRST ONLY for explicit route/API/request-flow tracing. For edit/debug/spec use get_change_pack.';
+      return 'PRIMARY API/endpoint/request-flow pack - call FIRST ONLY for explicit route/API/request-flow tracing. Returns answerable, stopRule, and rg/shell bans; for edit/debug/spec use get_change_pack.';
     case 'get_research_pack':
       return 'PRIMARY architecture/research pack - call FIRST for onboarding, surveying an area, where/what is X, or how X works. For edit/debug/spec use get_change_pack.';
     case 'get_context_packet':

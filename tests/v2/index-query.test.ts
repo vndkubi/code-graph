@@ -1351,7 +1351,11 @@ public class PaymentService {
       taskType: string;
       responseMode: string;
       profile: string;
-      routing: { answerDirectly: boolean };
+      answerable: boolean;
+      allowedFollowups: Array<{ tool: string }>;
+      disallowedFollowups: string[];
+      stopRule: string;
+      routing: { answerDirectly: boolean; followUpRule: string };
       evidenceSlices: Array<{ text: string }>;
       evidenceHandles: Array<{ tool: string }>;
       compressedEvidence: { factCards: unknown[] };
@@ -1361,6 +1365,12 @@ public class PaymentService {
     expect(flowPack.taskType).toBe('architecture');
     expect(flowPack.responseMode).toBe('agent');
     expect(flowPack.profile).toBe('compact');
+    expect(flowPack.answerable).toBe(true);
+    expect(flowPack.allowedFollowups).toEqual([]);
+    expect(flowPack.disallowedFollowups).toContain('shell_rg');
+    expect(flowPack.disallowedFollowups).toContain('broad_shell_search');
+    expect(flowPack.stopRule).toContain('Do not call rg');
+    expect(flowPack.routing.followUpRule).toContain('Do not call rg');
     expect(flowPack.routing.answerDirectly).toBe(true);
     expect(flowPack.evidenceSlices.some(slice => slice.text.includes('processRefund'))).toBe(true);
     expect(flowPack.evidenceHandles.some(handle => handle.tool === 'get_file_slice')).toBe(true);

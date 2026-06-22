@@ -617,6 +617,10 @@ same first-tool rules still apply.
 
 - Treat evidenceSlices as already-read source. They include file paths, line
   ranges, and capped source text.
+- After get_flow_pack or get_research_pack returns answerable=true or
+  sufficientForAnswer=true, answer from the packet; do not call rg, shell
+  search, search_code, search_symbol, or read loops unless the user explicitly
+  asks for more detail.
 - After codegraph_slice/get_file_slice returns requested source, answer from
   that slice plus the prior packet; do not call shell, do not call rg, and do
   not start another search/read loop for the same file or symbol.
