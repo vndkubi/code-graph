@@ -351,7 +351,7 @@ export function parseToolArgs(name: string, args: unknown): Record<string, unkno
 
 export function mcpToolNamesForProfile(profile: string | undefined): Set<string> | undefined {
   const normalized = normalizeMcpToolProfile(profile);
-  if (!normalized) return undefined;
+  if (!normalized) return new Set(V2_TOOL_PROFILES.client);
   return new Set(V2_TOOL_PROFILES[normalized]);
 }
 
@@ -374,7 +374,7 @@ function descriptionFor(name: V2ToolName, options: V2ToolDefinitionOptions = {})
     case 'codegraph_slice':
       return 'FOLLOW-UP ONLY after codegraph_context names exact missing evidence. Returns one or many bounded source slices for specific files, line ranges, or symbols; do not use as the first tool for broad repo questions.';
     case 'get_flow_pack':
-      return 'PRIMARY endpoint/API/investigation/request-flow tool - call FIRST when the task asks to trace a route, endpoint, API, request flow, startup flow, or how data reaches another layer. Default responseMode=agent returns ordered steps, ranked files/symbols, call evidence, capped source slices, taskOracle, and evidenceHandles. For implementation/debug/refactor/spec planning, use get_change_pack instead.';
+      return 'PRIMARY endpoint/API/request-flow tool - call FIRST ONLY for explicit route, endpoint, API, request-flow, startup-flow, or handler-flow tracing. Default responseMode=agent returns ordered steps, ranked files/symbols, call evidence, capped source slices, taskOracle, and evidenceHandles. For implementation, debug, refactor, bug, or spec planning prompts, use get_change_pack instead.';
     case 'get_research_pack':
       return 'PRIMARY broad architecture/research tool - call FIRST for onboarding, surveying an area, "where/what is X", or "how does X work" when no concrete endpoint/API path or edit is named. Returns ranked definitions, flow steps, related edges, top files, bounded evidence, budget metrics, and evidenceHandles. For edit/debug/spec tasks, use get_change_pack.';
     case 'get_context_packet':
@@ -414,7 +414,7 @@ function descriptionFor(name: V2ToolName, options: V2ToolDefinitionOptions = {})
     case 'simulate_patch_impact':
       return 'Simulate patch impact from changed files, symbols, or a unified diff. Default outputMode=compact/maxResponseTokens caps broad graph rows while preserving touched symbols, dependency/call counts, endpoints, likely tests, validation commands, and risk flags; use outputMode=full only when expanded evidence is needed.';
     case 'review_patch':
-      return 'Build a budgeted code review packet from changed files, symbols, or a unified diff: verdict, top findings, risky hunks, capped evidence, validation gaps, and next tool calls. Use outputMode=full only when the agent explicitly needs expanded evidence.';
+      return 'PRIMARY review tool - call FIRST for code review prompts with changed files, symbols, or a unified diff: verdict, top findings, risky hunks, capped evidence, validation gaps, and next tool calls. Use outputMode=full only when the agent explicitly needs expanded evidence.';
     case 'find_tests_for':
       return 'Find tests likely relevant to a symbol using test file names, test symbols, and indexed call edges.';
     case 'search_code':
@@ -435,7 +435,7 @@ function compactDescriptionFor(name: V2ToolName): string {
     case 'codegraph_slice':
       return 'FOLLOW-UP ONLY after codegraph_context names exact missing file/line/symbol evidence. Exact bounded slice(s), batch via slices[].';
     case 'get_flow_pack':
-      return 'PRIMARY API/endpoint/request-flow pack - call FIRST to trace routes, APIs, flows, or how data reaches another layer. For edit/debug/spec use get_change_pack.';
+      return 'PRIMARY API/endpoint/request-flow pack - call FIRST ONLY for explicit route/API/request-flow tracing. For edit/debug/spec use get_change_pack.';
     case 'get_research_pack':
       return 'PRIMARY architecture/research pack - call FIRST for onboarding, surveying an area, where/what is X, or how X works. For edit/debug/spec use get_change_pack.';
     case 'get_context_packet':
@@ -443,7 +443,7 @@ function compactDescriptionFor(name: V2ToolName): string {
     case 'get_change_pack':
       return 'PRIMARY change pack - call FIRST before implement/debug/refactor/test/edit tasks. Returns scoped files/symbols, edit handles, risks, tests, validation.';
     case 'compile_evidence':
-      return 'PRIMARY TokenOpt-style evidence compiler/cost gate for repo tasks and PBIs: answerability, compact evidence, exact follow-ups, stop rules.';
+      return 'PRIMARY TokenOpt-style evidence compiler/cost gate - call FIRST for repo tasks, PBIs, answerability, or rubric coverage. Exact follow-ups, stop rules.';
     case 'search_symbol':
       return 'FOLLOW-UP ONLY symbol lookup after a pack names a missing symbol. Includes ranking, facets, pagination.';
     case 'search_files':
@@ -475,7 +475,7 @@ function compactDescriptionFor(name: V2ToolName): string {
     case 'simulate_patch_impact':
       return 'Capped patch impact from files/symbols/diff: touched symbols, graph impact counts, endpoints, tests, risks.';
     case 'review_patch':
-      return 'Budgeted review packet from files/symbols/diff: verdict, findings, risky hunks, evidence, validation gaps.';
+      return 'PRIMARY review packet - call FIRST for files/symbols/diff: verdict, findings, risky hunks, evidence, validation gaps.';
     case 'find_tests_for':
       return 'Find tests relevant to a symbol using names, test symbols, call edges.';
     case 'search_code':

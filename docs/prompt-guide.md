@@ -56,7 +56,7 @@ Draw a Mermaid flowchart and cite concrete files/methods.
 Stronger version:
 
 ```text
-Use CodeGraph MCP. Start with get_flow_pack for <METHOD /path or handler symbol>.
+Use CodeGraph MCP. Start with codegraph_context for <METHOD /path or handler symbol>; it will route to the right flow packet.
 Trace handler -> request object -> service layer -> downstream dependencies -> response.
 Include tests and risks. Return a Mermaid flowchart plus a short explanation.
 ```
@@ -103,7 +103,7 @@ Do not edit files yet.
 Stronger version:
 
 ```text
-Use CodeGraph MCP. Start with get_change_pack for <feature/change>.
+Use CodeGraph MCP. Start with codegraph_context for <feature/change>; it will route to the change packet.
 Return a step-by-step implementation plan with target files, symbols to modify, likely tests, risks, and validation commands.
 ```
 
@@ -139,7 +139,7 @@ Do not make unsupported claims.
 Stronger version:
 
 ```text
-Use CodeGraph MCP. Start with review_patch for this diff, then inspect only the required follow-up slices.
+Use CodeGraph MCP. Start with codegraph_context for this diff, then inspect only the required follow-up slices.
 Return findings first, ordered by severity. If there are no issues, say so and list residual test gaps.
 
 <paste diff>
@@ -277,16 +277,20 @@ target, summary, keyFiles, keySymbols, flowSteps, risks, tests, confidence.
 
 ## When To Mention A Tool Name
 
-Most prompts should not mention tool names. Mention a first tool only when you want repeatable benchmark behavior or the task is broad.
+Most prompts should not mention direct packet tool names. In the default/client
+MCP profile, the only first-tool hint should be `codegraph_context`; it routes
+to the right internal packet. Mention direct packet tools only when running with
+`--mcp-profile full` or when you need repeatable benchmark behavior.
 
 | If the task is... | Optional first-tool hint |
 | --- | --- |
-| API or method flow | `Start with get_flow_pack.` |
-| Feature implementation or refactor | `Start with get_change_pack.` |
-| Broad investigation | `Start with get_research_pack.` |
-| Code review with a diff | `Start with review_patch.` |
-| Exact symbol lookup | `Use search_symbol only if the pack misses the symbol.` |
-| Exact source quote needed | `Use get_file_slice after the pack identifies the file.` |
+| API or method flow | `Start with codegraph_context; it routes flow tasks to get_flow_pack.` |
+| Bug, debug, fix, implementation, or refactor, even if it mentions flow | `Start with codegraph_context; it routes change tasks to get_change_pack.` |
+| Feature implementation or refactor | `Start with codegraph_context; it routes change tasks to get_change_pack.` |
+| Broad investigation | `Start with codegraph_context; it routes research tasks to get_research_pack.` |
+| Code review with a diff | `Start with codegraph_context; it routes diff review to review_patch.` |
+| Exact symbol lookup | `Use search_symbol only as a full-profile follow-up if the packet misses the symbol.` |
+| Exact source quote needed | `Use codegraph_slice after the packet identifies the file, or get_file_slice in full profile.` |
 
 ## Anti-Patterns
 

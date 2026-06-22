@@ -47,7 +47,8 @@ class McpStructuredError extends Error {
 }
 
 export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
-  const allowedToolNames = mcpToolNamesForProfile(options.mcpProfile);
+  const activeMcpProfile = options.mcpProfile ?? 'client';
+  const allowedToolNames = mcpToolNamesForProfile(activeMcpProfile);
   const toolDefinitions = allowedToolNames
     ? V2_TOOL_DEFINITIONS.filter(tool => allowedToolNames.has(tool.name))
     : V2_TOOL_DEFINITIONS;
@@ -174,7 +175,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
             text: JSON.stringify({
               error: {
                 code: 'tool_not_available_in_profile',
-                message: `Tool ${request.params.name} is not available in MCP profile ${options.mcpProfile}. Use codegraph_context or codegraph_slice, or run with --mcp-profile full.`,
+                message: `Tool ${request.params.name} is not available in MCP profile ${activeMcpProfile}. Use codegraph_context or codegraph_slice, or run with --mcp-profile full.`,
               },
             }),
           }],
@@ -437,11 +438,23 @@ export function inferCodeGraphContextMode(task: string, args: Record<string, unk
   }
   const text = `${task}\n${typeof args.diff === 'string' ? args.diff.slice(0, 2000) : ''}`.toLowerCase();
   if (typeof args.diff === 'string' && args.diff.trim().length > 0) return 'review';
-  if (/\b(review|diff|pr|regression|risk|finding)\b|\bpatch\b(?!\s*\/)/.test(text)) return 'review';
-  if (/\b(get|post|put|delete|patch)\s+\/|\b(endpoint|api|route|request flow|trace|flow)\b/.test(text)) return 'flow';
+  if (/\b(review|diff|pr|risk|finding)\b|\bpatch\b(?!\s*\/)/.test(text)) return 'review';
   if (/\b(evidence|answerable|rubric|coverage|pbi|ticket|story|acceptance criteria)\b/.test(text)) return 'evidence';
-  if (/\b(implement|fix|debug|refactor|change|modify|test|add|remove|update)\b/.test(text)) return 'change';
+  if (hasChangeIntent(text)) return 'change';
+  if (hasExplicitFlowIntent(text)) return 'flow';
   return 'research';
+}
+
+function hasChangeIntent(text: string): boolean {
+  return /\b(implement|fix|debug|refactor|change|modify|test|add|remove|update|bug|regression|failure|failing|root cause)\b/.test(text)
+    || /\binvestigate\b.*\b(bug|issue|error|failure|failing|regression|timeout|wrong|slow|root cause)\b/.test(text)
+    || /\bwhy\b.*\b(fail|fails|failing|error|timeout|wrong|slow|happen|happens)\b/.test(text);
+}
+
+function hasExplicitFlowIntent(text: string): boolean {
+  return /\b(get|post|put|delete|patch)\s+\//.test(text)
+    || /\b(endpoint|api|route|request flow|startup flow|method flow|handler flow|rpc)\b/.test(text)
+    || /\btrace\b.*\b(flow|route|endpoint|api|handler|request)\b/.test(text);
 }
 
 async function codegraphStatus(
@@ -556,26 +569,36 @@ function freshnessArgs(args: Record<string, unknown>): Record<string, unknown> {
   });
 }
 
-const MCP_SERVER_INSTRUCTIONS = `# CodeGraph usage
+export const MCP_SERVER_INSTRUCTIONS = `# CodeGraph usage
 
-CodeGraph is the PRIMARY local repository context server. Call codegraph_context
-FIRST for almost any repo question or before an edit: investigate code, explain
-how X works, explore architecture, trace endpoint/request flows, debug bugs,
-plan changes, assess impact, review risk, or compile compact PBI evidence. It
-combines a pre-indexed SQLite code graph with TokenOpt-style evidence packets so
-you do not need to rediscover structure through grep/read loops.
+These MCP initialize instructions are the single source of truth for how an AI
+agent should use CodeGraph tools. The agent also sees the active tools/list
+descriptions; together they are how it knows what it can call.
+
+CodeGraph is the PRIMARY local repository context server. It combines a
+pre-indexed SQLite code graph with TokenOpt-style evidence packets so you do
+not need to rediscover structure through grep/read loops.
+
+## Tool surface
+
+Default/client profile exposes only codegraph_context, codegraph_slice, and codegraph_status.
+If unsure, call codegraph_context first with the user's full task text.
+Full profile exposes direct pack tools for benchmark/power-user flows, but the
+same first-tool rules still apply.
 
 ## Tool selection by intent
 
 - Almost any repository question or pre-edit investigation:
   call codegraph_context first with the user's full task text.
 - Endpoint/API/route/request-flow/startup-flow questions:
-  codegraph_context routes to get_flow_pack; in full profile you may call
-  get_flow_pack first only when that flow intent is explicit.
+  codegraph_context routes to get_flow_pack; in full profile call
+  get_flow_pack only for explicit endpoint/API/request-flow tracing.
 - Architecture, onboarding, "where/what is X", or "how does X work":
   codegraph_context routes to get_research_pack.
 - Implement, fix, debug, refactor, test, modify, or "what should I change":
-  codegraph_context routes to get_change_pack before editing.
+  codegraph_context routes to get_change_pack before editing; in full profile
+  use get_change_pack for implement/fix/debug/refactor/test/edit tasks even
+  when they mention a request flow.
 - Review with a unified diff:
   codegraph_context routes to review_patch.
 - Compact evidence, answerability, rubric, PBI, or coverage gate:
@@ -583,6 +606,12 @@ you do not need to rediscover structure through grep/read loops.
 - Reading source:
   use codegraph_slice/get_file_slice only after a pack identifies exact
   file/line/symbol evidence or a specific missing fact.
+
+- FOLLOW-UP ONLY tools:
+  search_symbol, search_files, search_code, find_references, get_callers,
+  get_callees, get_dependencies, get_dependents, and get_file_slice are not
+  first calls for broad repo work. Use them only for exact missing facts named
+  by the context packet or when the user asks for that exact known symbol/path.
 
 ## Follow-up policy
 
@@ -594,7 +623,7 @@ you do not need to rediscover structure through grep/read loops.
   search_code.
 - Preserve HTTP methods and paths exactly, for example GET /ws/v1/cluster/apps.
 - Do not set autoRefresh=true unless the user explicitly asks for a fresh index.
-- Do not set warnStale=true during exploration benchmarks.
+- Avoid forcing warnStale=true for every tool during exploration benchmarks unless freshness is part of the benchmark objective.
 
 ## Anti-patterns
 

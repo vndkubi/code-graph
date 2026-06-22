@@ -4,19 +4,21 @@ This guide explains how to get reliable answers from CodeGraph MCP during real c
 
 ## The Short Version
 
-Do not use free-form `MCP-first` as the default for every task. For answerable
-investigation, review, and planning tasks, ask CodeGraph to compile one bounded
-evidence packet, then stop when the packet says it is answerable.
+Do not use free-form `MCP-first` as the default for every task. In the
+default/client MCP profile, ask CodeGraph to start with `codegraph_context`.
+That facade routes to the right internal packet, then the agent should stop when
+the packet says it is answerable.
 
 ```text
-Use CodeGraph MCP compile_evidence first.
+Use CodeGraph MCP. Start with codegraph_context.
 Trace <target API/method/field/change>.
 Include handlers, service calls, callers/callees, dependencies, tests, and risks as a quality rubric.
 If answerable=true, do not search further; answer from the evidence ids.
 Cite repository-relative files and methods.
 ```
 
-For benchmark or audit runs, remove fallback:
+For full-profile benchmark or audit runs, remove fallback and name the direct
+tool intentionally:
 
 ```text
 Use CodeGraph MCP compile_evidence only. Do not use shell/read/write/edit.
@@ -88,24 +90,31 @@ Include applicationTags behavior, cache key, likely tests, and risks. Cite files
 
 ## Tool Choice
 
-You usually do not need to remember tool names. Ask for the task, and let the agent choose. Mention a first tool only when you want repeatable behavior.
+You usually do not need to remember tool names. The agent learns the available
+tools from the MCP `initialize` instructions plus the active `tools/list`
+descriptions. The default/client MCP profile intentionally exposes only the
+facade tools (`codegraph_context`, `codegraph_slice`, `codegraph_status`) so the
+agent starts with `codegraph_context` and drills down only when a packet names an
+exact follow-up. Mention a first tool only when you want repeatable behavior or
+when running with `--mcp-profile full`.
 
-| Task | Best first tool | Why |
+| Task | Default first tool | Internal/full-profile route | Why |
 | --- | --- | --- |
-| Answer-ready investigation, review, or planning | `compile_evidence` | Returns an answerability certificate, compact evidence ids, missing coverage, allowed exact follow-ups, and stop rules. |
-| API, RPC, handler, or method flow | `get_flow_pack` | Returns entry point, flow steps, callers/callees, tests, and risk hints. |
-| Broad investigation or architecture | `get_research_pack` | Finds ranked symbols, files, evidence slices, and follow-up hints. |
-| Implementation planning | `get_change_pack` | Produces target files, symbols, tests, edit plan, and validation hints. |
-| Code review | `review_patch` | Builds findings, risky hunks, impacted tests, and follow-up slices from a diff. |
-| Field, method, or constant impact | `find_references` | Finds definitions, calls, imports, and field usages when enabled. |
-| Exact source evidence | `get_file_slice` | Opens bounded file ranges after a pack has narrowed the context. |
-| Dependency or dependent analysis | `trace_dependencies` | Walks graph edges instead of broad text search. |
-| Index health | `get_index_stats` | Confirms counts, snapshot state, warnings, and freshness. |
+| Answer-ready investigation, review, or planning | `codegraph_context` | `compile_evidence` | Returns an answerability certificate, compact evidence ids, missing coverage, allowed exact follow-ups, and stop rules. |
+| API, RPC, handler, or method flow | `codegraph_context` | `get_flow_pack` | Returns entry point, flow steps, callers/callees, tests, and risk hints. |
+| Bug, debug, fix, implementation, or refactor, even if it mentions flow | `codegraph_context` | `get_change_pack` | Produces scoped files, symbols, edit handles, tests, risks, and validation hints. |
+| Broad investigation or architecture | `codegraph_context` | `get_research_pack` | Finds ranked symbols, files, evidence slices, and follow-up hints. |
+| Implementation planning | `codegraph_context` | `get_change_pack` | Produces target files, symbols, tests, edit plan, and validation hints. |
+| Code review | `codegraph_context` | `review_patch` | Builds findings, risky hunks, impacted tests, and follow-up slices from a diff. |
+| Field, method, or constant impact | `codegraph_context`, then `codegraph_slice` if needed | `find_references` | Finds definitions, calls, imports, and field usages when enabled. |
+| Exact source evidence | `codegraph_slice` after a packet | `get_file_slice` | Opens bounded file ranges after a pack has narrowed the context. |
+| Dependency or dependent analysis | `codegraph_context` | `trace_dependencies` | Walks graph edges instead of broad text search. |
+| Index health | `codegraph_status` | `get_index_stats` | Confirms counts, snapshot state, warnings, and freshness. |
 
-Recommended pattern:
+Recommended default/client pattern:
 
 ```text
-Use CodeGraph MCP compile_evidence for this task.
+Use CodeGraph MCP. Start with codegraph_context for this task.
 If answerable=true, answer from the packet and do not call more tools.
 If missing is non-empty, use only allowedFollowups from the packet.
 Do not open broad files or run broad shell search.
@@ -178,7 +187,7 @@ Expected quality:
 
 ```text
 Use CodeGraph MCP. Review this diff for correctness, security, performance, compatibility, and missing tests.
-Start with review_patch, then inspect only required follow-up slices.
+Start with codegraph_context, then inspect only required follow-up slices. In full profile, review_patch is the direct route.
 Findings first. Each finding must include severity, failure mode, affected file/method, and required test.
 
 <diff>

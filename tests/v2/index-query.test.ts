@@ -2796,7 +2796,8 @@ public class NoisyOrder${i} {
     expect(compactChars).toBeLessThan(normalChars * 0.75);
   });
 
-  it('uses a single full MCP tool mode and treats legacy profiles as aliases', () => {
+  it('uses client MCP tool mode by default and keeps full mode opt-in', () => {
+    expect(mcpToolNamesForProfile(undefined)).toEqual(new Set(V2_TOOL_PROFILES.client));
     expect(mcpToolNamesForProfile('client')).toEqual(new Set(V2_TOOL_PROFILES.client));
     expect(mcpToolNamesForProfile('minimal')).toEqual(new Set(V2_TOOL_PROFILES.minimal));
     expect(mcpToolNamesForProfile('research')).toEqual(new Set(V2_TOOL_PROFILES.research));

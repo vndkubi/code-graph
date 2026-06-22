@@ -121,11 +121,24 @@ function evaluateRouteGateTask(task: RouteGateTask): RouteGateTaskResult {
 function inferExpectedModeForRouteGate(task: string, input: RouteGateTask): CodeGraphContextMode {
   if (input.expectedMode) return input.expectedMode;
   if (input.diff) return 'review';
-  if (/\b(review|diff|pr|regression|finding)\b/i.test(task)) return 'review';
-  if (/\b(GET|POST|PUT|DELETE|PATCH)\s+\//.test(task) || /\b(endpoint|api|route|request flow)\b/i.test(task)) return 'flow';
-  if (/\b(evidence|answerable|rubric|coverage|pbi|ticket|story|acceptance criteria)\b/i.test(task)) return 'evidence';
-  if (/\b(implement|fix|debug|refactor|change|modify|test|add|remove|update)\b/i.test(task)) return 'change';
+  const text = task.toLowerCase();
+  if (/\b(review|diff|pr|risk|finding)\b|\bpatch\b(?!\s*\/)/.test(text)) return 'review';
+  if (/\b(evidence|answerable|rubric|coverage|pbi|ticket|story|acceptance criteria)\b/.test(text)) return 'evidence';
+  if (hasExpectedChangeIntent(text)) return 'change';
+  if (hasExpectedFlowIntent(text)) return 'flow';
   return 'research';
+}
+
+function hasExpectedChangeIntent(text: string): boolean {
+  return /\b(implement|fix|debug|refactor|change|modify|test|add|remove|update|bug|regression|failure|failing|root cause)\b/.test(text)
+    || /\binvestigate\b.*\b(bug|issue|error|failure|failing|regression|timeout|wrong|slow|root cause)\b/.test(text)
+    || /\bwhy\b.*\b(fail|fails|failing|error|timeout|wrong|slow|happen|happens)\b/.test(text);
+}
+
+function hasExpectedFlowIntent(text: string): boolean {
+  return /\b(get|post|put|delete|patch)\s+\//.test(text)
+    || /\b(endpoint|api|route|request flow|startup flow|method flow|handler flow|rpc)\b/.test(text)
+    || /\btrace\b.*\b(flow|route|endpoint|api|handler|request)\b/.test(text);
 }
 
 function expectedToolForMode(mode: CodeGraphContextMode): string {
