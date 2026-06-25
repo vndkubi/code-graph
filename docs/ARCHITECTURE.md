@@ -1,5 +1,25 @@
 # CodeGraph Architecture
 
+## Joint Flow with TokenOpt
+
+![Architecture diagram](architecture.svg)
+
+CodeGraph is the secondary evidence provider in the joint workflow. TokenOpt routes first; when a `code_graph` evidence gap remains, the agent calls `codegraph_context` to fill it.
+
+| Task type | Call order |
+| --- | --- |
+| Broad investigation / PBI | `contextgate_get_context` → if gap → `codegraph_context` |
+| Implement / write tests | `contextgate_get_context` → `codegraph_context` change/test pack |
+| Code review round 1 | `contextgate_get_context` (review_diff) + `get_change_pack` |
+| Code review round 2 | No MCPs — direct diff only |
+| Code review round 3 | `codegraph_context` only |
+| Exact file / symbol known | Direct read — skip both MCPs |
+
+Every response from CodeGraph includes `_codegraph_meta` (tool, duration_ms, response_chars, tokens_est, symbols_returned, call_edges_returned, files_returned) for cost tracking in the session log.
+
+---
+
+
 ## Summary
 
 CodeGraph now runs as a direct, per-workspace SQLite application:

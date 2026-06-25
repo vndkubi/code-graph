@@ -1,0 +1,142 @@
+<svg viewBox="0 0 900 720" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif" font-size="13">
+  <title>TokenOpt + CodeGraph Architecture</title>
+  <desc>Flow diagram showing how natural user prompts are routed through TokenOpt and CodeGraph MCPs to produce bounded evidence and answers.</desc>
+
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5 Z" fill="#333"/>
+    </marker>
+    <marker id="arr-red" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5 Z" fill="#e05252"/>
+    </marker>
+    <marker id="arr-green" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5 Z" fill="#3aaa6a"/>
+    </marker>
+    <marker id="arr-blue" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L0,7 L8,3.5 Z" fill="#4a80c4"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="900" height="720" fill="#ffffff" rx="12"/>
+
+  <!-- Band separators -->
+  <rect x="0" y="60" width="900" height="1" fill="#e0e0e0"/>
+  <rect x="0" y="190" width="900" height="1" fill="#e0e0e0"/>
+  <rect x="0" y="360" width="900" height="1" fill="#e0e0e0"/>
+  <rect x="0" y="520" width="900" height="1" fill="#e0e0e0"/>
+  <rect x="0" y="630" width="900" height="1" fill="#e0e0e0"/>
+
+  <!-- Band fills -->
+  <rect x="0" y="61" width="900" height="129" fill="#f8f8f8"/>
+  <rect x="0" y="191" width="900" height="169" fill="#fff"/>
+  <rect x="0" y="361" width="900" height="159" fill="#f8f8f8"/>
+  <rect x="0" y="521" width="900" height="109" fill="#fff"/>
+  <rect x="0" y="631" width="900" height="89" fill="#f8f8f8"/>
+
+  <!-- Title -->
+  <text x="450" y="36" text-anchor="middle" font-size="17" font-weight="700" fill="#111">TokenOpt + CodeGraph — Architecture &amp; Flow</text>
+
+  <!-- Row labels -->
+  <text x="14" y="82" font-size="10" font-weight="700" fill="#999">USER</text>
+  <text x="14" y="212" font-size="10" font-weight="700" fill="#999">AGENT</text>
+  <text x="14" y="382" font-size="10" font-weight="700" fill="#999">MCP</text>
+  <text x="14" y="542" font-size="10" font-weight="700" fill="#999">EVIDENCE</text>
+  <text x="14" y="652" font-size="10" font-weight="700" fill="#999">OUTPUT</text>
+
+  <!-- ── ROW 1: USER ── -->
+  <rect x="320" y="70" width="260" height="54" rx="8" fill="#ddeaff" stroke="#4a80c4" stroke-width="1.5"/>
+  <text x="450" y="91" text-anchor="middle" font-size="12" font-weight="700" fill="#2a5fa0">User types a natural prompt</text>
+  <text x="450" y="109" text-anchor="middle" font-size="11" fill="#444">"Investigate PBI-42 and create a plan"</text>
+
+  <!-- ── ROW 2: AGENT ── -->
+  <line x1="450" y1="124" x2="450" y2="198" stroke="#333" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="100" y="202" width="620" height="140" rx="8" fill="none" stroke="#ccc" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="170" y="222" font-size="11" font-weight="700" fill="#888">Agent (Codex / Copilot) — guided by installed SERVER_INSTRUCTIONS</text>
+
+  <!-- Decision diamond -->
+  <polygon points="450,235 500,262 450,289 400,262" fill="#fff9e6" stroke="#e0a020" stroke-width="1.5"/>
+  <text x="450" y="257" text-anchor="middle" font-size="11" font-weight="600" fill="#b07010">Broad task?</text>
+  <text x="450" y="271" text-anchor="middle" font-size="10" fill="#b07010">Unknown owner?</text>
+
+  <!-- YES arrow down -->
+  <line x1="450" y1="289" x2="450" y2="355" stroke="#3aaa6a" stroke-width="1.5" marker-end="url(#arr-green)"/>
+  <text x="458" y="325" font-size="10" fill="#3aaa6a" font-weight="600">YES → call MCP first</text>
+
+  <!-- NO arrow right -->
+  <line x1="500" y1="262" x2="680" y2="262" stroke="#e05252" stroke-width="1.5" marker-end="url(#arr-red)"/>
+  <text x="590" y="254" text-anchor="middle" font-size="10" fill="#e05252" font-weight="600">NO (exact symbol known)</text>
+  <rect x="682" y="244" width="118" height="36" rx="6" fill="#ffeaea" stroke="#e05252" stroke-width="1.2"/>
+  <text x="741" y="257" text-anchor="middle" font-size="11" fill="#e05252" font-weight="600">Direct read /</text>
+  <text x="741" y="271" text-anchor="middle" font-size="11" fill="#e05252" font-weight="600">search only</text>
+
+  <!-- ── ROW 3: MCP ── -->
+
+  <!-- TokenOpt -->
+  <rect x="60" y="368" width="230" height="140" rx="8" fill="#edf4ff" stroke="#4a80c4" stroke-width="2"/>
+  <text x="175" y="390" text-anchor="middle" font-size="13" font-weight="700" fill="#2a5fa0">TokenOpt MCP</text>
+  <text x="175" y="407" text-anchor="middle" font-size="10" fill="#4a80c4">contextgate_get_context</text>
+  <line x1="80" y1="414" x2="272" y2="414" stroke="#4a80c4" stroke-width="0.8" opacity="0.4"/>
+  <text x="175" y="430" text-anchor="middle" font-size="11" fill="#333">1. Scan repo inventory</text>
+  <text x="175" y="446" text-anchor="middle" font-size="11" fill="#333">2. Route → task type</text>
+  <text x="175" y="462" text-anchor="middle" font-size="11" fill="#333">3. Compile evidence packet</text>
+  <text x="175" y="478" text-anchor="middle" font-size="11" fill="#333">4. Write daily stats</text>
+  <text x="175" y="496" text-anchor="middle" font-size="10" fill="#4a80c4" font-style="italic">~/.tokenopt/stats/YYYY-MM-DD.jsonl</text>
+
+  <!-- CodeGraph -->
+  <rect x="610" y="368" width="230" height="140" rx="8" fill="#f0faf3" stroke="#3aaa6a" stroke-width="2"/>
+  <text x="725" y="390" text-anchor="middle" font-size="13" font-weight="700" fill="#1a7a40">CodeGraph MCP</text>
+  <text x="725" y="407" text-anchor="middle" font-size="10" fill="#3aaa6a">codegraph_context</text>
+  <line x1="628" y1="414" x2="822" y2="414" stroke="#3aaa6a" stroke-width="0.8" opacity="0.4"/>
+  <text x="725" y="430" text-anchor="middle" font-size="11" fill="#333">SQLite graph index</text>
+  <text x="725" y="446" text-anchor="middle" font-size="11" fill="#333">Symbols · Call edges</text>
+  <text x="725" y="462" text-anchor="middle" font-size="11" fill="#333">Flow packs · Change packs</text>
+  <text x="725" y="478" text-anchor="middle" font-size="11" fill="#333">Review packets</text>
+  <text x="725" y="496" text-anchor="middle" font-size="10" fill="#3aaa6a" font-style="italic">Fills code_graph evidence gaps</text>
+
+  <!-- Agent → TokenOpt -->
+  <line x1="400" y1="355" x2="270" y2="368" stroke="#4a80c4" stroke-width="1.8" marker-end="url(#arr-blue)"/>
+  <text x="320" y="352" text-anchor="middle" font-size="10" fill="#4a80c4" font-weight="600">① call first</text>
+
+  <!-- TokenOpt → CodeGraph gap -->
+  <line x1="290" y1="437" x2="608" y2="437" stroke="#3aaa6a" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr-green)"/>
+  <text x="450" y="428" text-anchor="middle" font-size="10" fill="#3aaa6a" font-weight="600">② tool_categories: [code_graph] gap → fill</text>
+
+  <!-- ── ROW 4: EVIDENCE ── -->
+  <line x1="175" y1="508" x2="175" y2="525" stroke="#4a80c4" stroke-width="1.5" marker-end="url(#arr-blue)"/>
+  <line x1="725" y1="508" x2="725" y2="525" stroke="#3aaa6a" stroke-width="1.5" marker-end="url(#arr-green)"/>
+
+  <!-- Lines from sides to center packet -->
+  <line x1="175" y1="568" x2="210" y2="568" stroke="#4a80c4" stroke-width="1" stroke-dasharray="3,2"/>
+  <line x1="725" y1="568" x2="690" y2="568" stroke="#3aaa6a" stroke-width="1" stroke-dasharray="3,2"/>
+
+  <rect x="60" y="527" width="780" height="82" rx="8" fill="#fffdf0" stroke="#e0a020" stroke-width="1.8"/>
+  <text x="450" y="549" text-anchor="middle" font-size="13" font-weight="700" fill="#8a6000">Evidence Packet</text>
+  <text x="180" y="567" text-anchor="middle" font-size="11" fill="#333">answerable · confidence</text>
+  <text x="180" y="582" text-anchor="middle" font-size="11" fill="#333">coverage · evidence[]</text>
+  <text x="180" y="597" text-anchor="middle" font-size="11" fill="#333">answer_contract</text>
+  <line x1="300" y1="535" x2="300" y2="601" stroke="#e0a020" stroke-width="0.8" opacity="0.5"/>
+  <text x="450" y="567" text-anchor="middle" font-size="11" fill="#333">missing[] · allowed_followups</text>
+  <text x="450" y="582" text-anchor="middle" font-size="11" fill="#333">tool_categories per gap</text>
+  <text x="450" y="597" text-anchor="middle" font-size="11" fill="#333">recommended_next_action</text>
+  <line x1="600" y1="535" x2="600" y2="601" stroke="#e0a020" stroke-width="0.8" opacity="0.5"/>
+  <text x="730" y="567" text-anchor="middle" font-size="11" fill="#333">~N tokens saved this call</text>
+  <text x="730" y="582" text-anchor="middle" font-size="11" fill="#333">session: M calls · K tok</text>
+  <text x="730" y="597" text-anchor="middle" font-size="10" fill="#4a80c4" font-style="italic">savings line appended inline</text>
+
+  <!-- ── ROW 5: OUTPUT ── -->
+  <line x1="450" y1="609" x2="450" y2="637" stroke="#333" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="200" y="640" width="500" height="62" rx="8" fill="#f3fff7" stroke="#3aaa6a" stroke-width="1.8"/>
+  <text x="450" y="662" text-anchor="middle" font-size="13" font-weight="700" fill="#1a7a40">Agent answer (from packet)</text>
+  <text x="450" y="680" text-anchor="middle" font-size="11" fill="#555">No redundant grep / shell / broad reads</text>
+  <text x="450" y="695" text-anchor="middle" font-size="10" fill="#3aaa6a" font-style="italic">answerable=true → answer immediately, do NOT re-explore</text>
+
+  <!-- Legend -->
+  <rect x="62" y="68" width="10" height="10" rx="2" fill="#4a80c4"/>
+  <text x="76" y="77" font-size="10" fill="#4a80c4">TokenOpt flow</text>
+  <rect x="62" y="84" width="10" height="10" rx="2" fill="#3aaa6a"/>
+  <text x="76" y="93" font-size="10" fill="#3aaa6a">CodeGraph flow</text>
+  <rect x="62" y="100" width="10" height="10" rx="2" fill="#e05252"/>
+  <text x="76" y="109" font-size="10" fill="#e05252">Bypass (exact target)</text>
+</svg>
