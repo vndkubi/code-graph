@@ -222,18 +222,21 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
         toolName: routed.toolName,
         args: routed.args,
       });
+      const durationMs = Date.now() - startedAt;
+      const serialized = JSON.stringify(result);
       logQueryEvent(current.logPath, {
         event: 'query',
         toolName: request.params.name,
         routedToolName: routed.toolName,
         workspaceId: current.workspace.workspaceId,
-        durationMs: Date.now() - startedAt,
-        responseChars: JSON.stringify(result).length,
+        durationMs,
+        responseChars: serialized.length,
         args: summarizeArgs(args),
         result: summarizeResult(result),
       });
+      const enriched = addResponseMeta(result, request.params.name, durationMs, serialized.length);
       return {
-        content: [{ type: 'text' as const, text: withFreshnessBanner(JSON.stringify(result, null, 2), result) }],
+        content: [{ type: 'text' as const, text: withFreshnessBanner(JSON.stringify(enriched, null, 2), result) }],
       };
     } catch (error) {
       const payload = errorPayload(error);
@@ -682,15 +685,52 @@ function freshnessArgs(args: Record<string, unknown>): Record<string, unknown> {
   });
 }
 
+function addResponseMeta(
+  result: unknown,
+  toolName: string,
+  durationMs: number,
+  responseChars: number
+): unknown {
+  if (!isRecord(result)) return result;
+  const tokensEst = Math.ceil(responseChars / 4);
+  const symbolCount = Array.isArray(result.symbols) ? result.symbols.length : undefined;
+  const callEdgeCount = Array.isArray(result.callEdges) ? result.callEdges.length : undefined;
+  const fileCount = Array.isArray(result.files) ? result.files.length : undefined;
+  const meta: Record<string, unknown> = {
+    tool: toolName,
+    duration_ms: durationMs,
+    response_chars: responseChars,
+    tokens_est: tokensEst
+  };
+  if (symbolCount !== undefined) meta.symbols_returned = symbolCount;
+  if (callEdgeCount !== undefined) meta.call_edges_returned = callEdgeCount;
+  if (fileCount !== undefined) meta.files_returned = fileCount;
+  return { ...result, _codegraph_meta: meta };
+}
+
 export const MCP_SERVER_INSTRUCTIONS = `# CodeGraph usage
 
 These MCP initialize instructions are the single source of truth for how an AI
 agent should use CodeGraph tools. The agent also sees the active tools/list
 descriptions; together they are how it knows what it can call.
 
+## Role when TokenOpt MCP is also connected
+
+CodeGraph is the \`code_graph\` provider in a TokenOpt evidence workflow.
+Do NOT call codegraph_context first for broad tasks when TokenOpt is present — let contextgate_get_context run first.
+
+After contextgate_get_context returns an evidence packet:
+- evidence_gap with tool_categories containing "code_graph" → call codegraph_context with the gap description as the task
+- evidence_gap with tool_categories containing "file_read" → call codegraph_slice with the known file path
+- evidence_gap with tool_categories containing "search" → call search_symbol or tokenopt_search
+- answerable=true → do not call codegraph_context at all; answer from the packet
+
+## Role when TokenOpt MCP is NOT connected
+
 CodeGraph is the PRIMARY local repository context server. It combines a
 pre-indexed SQLite code graph with TokenOpt-style evidence packets so you do
 not need to rediscover structure through grep/read loops.
+Call codegraph_context first with the user's full task text for any broad repo question.
 
 ## Tool surface
 
