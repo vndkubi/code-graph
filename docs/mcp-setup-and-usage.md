@@ -83,6 +83,28 @@ benchmarks or clients that intentionally need direct pack/follow-up tools.
 | `--mcp-profile <client|minimal|research|change|review|full>` | Control the exposed `tools/list` surface. Default/client exposes only facade tools; `full` exposes every direct pack and follow-up tool. |
 | `--workspace-key <key>` | Use a stable identity when roots are mounted through unusual paths. |
 
+## Joint Workflow with TokenOpt
+
+When both CodeGraph and TokenOpt MCPs are active in the same session, they coordinate via their `initialize` instructions:
+
+- **TokenOpt** is the primary router. For broad or unknown-owner tasks, `contextgate_get_context` runs first and returns an evidence packet with `evidence_gaps` entries tagged `tool_categories: ["code_graph"]`.
+- **CodeGraph** self-registers as the `code_graph` provider. It waits for the TokenOpt packet and fills the named `code_graph` evidence gaps using `codegraph_context`.
+- **Do NOT** call `codegraph_context` first when TokenOpt is connected. Its `SERVER_INSTRUCTIONS` direct it to defer to TokenOpt and fill gaps after the packet returns.
+
+Role matrix:
+
+| Task type | Call order |
+| --- | --- |
+| Broad investigation / PBI / unknown owner | `contextgate_get_context` → `codegraph_context` (fills gaps) |
+| Code review round 1 (business) | `contextgate_get_context` + `codegraph_context get_change_pack` |
+| Code review round 2 (technical YAGNI/KISS) | No MCPs — direct diff |
+| Code review round 3 (checklist) | `codegraph_context` only (`get_change_pack`) |
+| Exact file/symbol known | Direct read — skip both MCPs |
+
+Each CodeGraph tool response includes `_codegraph_meta` with `tool`, `duration_ms`, `response_chars`, `tokens_est`, and item counts. This lets the orchestrator or benchmark track CodeGraph cost alongside TokenOpt savings.
+
+When TokenOpt is not connected, CodeGraph behaves as the primary context server; use `codegraph_context` directly as usual.
+
 ## Daily Workflow
 
 ```powershell

@@ -16,6 +16,30 @@ The goal is to let agents start from compact graph-backed packets instead of rep
 | Incremental refresh | Small edits and deletes can refresh by changed path instead of rebuilding the whole workspace. |
 | Agent-ready packets | `get_research_pack`, `get_flow_pack`, `get_change_pack`, and `review_patch` return ranked context with bounded evidence. |
 | Offline graph export | Generates a static HTML graph viewer from indexed facts. |
+| Response metadata | Every tool response includes `_codegraph_meta` with tool name, `duration_ms`, `response_chars`, `tokens_est`, and item counts. |
+
+## Joint Workflow with TokenOpt
+
+When both CodeGraph and TokenOpt MCPs are connected, they coordinate automatically via their `SERVER_INSTRUCTIONS`:
+
+| Role | When TokenOpt present | When standalone |
+| --- | --- | --- |
+| **TokenOpt** | PRIMARY router — call `contextgate_get_context` first for broad/unknown-owner tasks | N/A |
+| **CodeGraph** | `code_graph` provider — fills evidence gaps named by the TokenOpt packet | PRIMARY — use `codegraph_context` directly |
+
+The flow for broad tasks:
+
+1. Call `contextgate_get_context` (TokenOpt) with the full natural task.
+2. If the packet has evidence gaps with `tool_categories: ["code_graph"]`, fill them with `codegraph_context` or the appropriate CodeGraph pack tool.
+3. Do NOT call CodeGraph first when TokenOpt is connected — its `SERVER_INSTRUCTIONS` will self-direct it to wait for the TokenOpt packet.
+
+The flow for code review:
+
+1. Round 1 (business): `contextgate_get_context` + CodeGraph `get_change_pack` for requirement/impact evidence.
+2. Round 2 (technical YAGNI/KISS): No MCPs — direct diff review.
+3. Round 3 (checklist): CodeGraph `get_change_pack` only for changed-file coverage.
+
+For exact file/symbol tasks where the owner is already known, skip both MCPs and read directly.
 
 ## Quick Start
 
