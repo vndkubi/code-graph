@@ -772,6 +772,9 @@ export class V2Indexer {
       if (!preResolveCallEdges) {
         await this.resolveCallEdges(snapshotId);
       }
+      // Unique-name resolution runs on both flows (the pre-resolve path does not
+      // cover bare function calls, which dominate TS/JS/Python).
+      await this.resolveUniqueNameCallEdges(snapshotId);
       options.progress?.({
         phase: 'edges',
         status: 'complete',
@@ -2090,6 +2093,7 @@ export class V2Indexer {
           });
         }
 
+        await this.resolveUniqueNameCallEdges(args.snapshotId);
         if (!args.skipSnapshotStats) {
           await this.refreshSnapshotStats(args.snapshotId);
         }
@@ -2491,6 +2495,7 @@ export class V2Indexer {
         elapsedMs: Date.now() - args.start,
       });
       await this.resolveCallEdges(args.snapshotId, changedPaths);
+      await this.resolveUniqueNameCallEdges(args.snapshotId);
       args.progress?.({
         phase: 'edges',
         status: 'complete',
@@ -3273,6 +3278,42 @@ export class V2Indexer {
 
     await this.updateCallEdges(edgeUpdates);
     await this.insertRows('call_edges', copyableColumnsFor('call_edges'), implementationEdgeRows);
+  }
+
+  /**
+   * Unique-name call resolution. Most TS/JS/Python calls are bare function
+   * names (no receiver), which the Java-centric receiver resolver leaves as
+   * name-only. A bare callee that maps to EXACTLY ONE project-defined
+   * function/method is an unambiguous target, so promote those name-only edges
+   * to name-unique. Names with multiple definitions stay name-only (ambiguous).
+   * Runs as one set-based UPDATE after materialization on BOTH the pre-resolved
+   * and slow-path flows, so it is independent of how call edges were produced.
+   */
+  private async resolveUniqueNameCallEdges(snapshotId: string): Promise<void> {
+    await this.db.prepare(`
+      UPDATE call_edges
+      SET callee = (
+            SELECT MIN(s.fq_name) FROM symbols s
+            WHERE s.snapshot_id = call_edges.snapshot_id
+              AND s.simple_name = call_edges.callee
+              AND s.kind IN ('function', 'method')
+              AND s.file_role IN ('main_source', 'generated')
+          ),
+          confidence = 0.75,
+          resolution_kind = 'name-unique'
+      WHERE snapshot_id = ?
+        AND resolution_kind = 'name-only'
+        AND signal_tier = 'primary'
+        AND callee NOT LIKE '%.%'
+        AND callee IN (
+          SELECT s.simple_name FROM symbols s
+          WHERE s.snapshot_id = ?
+            AND s.kind IN ('function', 'method')
+            AND s.file_role IN ('main_source', 'generated')
+          GROUP BY s.simple_name
+          HAVING COUNT(*) = 1
+        )
+    `).run(snapshotId, snapshotId);
   }
 
   private async updateCallEdges(rows: SqlValue[][]): Promise<void> {
