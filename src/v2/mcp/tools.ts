@@ -31,6 +31,15 @@ const DebugTimingOption = {
   debugTiming: z.boolean().optional(),
 };
 
+// Session evidence ledger. Pass a stable `sessionId` on every call in a
+// conversation to let CodeGraph omit source bodies it already delivered (avoids
+// duplicate token spend). Without sessionId every packet stays self-contained.
+// `freshEvidence: true` forces full bodies even within a session.
+const EvidenceLedgerOption = {
+  sessionId: z.string().optional(),
+  freshEvidence: z.boolean().optional(),
+};
+
 export const V2ToolSchemas = {
   codegraph_status: z.object({
     includeDiagnostics: z.boolean().default(false),
@@ -49,6 +58,7 @@ export const V2ToolSchemas = {
     ...SnippetOptions,
     ...FreshnessOptions,
     ...DebugTimingOption,
+    ...EvidenceLedgerOption,
   }),
   codegraph_slice: z.object({
     file: z.string().optional(),
@@ -225,6 +235,7 @@ export const V2ToolSchemas = {
     ...PackProfileOption,
     ...SnippetOptions,
     ...FreshnessOptions,
+    ...EvidenceLedgerOption,
   }),
   get_research_pack: z.object({
     target: z.string(),
@@ -235,6 +246,7 @@ export const V2ToolSchemas = {
     ...PackProfileOption,
     ...SnippetOptions,
     ...FreshnessOptions,
+    ...EvidenceLedgerOption,
   }),
   get_context_packet: z.object({
     task: z.string(),
@@ -247,6 +259,7 @@ export const V2ToolSchemas = {
     ...PackProfileOption,
     ...SnippetOptions,
     ...FreshnessOptions,
+    ...EvidenceLedgerOption,
   }),
   get_change_pack: z.object({
     task: z.string(),
@@ -264,6 +277,7 @@ export const V2ToolSchemas = {
     ...SnippetOptions,
     ...DebugTimingOption,
     ...FreshnessOptions,
+    ...EvidenceLedgerOption,
   }),
   compile_evidence: z.object({
     task: z.string(),

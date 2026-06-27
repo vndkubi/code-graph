@@ -783,6 +783,24 @@ same first-tool rules still apply.
 - If the packet lists missingFacts or allowed follow-ups, use only the named
   exact follow-up tools such as codegraph_slice, search_symbol, search_files, or
   search_code.
+
+## Evidence reuse (avoid duplicate tokens)
+
+- Pass a stable \`sessionId\` (any constant string for this conversation, e.g.
+  the conversation/thread id) on EVERY codegraph_context / pack call. This lets
+  CodeGraph remember which source bodies it already gave you and skip resending
+  them, which is the single biggest saver of duplicate tokens across an
+  investigate -> trace -> change -> review sequence. Without a sessionId every
+  packet re-sends full source.
+- With a sessionId, a slice you already received comes back on later calls with
+  \`reusedFromEarlierCall: true\` and NO \`text\` field (only file/lines/symbol).
+  That is intentional: reuse the source you were already given earlier in the
+  conversation. Do NOT re-open it with get_file_slice, rg, or Read just because
+  the body is absent from this packet.
+- \`completeness.reusedEvidenceCount\` tells you how many slices were deduped.
+- Only if a reused slice genuinely scrolled out of your context window, re-fetch
+  that one exact slice with codegraph_slice/get_file_slice, or pass
+  \`freshEvidence: true\` to get full bodies again.
 - Preserve HTTP methods and paths exactly, for example GET /ws/v1/cluster/apps.
 - Do not set autoRefresh=true unless the user explicitly asks for a fresh index.
 - Avoid forcing warnStale=true for every tool during exploration benchmarks unless freshness is part of the benchmark objective.
