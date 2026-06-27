@@ -18,6 +18,7 @@ import { deriveReviewProofTasks, loadReviewProofTasks, runReviewProofEval } from
 import { runCodexE2eBenchmark, type CodexBenchmarkMode } from './v2/benchmark/codex-e2e.js';
 import { compareCodexE2eReports, formatCompetitiveComparisonMarkdown } from './v2/benchmark/competitive-compare.js';
 import { runRouteGateBenchmark } from './v2/benchmark/route-gate.js';
+import { runQualityTrend, appendQualityTrend } from './v2/benchmark/quality-trend.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 import { buildLocalArtifactIndex } from './v2/mcp/local-artifact.js';
 import { inspectWorkspaceReadiness } from './v2/workspace-health.js';
@@ -162,6 +163,19 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     case 'route-gate':
       console.log(JSON.stringify(runRouteGateBenchmark(getFlag(parsed, 'suite') ?? getFlag(parsed, 'tasks')), null, 2));
       return;
+    case 'quality-trend': {
+      const root = getFlag(parsed, 'root') ?? process.cwd();
+      const { db } = await openCodeGraphDb(root);
+      try {
+        const row = await runQualityTrend(db, root, new Date().toISOString());
+        const out = getFlag(parsed, 'out');
+        if (out) appendQualityTrend(out, row);
+        console.log(JSON.stringify({ ...row, report: out ? path.resolve(out) : undefined }, null, 2));
+      } finally {
+        await db.close();
+      }
+      return;
+    }
     case 'copilot-e2e':
       runCopilotE2eBenchmark(parsed);
       return;
@@ -201,7 +215,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|copilot-e2e|codex-e2e|competitive-compare');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|copilot-e2e|codex-e2e|competitive-compare');
   }
 }
 
