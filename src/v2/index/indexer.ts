@@ -3220,8 +3220,18 @@ export class V2Indexer {
       method: string,
     ): void => {
       const implementations = implementationsByInterface.get(simpleTypeName(receiverType)) ?? [];
-      for (const implementation of implementations) {
-        if (!methodOwners.has(`${implementation}.${method}`)) continue;
+      const candidates = implementations.filter(impl => methodOwners.has(`${impl}.${method}`));
+      const fanOut = candidates.length;
+      if (fanOut === 0) return;
+      // A single implementation is an unambiguous dispatch target — keep it as a
+      // confident primary edge. With many implementations the expansion is a
+      // guess (we don't know which impl actually runs), so demote it to the
+      // low-signal tier (hidden from default results) and scale confidence down
+      // by fan-out. This stops a widely-implemented interface from flooding the
+      // call graph with low-value edges.
+      const tier = fanOut === 1 ? 'primary' : 'low_signal';
+      const confidence = fanOut === 1 ? 0.65 : Math.max(0.2, Math.min(0.5, 0.6 / fanOut));
+      for (const implementation of candidates) {
         const callee = `${implementation}.${method}`;
         const key = `${row.caller}\0${callee}\0${row.file}\0${row.line}`;
         if (insertedImplementationEdges.has(key)) continue;
@@ -3232,11 +3242,11 @@ export class V2Indexer {
           callee,
           row.file,
           row.line,
-          0.65,
+          confidence,
           'interface-implementation',
           row.file_role,
-          'primary',
-          JSON.stringify(['interface implementation expansion']),
+          tier,
+          JSON.stringify([`interface implementation expansion (fan-out ${fanOut})`]),
         ]);
       }
     };
@@ -4658,8 +4668,17 @@ function queueImplementationCallEdges(
   implementationCallRows: SqlValue[][],
 ): void {
   const implementations = context.implementationsByInterface.get(simpleTypeName(receiverType)) ?? [];
-  for (const implementation of implementations) {
-    if (!context.methodOwners.has(`${implementation}.${method}`)) continue;
+  const candidates = implementations.filter(impl => context.methodOwners.has(`${impl}.${method}`));
+  const fanOut = candidates.length;
+  if (fanOut === 0) return;
+  // Single implementation = unambiguous dispatch target (confident primary
+  // edge). Many implementations = a guess about which impl runs, so demote to
+  // the low-signal tier (hidden by default) with fan-out-scaled confidence so a
+  // widely-implemented interface does not flood the call graph. Mirror of the
+  // same rule in resolveCallEdges#queueImplementationEdges.
+  const tier = fanOut === 1 ? 'primary' : 'low_signal';
+  const confidence = fanOut === 1 ? 0.65 : Math.max(0.2, Math.min(0.5, 0.6 / fanOut));
+  for (const implementation of candidates) {
     const callee = `${implementation}.${method}`;
     const key = `${normalizedCall.caller}\0${callee}\0${file.relPath}\0${line}`;
     if (context.insertedImplementationEdges.has(key)) continue;
@@ -4670,11 +4689,11 @@ function queueImplementationCallEdges(
       callee,
       file.relPath,
       line,
-      0.65,
+      confidence,
       'interface-implementation',
       file.role,
-      'primary',
-      JSON.stringify(['interface implementation expansion']),
+      tier,
+      JSON.stringify([`interface implementation expansion (fan-out ${fanOut})`]),
     ]);
   }
 }
