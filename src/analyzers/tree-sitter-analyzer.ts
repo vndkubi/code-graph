@@ -1645,6 +1645,38 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
             if (body) {
               this.extractCallsFromNode(body, file, lines, calls, references, funcName, undefined, undefined, parentClass, this.scriptCallbackContext);
             }
+            // TS constructor parameter properties:
+            // `constructor(private readonly db: CodeGraphDb)` declares a class
+            // field `db` of type CodeGraphDb. These are the dominant field-decl
+            // form in this codebase and are not public_field_definition nodes,
+            // so extract them explicitly to feed receiver-field resolution.
+            if (parentClass && nameNode.text === 'constructor') {
+              this.extractTsConstructorParameterProperties(child, file, lines, symbols, parentClass);
+            }
+          }
+          break;
+        }
+        case 'public_field_definition':
+        case 'property_signature': {
+          // TS class fields. Capturing the declared type into returnType lets
+          // the call resolver turn `this.<field>.method()` into
+          // `<FieldType>.method` (receiver-field resolution), which was
+          // previously impossible because TS field types were never recorded.
+          const nameNode = child.childForFieldName('name');
+          if (nameNode && (nameNode.type === 'property_identifier' || nameNode.type === 'identifier')) {
+            symbols.push({
+              name: nameNode.text,
+              kind: 'field',
+              file,
+              line: child.startPosition.row + 1,
+              column: child.startPosition.column + 1,
+              endLine: child.endPosition.row + 1,
+              signature: this.getLineText(lines, child.startPosition.row).trim(),
+              visibility: this.getTsVisibility(child),
+              module: this.getTsModule(file),
+              parent: parentClass,
+              returnType: this.extractTsTypeName(child.childForFieldName('type')),
+            });
           }
           break;
         }
@@ -1721,6 +1753,65 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         parent: parentName,
       });
     }
+  }
+
+  /**
+   * Resolve the base type name from a TS `type_annotation` (the `type` field of
+   * a class field / property). `: CodeGraphDb` -> `CodeGraphDb`,
+   * `: Map<string, X>` -> `Map`, `ns.Foo` -> `Foo`. Returns undefined when there
+   * is no usable nominal type (unions, literals, primitives are not useful
+   * receiver types).
+   */
+  /**
+   * Extract TypeScript constructor parameter properties (`constructor(private
+   * readonly db: CodeGraphDb)`) as class field symbols carrying their declared
+   * type, so `this.db.method()` can be resolved to `CodeGraphDb.method`.
+   */
+  private extractTsConstructorParameterProperties(
+    constructorNode: SyntaxNode,
+    file: string,
+    lines: string[],
+    symbols: SymbolInfo[],
+    parentClass: string,
+  ): void {
+    const params = constructorNode.childForFieldName('parameters');
+    if (!params) return;
+    for (const param of params.namedChildren) {
+      if (param.type !== 'required_parameter' && param.type !== 'optional_parameter') continue;
+      // Only parameters with an accessibility/readonly modifier become fields.
+      const hasModifier = param.children.some(c =>
+        c.type === 'accessibility_modifier' || c.text === 'readonly' || c.type === 'override_modifier');
+      if (!hasModifier) continue;
+      const pattern = param.childForFieldName('pattern');
+      if (!pattern || (pattern.type !== 'identifier' && pattern.type !== 'property_identifier')) continue;
+      symbols.push({
+        name: pattern.text,
+        kind: 'field',
+        file,
+        line: param.startPosition.row + 1,
+        column: param.startPosition.column + 1,
+        endLine: param.endPosition.row + 1,
+        signature: this.getLineText(lines, param.startPosition.row).trim(),
+        visibility: 'private',
+        module: this.getTsModule(file),
+        parent: parentClass,
+        returnType: this.extractTsTypeName(param.childForFieldName('type')),
+      });
+    }
+  }
+
+  private extractTsTypeName(typeAnnotation: SyntaxNode | null | undefined): string | undefined {
+    if (!typeAnnotation) return undefined;
+    const raw = (typeAnnotation.text ?? '').replace(/^:\s*/, '').trim();
+    if (!raw) return undefined;
+    const match = raw.match(/^[A-Za-z_$][A-Za-z0-9_$.]*/);
+    if (!match) return undefined;
+    const base = (match[0].split('.').pop() ?? match[0]).trim();
+    if (!base) return undefined;
+    // Built-in/primitive types are never project classes with resolvable methods.
+    const PRIMITIVES = new Set(['string', 'number', 'boolean', 'any', 'unknown', 'void', 'never', 'object', 'symbol', 'bigint', 'undefined', 'null']);
+    if (PRIMITIVES.has(base)) return undefined;
+    return base;
   }
 
   private tsObjectPropertyName(node: SyntaxNode | null | undefined): string | undefined {
