@@ -100,6 +100,29 @@ public class PaymentService {
     const top = packet.topFiles.map(f => f.replace(/\\/g, '/'));
     expect(top.some(f => f.endsWith('PaymentService.java'))).toBe(true);
   });
+
+  it('contributes a BM25 textual-relevance signal to file ranking', async () => {
+    const repo = tempDir('codegraph-bm25-');
+    writeFile(repo, 'src/payment/PaymentService.java', `package com.example.payment;
+
+public class PaymentService {
+  public boolean refund(String paymentId, long amount) {
+    return amount > 0;
+  }
+}
+`);
+    const { db } = await openDb(repo);
+    const indexed = await new V2Indexer(db).indexWorkspace({ root: repo });
+    const result = await new V2QueryService(db).query({
+      workspaceId: indexed.workspaceId,
+      toolName: 'search_files',
+      args: { query: 'payment refund', limit: 5, explainRank: true },
+    }) as { files: Array<{ path: string; rankExplanation?: string[] }> };
+
+    const match = result.files.find(f => f.path.replace(/\\/g, '/').endsWith('PaymentService.java'));
+    expect(match).toBeTruthy();
+    expect((match?.rankExplanation ?? []).some(factor => /BM25/.test(factor))).toBe(true);
+  });
 });
 
 async function openDb(root: string): Promise<{ db: CodeGraphDb }> {
