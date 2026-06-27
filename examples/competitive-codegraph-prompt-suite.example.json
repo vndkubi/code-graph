@@ -1,0 +1,184 @@
+{
+  "name": "competitive-codegraph-self-prompt-suite",
+  "repoRoot": ".",
+  "rootProfile": {
+    "name": "codegraph-self-competitive",
+    "requiredFiles": [
+      "src/v2/mcp/proxy.ts",
+      "src/v2/mcp/tools.ts",
+      "src/v2/query/service.ts",
+      "tests/v2/mcp-client-profile.test.ts",
+      "tests/v2/index-query.test.ts"
+    ],
+    "requiredMethods": [
+      "routeCodeGraphContext",
+      "inferCodeGraphContextMode",
+      "inspectCodeGraphRoute",
+      "compileEvidenceAnswerable",
+      "compileAllowedFollowups",
+      "routeGateCompileEvidence"
+    ]
+  },
+  "tasks": [
+    {
+      "id": "natural-api-trace",
+      "type": "api-flow",
+      "prompt": "trace api \"codegraph_context\" please. Explain how a natural request enters the MCP proxy, how it routes to the internal pack, and why answer-mode should stop extra tool calls. Return compact JSON with keys task,keyFiles,methods,flow,stopRule,tests,confidence.",
+      "expectedFiles": [
+        "src/v2/mcp/proxy.ts",
+        "src/v2/mcp/tools.ts",
+        "tests/v2/mcp-client-profile.test.ts"
+      ],
+      "expectedMethods": [
+        "routeCodeGraphContext",
+        "inferCodeGraphContextMode",
+        "inspectCodeGraphRoute"
+      ],
+      "expectedTerms": [
+        "responseMode",
+        "answer",
+        "codegraph_context"
+      ],
+      "requiredAnswerFields": [
+        "task",
+        "keyFiles",
+        "methods",
+        "flow",
+        "stopRule"
+      ],
+      "requireJson": true
+    },
+    {
+      "id": "answerability-gate",
+      "type": "investigation",
+      "prompt": "Explain how compile_evidence decides whether a packet is answerable and how allowedFollowups are restricted when evidence is incomplete. Return compact JSON with keys task,keyFiles,methods,answerability,allowedFollowups,risks,tests,confidence.",
+      "expectedFiles": [
+        "src/v2/query/service.ts",
+        "tests/v2/index-query.test.ts"
+      ],
+      "expectedMethods": [
+        "compileEvidenceAnswerable",
+        "compileAllowedFollowups"
+      ],
+      "expectedTerms": [
+        "answerable",
+        "allowedFollowups",
+        "disallowedFollowups"
+      ],
+      "requiredAnswerFields": [
+        "task",
+        "keyFiles",
+        "methods",
+        "answerability",
+        "allowedFollowups"
+      ],
+      "requireJson": true
+    },
+    {
+      "id": "change-planning",
+      "type": "implement",
+      "prompt": "Plan the smallest safe change to tighten natural prompt routing so API trace questions do not trigger unnecessary follow-up tools. Include target files, methods, invariants, tests, and validation commands. Return compact JSON with keys task,keyFiles,methods,plan,invariants,tests,validation,confidence.",
+      "expectedFiles": [
+        "src/v2/mcp/proxy.ts",
+        "src/v2/mcp/tools.ts",
+        "tests/v2/mcp-client-profile.test.ts"
+      ],
+      "expectedMethods": [
+        "routeCodeGraphContext",
+        "inferCodeGraphContextMode"
+      ],
+      "expectedTerms": [
+        "responseMode",
+        "answer",
+        "mcp-client-profile"
+      ],
+      "requiredAnswerFields": [
+        "task",
+        "keyFiles",
+        "methods",
+        "plan",
+        "tests",
+        "validation"
+      ],
+      "requireJson": true
+    },
+    {
+      "id": "review-routing-diff",
+      "type": "code-review",
+      "prompt": "Review this routing patch for correctness, regressions, and missing tests. Return compact JSON with keys status,topFindings,impactedFlow,tests,confidence.\n\ndiff --git a/src/v2/mcp/proxy.ts b/src/v2/mcp/proxy.ts\n--- a/src/v2/mcp/proxy.ts\n+++ b/src/v2/mcp/proxy.ts\n@@\n-        responseMode: 'agent',\n+        responseMode: args.responseMode ?? 'answer',",
+      "expectedFiles": [
+        "src/v2/mcp/proxy.ts",
+        "tests/v2/mcp-client-profile.test.ts"
+      ],
+      "expectedMethods": [
+        "routeCodeGraphContext"
+      ],
+      "expectedTerms": [
+        "responseMode",
+        "answer",
+        "test"
+      ],
+      "requiredAnswerFields": [
+        "status",
+        "topFindings",
+        "impactedFlow",
+        "tests"
+      ],
+      "requireJson": true
+    },
+    {
+      "id": "architecture-research",
+      "type": "investigation",
+      "prompt": "Explain the architecture of CodeGraph's MCP route facade and query service. Include the tool surface, routing decision points, packet generation, logs/telemetry, and tests. Return compact JSON with keys task,keyFiles,modules,flow,tests,risks,confidence.",
+      "expectedFiles": [
+        "src/v2/mcp/proxy.ts",
+        "src/v2/mcp/tools.ts",
+        "src/v2/query/service.ts"
+      ],
+      "expectedMethods": [
+        "routeMcpTool",
+        "routeCodeGraphContext",
+        "query"
+      ],
+      "expectedTerms": [
+        "MCP_SERVER_INSTRUCTIONS",
+        "V2_TOOL_PROFILES",
+        "V2QueryService"
+      ],
+      "requiredAnswerFields": [
+        "task",
+        "keyFiles",
+        "modules",
+        "flow",
+        "tests"
+      ],
+      "requireJson": true
+    },
+    {
+      "id": "test-discovery",
+      "type": "test",
+      "prompt": "Find the tests that prove codegraph_context routing, MCP profile restrictions, answerable packet stop rules, and compact tool descriptions. Return compact JSON with keys task,keyFiles,testFiles,testCases,coveredBehaviors,gaps,confidence.",
+      "expectedFiles": [
+        "tests/v2/mcp-client-profile.test.ts",
+        "tests/v2/index-query.test.ts"
+      ],
+      "expectedMethods": [
+        "routeCodeGraphContext",
+        "inspectCodeGraphRoute"
+      ],
+      "expectedTerms": [
+        "answerable",
+        "allowedFollowups",
+        "compact descriptions"
+      ],
+      "requiredAnswerFields": [
+        "task",
+        "keyFiles",
+        "testFiles",
+        "testCases",
+        "coveredBehaviors"
+      ],
+      "requireJson": true
+    }
+  ]
+}

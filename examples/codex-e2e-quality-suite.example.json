@@ -7,6 +7,12 @@
     "requiredFiles": [
       "hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/webapp/RMWebServices.java",
       "hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/BlockReceiver.java"
+    ],
+    "requiredMethods": [
+      "getApps",
+      "withApplicationTags",
+      "getDataNode",
+      "run"
     ]
   },
   "tasks": [
