@@ -3012,5 +3012,12 @@ function runGit(cwd: string, ...args: string[]): void {
 
 function firstMcpText(result: unknown): string {
   const content = (result as { content?: Array<{ type?: string; text?: string }> }).content ?? [];
-  return content.find(part => part.type === 'text')?.text ?? '';
+  const text = content.find(part => part.type === 'text')?.text ?? '';
+  // Stale responses are prefixed with a human-readable freshness banner
+  // ("⚠️ Index may be stale...\n\n{json}"). Strip it so the JSON body parses.
+  if (text.startsWith('⚠')) {
+    const jsonStart = text.indexOf('\n\n');
+    if (jsonStart >= 0) return text.slice(jsonStart + 2);
+  }
+  return text;
 }

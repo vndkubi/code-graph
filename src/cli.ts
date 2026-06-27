@@ -42,7 +42,13 @@ async function main(): Promise<void> {
         workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
         autoRefresh: parsed.flags.get('auto-refresh') === true || envFlag('CODEGRAPH_AUTO_REFRESH'),
         watch: parsed.flags.get('watch') === true || envFlag('CODEGRAPH_WATCH'),
-        warnStale: parsed.flags.get('warn-stale') === true || envFlag('CODEGRAPH_WARN_STALE'),
+        // Tri-state: explicit --no-warn-stale disables it; --warn-stale / env
+        // enable it; absent leaves it undefined so the proxy applies its
+        // default-ON policy. Collapsing absent->false (the old behavior) wrongly
+        // turned stale-index detection OFF for every MCP tool call by default.
+        warnStale: parsed.flags.get('no-warn-stale') === true
+          ? false
+          : parsed.flags.get('warn-stale') === true || envFlag('CODEGRAPH_WARN_STALE') || undefined,
         indexProviders: indexProvidersFlag(parsed),
         scipIndexPath: scipIndexFlag(parsed),
         mcpProfile: getFlag(parsed, 'mcp-profile') ?? process.env.CODEGRAPH_MCP_PROFILE,
