@@ -47,8 +47,29 @@ export function run(): void {
       SELECT resolution_kind FROM call_edges
       WHERE snapshot_id = ? AND callee LIKE '%sharedHelper%'
     `, indexed.snapshotId) as Array<{ resolution_kind: string }>;
-    // Ambiguous (two definitions) -> never promoted to name-unique.
-    expect(shared.every(e => e.resolution_kind !== 'name-unique')).toBe(true);
+    // Ambiguous (two definitions, neither in the caller's file) -> never
+    // promoted to name-unique or name-local.
+    expect(shared.every(e => e.resolution_kind !== 'name-unique' && e.resolution_kind !== 'name-local')).toBe(true);
+  });
+
+  it('resolves a bare call to a same-file helper even when the name is ambiguous project-wide', async () => {
+    const repo = tempDir('codegraph-local-');
+    // `format` is defined in BOTH files (ambiguous globally) but each call must
+    // bind to its own file's definition.
+    writeFile(repo, 'src/x.ts', `function format(v: string): string { return v.trim(); }
+export function runX(): void { format('x'); }
+`);
+    writeFile(repo, 'src/y.ts', `function format(v: string): string { return v.toUpperCase(); }
+export function runY(): void { format('y'); }
+`);
+    const { db } = await openDb(repo);
+    const indexed = await new V2Indexer(db).indexWorkspace({ root: repo });
+    const edges = await db.all(`
+      SELECT file, callee, resolution_kind FROM call_edges
+      WHERE snapshot_id = ? AND callee LIKE '%format%' AND resolution_kind = 'name-local'
+    `, indexed.snapshotId) as Array<{ file: string; callee: string; resolution_kind: string }>;
+    // Both call sites resolve same-file (name-local), not left name-only.
+    expect(edges.length).toBeGreaterThanOrEqual(2);
   });
 });
 

@@ -3290,6 +3290,39 @@ export class V2Indexer {
    * and slow-path flows, so it is independent of how call edges were produced.
    */
   private async resolveUniqueNameCallEdges(snapshotId: string): Promise<void> {
+    // Pass 1 — same-file resolution. A bare callee defined in the SAME file as
+    // the call site is the unambiguous lexical target (a file-local helper
+    // shadows any same-named function elsewhere). This is common in TS/JS where
+    // each module re-defines small helpers (uniqueStrings, clampInt, ...), which
+    // the global-unique pass below cannot touch because the name is not unique.
+    await this.db.prepare(`
+      UPDATE call_edges
+      SET callee = (
+            SELECT MIN(s.fq_name) FROM symbols s
+            WHERE s.snapshot_id = call_edges.snapshot_id
+              AND s.file = call_edges.file
+              AND s.simple_name = call_edges.callee
+              AND s.kind IN ('function', 'method')
+              AND s.file_role IN ('main_source', 'generated')
+          ),
+          confidence = 0.8,
+          resolution_kind = 'name-local'
+      WHERE snapshot_id = ?
+        AND resolution_kind = 'name-only'
+        AND signal_tier = 'primary'
+        AND callee NOT LIKE '%.%'
+        AND EXISTS (
+          SELECT 1 FROM symbols s
+          WHERE s.snapshot_id = call_edges.snapshot_id
+            AND s.file = call_edges.file
+            AND s.simple_name = call_edges.callee
+            AND s.kind IN ('function', 'method')
+            AND s.file_role IN ('main_source', 'generated')
+        )
+    `).run(snapshotId);
+
+    // Pass 2 — global-unique resolution. A bare callee that maps to EXACTLY ONE
+    // project-defined function/method anywhere is an unambiguous target.
     await this.db.prepare(`
       UPDATE call_edges
       SET callee = (
