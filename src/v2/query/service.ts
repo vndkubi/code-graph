@@ -3336,6 +3336,60 @@ export class V2QueryService {
       .map(row => compactFileCandidate(row))
       .filter(candidate => explicitContext.topFiles.length === 0
         || isCompatibleExplicitFileCandidate(candidate.file, explicitContext.topFiles));
+
+    // Fixture/test fallback tier. The primary research search is main-source
+    // only so tests/mocks don't pollute normal results. But when the concept
+    // the user is after lives ONLY in test/fixture/mock code (or the main-source
+    // matches are all generic noise), returning that noise is worse than
+    // surfacing the real match. So: if no primary candidate's path actually
+    // covers a SPECIFIC (non-broad) query word, re-run the search including
+    // tests + fixtures and keep only the candidates that genuinely cover one of
+    // those words. Role boosts + tie-breaks keep main_source on top whenever it
+    // does match, so this only adds signal, never displaces real impl.
+    const specificTaskTokens = uniqueStrings(
+      tokenizeSearchQuery(query).filter(token =>
+        token.length >= 3 && !isBroadSearchTerm(token) && !FILE_SEARCH_STOP_WORDS.has(token)),
+    );
+    const coversSpecificToken = (filePath: string): boolean => {
+      const words = new Set(splitIdentifierWords(filePath));
+      return specificTaskTokens.some(token => words.has(token));
+    };
+    const primaryCoversTask = fuzzyFileCandidates.some(candidate => coversSpecificToken(String(candidate.file ?? '')));
+    let fallbackFileCandidates: Array<ReturnType<typeof compactFileCandidate>> = [];
+    let fallbackSymbolCandidates: Array<ReturnType<typeof compactSymbolCandidate>> = [];
+    if (!exactDomainContext && !hasEndpointContext && specificTaskTokens.length > 0 && !primaryCoversTask) {
+      const fallbackFiles = await this.searchFiles(snapshotId, {
+        ...args,
+        query,
+        limit: maxFiles,
+        includeTests: true,
+        includeGenerated: false,
+        includeFixtures: true,
+        explainRank: true,
+        includeSnippets,
+        snippetLines,
+        snippetTokenBudget,
+      }) as { files: Array<Record<string, unknown>> };
+      fallbackFileCandidates = fallbackFiles.files
+        .map(row => compactFileCandidate(row))
+        .filter(candidate => coversSpecificToken(String(candidate.file ?? '')));
+      const fallbackSymbols = await this.searchSymbol(snapshotId, {
+        ...args,
+        query,
+        limit: maxSymbols,
+        includeTests: true,
+        includeGenerated: false,
+        includeFixtures: true,
+        includeSynthetic: false,
+        explainRank: true,
+        includeSnippets: false,
+      }) as { symbols: Array<Record<string, unknown>> };
+      fallbackSymbolCandidates = fallbackSymbols.symbols
+        .map(row => compactSymbolCandidate(row))
+        .filter(candidate => coversSpecificToken(String(candidate.file ?? ''))
+          || specificTaskTokens.some(token => splitIdentifierWords(String(candidate.name ?? '')).includes(token)));
+    }
+
     const explicitCandidateFiles = hasEndpointContext
       ? explicitContext.candidateFiles.filter(candidate => endpointFileSet.has(candidate.file))
       : explicitContext.candidateFiles;
@@ -3346,12 +3400,22 @@ export class V2QueryService {
       ...endpointFileCandidates,
       ...explicitCandidateFiles,
       ...myBatisContext.candidateFiles,
-      ...fuzzyFileCandidates,
+      // Fallback matches genuinely cover the task's specific words and only
+      // exist when the primary main-source set did not, so they rank ahead of
+      // the primary candidates. When the fallback fired, the primary set is
+      // entirely non-covering noise — drop the primary entries that still fail
+      // to cover any specific query word so they cannot occupy top slots ahead
+      // of the real matches.
+      ...fallbackFileCandidates,
+      ...(fallbackFileCandidates.length > 0
+        ? fuzzyFileCandidates.filter(candidate => coversSpecificToken(String(candidate.file ?? '')))
+        : fuzzyFileCandidates),
     ]).slice(0, maxFiles);
     const relevantSymbols = uniqueSymbolCandidates([
       ...endpointSymbolCandidates,
       ...explicitRelevantSymbols,
       ...myBatisContext.relevantSymbols,
+      ...fallbackSymbolCandidates,
       ...symbols.symbols.map(row => compactSymbolCandidate(row)),
     ]).slice(0, maxSymbols);
     const endpointCandidates = compactEndpointCandidates([
@@ -9752,6 +9816,14 @@ function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined, query
   const pathLower = row.path.toLowerCase();
   const basename = pathLower.substring(pathLower.lastIndexOf('/') + 1);
   const basenameWithoutExt = basename.replace(/\.[^.]+$/, '');
+  // Original-case basename for camelCase-aware word splitting. Splitting the
+  // lowercased form would collapse `OrderService` into `orderservice`, which has
+  // no boundary to split on — so a PascalCase Java file would lose the
+  // per-word/compound boosts that a separator-cased sibling (`order-service.ts`)
+  // gets for free.
+  const basenameOriginalNoExt = row.path
+    .substring(Math.max(row.path.lastIndexOf('/'), row.path.lastIndexOf('\\')) + 1)
+    .replace(/\.[^.]+$/, '');
   const queryLower = query.toLowerCase();
   const queryIdentifiers = identifierSearchTerms(queryLower);
   const symbols = evidence?.symbols ?? [];
@@ -9797,17 +9869,47 @@ function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined, query
     score += 18 * pathMatches.length;
     factors.push(`${pathMatches.length} query tokens matched file path`);
   }
-  const exactBasenameMatches = tokens.filter(token => token === basenameWithoutExt);
+  // Exact-basename and basename-part boosts only fire for SPECIFIC tokens. A
+  // file literally named `service.ts` matching the broad token "service" must
+  // not collect +90/+45 and bury `PaymentService.java`; broad terms are noise
+  // on their own and only carry signal as part of a compound (handled below).
+  const exactBasenameMatches = tokens.filter(token => token === basenameWithoutExt && !isBroadSearchTerm(token));
   if (exactBasenameMatches.length > 0) {
     score += 90;
     reason = 'query token exactly matched file basename';
     factors.push('query token exactly matched file basename');
   }
-  const basenameParts = basenameWithoutExt.split(/[._-]+/g).filter(Boolean);
-  const basenamePartMatches = tokens.filter(token => basenameParts.includes(token));
-  if (basenamePartMatches.length > 0) {
-    score += 45 * basenamePartMatches.length;
-    factors.push(`${basenamePartMatches.length} query tokens matched file basename parts`);
+  // Split the basename on BOTH camelCase and separators so a PascalCase name
+  // like `PaymentService` contributes its individual words ("payment",
+  // "service") instead of staying an opaque single token.
+  const basenameParts = splitIdentifierWords(basenameOriginalNoExt);
+  const basenamePartMatches = uniqueStrings(tokens.filter(token => basenameParts.includes(token)));
+  const specificBasenamePartMatches = basenamePartMatches.filter(token => !isBroadSearchTerm(token));
+  if (specificBasenamePartMatches.length > 0) {
+    score += 45 * specificBasenamePartMatches.length;
+    factors.push(`${specificBasenamePartMatches.length} specific query tokens matched file basename parts`);
+  }
+  // Compound specificity: a basename whose camel-split words cover MULTIPLE
+  // distinct query tokens (e.g. PaymentService covering both "payment" and
+  // "service") is a far more precise hit than a generic file matching one broad
+  // token. Requires >=2 covered words with >=1 being non-broad so a bare
+  // "service" match cannot trigger it.
+  if (basenamePartMatches.length >= 2 && specificBasenamePartMatches.length >= 1) {
+    score += 110;
+    reason = 'file basename matched a multi-word query phrase';
+    factors.push(`file basename covered ${basenamePartMatches.length} query words (${basenamePartMatches.join('+')})`);
+  }
+  // A file that DEFINES a symbol whose camel-split name covers the same
+  // multi-word phrase is the canonical home of that concept even when its
+  // filename differs from the class name.
+  const definesPhraseSymbol = symbols.some(symbol => {
+    const words = splitIdentifierWords(String((symbol as { name?: unknown }).name ?? ''));
+    const covered = uniqueStrings(tokens.filter(token => words.includes(token)));
+    return covered.length >= 2 && covered.some(token => !isBroadSearchTerm(token));
+  });
+  if (definesPhraseSymbol) {
+    score += 80;
+    factors.push('file defines a symbol whose name matches a multi-word query phrase');
   }
   const identifierPathMatches = queryIdentifiers.filter(identifier => pathLower.includes(identifier));
   if (identifierPathMatches.length > 0) {
@@ -10454,6 +10556,27 @@ function compactSearchText(value: string): string {
     .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '');
+}
+
+/**
+ * Split an identifier (filename, symbol name) into its lowercase word parts,
+ * honoring BOTH camel/Pascal-case boundaries and separator characters.
+ * `PaymentService` -> ['payment','service'], `order_service` -> ['order','service'].
+ *
+ * The query tokenizer ({@link tokenizeSearchQuery}) already splits camelCase, but
+ * the file ranker historically only split filenames on `._-`. That left a
+ * PascalCase basename like `PaymentService` as a single opaque token that never
+ * matched the individual query words "payment"/"service", so a generic file
+ * literally named `service.ts` outranked the specific `PaymentService.java` the
+ * user wanted. Splitting both sides the same way closes that gap.
+ */
+function splitIdentifierWords(value: string): string[] {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .filter(Boolean);
 }
 
 function kindFilterFor(kind: string): { sql: string; params: unknown[] } {
