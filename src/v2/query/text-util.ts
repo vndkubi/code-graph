@@ -32,6 +32,25 @@ export const EXPLICIT_FILENAME_STOP_WORDS = new Set([
   'Cases',
   'Validation',
   'Commands',
+  // Common English words that appear capitalized at sentence start but are NOT class names.
+  'Trace',
+  'Implement',
+  'Check',
+  'Show',
+  'List',
+  'When',
+  'What',
+  'Which',
+  'Using',
+  'Given',
+  'Through',
+  'Create',
+  'Update',
+  'Delete',
+  'Search',
+  'Load',
+  'Save',
+  'Build',
 ]);
 
 export const SEARCH_STOP_WORDS = new Set([
@@ -78,6 +97,11 @@ export const RESEARCH_STOP_WORDS = new Set([
 
 export const FILE_SEARCH_STOP_WORDS = new Set([
   ...RESEARCH_STOP_WORDS,
+  // Common auxiliary/function words that carry no search signal for file names.
+  // These are 3-letter words that survive the tokenizer's length-2 cutoff but
+  // produce catastrophically broad FTS prefix queries (e.g. "are*" matches all
+  // files whose symbols mention common words starting with "are").
+  'are', 'was', 'were', 'has', 'had', 'can', 'did', 'its', 'not', 'but', 'per',
   'business',
   'deep',
   'deepdive',

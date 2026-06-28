@@ -21,6 +21,7 @@ import {
 } from './parse.js';
 import { roleRank } from './file-role.js';
 import { buildIndexProviderSet, type IndexProviderSet } from './providers.js';
+import { splitIdentifierWords } from '../query/text-util.js';
 import {
   addFactShardStats,
   createCopyTextWriter,
@@ -2609,42 +2610,52 @@ export class V2Indexer {
 
   private async insertFileSearchRows(snapshotId: string, files?: string[]): Promise<void> {
     const filter = files && files.length > 0 ? `AND path IN (${files.map(() => '?').join(', ')})` : '';
-    await this.db.prepare(`
-      INSERT INTO codegraph_search_fts (snapshot_id, entity_type, entity_id, file, name, content)
-      SELECT
-        snapshot_id,
-        'file',
-        path,
-        path,
-        path,
-        path || ' ' || COALESCE(language, '') || ' ' || file_role || ' ' || parse_status
-      FROM files
-      WHERE snapshot_id = ?
-        ${filter}
-    `).run(snapshotId, ...(files ?? []));
+    const fileRows = await this.db.prepare(`
+      SELECT path, COALESCE(language, '') AS language, file_role, parse_status
+      FROM files WHERE snapshot_id = ? ${filter}
+    `).all<{ path: string; language: string; file_role: string; parse_status: string }>(
+      snapshotId, ...(files ?? []),
+    );
+    const ftsRows = fileRows.map(r => {
+      // Expand PascalCase/camelCase basename so "SpacedRepetitionAlgorithm.java"
+      // matches natural-language query tokens "spaced repetition algorithm".
+      const basename = (r.path.replace(/\\/g, '/').split('/').pop() ?? r.path).replace(/\.[^/.]+$/, '');
+      const expanded = splitIdentifierWords(basename).join(' ');
+      const content = `${r.path} ${expanded} ${r.language} ${r.file_role} ${r.parse_status}`;
+      return [snapshotId, 'file', r.path, r.path, r.path, content];
+    });
+    await this.db.copyFromRows(
+      'codegraph_search_fts',
+      ['snapshot_id', 'entity_type', 'entity_id', 'file', 'name', 'content'],
+      ftsRows,
+    );
   }
 
   private async insertSymbolSearchRows(snapshotId: string, files?: string[]): Promise<void> {
     const filter = files && files.length > 0 ? `AND file IN (${files.map(() => '?').join(', ')})` : '';
-    await this.db.prepare(`
-      INSERT INTO codegraph_search_fts (snapshot_id, entity_type, entity_id, file, name, content)
-      SELECT
-        snapshot_id,
-        'symbol',
-        fq_name || char(9) || file || char(9) || CAST(line AS TEXT),
-        file,
-        simple_name,
-        fq_name
-          || ' ' || simple_name
-          || ' ' || file
-          || ' ' || kind
-          || ' ' || COALESCE(package_name, '')
-          || ' ' || COALESCE(framework_role, '')
-          || ' ' || COALESCE(signature, '')
-      FROM symbols
-      WHERE snapshot_id = ?
-        ${filter}
-    `).run(snapshotId, ...(files ?? []));
+    const symbolRows = await this.db.prepare(`
+      SELECT fq_name, simple_name, file, kind,
+             COALESCE(package_name, '') AS package_name,
+             COALESCE(framework_role, '') AS framework_role,
+             COALESCE(signature, '') AS signature,
+             line
+      FROM symbols WHERE snapshot_id = ? ${filter}
+    `).all<{ fq_name: string; simple_name: string; file: string; kind: string; package_name: string; framework_role: string; signature: string; line: number }>(
+      snapshotId, ...(files ?? []),
+    );
+    const ftsRows = symbolRows.map(r => {
+      // Expand PascalCase/camelCase symbol names so "AssimilationService" matches
+      // natural-language query tokens "assimilation service".
+      const expanded = splitIdentifierWords(r.simple_name).join(' ');
+      const entityId = `${r.fq_name}\t${r.file}\t${r.line}`;
+      const content = `${r.fq_name} ${r.simple_name} ${expanded} ${r.file} ${r.kind} ${r.package_name} ${r.framework_role} ${r.signature}`;
+      return [snapshotId, 'symbol', entityId, r.file, r.simple_name, content];
+    });
+    await this.db.copyFromRows(
+      'codegraph_search_fts',
+      ['snapshot_id', 'entity_type', 'entity_id', 'file', 'name', 'content'],
+      ftsRows,
+    );
   }
 
   private async pruneOldSnapshots(workspaceId: string, currentSnapshotId: string): Promise<void> {

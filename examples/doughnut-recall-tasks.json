@@ -1,0 +1,52 @@
+{
+  "_comment": "Broad recall tasks for the Doughnut repo (Spring Boot + Vue.js spaced-repetition learning app). Run with: codegraph benchmark recall --root <doughnut> --tasks <this-file>. expectedFiles are matched as path suffixes.",
+  "tasks": [
+    {
+      "id": "doughnut-spaced-repetition",
+      "task": "How does the spaced repetition algorithm work? Trace from the forgetting curve parameters and note recall settings through to the scheduling logic that decides when a note is due.",
+      "expectedFiles": [
+        "algorithms/SpacedRepetitionAlgorithm.java",
+        "entities/ForgettingCurve.java",
+        "entities/NoteRecallSetting.java",
+        "services/AssimilationService.java"
+      ]
+    },
+    {
+      "id": "doughnut-note-creation",
+      "task": "Implement note creation and editing: what controller handles the request, which service builds the note entity, and how is the Note entity structured?",
+      "expectedFiles": [
+        "controllers/NoteController.java",
+        "services/NoteConstructionService.java",
+        "entities/Note.java"
+      ]
+    },
+    {
+      "id": "doughnut-ai-embedding",
+      "task": "How does the AI embedding pipeline work for notes? Trace from the embedding maintenance job through the embedding service to the stored NoteEmbedding entity.",
+      "expectedFiles": [
+        "services/EmbeddingMaintenanceJob.java",
+        "services/NoteEmbeddingService.java",
+        "entities/NoteEmbedding.java"
+      ]
+    },
+    {
+      "id": "doughnut-recall-session",
+      "task": "Trace the recall session flow: how does a user start a recall session, how are recall prompts generated and answered, and how does the assimilation counter track progress?",
+      "expectedFiles": [
+        "controllers/RecallsController.java",
+        "controllers/AssimilationController.java",
+        "services/AssimilationService.java",
+        "services/RecallService.java",
+        "entities/RecallPrompt.java"
+      ]
+    },
+    {
+      "id": "doughnut-authorization",
+      "task": "How does authorization work across controllers? What service enforces access control, and how is the current user resolved from the request context?",
+      "expectedFiles": [
+        "services/AuthorizationService.java",
+        "controllers/ApplicationController.java"
+      ]
+    }
+  ]
+}
