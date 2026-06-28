@@ -181,12 +181,39 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       const root = getFlag(parsed, 'root') ?? process.cwd();
       const { db } = await openCodeGraphDb(root);
       try {
-        const result = await runEvidenceAudit(db, root, {
-          tasksFile: getFlag(parsed, 'tasks'),
-          defaultMaxFiles: getNumberFlag(parsed, 'max-files'),
-          maxFilesCap: getNumberFlag(parsed, 'max-files-cap'),
-        });
-        console.log(JSON.stringify(result, null, 2));
+        const listGaps = parsed.flags.has('list-gaps');
+        const calibrate = parsed.flags.has('calibrate');
+        const explicitKeepRatio = getNumberFlag(parsed, 'keep-ratio');
+        if (calibrate) {
+          // Sweep keepRatio values and pick the most aggressive with gap%=0.
+          const ratios = [0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.5];
+          let best = null;
+          for (const ratio of ratios) {
+            process.stderr.write(`Trying keepRatio=${ratio}...\n`);
+            const r = await runEvidenceAudit(db, root, {
+              tasksFile: getFlag(parsed, 'tasks'),
+              defaultMaxFiles: getNumberFlag(parsed, 'max-files'),
+              maxFilesCap: getNumberFlag(parsed, 'max-files-cap'),
+              keepRatio: ratio,
+              listGaps,
+            });
+            if (r.gapPct === 0) {
+              best = r;
+              break; // most aggressive with no gap found
+            }
+          }
+          if (!best) best = await runEvidenceAudit(db, root, { keepRatio: 0.5 });
+          console.log(JSON.stringify(best, null, 2));
+        } else {
+          const result = await runEvidenceAudit(db, root, {
+            tasksFile: getFlag(parsed, 'tasks'),
+            defaultMaxFiles: getNumberFlag(parsed, 'max-files'),
+            maxFilesCap: getNumberFlag(parsed, 'max-files-cap'),
+            keepRatio: explicitKeepRatio,
+            listGaps,
+          });
+          console.log(JSON.stringify(result, null, 2));
+        }
       } finally {
         await db.close();
       }

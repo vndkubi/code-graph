@@ -85,16 +85,17 @@ Add `.codegraph/` to `.gitignore`; it is local generated state.
 
 ## Current Local Benchmark
 
-Run on this repository after the tokenizer/CI feedback pass. These are self-repo deterministic proof harnesses, not external multi-repo claims:
+Run on this repository after the Phase A right-sizing pass (relevance-cliff trimming, keepRatio=0.8 default). These are self-repo deterministic proof harnesses, not external multi-repo claims:
 
 | Benchmark | Result |
 | --- | ---: |
 | Index smoke | 84 files, 6.81s, 148 MB RSS |
 | Setup warm path | 84 parse-cache hits, 740 ms |
-| Golden eval | 4/4 correct, 96.0% estimated token saving |
-| Context proof | 5/5 MCP correct, 80.1% estimated input-token saving, 74.4% file-open reduction, p95 workflow 658 ms |
-| Review proof | 5/5 MCP correct, 85.4% estimated input-token saving, 87.2% file-open reduction, p95 `review_patch` 411 ms |
+| Golden eval | 4/4 correct, 98.0% estimated token saving |
+| Context proof | 5/5 MCP correct, 86.9% estimated input-token saving, 91.4% file-open reduction, p95 workflow 406 ms |
+| Review proof | 5/5 MCP correct, 87.3% estimated input-token saving, 96.9% file-open reduction, p95 `review_patch` 411 ms |
 | Local fallback | 5/5 correct, p50 19 ms, p95 632 ms |
+| Evidence right-sizing | 15–17% additional input-token reduction via relevance-cliff trimming (keepRatio=0.8), gap%=0 |
 
 Token counts use the shared `cl100k_base/js-tiktoken` text estimator. Actual model billing can differ because tools, files, cached input, and model runtime accounting are provider-specific.
 

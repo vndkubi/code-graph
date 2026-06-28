@@ -198,3 +198,4 @@ The refactor meets the intended local runtime shape:
 - local generated folders are excluded from indexing and benchmark baselines.
 
 The deterministic feature benchmarks show the strongest gains for graph/search/review workflows after the fixed setup cost is paid. Real model quality still requires separate non-dry-run Codex/Copilot E2E runs because agent behavior and token accounting are model/runtime dependent. The token estimator now uses a real text tokenizer, but it is still not billing-exact for requests that include tool schemas, files, cached input, or model-specific accounting.
+| 2026-06-28T05:08:50.838Z | 4/4 | 5/5 | ok | 86.9% | 5/5 | 87.3% | 5/5 |

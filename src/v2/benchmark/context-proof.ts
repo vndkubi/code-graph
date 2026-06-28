@@ -19,6 +19,8 @@ export interface ContextProofTask {
   tokenBudget?: number;
   sliceCount?: number;
   includeSnippets?: boolean;
+  rightSize?: boolean;
+  keepRatio?: number;
 }
 
 export interface ContextProofResult {
@@ -401,6 +403,8 @@ async function runMcpProof(
       includeTests: true,
       includeSnippets: task.includeSnippets ?? false,
       snippetLines: 8,
+      ...(task.rightSize !== undefined ? { rightSize: task.rightSize } : {}),
+      ...(task.keepRatio !== undefined ? { keepRatio: task.keepRatio } : {}),
     },
   }) as Record<string, unknown>;
   const contextPacketMs = Date.now() - packetStart;

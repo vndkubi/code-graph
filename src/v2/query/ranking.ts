@@ -377,3 +377,30 @@ export function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined
     factors,
   };
 }
+
+/**
+ * Relevance-cliff trimming. Candidates must already be sorted highest-score
+ * first. Drops the low-relevance tail where the score falls below
+ * `topScore * keepRatio`. `minKeep` (default 1) ensures we never return empty
+ * even when all scores are low; the existing cap (maxFiles/maxSymbols) is
+ * applied upstream and is not altered here — this only co, never grows.
+ *
+ * Rows must expose a numeric `searchScore` property (present on raw DB rows
+ * returned by searchFiles / searchSymbol). Rows without it are kept as-is.
+ */
+export function rightSizeCandidates<T extends Record<string, unknown>>(
+  rows: T[],
+  opts: { keepRatio?: number; minKeep?: number } = {},
+): T[] {
+  const keepRatio = opts.keepRatio ?? 0.8;
+  const minKeep = Math.max(1, opts.minKeep ?? 1);
+  if (rows.length <= minKeep) return rows;
+  const topScore = typeof rows[0].searchScore === 'number' ? rows[0].searchScore as number : 0;
+  if (topScore <= 0) return rows;
+  const cutoff = topScore * keepRatio;
+  return rows.filter((row, i) => {
+    if (i < minKeep) return true;
+    const score = typeof row.searchScore === 'number' ? row.searchScore as number : 0;
+    return score >= cutoff;
+  });
+}
