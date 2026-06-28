@@ -113,10 +113,13 @@ codegraph upgrade-audit --root <workspace> [--policy <path>] [--min-score <numbe
 codegraph status --root <workspace>    Human-readable status report with optional machine-readable --json
 codegraph logs --root <workspace> --tail <number> [--summary|--all|--since|--until|--tool|--event|--invalid]
                                       Print recent workspace query events or a compact aggregate summary
-codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|copilot-e2e|codex-e2e
+codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|copilot-e2e|codex-e2e
                                       Generate repos, measure indexing, or prove retrieval savings
                                       (quality-trend [--out <report.md>] appends a dated correctness/
-                                      token-saving row so ranking/resolver regressions surface over time)
+                                      token-saving row so ranking/resolver regressions surface over time;
+                                      evidence-audit measures Waste% (evidence sent but not needed for a
+                                      correct answer) and Gap% (needed evidence the packet never delivered)
+                                      so packets can be right-sized: exactly what the agent needs, no more)
 ```
 
 ### Codex E2E suite contract

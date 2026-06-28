@@ -19,6 +19,7 @@ import { runCodexE2eBenchmark, type CodexBenchmarkMode } from './v2/benchmark/co
 import { compareCodexE2eReports, formatCompetitiveComparisonMarkdown } from './v2/benchmark/competitive-compare.js';
 import { runRouteGateBenchmark } from './v2/benchmark/route-gate.js';
 import { runQualityTrend, appendQualityTrend } from './v2/benchmark/quality-trend.js';
+import { runEvidenceAudit } from './v2/benchmark/evidence-audit.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 import { buildLocalArtifactIndex } from './v2/mcp/local-artifact.js';
 import { inspectWorkspaceReadiness } from './v2/workspace-health.js';
@@ -176,6 +177,21 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     }
+    case 'evidence-audit': {
+      const root = getFlag(parsed, 'root') ?? process.cwd();
+      const { db } = await openCodeGraphDb(root);
+      try {
+        const result = await runEvidenceAudit(db, root, {
+          tasksFile: getFlag(parsed, 'tasks'),
+          defaultMaxFiles: getNumberFlag(parsed, 'max-files'),
+          maxFilesCap: getNumberFlag(parsed, 'max-files-cap'),
+        });
+        console.log(JSON.stringify(result, null, 2));
+      } finally {
+        await db.close();
+      }
+      return;
+    }
     case 'copilot-e2e':
       runCopilotE2eBenchmark(parsed);
       return;
@@ -215,7 +231,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|copilot-e2e|codex-e2e|competitive-compare');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|copilot-e2e|codex-e2e|competitive-compare');
   }
 }
 
