@@ -57,3 +57,17 @@ export function parseJson<T>(value: string | undefined, fallback: T): T {
     return fallback;
   }
 }
+
+export function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(item => String(item));
+}
+
+export function confidenceFromScore(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0.65;
+  if (value >= 100) return 0.9;
+  if (value >= 80) return 0.8;
+  if (value >= 60) return 0.7;
+  if (value >= 40) return 0.6;
+  return 0.45;
+}
