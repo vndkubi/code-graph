@@ -97,6 +97,7 @@ Run on this repository after the right-sizing + ranking pass (relevance-cliff tr
 | Local fallback | 5/5 correct, p50 19 ms, p95 632 ms |
 | Evidence right-sizing | Quality-neutral on a broad multi-file suite: trimming ON matches the no-trim baseline on both repos (internal 2/3 tasks recall 0.83; external 4/5 recall 0.93) while saving input tokens. The earlier keepRatio=0.8 default was a net quality loss on broad tasks (internal 1/3 0.61, external 2/5 0.70) and was corrected to 0.5 + outlier guard + minKeep floor + stem-aware ranking. |
 | Broad-task recall (`benchmark recall`) | Internal 2/3 allFound, avg recall 0.83; external corpus 4/5, 0.93 — right-sizing ON equals the no-trim baseline on both. Point `--root`/`--tasks` at any repo. |
+| Test-impact selection (`benchmark affected-tests`) | Every directly-coupled test recovered (recall 1.0, worst 1.0) while cutting the suite ~76–79% on average (internal 41 tests → ~8.7 selected; external 86 → ~21.4). Reverse local-import reachability; `affected-tests --changed <files>` for a real diff. |
 
 Token counts use the shared `cl100k_base/js-tiktoken` text estimator. Actual model billing can differ because tools, files, cached input, and model runtime accounting are provider-specific.
 
@@ -112,10 +113,13 @@ codegraph graph --root <workspace> --out <graph.html>
 codegraph doctor --root <workspace>    Inspect readiness, freshness, and setup actions
 codegraph upgrade-audit --root <workspace> [--policy <path>] [--min-score <number>] [--min-grade <A+|A|B+|B|C|D|F>] [--max-slow-ms <ms>] [--max-slow-ms-p95 <ms>] [--max-invalid-lines <number>] [--max-stale-queries <number>] [--max-degraded-queries <number>] [--max-stale-ratio <percent>] [--max-degraded-ratio <percent>] [--tail <number>] [--since/--until/--tool/--event]
                                       Run a readiness + query-log audit with a super-VIP grade
+codegraph affected-tests --root <workspace> --changed <file[,file...]> [--max-depth N] [--limit N]
+                                      Test-impact selection: tests reachable from the changed files
+                                      via the reverse local-import graph (run a targeted subset, not all)
 codegraph status --root <workspace>    Human-readable status report with optional machine-readable --json
 codegraph logs --root <workspace> --tail <number> [--summary|--all|--since|--until|--tool|--event|--invalid]
                                       Print recent workspace query events or a compact aggregate summary
-codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|copilot-e2e|codex-e2e
+codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e
                                       Generate repos, measure indexing, or prove retrieval savings
                                       (quality-trend [--out <report.md>] appends a dated correctness/
                                       token-saving row so ranking/resolver regressions surface over time;

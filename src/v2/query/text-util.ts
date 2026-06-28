@@ -109,6 +109,12 @@ export const FILE_SEARCH_BROAD_TERMS = new Set([
   'service',
   'study',
   'system',
+  // "test"/"tests" are generic query words ("...and tests for X"); a file merely
+  // named `*-tests` must not collect the basename boost and outrank the real
+  // implementation. Test files are surfaced by the fixture/test fallback tier,
+  // not by name-matching the word "test".
+  'test',
+  'tests',
 ]);
 
 export function isBroadExplicitRef(value: string): boolean {

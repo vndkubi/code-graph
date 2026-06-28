@@ -21,6 +21,8 @@ import { runRouteGateBenchmark } from './v2/benchmark/route-gate.js';
 import { runQualityTrend, appendQualityTrend } from './v2/benchmark/quality-trend.js';
 import { runEvidenceAudit } from './v2/benchmark/evidence-audit.js';
 import { runRecallBench } from './v2/benchmark/recall-bench.js';
+import { findAffectedTests } from './v2/query/affected-tests.js';
+import { runAffectedTestsEval } from './v2/benchmark/affected-tests-eval.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 import { buildLocalArtifactIndex } from './v2/mcp/local-artifact.js';
 import { inspectWorkspaceReadiness } from './v2/workspace-health.js';
@@ -83,6 +85,9 @@ async function main(): Promise<void> {
       return;
     case 'route-inspect':
       runRouteInspectCommand(parsed);
+      return;
+    case 'affected-tests':
+      await runAffectedTestsCommand(parsed);
       return;
     case 'benchmark':
       await runBenchmarkCommand(subcommand, parsed);
@@ -235,6 +240,20 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     }
+    case 'affected-tests': {
+      const root = getFlag(parsed, 'root') ?? process.cwd();
+      const { db } = await openCodeGraphDb(root);
+      try {
+        const result = await runAffectedTestsEval(db, root, {
+          sample: getNumberFlag(parsed, 'sample'),
+          maxDepth: getNumberFlag(parsed, 'max-depth'),
+        });
+        console.log(JSON.stringify(result, null, 2));
+      } finally {
+        await db.close();
+      }
+      return;
+    }
     case 'copilot-e2e':
       runCopilotE2eBenchmark(parsed);
       return;
@@ -274,7 +293,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|copilot-e2e|codex-e2e|competitive-compare');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e|competitive-compare');
   }
 }
 
@@ -367,6 +386,25 @@ async function runSetupCommand(parsed: ParsedArgs): Promise<void> {
       artifactPath: artifact.artifactPath,
       next: 'Point your MCP client at `codegraph mcp --root <workspace>`.',
     }, null, 2));
+  } finally {
+    await db.close();
+  }
+}
+
+async function runAffectedTestsCommand(parsed: ParsedArgs): Promise<void> {
+  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const changed = splitCsv(getFlag(parsed, 'changed') ?? getFlag(parsed, 'files')) ?? [];
+  if (changed.length === 0) {
+    throw new Error('affected-tests requires --changed <file[,file...]> (repo-relative paths).');
+  }
+  const { db } = await openCodeGraphDb(root);
+  try {
+    const index = await new V2Indexer(db).indexWorkspace({ root });
+    const result = await findAffectedTests(db, index.snapshotId, changed, {
+      maxDepth: getNumberFlag(parsed, 'max-depth'),
+      limit: getNumberFlag(parsed, 'limit'),
+    });
+    console.log(JSON.stringify(result, null, 2));
   } finally {
     await db.close();
   }

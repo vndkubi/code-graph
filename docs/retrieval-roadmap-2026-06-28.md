@@ -22,7 +22,30 @@ loop. Everything below is ordered by that.
   right-sizing work (a file-role fix that never reached unchanged files). Bump
   the constant whenever that derivation logic changes.
 
+## Shipped in a follow-up pass (test-impact + eval)
+
+- **Test-impact selection (`affected-tests` + `benchmark affected-tests`).**
+  Given changed files, walk the reverse local-import graph to the tests that
+  depend on them, so CI runs a targeted subset. Graph-native and precise (a test
+  is affected only if an actual import path reaches a changed file). Eval: every
+  directly-coupled test recovered (recall 1.0) while cutting the suite ~76–79%
+  (internal 41 tests → ~8.7 selected; external 86 → ~21.4). See
+  [`affected-tests.ts`](../src/v2/query/affected-tests.ts) and
+  [`affected-tests-eval.ts`](../src/v2/benchmark/affected-tests-eval.ts).
+  Next: augment reverse-import reachability with reverse call-graph edges, and
+  expose as an MCP tool (currently CLI + eval).
+
 ## Deferred — ordered
+
+### 0. Semantic embedding channel (the "A" bet — designed, not shipped)
+The remaining ranking residuals (`tree-sitter.ts` for "parsed/extracted") are
+**semantic** misses that neither lexical BM25 nor the graph closes. A local
+embedding model + ANN index as a third retrieval channel (fused via RRF) is the
+fix. NOT shipped this pass on purpose: it needs a model runtime + vector index,
+which is a real departure from the current deterministic, no-daemon, no-extra-
+dependency design — it deserves its own design pass (model choice, on-disk ANN
+format, determinism/caching, cold-index cost) rather than a half-build. This is
+the top "A" item; treat it as the next major effort alongside fusion.
 
 ### 1. Cross-channel fusion (the biggest remaining quality lever)
 The two residual misses (`tree-sitter.ts` for an indexing task; `text-util.ts`
