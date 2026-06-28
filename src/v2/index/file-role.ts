@@ -98,6 +98,17 @@ function isTest(lowerPath: string): boolean {
   // hits on segments like `latest/`.
   return /(^|\/)(__tests__|__test__|test|tests|spec|specs)(\/|$)/.test(lowerPath)
     || lowerPath.includes('/src/test/')
+    // End-to-end / acceptance test conventions. These live OUTSIDE the unit-test
+    // dirs above and use compound segment names that the strict-segment regex
+    // misses (`e2e_test/`, not `test/`). Without this, an entire e2e tree of page
+    // objects, step definitions, and fixtures (often hundreds of files in a
+    // polyglot repo) is classified main_source — e2e helpers whose names
+    // substring-match domain terms (assumeAssimilationPage) then flood research
+    // seed selection and bury the real implementation.
+    || /(^|\/)(e2e|e2e_test|e2e_tests|e2e-test|e2e-tests|e2etest|e2etests)(\/|$)/.test(lowerPath)
+    || /(^|\/)(step_definitions|step-definitions|pageobjects|page_objects|page-objects)(\/|$)/.test(lowerPath)
+    || /(^|\/)(cypress|playwright|integration_test|integration-tests?)(\/|$)/.test(lowerPath)
+    || /test[-_]fixtures?(\/|$)/.test(lowerPath)
     || /\.(test|spec)\.[cm]?[jt]sx?$/.test(lowerPath)
     || lowerPath.endsWith('test.java')
     || lowerPath.endsWith('tests.java')
