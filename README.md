@@ -85,7 +85,7 @@ Add `.codegraph/` to `.gitignore`; it is local generated state.
 
 ## Current Local Benchmark
 
-Run on this repository after the Phase A right-sizing pass (relevance-cliff trimming, keepRatio=0.8 default). These are self-repo deterministic proof harnesses, not external multi-repo claims:
+Run on this repository after the right-sizing + ranking pass (relevance-cliff trimming with an outlier guard and a `minKeep` floor, keepRatio=0.5 default; stem-aware file ranking; `__tests__/` role classification). These are self-repo deterministic proof harnesses, not external multi-repo claims:
 
 | Benchmark | Result |
 | --- | ---: |
@@ -95,7 +95,8 @@ Run on this repository after the Phase A right-sizing pass (relevance-cliff trim
 | Context proof | 5/5 MCP correct, 86.9% estimated input-token saving, 91.4% file-open reduction, p95 workflow 406 ms |
 | Review proof | 5/5 MCP correct, 87.3% estimated input-token saving, 96.9% file-open reduction, p95 `review_patch` 411 ms |
 | Local fallback | 5/5 correct, p50 19 ms, p95 632 ms |
-| Evidence right-sizing | 15–17% additional input-token reduction via relevance-cliff trimming (keepRatio=0.8), gap%=0 |
+| Evidence right-sizing | Quality-neutral on a broad multi-file suite: trimming ON matches the no-trim baseline on both repos (internal 2/3 tasks recall 0.83; external 4/5 recall 0.93) while saving input tokens. The earlier keepRatio=0.8 default was a net quality loss on broad tasks (internal 1/3 0.61, external 2/5 0.70) and was corrected to 0.5 + outlier guard + minKeep floor + stem-aware ranking. |
+| Broad-task recall (`benchmark recall`) | Internal 2/3 allFound, avg recall 0.83; external corpus 4/5, 0.93 — right-sizing ON equals the no-trim baseline on both. Point `--root`/`--tasks` at any repo. |
 
 Token counts use the shared `cl100k_base/js-tiktoken` text estimator. Actual model billing can differ because tools, files, cached input, and model runtime accounting are provider-specific.
 
@@ -114,13 +115,17 @@ codegraph upgrade-audit --root <workspace> [--policy <path>] [--min-score <numbe
 codegraph status --root <workspace>    Human-readable status report with optional machine-readable --json
 codegraph logs --root <workspace> --tail <number> [--summary|--all|--since|--until|--tool|--event|--invalid]
                                       Print recent workspace query events or a compact aggregate summary
-codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|copilot-e2e|codex-e2e
+codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|copilot-e2e|codex-e2e
                                       Generate repos, measure indexing, or prove retrieval savings
                                       (quality-trend [--out <report.md>] appends a dated correctness/
                                       token-saving row so ranking/resolver regressions surface over time;
                                       evidence-audit measures Waste% (evidence sent but not needed for a
                                       correct answer) and Gap% (needed evidence the packet never delivered)
-                                      so packets can be right-sized: exactly what the agent needs, no more)
+                                      so packets can be right-sized: exactly what the agent needs, no more;
+                                      recall [--root <repo>] [--tasks <suite.json>] [--max-files N]
+                                      [--keep-ratio R] measures broad multi-file recall (allFound, avg
+                                      recall, recall@N) with right-sizing ON vs the no-trim baseline —
+                                      point it at any repo to check retrieval on a real corpus)
 ```
 
 ### Codex E2E suite contract

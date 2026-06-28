@@ -1,0 +1,30 @@
+{
+  "_comment": "Broad, multi-file recall tasks. Each task's answer is a UNION of files across modules, so any one being mis-ranked or trimmed fails it. Run with: codegraph benchmark recall --root <repo> --tasks <this-file>. expectedFiles are matched as path suffixes. This sample targets the codegraph-external corpus; copy and adapt expectedFiles for your own repo.",
+  "tasks": [
+    {
+      "id": "ext-indexing",
+      "task": "Trace the full indexing pipeline: how files are discovered, parsed and extracted into symbols, and written to the database.",
+      "expectedFiles": ["extraction/index.ts", "extraction/tree-sitter.ts", "db/index.ts"]
+    },
+    {
+      "id": "ext-mcp",
+      "task": "How does the MCP server register its tools, route an incoming tool call to a handler, and manage a session?",
+      "expectedFiles": ["mcp/tools.ts", "mcp/engine.ts", "mcp/session.ts"]
+    },
+    {
+      "id": "ext-grammars",
+      "task": "How are tree-sitter grammars loaded and used to extract symbols for multiple languages?",
+      "expectedFiles": ["extraction/grammars.ts", "extraction/tree-sitter.ts"]
+    },
+    {
+      "id": "ext-resolution",
+      "task": "How does cross-file symbol resolution and name matching work?",
+      "expectedFiles": ["resolution/index.ts", "resolution/name-matcher.ts"]
+    },
+    {
+      "id": "ext-search",
+      "task": "How does search query parsing and ranking work for symbols and files?",
+      "expectedFiles": ["search/query-parser.ts", "search/query-utils.ts"]
+    }
+  ]
+}

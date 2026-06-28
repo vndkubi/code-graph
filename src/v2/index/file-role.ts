@@ -91,9 +91,14 @@ function isGenerated(lowerPath: string): boolean {
 }
 
 function isTest(lowerPath: string): boolean {
-  return lowerPath.includes('/src/test/')
-    || lowerPath.includes('/test/')
-    || lowerPath.includes('/tests/')
+  // Segment-aware so the JS `__tests__/` convention is caught — its surrounding
+  // underscores mean a plain `.includes('/tests/')` misses it, which let a file
+  // like `__tests__/evaluation/scoring.ts` masquerade as main_source and slip
+  // past `includeTests:false`. The boundary `(^|/)...(/|$)` also avoids false
+  // hits on segments like `latest/`.
+  return /(^|\/)(__tests__|__test__|test|tests|spec|specs)(\/|$)/.test(lowerPath)
+    || lowerPath.includes('/src/test/')
+    || /\.(test|spec)\.[cm]?[jt]sx?$/.test(lowerPath)
     || lowerPath.endsWith('test.java')
     || lowerPath.endsWith('tests.java')
     || lowerPath.endsWith('spec.ts')
@@ -101,10 +106,5 @@ function isTest(lowerPath: string): boolean {
 }
 
 function isMock(lowerPath: string): boolean {
-  return lowerPath.includes('/mock/')
-    || lowerPath.includes('/mocks/')
-    || lowerPath.includes('/fixtures/')
-    || lowerPath.includes('/testdata/')
-    || lowerPath.includes('/stub/')
-    || lowerPath.includes('/stubs/');
+  return /(^|\/)(__mocks__|mock|mocks|fixtures|testdata|stub|stubs)(\/|$)/.test(lowerPath);
 }

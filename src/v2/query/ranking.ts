@@ -9,6 +9,7 @@ import {
   splitIdentifierWords,
   isBroadSearchTerm,
   identifierSearchTerms,
+  wordsShareStem,
 } from './text-util.js';
 import { parseJson, uniqueStrings } from './util.js';
 import type {
@@ -260,17 +261,21 @@ export function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined
   // file literally named `service.ts` matching the broad token "service" must
   // not collect +90/+45 and bury `PaymentService.java`; broad terms are noise
   // on their own and only carry signal as part of a compound (handled below).
-  const exactBasenameMatches = tokens.filter(token => token === basenameWithoutExt && !isBroadSearchTerm(token));
+  // Stem-aware so a file named for the concept matches an inflected query token
+  // (`indexer.ts` <- "indexing pipeline"). Without this the named orchestrator
+  // misses the +90 boost and loses to a verbose file that merely repeats the
+  // term in its body.
+  const exactBasenameMatches = tokens.filter(token => wordsShareStem(token, basenameWithoutExt) && !isBroadSearchTerm(token));
   if (exactBasenameMatches.length > 0) {
     score += 90;
-    reason = 'query token exactly matched file basename';
-    factors.push('query token exactly matched file basename');
+    reason = 'query token matched file basename';
+    factors.push('query token matched file basename (stem-aware)');
   }
   // Split the basename on BOTH camelCase and separators so a PascalCase name
   // like `PaymentService` contributes its individual words ("payment",
   // "service") instead of staying an opaque single token.
   const basenameParts = splitIdentifierWords(basenameOriginalNoExt);
-  const basenamePartMatches = uniqueStrings(tokens.filter(token => basenameParts.includes(token)));
+  const basenamePartMatches = uniqueStrings(tokens.filter(token => basenameParts.some(part => wordsShareStem(token, part))));
   const specificBasenamePartMatches = basenamePartMatches.filter(token => !isBroadSearchTerm(token));
   if (specificBasenamePartMatches.length > 0) {
     score += 45 * specificBasenamePartMatches.length;
@@ -291,7 +296,7 @@ export function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined
   // filename differs from the class name.
   const definesPhraseSymbol = symbols.some(symbol => {
     const words = splitIdentifierWords(String((symbol as { name?: unknown }).name ?? ''));
-    const covered = uniqueStrings(tokens.filter(token => words.includes(token)));
+    const covered = uniqueStrings(tokens.filter(token => words.some(word => wordsShareStem(token, word))));
     return covered.length >= 2 && covered.some(token => !isBroadSearchTerm(token));
   });
   if (definesPhraseSymbol) {
@@ -379,11 +384,25 @@ export function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined
 }
 
 /**
+ * Rank-1 is treated as a spurious outlier (and the cutoff anchored to rank-2
+ * instead) once it exceeds the cluster head by this factor. Calibrated against
+ * the evidence corpus: a verbose file that merely repeats the query term can
+ * outscore the genuine cluster ~2x (e.g. `evaluation/scoring.ts` 208 over a
+ * 95-point cluster); a real clear winner sits ~1.2-1.3x above rank-2. 1.4 sits
+ * between those so only the spurious case relaxes the cut.
+ */
+const RIGHTSIZE_OUTLIER_FACTOR = 1.4;
+
+/**
  * Relevance-cliff trimming. Candidates must already be sorted highest-score
  * first. Drops the low-relevance tail where the score falls below
- * `topScore * keepRatio`. `minKeep` (default 1) ensures we never return empty
- * even when all scores are low; the existing cap (maxFiles/maxSymbols) is
- * applied upstream and is not altered here — this only co, never grows.
+ * `anchor * keepRatio`. The anchor is normally the top score, BUT when rank-1
+ * is an outlier far above rank-2 the anchor drops to rank-2 — otherwise a
+ * single spurious high scorer pulls the cutoff up and nukes the genuine
+ * candidate cluster (observed: a 271-point outlier trimming a real answer at
+ * 135 down to nothing). `minKeep` (default 1) ensures we never return empty;
+ * the existing cap (maxFiles/maxSymbols) is applied upstream and only shrinks
+ * the set further, never grows it.
  *
  * Rows must expose a numeric `searchScore` property (present on raw DB rows
  * returned by searchFiles / searchSymbol). Rows without it are kept as-is.
@@ -395,12 +414,20 @@ export function rightSizeCandidates<T extends Record<string, unknown>>(
   const keepRatio = opts.keepRatio ?? 0.8;
   const minKeep = Math.max(1, opts.minKeep ?? 1);
   if (rows.length <= minKeep) return rows;
-  const topScore = typeof rows[0].searchScore === 'number' ? rows[0].searchScore as number : 0;
+  const scoreOf = (row: T): number => (typeof row.searchScore === 'number' ? row.searchScore as number : 0);
+  const topScore = scoreOf(rows[0]);
   if (topScore <= 0) return rows;
-  const cutoff = topScore * keepRatio;
+  const secondScore = scoreOf(rows[1]);
+  // Outlier guard: if rank-1 stands far above rank-2, it is likely a spurious
+  // term-frequency winner, not evidence that everything below it is irrelevant.
+  // Anchor the cutoff to the cluster head (rank-2) so the real candidates below
+  // survive; the answer is often in that cluster, not the outlier.
+  const anchor = secondScore > 0 && topScore / secondScore >= RIGHTSIZE_OUTLIER_FACTOR
+    ? secondScore
+    : topScore;
+  const cutoff = anchor * keepRatio;
   return rows.filter((row, i) => {
     if (i < minKeep) return true;
-    const score = typeof row.searchScore === 'number' ? row.searchScore as number : 0;
-    return score >= cutoff;
+    return scoreOf(row) >= cutoff;
   });
 }

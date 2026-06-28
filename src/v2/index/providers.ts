@@ -5,6 +5,17 @@ import { sha256File } from '../hash.js';
 import type { CallInfo, ParseResult, SymbolInfo, SymbolKind } from '../../analyzers/base-analyzer.js';
 import { parseFilesBatch, type ParseBatchOptions, type ParseWorkItem, type ParseWorkResult } from './parse.js';
 
+/**
+ * Version of path-/content-derived indexing logic that is NOT owned by a parse
+ * provider — file-role classification, role-derived filtering, and any other
+ * derivation written onto file rows. It is folded into the provider-set version
+ * so a change here invalidates cached snapshots and forces a full re-derive on
+ * the next index, instead of incremental refresh silently serving stale values
+ * (e.g. a file-role fix that never reaches unchanged files). Bump on any change
+ * to that derivation logic.
+ */
+export const DERIVATION_LOGIC_VERSION = 2;
+
 export interface IndexProviderOptions {
   root: string;
   indexProviders?: string[] | string;
@@ -98,7 +109,16 @@ export function buildIndexProviderSet(options: IndexProviderOptions): IndexProvi
     }
   });
   const providerIds = providers.map(provider => provider.id);
-  const providerVersions = Object.fromEntries(providers.map(provider => [provider.id, provider.version]));
+  // The `__derivation` synthetic entry folds non-provider derivation logic
+  // (file-role classification etc.) into providerVersions, which is the value
+  // `snapshotProviderMatches` compares and the parse-cache key uses. Bumping
+  // DERIVATION_LOGIC_VERSION therefore invalidates stale snapshots + parse
+  // caches and forces a full re-derive — closing the gap where incremental
+  // refresh kept stale path-derived metadata on unchanged files.
+  const providerVersions = {
+    ...Object.fromEntries(providers.map(provider => [provider.id, provider.version])),
+    __derivation: String(DERIVATION_LOGIC_VERSION),
+  };
   return {
     id: providerIds.join('+'),
     version: JSON.stringify(providerVersions),

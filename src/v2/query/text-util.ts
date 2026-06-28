@@ -168,3 +168,54 @@ export function splitIdentifierWords(value: string): string[] {
     .split(/[^a-z0-9]+/g)
     .filter(Boolean);
 }
+
+// Suffixes stripped longest-first so a single pass removes the most specific
+// morphological ending. Conservative on purpose: the `wordsShareStem` prefix
+// check below recovers cases this list doesn't normalize perfectly (e.g.
+// `extraction` ~ `extract`), so the list only needs the high-frequency endings.
+const STEM_SUFFIXES = [
+  'izations', 'ization', 'ations', 'ation', 'izing',
+  'ings', 'ies', 'ing', 'ers', 'ors', 'er', 'or', 'ed', 'es', 's',
+];
+
+/**
+ * Light morphological stem. Maps `indexing`, `indexer`, `index` -> `index`;
+ * `scoring` -> `scor`; `phases` -> `phas`. Not a full Porter stemmer — just
+ * enough to let a file literally named for a concept (`indexer.ts`) match a
+ * query that names the concept in a different inflection (`indexing pipeline`).
+ * Words of length <= 4 are returned unchanged to avoid over-stemming.
+ */
+export function stemWord(word: string): string {
+  const w = word.toLowerCase();
+  if (w.length <= 4) return w;
+  for (const suffix of STEM_SUFFIXES) {
+    if (w.endsWith(suffix) && w.length - suffix.length >= 3) {
+      return w.slice(0, w.length - suffix.length);
+    }
+  }
+  return w;
+}
+
+// The remainder a prefix match is allowed to add. Restricting it to genuine
+// inflectional endings stops a short query token from prefix-matching an
+// unrelated longer word (`call` must NOT match `callback` — remainder `back`;
+// but `extract` ~ `extraction` (remainder `ion`) and `scor` ~ `score`
+// (remainder `e`) are real morphology and must still match).
+const INFLECTIONAL_REMAINDER = /^(e|s|es|d|ed|r|er|ers|or|ors|ing|ings|ion|ions|tion|ation|al)$/;
+
+/**
+ * Whether two words refer to the same root after light stemming. Equal stems
+ * match; so do stems where one is a prefix of the other (min shared length 4)
+ * AND the trailing remainder is a real inflectional ending — the suffix list
+ * leaves silent-`e`/`-ion` cases slightly off, and this recovers them without
+ * letting `call` swallow `callback`.
+ */
+export function wordsShareStem(a: string, b: string): boolean {
+  if (a === b) return true;
+  const sa = stemWord(a);
+  const sb = stemWord(b);
+  if (sa === sb) return true;
+  const [shorter, longer] = sa.length <= sb.length ? [sa, sb] : [sb, sa];
+  if (shorter.length < 4 || !longer.startsWith(shorter)) return false;
+  return INFLECTIONAL_REMAINDER.test(longer.slice(shorter.length));
+}
