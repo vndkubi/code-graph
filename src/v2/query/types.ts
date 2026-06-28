@@ -61,3 +61,26 @@ export interface SearchScore {
 export interface SearchIntent {
   kind: 'none' | 'entry_point';
 }
+
+export interface EndpointRow {
+  method: string;
+  path: string;
+  path_resolution: string;
+  path_resolution_reason?: string;
+  handler_symbol: string;
+  controller?: string;
+  file: string;
+  line: number;
+  framework: string;
+  confidence: number;
+  file_role: string;
+}
+
+export interface DependencyTraceEdge {
+  fromFile: string;
+  toFile: string;
+  kind: string;
+  confidence: number;
+  resolutionKind: string;
+  depth: number;
+}

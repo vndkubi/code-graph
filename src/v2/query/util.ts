@@ -71,3 +71,16 @@ export function confidenceFromScore(value: unknown): number {
   if (value >= 40) return 0.6;
   return 0.45;
 }
+
+export function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, ch => `\\${ch}`);
+}
+
+export function rankFiles(files: string[]): string[] {
+  const counts = new Map<string, number>();
+  for (const file of files) {
+    if (!file) continue;
+    counts.set(file, (counts.get(file) ?? 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([file]) => file);
+}
