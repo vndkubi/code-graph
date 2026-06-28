@@ -16,6 +16,7 @@ The goal is to let agents start from compact graph-backed packets instead of rep
 | Incremental refresh | Small edits and deletes can refresh by changed path instead of rebuilding the whole workspace. |
 | Agent-ready packets | `get_research_pack`, `get_flow_pack`, `get_change_pack`, and `review_patch` return ranked context with bounded evidence. |
 | Offline graph export | Generates a static HTML graph viewer from indexed facts. |
+| Session evidence reuse | Pass a stable `sessionId` on every pack call and CodeGraph omits source bodies it already delivered (`reusedFromEarlierCall`), cutting duplicate tokens across a multi-step task; `freshEvidence: true` forces full bodies. |
 | Response metadata | Every tool response includes `_codegraph_meta` with tool name, `duration_ms`, `response_chars`, `tokens_est`, and item counts. |
 
 ## Joint Workflow with TokenOpt
@@ -112,8 +113,10 @@ codegraph upgrade-audit --root <workspace> [--policy <path>] [--min-score <numbe
 codegraph status --root <workspace>    Human-readable status report with optional machine-readable --json
 codegraph logs --root <workspace> --tail <number> [--summary|--all|--since|--until|--tool|--event|--invalid]
                                       Print recent workspace query events or a compact aggregate summary
-codegraph benchmark generate|index|eval|proof|review|fallback|copilot-e2e|codex-e2e
+codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|copilot-e2e|codex-e2e
                                       Generate repos, measure indexing, or prove retrieval savings
+                                      (quality-trend [--out <report.md>] appends a dated correctness/
+                                      token-saving row so ranking/resolver regressions surface over time)
 ```
 
 ### Codex E2E suite contract
@@ -153,7 +156,8 @@ Common options:
 --auto-refresh                         Refresh stale snapshots before MCP tool calls when safe
 --refresh-on-start                     Queue a background refresh when MCP starts
 --watch                                Watch files and refresh changed paths in the background
---warn-stale                           Include freshness checks in all MCP tool responses
+--warn-stale                           Freshness/stale-index checks are ON by default for all MCP
+                                       tool responses; pass --no-warn-stale to opt out
 --prewarm                              Index missing snapshots inside MCP startup/runtime
 ```
 
