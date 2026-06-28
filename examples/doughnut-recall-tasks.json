@@ -41,11 +41,12 @@
       ]
     },
     {
+      "_note": "Target corrected after ground-truth audit: ApplicationController.java is the robots.txt / SPA-serving controller (verified by reading it) with nothing to do with authorization. The query clause 'how is the current user resolved from the request context' is precisely answered by CurrentUserFetcherFromRequest (a @RequestScope component that takes HttpServletRequest and resolves the User).",
       "id": "doughnut-authorization",
       "task": "How does authorization work across controllers? What service enforces access control, and how is the current user resolved from the request context?",
       "expectedFiles": [
         "services/AuthorizationService.java",
-        "controllers/ApplicationController.java"
+        "currentUser/CurrentUserFetcherFromRequest.java"
       ]
     }
   ]
