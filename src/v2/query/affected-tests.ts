@@ -6,10 +6,16 @@
  * not: a test is "affected" only if there is an actual import path from it to a
  * changed file.
  *
- * Uses the `imports` table (local, is_external = 0, relative specifiers resolved
- * against the file set) and `files.file_role`. Correct role classification is a
- * prerequisite — see DERIVATION_LOGIC_VERSION in the indexer, which forces a
- * re-derive when that logic changes so this never walks stale roles.
+ * Edges come from two sources, unioned:
+ *  - the `imports` table (local, is_external = 0, relative specifiers resolved
+ *    against the file set) — covers JS/TS where imports are relative paths;
+ *  - the `dependency_edges` table (resolved file->file edges) — covers languages
+ *    whose imports are NOT relative paths, above all Java/Kotlin where imports are
+ *    package-qualified and flagged is_external (so the imports table alone yields
+ *    an EMPTY graph and affected-tests returned 0 for every Java change).
+ * Correct role classification is a prerequisite — see DERIVATION_LOGIC_VERSION in
+ * the indexer, which forces a re-derive when that logic changes so this never
+ * walks stale roles.
  */
 import type { CodeGraphDb } from '../storage/database.js';
 import path from 'node:path';
@@ -72,12 +78,25 @@ export async function buildImportGraph(db: CodeGraphDb, snapshotId: string): Pro
     'SELECT file, source FROM imports WHERE snapshot_id = ? AND is_external = 0',
   ).all(snapshotId) as Array<{ file: string; source: string }>;
   const importers = new Map<string, Set<string>>();
+  const addEdge = (target: string, importer: string): void => {
+    if (!target || !importer || target === importer) return;
+    if (!importers.has(target)) importers.set(target, new Set());
+    importers.get(target)!.add(importer);
+  };
   for (const row of importRows) {
     const target = resolveSpecifier(row.file, row.source, allPaths);
-    if (!target) continue;
-    if (!importers.has(target)) importers.set(target, new Set());
-    importers.get(target)!.add(row.file);
+    if (target) addEdge(target, row.file);
   }
+
+  // Resolved file->file edges (Java/Kotlin and any non-relative-import language).
+  // from_file depends on to_file, so to_file's importer set gains from_file.
+  const depRows = await db.prepare(
+    'SELECT from_file, to_file FROM dependency_edges WHERE snapshot_id = ?',
+  ).all(snapshotId) as Array<{ from_file: string; to_file: string }>;
+  for (const row of depRows) {
+    if (allPaths.has(row.from_file) && allPaths.has(row.to_file)) addEdge(row.to_file, row.from_file);
+  }
+
   return { importers, roleByPath, allPaths, totalTests };
 }
 
