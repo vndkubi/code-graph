@@ -107,6 +107,27 @@ export function isEntityLike(symbol: Record<string, unknown>): boolean {
  * or local, so definitions outrank members outrank locals. Small enough to only
  * break ties among equal name-match tiers, never to override a stronger match.
  */
+/**
+ * Role weight for symbol ranking. main_source is the investigation target;
+ * config/build/test/generated symbols are demoted with real (negative) weight so
+ * the thousands of YAML/properties keys a repo exposes cannot outrank code on an
+ * exact name match, while still ranking when no code symbol matches. Steeper than
+ * the file-search roleRank/10 (which is near-flat: 10 vs 8) on purpose.
+ */
+function symbolRoleScore(role: string): number {
+  switch (role) {
+    case 'main_source': return 10;
+    case 'test_source': return -8;
+    case 'mock_source': return -10;
+    case 'resource_config': return -12;
+    case 'build_config': return -15;
+    case 'generated': return -12;
+    case 'external_stub': return -14;
+    case 'vendored': return -20;
+    default: return 0;
+  }
+}
+
 function symbolKindRank(kind: string): number {
   switch (kind) {
     case 'class':
@@ -234,7 +255,13 @@ export function scoreSymbolSearch(
       factors.push(`symbol kind ${row.kind} contributed ${kindBoost} points (definition-over-member priority)`);
     }
   }
-  const fileRoleBoost = Math.round(roleRank(row.file_role) / 10);
+  // Role weight for symbol search. Steeper than file search: config/build files
+  // expose huge numbers of key "symbols" (doughnut: 6353 resource_config vs 5023
+  // main_source), so a near-flat role boost let YAML/properties keys exactly
+  // matching a query ("username", "password") bury all code — search_symbol
+  // "password" returned only ci.yml / *.properties keys. Demote non-source roles
+  // so code wins equal matches while config stays findable when nothing else hits.
+  const fileRoleBoost = symbolRoleScore(row.file_role);
   score += fileRoleBoost;
   factors.push(`file role ${row.file_role} contributed ${fileRoleBoost} points`);
 
