@@ -101,6 +101,36 @@ export function isEntityLike(symbol: Record<string, unknown>): boolean {
   return role.includes('entity') || name.endsWith('Entity');
 }
 
+/**
+ * Relative findability of a symbol kind when its name matches the query. A bare
+ * type name resolves to its definition far more often than to a same-named field
+ * or local, so definitions outrank members outrank locals. Small enough to only
+ * break ties among equal name-match tiers, never to override a stronger match.
+ */
+function symbolKindRank(kind: string): number {
+  switch (kind) {
+    case 'class':
+    case 'interface':
+    case 'enum':
+    case 'record':
+    case 'annotation':
+    case 'struct':
+    case 'type':
+      return 18;
+    case 'method':
+    case 'constructor':
+    case 'function':
+      return 10;
+    case 'field':
+    case 'property':
+    case 'enum_constant':
+    case 'constant':
+      return 5;
+    default:
+      return 0;
+  }
+}
+
 export function scoreSymbolSearch(
   row: SymbolRow,
   query: string,
@@ -174,6 +204,21 @@ export function scoreSymbolSearch(
   if (syntheticPenalty) {
     score += syntheticPenalty;
     factors.push('lombok synthetic symbol penalty');
+  }
+  // Kind priority: a bare type-name query ("Note", "User", "RecallPrompt") almost
+  // always wants the DEFINITION, but a field/parameter that happens to share the
+  // lowercased name ties it at the exact-match tier and — because such fields are
+  // numerous (72 `name` fields, 116 `description`) — floods the result and buries
+  // the one class. Rank definition kinds above members above locals so the type
+  // wins its exact-name tie. Applied only to genuine name matches (exact tiers or
+  // a name-token hit) so it never resurfaces an otherwise-irrelevant definition.
+  const nameMatched = matchedInSimple.length > 0 || exactPhrase;
+  if (nameMatched) {
+    const kindBoost = symbolKindRank(row.kind);
+    if (kindBoost !== 0) {
+      score += kindBoost;
+      factors.push(`symbol kind ${row.kind} contributed ${kindBoost} points (definition-over-member priority)`);
+    }
   }
   const fileRoleBoost = Math.round(roleRank(row.file_role) / 10);
   score += fileRoleBoost;
