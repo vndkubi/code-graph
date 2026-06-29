@@ -159,12 +159,26 @@ export function scoreSymbolSearch(
   const exactPhrase = simpleLower === queryLower || fqLower === queryLower
     || simpleLower.includes(queryLower)
     || fqLower.includes(queryLower);
+  // Qualified member reference: a dotted query "Owner.member" whose FQCN ends with
+  // ".owner.member" is the precise member the user named. Rank it at the exact tier
+  // so it beats a class whose name merely COMPACTS to the same string — e.g.
+  // "Note.title" resolves to the Note.title field, not the unrelated NoteTitle class
+  // (which otherwise wins the compact tier since "Note.title" -> "notetitle").
+  const qualifiedMember = queryLower.includes('.')
+    && (fqLower === queryLower || fqLower.endsWith(`.${queryLower}`));
 
   let score = 0;
   let reason = 'partial token match';
   const factors: string[] = [];
 
-  if (simpleLower === queryLower || fqLower === queryLower) {
+  if (qualifiedMember && simpleLower !== queryLower) {
+    // Above the plain exact tier: a dotted Owner.member query is more specific
+    // than a bare name, and must win even against a class that takes the compact
+    // tier (112) plus the definition kind boost (+18) for the concatenated name.
+    score = 135;
+    reason = 'exact qualified member match';
+    factors.push('FQCN ends with the qualified Owner.member query');
+  } else if (simpleLower === queryLower || fqLower === queryLower) {
     score = 120;
     reason = 'exact symbol/FQCN match';
     factors.push('exact symbol or FQCN equals query');

@@ -49,6 +49,31 @@ export class ${owner} {
     expect(top?.file ?? '').toContain('Note.ts');
   });
 
+  it('resolves a qualified Owner.member query to the member, not a same-compact class', async () => {
+    // Regression: "Note.title" compacts to "notetitle" and was hijacked by an
+    // unrelated NoteTitle class (compact tier + class kind boost). A dotted query
+    // whose FQCN ends with .owner.member is the precise member the user named.
+    const repo = tempDir('codegraph-qualified-');
+    writeFile(repo, 'src/Note.ts', `export class Note {
+  title: string = '';
+}
+`);
+    writeFile(repo, 'src/NoteTitle.ts', `export class NoteTitle {
+  value: string = '';
+}
+`);
+    const { db } = await openDb(repo);
+    const indexed = await new V2Indexer(db).indexWorkspace({ root: repo });
+    const result = await new V2QueryService(db).query({
+      workspaceId: indexed.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'Note.title', limit: 3 },
+    }) as { symbols: Array<{ name: string; kind?: string }> };
+
+    expect(result.symbols[0]?.name).toBe('title');
+    expect(result.symbols[0]?.kind).toBe('field');
+  });
+
   it('still resolves a field query to the field when no type shares the name', async () => {
     const repo = tempDir('codegraph-kind-field-');
     writeFile(repo, 'src/Tracker.ts', `export class Tracker {
