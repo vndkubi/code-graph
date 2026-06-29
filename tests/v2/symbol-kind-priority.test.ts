@@ -74,6 +74,32 @@ export class ${owner} {
     expect(result.symbols[0]?.kind).toBe('field');
   });
 
+  it('resolves a physical DB table name to its entity via @Table, from Java only', async () => {
+    // The schema-driven lookup: a developer with only the DB schema (no DB access)
+    // searches the physical table name; @Table(name=...) maps it to the Java entity
+    // even when the names differ (table quiz_answer -> class Answer).
+    const repo = tempDir('codegraph-dbname-');
+    writeFile(repo, 'src/Answer.java', `package com.x;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Table;
+@Entity
+@Table(name = "quiz_answer")
+public class Answer {
+  private int id;
+}
+`);
+    const { db } = await openDb(repo);
+    const indexed = await new V2Indexer(db).indexWorkspace({ root: repo });
+    const result = await new V2QueryService(db).query({
+      workspaceId: indexed.workspaceId,
+      toolName: 'search_symbol',
+      args: { query: 'quiz_answer', limit: 3 },
+    }) as { symbols: Array<{ name: string; kind?: string }> };
+
+    expect(result.symbols[0]?.name).toBe('Answer');
+    expect(result.symbols[0]?.kind).toBe('class');
+  });
+
   it('still resolves a field query to the field when no type shares the name', async () => {
     const repo = tempDir('codegraph-kind-field-');
     writeFile(repo, 'src/Tracker.ts', `export class Tracker {

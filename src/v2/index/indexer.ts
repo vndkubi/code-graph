@@ -2638,9 +2638,10 @@ export class V2Indexer {
              COALESCE(package_name, '') AS package_name,
              COALESCE(framework_role, '') AS framework_role,
              COALESCE(signature, '') AS signature,
+             COALESCE(framework_meta_json, '') AS framework_meta_json,
              line
       FROM symbols WHERE snapshot_id = ? ${filter}
-    `).all<{ fq_name: string; simple_name: string; file: string; kind: string; package_name: string; framework_role: string; signature: string; line: number }>(
+    `).all<{ fq_name: string; simple_name: string; file: string; kind: string; package_name: string; framework_role: string; signature: string; framework_meta_json: string; line: number }>(
       snapshotId, ...(files ?? []),
     );
     const ftsRows = symbolRows.map(r => {
@@ -2648,7 +2649,12 @@ export class V2Indexer {
       // natural-language query tokens "assimilation service".
       const expanded = splitIdentifierWords(r.simple_name).join(' ');
       const entityId = `${r.fq_name}\t${r.file}\t${r.line}`;
-      const content = `${r.fq_name} ${r.simple_name} ${expanded} ${r.file} ${r.kind} ${r.package_name} ${r.framework_role} ${r.signature}`;
+      // Physical DB name from @Table/@Column(name=...) so a query for the physical
+      // identifier (e.g. "quiz_answer" -> entity Answer) resolves from Java source
+      // alone, no DB access. Include both the raw name and its split words.
+      const dbName = parseDbName(r.framework_meta_json);
+      const dbNameTokens = dbName ? `${dbName} ${splitIdentifierWords(dbName).join(' ')}` : '';
+      const content = `${r.fq_name} ${r.simple_name} ${expanded} ${r.file} ${r.kind} ${r.package_name} ${r.framework_role} ${r.signature} ${dbNameTokens}`;
       return [snapshotId, 'symbol', entityId, r.file, r.simple_name, content];
     });
     await this.db.copyFromRows(
@@ -4740,6 +4746,17 @@ const RECEIVER_METHOD_PATTERN = /^(this|super|[A-Za-z_$][A-Za-z0-9_$]*)(?:[.][A-
 
 function isPreResolvableCallCallee(callee: string): boolean {
   return SIMPLE_METHOD_PATTERN.test(callee) || RECEIVER_METHOD_PATTERN.test(callee);
+}
+
+/** Physical DB name (@Table/@Column name=...) captured into frameworkMeta, if any. */
+function parseDbName(frameworkMetaJson: string): string | undefined {
+  if (!frameworkMetaJson) return undefined;
+  try {
+    const meta = JSON.parse(frameworkMetaJson) as { dbName?: unknown };
+    return typeof meta.dbName === 'string' && meta.dbName.length > 0 ? meta.dbName : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function queueImplementationCallEdges(

@@ -14,7 +14,7 @@ import { parseFilesBatch, type ParseBatchOptions, type ParseWorkItem, type Parse
  * (e.g. a file-role fix that never reaches unchanged files). Bump on any change
  * to that derivation logic.
  */
-export const DERIVATION_LOGIC_VERSION = 4;
+export const DERIVATION_LOGIC_VERSION = 5;
 
 export interface IndexProviderOptions {
   root: string;

@@ -1148,6 +1148,15 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       'ServerEndpoint',
     ]);
 
+    // JPA/Jakarta persistence annotations whose `name`/`value` argument is the
+    // PHYSICAL database identifier (table or column). Capturing it lets a developer
+    // who only has the DB schema — no DB access, just the Java source — find the
+    // entity/field by its physical name even when it differs from the Java name
+    // (e.g. @Table(name="quiz_answer") on class Answer, @Column(name="type")).
+    const JPA_NAME_ANNOTATIONS = new Set([
+      'Table', 'Entity', 'Column', 'JoinColumn', 'SecondaryTable', 'CollectionTable',
+    ]);
+
     const meta: Record<string, string> = {};
     for (const child of node.children) {
       if (child.type !== 'modifiers') continue;
@@ -1157,6 +1166,15 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
         if (!nameNode) continue;
         const rawName = nameNode.text;
         const simpleName = rawName.includes('.') ? rawName.substring(rawName.lastIndexOf('.') + 1) : rawName;
+
+        if (JPA_NAME_ANNOTATIONS.has(simpleName)) {
+          const argsNode = mod.childForFieldName('arguments');
+          const allowPositional = simpleName === 'Table' || simpleName === 'Entity';
+          const dbName = argsNode ? this.extractNamedAnnotationArgument(argsNode, 'name', allowPositional) : undefined;
+          if (dbName) meta['dbName'] = dbName;
+          continue;
+        }
+
         if (!HTTP_ANNOTATIONS.has(simpleName)) continue;
 
         const impliedMethod = this.httpMethodForAnnotation(simpleName);
@@ -1230,6 +1248,27 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     // Last resort: first string_literal anywhere under args
     const anyStr = argsNode.namedChildren.find(c => c.type === 'string_literal');
     return anyStr ? this.unquoteJavaString(anyStr.text) : undefined;
+  }
+
+  /**
+   * Extract a named string argument from an annotation, e.g. the `name` of
+   * @Table(name = "quiz_answer") or @Column(name = "type"). When allowPositional
+   * is set (single-value annotations like @Table("t")/@Entity("E")), falls back
+   * to the first positional string literal.
+   */
+  private extractNamedAnnotationArgument(argsNode: SyntaxNode, key: string, allowPositional: boolean): string | undefined {
+    for (const child of argsNode.namedChildren) {
+      if (child.type !== 'element_value_pair') continue;
+      if (child.childForFieldName('key')?.text !== key) continue;
+      const val = child.childForFieldName('value');
+      const resolved = val ? this.evaluateJavaStringExpression(val, this.javaStringConstants) : undefined;
+      if (resolved !== undefined) return resolved;
+    }
+    if (allowPositional) {
+      const direct = argsNode.namedChildren.find(c => c.type === 'string_literal');
+      if (direct) return this.unquoteJavaString(direct.text);
+    }
+    return undefined;
   }
 
   private hasPathLikeAnnotationArgument(argsNode: SyntaxNode): boolean {

@@ -169,11 +169,16 @@ export function scoreSymbolSearch(
   const signatureLower = row.signature.toLowerCase();
   const annotations = parseJson<string[]>(row.annotations_json, []);
   const annotationLower = annotations.join(' ').toLowerCase();
+  // Physical DB identifier from @Table/@Column(name=...), captured at index time.
+  // Lets a query for the physical name ("quiz_answer") resolve to the entity/field
+  // even when it differs from the Java name (class Answer) — from Java source only.
+  const dbName = parseJson<{ dbName?: string }>(row.framework_meta_json, {}).dbName?.toLowerCase() ?? '';
+  const dbNameCompact = dbName ? compactSearchText(dbName) : '';
   const simpleCompact = compactSearchText(row.simple_name);
   const fqCompact = compactSearchText(row.fq_name);
   const fileCompact = compactSearchText(row.file);
-  const haystack = `${simpleLower} ${fqLower} ${fileLower} ${packageLower} ${frameworkLower} ${signatureLower} ${annotationLower}`;
-  const haystackCompact = `${simpleCompact} ${fqCompact} ${fileCompact}`;
+  const haystack = `${simpleLower} ${fqLower} ${fileLower} ${packageLower} ${frameworkLower} ${signatureLower} ${annotationLower} ${dbName}`;
+  const haystackCompact = `${simpleCompact} ${fqCompact} ${fileCompact} ${dbNameCompact}`;
   const matchedTokens = tokens.filter(token => haystack.includes(token) || haystackCompact.includes(compactSearchText(token)));
   const allTokensMatched = matchedTokens.length === tokens.length;
   const matchedInSimple = tokens.filter(token => simpleLower.includes(token) || simpleCompact.includes(compactSearchText(token)));
@@ -187,12 +192,19 @@ export function scoreSymbolSearch(
   // (which otherwise wins the compact tier since "Note.title" -> "notetitle").
   const qualifiedMember = queryLower.includes('.')
     && (fqLower === queryLower || fqLower.endsWith(`.${queryLower}`));
+  // The query IS this symbol's physical DB name (table/column) — the precise hit
+  // for a schema-driven lookup, even when the Java name differs entirely.
+  const physicalNameMatch = dbName !== '' && (dbName === queryLower || (compactQuery !== '' && dbNameCompact === compactQuery));
 
   let score = 0;
   let reason = 'partial token match';
   const factors: string[] = [];
 
-  if (qualifiedMember && simpleLower !== queryLower) {
+  if (physicalNameMatch && simpleLower !== queryLower) {
+    score = 122;
+    reason = 'exact physical DB name (@Table/@Column) match';
+    factors.push('query equals the symbol physical DB name from @Table/@Column');
+  } else if (qualifiedMember && simpleLower !== queryLower) {
     // Above the plain exact tier: a dotted Owner.member query is more specific
     // than a bare name, and must win even against a class that takes the compact
     // tier (112) plus the definition kind boost (+18) for the concatenated name.
