@@ -192,9 +192,17 @@ export function scoreSymbolSearch(
   // (which otherwise wins the compact tier since "Note.title" -> "notetitle").
   const qualifiedMember = queryLower.includes('.')
     && (fqLower === queryLower || fqLower.endsWith(`.${queryLower}`));
-  // The query IS this symbol's physical DB name (table/column) — the precise hit
-  // for a schema-driven lookup, even when the Java name differs entirely.
-  const physicalNameMatch = dbName !== '' && (dbName === queryLower || (compactQuery !== '' && dbNameCompact === compactQuery));
+  // The query references this symbol's physical DB name (table/column) — the
+  // precise hit for a schema-driven lookup, even when the Java name differs
+  // entirely. Fires when the query IS the name, compacts to it, OR (for a
+  // distinctive snake_case identifier) contains it as a whole word — so a natural
+  // "where is the quiz_answer table used" question through codegraph_context still
+  // lifts the entity whose @Table name is quiz_answer, not just a bare lookup.
+  const dbNameDistinctive = dbName.length >= 5 && dbName.includes('_');
+  const queryContainsDbName = dbNameDistinctive
+    && new RegExp(`(^|[^a-z0-9_])${dbName}([^a-z0-9_]|$)`).test(queryLower);
+  const physicalNameMatch = dbName !== ''
+    && (dbName === queryLower || (compactQuery !== '' && dbNameCompact === compactQuery) || queryContainsDbName);
 
   let score = 0;
   let reason = 'partial token match';
