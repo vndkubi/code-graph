@@ -23,7 +23,8 @@
   ],
   "bin": {
     "mcp-code-graph": "dist/cli.js",
-    "codegraph": "dist/cli.js"
+    "codegraph": "dist/cli.js",
+    "tokenopt": "dist/tokenopt/cli.js"
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
@@ -34,7 +35,8 @@
     "dev": "tsx src/cli.ts",
     "hooks:install": "node .githooks/install-hooks.js",
     "quality-gate": "node dist/cli.js upgrade-audit --root . --require-ready --require-fresh --min-grade A --min-score 96 --max-slow-ms 5000",
-    "test": "vitest run --maxWorkers=1",
+    "test": "vitest run --maxWorkers=1 && npm run test:tokenopt",
+    "test:tokenopt": "npm run build && node --test \"test/tokenopt/**/*.test.mjs\" \"test/fusion/**/*.test.mjs\"",
     "test:local": "node .githooks/run-verification.js",
     "verify": "npm run lint && npm run build && npm test && npm run quality-gate",
     "verify:local": "node .githooks/run-verification.js",
@@ -64,7 +66,8 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@anthropic-ai/sdk": "^0.106.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^12.10.0",
     "chokidar": "^4.0.3",
     "glob": "^11.0.1",

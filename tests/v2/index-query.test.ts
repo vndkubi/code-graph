@@ -1635,6 +1635,37 @@ public class OrderService {
       },
     }) as { callees: Array<{ callee: string }> };
     expect(directCallees.callees.some(edge => edge.callee.includes('OrderService.listOrders'))).toBe(true);
+
+    // Keyword endpoint fallback: a natural-language flow question that names no
+    // explicit "/path" still resolves the endpoint by matching the domain token
+    // ("orders") against indexed endpoint paths/handlers, so impactedEndpoints is
+    // populated instead of left empty.
+    const keywordEndpointPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_flow_pack',
+      args: {
+        target: 'How does the orders REST API return order data to the caller?',
+        profile: 'full',
+        tokenBudget: 6000,
+      },
+    }) as { impactedEndpoints: Array<{ method: string; path: string; handlerSymbol: string }> };
+    expect(keywordEndpointPack.impactedEndpoints).toContainEqual(expect.objectContaining({
+      method: 'GET',
+      path: '/api/orders',
+    }));
+
+    // The same fallback must NOT fire for a plain architecture question with no
+    // endpoint/flow intent — that would pollute the packet with unrelated routes.
+    const archPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_research_pack',
+      args: {
+        target: 'Summarize the overall module structure of this project.',
+        profile: 'full',
+        tokenBudget: 6000,
+      },
+    }) as { impactedEndpoints: Array<{ path: string }> };
+    expect(archPack.impactedEndpoints).toHaveLength(0);
   });
 
   it('packs endpoint downstream service side effects into the first flow packet', async () => {

@@ -19,28 +19,31 @@ The goal is to let agents start from compact graph-backed packets instead of rep
 | Session evidence reuse | Pass a stable `sessionId` on every pack call and CodeGraph omits source bodies it already delivered (`reusedFromEarlierCall`), cutting duplicate tokens across a multi-step task; `freshEvidence: true` forces full bodies. |
 | Response metadata | Every tool response includes `_codegraph_meta` with tool name, `duration_ms`, `response_chars`, `tokens_est`, and item counts. |
 
-## Joint Workflow with TokenOpt
+## Built-in TokenOpt / ContextGate gate
 
-When both CodeGraph and TokenOpt MCPs are connected, they coordinate automatically via their `SERVER_INSTRUCTIONS`:
+TokenOpt/ContextGate is now **fused into CodeGraph** — one package, one MCP server, one CLI. The single `codegraph mcp` server exposes both the CodeGraph pack tools and the TokenOpt gate tools (`contextgate_get_context`, `tokenopt_compile_evidence`, …). The ContextGate broker enriches its packets by calling the CodeGraph query engine **in-process**, so there is no second MCP server to install and no subprocess spawn / double-spend.
 
-| Role | When TokenOpt present | When standalone |
+| Surface | Tools | Role |
 | --- | --- | --- |
-| **TokenOpt** | PRIMARY router — call `contextgate_get_context` first for broad/unknown-owner tasks | N/A |
-| **CodeGraph** | `code_graph` provider — fills evidence gaps named by the TokenOpt packet | PRIMARY — use `codegraph_context` directly |
+| **ContextGate gate** | `contextgate_get_context`, `tokenopt_compile_evidence`, … | PRIMARY router — call first for broad/unknown-owner tasks |
+| **CodeGraph packs** | `codegraph_context`, `get_research_pack`, `get_change_pack`, `review_patch`, … | Fills the evidence gaps named by the gate packet (in-process) |
 
 The flow for broad tasks:
 
-1. Call `contextgate_get_context` (TokenOpt) with the full natural task.
-2. If the packet has evidence gaps with `tool_categories: ["code_graph"]`, fill them with `codegraph_context` or the appropriate CodeGraph pack tool.
-3. Do NOT call CodeGraph first when TokenOpt is connected — its `SERVER_INSTRUCTIONS` will self-direct it to wait for the TokenOpt packet.
+1. Call `contextgate_get_context` with the full natural task.
+2. If `answerable=true`, answer from the packet. Otherwise fill the named gaps with `codegraph_context` or the appropriate pack tool — the gate already folds in `code_graph` evidence automatically when `codegraph.enabled`.
 
 The flow for code review:
 
-1. Round 1 (business): `contextgate_get_context` + CodeGraph `get_change_pack` for requirement/impact evidence.
-2. Round 2 (technical YAGNI/KISS): No MCPs — direct diff review.
-3. Round 3 (checklist): CodeGraph `get_change_pack` only for changed-file coverage.
+1. Round 1 (business): `contextgate_get_context` + `get_change_pack` for requirement/impact evidence.
+2. Round 2 (technical YAGNI/KISS): direct diff review.
+3. Round 3 (checklist): `get_change_pack` only for changed-file coverage.
 
-For exact file/symbol tasks where the owner is already known, skip both MCPs and read directly.
+For exact file/symbol tasks where the owner is already known, skip the gate and read directly.
+
+**Tool exposure** is controlled by `--mcp-profile` (default `client` → CodeGraph context/slice/status + the ContextGate lite gate; `full` → every tool on both surfaces). `TOKENOPT_MCP_MODE=lite|full|broker` overrides the gate set.
+
+**CLI:** the TokenOpt surface (hooks, instructions, exec, doctor) lives under `codegraph gate <…>` (e.g. `codegraph gate hook codex pre-tool-use`, `codegraph gate doctor`). The legacy `tokenopt` binary alias is preserved for existing hook installs.
 
 ## Quick Start
 

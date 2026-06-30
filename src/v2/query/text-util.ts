@@ -153,15 +153,30 @@ export function isBroadSearchTerm(value: string): boolean {
 
 export function tokenizeSearchQuery(query: string): string[] {
   if (!query || query === '*') return [];
-  const withCamelBoundaries = query
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
-  const tokens = withCamelBoundaries
-    .toLowerCase()
-    .split(/[^a-z0-9]+/g)
+  const tokens: string[] = [];
+  for (const rawWord of query.split(/[^A-Za-z0-9]+/g)) {
+    if (!rawWord) continue;
+    const fragments = rawWord
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+      .toLowerCase()
+      .split(/\s+/g)
+      .filter(Boolean);
+    for (const fragment of fragments) tokens.push(fragment);
+    // Rescue acronym-words like "SQLite" -> ["sq","lite"], "OAuth" -> ["o","auth"]:
+    // the camel split produces a <3-char fragment that the FTS prefix builder drops,
+    // silently losing the whole-word signal (a 10-word "...SQLite snapshot" query
+    // collapsed to a single file). Emit the joined whole word too so "sqlite*" still
+    // runs. Only fires on the short-fragment case, so ordinary camelCase tokenization
+    // (PaymentService -> payment, service) is unchanged.
+    const whole = rawWord.toLowerCase();
+    if (whole.length >= 3 && fragments.length > 1 && fragments.some(fragment => fragment.length < 3)) {
+      tokens.push(whole);
+    }
+  }
+  return [...new Set(tokens
     .map(token => token.trim())
-    .filter(token => token.length >= 2 && !SEARCH_STOP_WORDS.has(token));
-  return [...new Set(tokens)];
+    .filter(token => token.length >= 2 && !SEARCH_STOP_WORDS.has(token)))];
 }
 
 export function identifierSearchTerms(query: string): string[] {
