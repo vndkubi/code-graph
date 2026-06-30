@@ -1,0 +1,86 @@
+# CLI Reference
+
+CodeGraph ships one CLI, `codegraph` (entrypoint `dist/cli.js`). After the
+TokenOpt fusion, the TokenOpt operational surface is reached through the
+`codegraph gate <…>` subcommand. The legacy `tokenopt` binary alias is preserved
+for existing hook installs.
+
+```powershell
+node dist/cli.js <command> [options]
+# or, when on PATH:
+codegraph <command> [options]
+```
+
+## CodeGraph commands
+
+| Command | Purpose |
+| --- | --- |
+| `mcp --root <repo>` | Run the fused MCP stdio server (CodeGraph packs + ContextGate gate). |
+| `setup --root <repo>` | Build `.codegraph/graph.sqlite` and the local artifact index. |
+| `index --root <repo>` | Build or refresh the SQLite graph index. |
+| `atlas --root <repo>` | Generate a deterministic repo atlas (JSON/Markdown). |
+| `graph --root <repo> --out <graph.html>` | Export a self-contained graph viewer. |
+| `doctor --root <repo>` | Inspect readiness, freshness, and setup actions. |
+| `status --root <repo> [--json] [--require-ready] [--require-fresh]` | Human/machine-readable status; non-zero exit for CI gating. |
+| `logs --root <repo> --tail <n> [--summary\|--all\|--since\|--until\|--tool\|--event\|--invalid]` | Print recent query events or a compact summary. |
+| `upgrade-audit --root <repo> [policy/threshold flags]` | Readiness + query-log audit with an `A+`–`F` grade. |
+| `affected-tests --root <repo> --changed <file[,file…]> [--max-depth N] [--limit N]` | Tests reachable from changed files via the reverse local-import graph. |
+| `benchmark <sub>` | Deterministic harnesses (see below). |
+
+### Common MCP flags
+
+```text
+--mcp-profile <client|minimal|research|change|review|full>   Exposed tools/list width
+--workspace-key <key>        Stable workspace identity for unusual mount paths
+--parse-workers <n>          Worker threads for cold/cache-miss parsing
+--auto-refresh               Refresh stale snapshots before MCP tool calls when safe
+--refresh-on-start           Queue a background refresh when MCP starts
+--watch                      Watch files and refresh changed paths in the background
+--warn-stale / --no-warn-stale   Freshness checks on every tool response (on by default)
+--prewarm                    Index missing snapshots inside MCP startup/runtime
+```
+
+See [MCP Setup And Usage](mcp-setup-and-usage.md) for profiles, modes, and the
+`TOKENOPT_MCP_MODE` override.
+
+### `benchmark` subcommands
+
+```text
+codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|
+                    quality-trend|evidence-audit|recall|affected-tests|
+                    copilot-e2e|codex-e2e
+```
+
+- `recall [--root <repo>] [--tasks <suite.json>] [--max-files N] [--keep-ratio R]`
+  — broad multi-file recall (allFound, avg recall, recall@N) with right-sizing ON
+  vs the no-trim baseline. Point it at any repo.
+- `evidence-audit` — measures Waste% (evidence sent but not needed) and Gap%
+  (needed evidence never delivered) so packets can be right-sized.
+- `quality-trend [--out <report.md>]` — appends a dated correctness/token-saving
+  row so ranking/resolver regressions surface over time.
+
+## `gate` subcommands
+
+`codegraph gate <…>` delegates to the TokenOpt CLI. It covers hook adapters,
+instruction emission/installation, exec wrapping, reporting, and gate doctors.
+
+| Subcommand | Purpose |
+| --- | --- |
+| `gate init` | Scaffold TokenOpt config in the current repo. |
+| `gate install codex` / `gate install copilot` / `gate setup copilot` | Install hook/instruction integration for an agent host. |
+| `gate hook codex <event>` / `gate hook copilot <event>` | Hook adapters (e.g. `pre-tool-use`) invoked by the agent host. |
+| `gate exec -- <command>` | Run a command through the gate's exec wrapper. |
+| `gate instructions audit\|emit\|graph\|prompts\|install\|install-graph\|install-prompts` | Inspect or install agent instruction files. |
+| `gate report` | Emit a gate/session report. |
+| `gate doctor [codex-hooks\|copilot]` | Diagnose gate wiring for a host. |
+| `gate benchmark workflow-ab\|suite\|codex-daily` | TokenOpt benchmark harnesses. |
+
+> `codegraph gate mcp` is intentionally **rejected**. The fused `codegraph mcp`
+> server already exposes the TokenOpt/ContextGate gate tools — there is no
+> separate gate MCP server. See [Migration](MIGRATION.md).
+
+### Legacy alias
+
+The `tokenopt` bin (→ `dist/tokenopt/cli.js`) is kept so existing hook installs
+that shell out to `tokenopt …` keep working. New setups should use
+`codegraph gate …`.

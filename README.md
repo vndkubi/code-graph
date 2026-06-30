@@ -227,11 +227,10 @@ See [Contributing](CONTRIBUTING.md) for CI-equivalent benchmark smoke commands a
 
 ## More Docs
 
-- [Migration Guide](docs/MIGRATION.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [System Design](docs/system-design.md)
-- [MCP Setup And Usage](docs/mcp-setup-and-usage.md)
-- [Benchmark Results](docs/benchmark-results.md)
+- [Architecture](docs/ARCHITECTURE.md) — fused single-server design, storage, flows
+- [MCP Setup And Usage](docs/mcp-setup-and-usage.md) — install, profiles, agent tool flow
+- [CLI Reference](docs/cli.md) — `codegraph` commands and `codegraph gate <…>`
+- [Migration Guide](docs/MIGRATION.md) — moving from two MCP servers to one fused server
 
 ## License
 
