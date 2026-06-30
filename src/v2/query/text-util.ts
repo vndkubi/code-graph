@@ -93,6 +93,27 @@ export const RESEARCH_STOP_WORDS = new Set([
   'where',
   'work',
   'works',
+  // Instruction/interrogative framing verbs and pronouns. These carry NO
+  // repository-identity signal but, left in, leak through researchSeedTerms as
+  // symbol seeds and exact-match unrelated methods — e.g. "Identify the algorithm"
+  // matched ApplicationController.identify() and ranked the auth endpoint #1 for a
+  // spaced-repetition query, polluting topFiles/flowSteps AND wasting evidence
+  // tokens on an irrelevant slice. Dropping them improves recall and cuts tokens.
+  // Deliberately NOT included: create/update/delete/save/load/build/search — those
+  // map to real domain method names (createNote, etc.) and carry signal.
+  'identify',
+  'find',
+  'locate',
+  'trace',
+  'show',
+  'describe',
+  'determine',
+  'decide',
+  'decides',
+  'responsible',
+  'which',
+  'that',
+  'handled',
 ]);
 
 export const FILE_SEARCH_STOP_WORDS = new Set([
