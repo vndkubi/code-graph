@@ -50,7 +50,7 @@ test("mcp exposes TokenOpt gated tools", async () => {
 // Pre-existing failure carried over from the standalone TokenOpt repo (fails
 // identically there); unrelated to the CodeGraph fusion. Skipped so it does not
 // turn the merged CI gate red. Track/fix separately.
-test("mcp full mode exposes command and project facts tools", { skip: "pre-existing tokenopt failure, unrelated to fusion" }, async () => {
+test("mcp full mode exposes command and project facts tools", async () => {
   await withTokenOptMcp(
     async (client) => {
       const result = await client.listTools();
@@ -68,6 +68,7 @@ test("mcp full mode exposes command and project facts tools", { skip: "pre-exist
         "tokenopt_read_file",
         "tokenopt_run_command",
         "tokenopt_search",
+        "tokenopt_session_stats",
         "tokenopt_symbol_packet",
         "tokenopt_symbols_find",
         "tokenopt_test_neighbors",
