@@ -1301,8 +1301,7 @@ public class PaymentService {
       };
       compressedEvidence: {
         factCards: Array<{ kind: string; subject?: string; file?: string }>;
-        callGraphEdges: Array<{ caller?: string; callee?: string }>;
-        sourceSliceRefs: Array<{ file?: string; textPreview?: string }>;
+        sourceSliceRefs: Array<{ file?: string; symbol?: string }>;
         compressionRatio: number;
       };
       budget: {

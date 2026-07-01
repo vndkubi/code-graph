@@ -285,3 +285,46 @@ export function wordsShareStem(a: string, b: string): boolean {
   if (shorter.length < 4 || !longer.startsWith(shorter)) return false;
   return INFLECTIONAL_REMAINDER.test(longer.slice(shorter.length));
 }
+
+// JDK / standard-library owner types whose calls are noise in a research/flow
+// packet. A call to `Arrays.stream`, `Integer.valueOf`, or `Optional.of` tells a
+// reviewer nothing about the domain flow (controller -> service -> repository)
+// yet these edges are the majority of a method's call list and were ~22% of the
+// investigate packet. The set is intentionally conservative — only unambiguous
+// java.lang / java.util / java.util.stream utility types — so a domain class is
+// never dropped by a name collision. Framework calls (Spring, JPA) are kept:
+// they can carry flow meaning (e.g. profile gating, repository queries).
+const LIBRARY_CALL_OWNERS = new Set([
+  // java.lang
+  'String', 'Integer', 'Long', 'Double', 'Float', 'Boolean', 'Byte', 'Short',
+  'Character', 'Number', 'Math', 'System', 'Object', 'Objects', 'Class',
+  'Thread', 'Void', 'Enum', 'Throwable', 'Exception', 'RuntimeException',
+  'StringBuilder', 'StringBuffer', 'Iterable', 'Comparable',
+  // java.util (+ .stream, .function)
+  'List', 'ArrayList', 'LinkedList', 'Map', 'HashMap', 'LinkedHashMap', 'TreeMap',
+  'Set', 'HashSet', 'LinkedHashSet', 'TreeSet', 'Collection', 'Collections',
+  'Arrays', 'Optional', 'OptionalInt', 'OptionalLong', 'Stream', 'IntStream',
+  'LongStream', 'DoubleStream', 'Collectors', 'Comparator', 'Iterator',
+  'Spliterator', 'Deque', 'ArrayDeque', 'Queue', 'PriorityQueue', 'Stack',
+  'EnumSet', 'EnumMap', 'BitSet', 'UUID', 'Random', 'Scanner', 'StringJoiner',
+  'Function', 'Supplier', 'Consumer', 'Predicate', 'BiFunction',
+  // apache-commons / guava utility surfaces that read as stdlib noise
+  'Strings', 'StringUtils', 'CollectionUtils', 'Preconditions', 'ObjectUtils',
+]);
+
+/**
+ * Whether a call edge target (a `Owner.method` string, possibly fully-qualified)
+ * points at a JDK/standard-library utility type rather than a domain symbol.
+ * Used to strip stdlib noise from research/flow call lists. Returns false for
+ * unqualified callees (no owner) so constructors and local calls are kept.
+ */
+export function isLibraryCallOwner(callee: string): boolean {
+  if (!callee) return false;
+  const segments = callee.split('.');
+  if (segments.length < 2) return false;
+  const owner = segments[segments.length - 2] ?? '';
+  if (!owner) return false;
+  // Explicit JDK/stdlib packages are always noise regardless of the simple name.
+  if (/(^|[.])java[x]?[.]/.test(callee)) return true;
+  return LIBRARY_CALL_OWNERS.has(owner);
+}
