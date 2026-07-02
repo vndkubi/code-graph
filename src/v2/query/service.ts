@@ -2426,6 +2426,10 @@ export class V2QueryService {
         evidenceOmittedCount: Math.max(0, changedMainSource.length - 5),
       });
     }
+    // Graph-only checks on symbols this patch touches: callers outside the
+    // diff, method length, parameter count, and dead private methods. None of
+    // these are visible from reading the diff alone.
+    const changedSymbolFindings = await this.changedSymbolFindingsForHunks(snapshotId, hunks, changedFiles);
     const allFindings = reviewFindingsForPatch({
       focus,
       diff,
@@ -2434,6 +2438,7 @@ export class V2QueryService {
       riskFlags,
       testsCount: tests.length,
       summary: isPlainObject(impact.summary) ? impact.summary : {},
+      ...changedSymbolFindings,
     });
     const findings = allFindings
       .slice(0, budget.maxFindings)
@@ -2602,6 +2607,88 @@ export class V2QueryService {
       result.set(hunk, patchLineMappingFor(hunk, sourceLines));
     }
     return result;
+  }
+
+  // One pass over the changed-hunk symbols backing several graph-only review
+  // checks: stale callers, long method, too many params, and dead code. Each
+  // symbol is resolved and deduped once and shared across all four checks
+  // instead of re-querying per check.
+  private async changedSymbolFindingsForHunks(
+    snapshotId: string,
+    hunks: PatchHunk[],
+    changedFiles: string[],
+  ): Promise<ChangedSymbolFindings> {
+    const changedFileSet = new Set(changedFiles);
+    const seenSymbols = new Set<string>();
+    const staleCallers: StaleCallerGroup[] = [];
+    const longMethods: LongMethodCandidate[] = [];
+    const tooManyParams: TooManyParamsCandidate[] = [];
+    const deadCode: DeadCodeCandidate[] = [];
+    for (const hunk of hunks) {
+      const resolvedFile = await this.resolveFile(snapshotId, hunk.file) ?? hunk.file;
+      const symbolRow = await this.symbolForPatchHunk(snapshotId, resolvedFile, hunk);
+      if (!symbolRow || !['method', 'function', 'constructor'].includes(symbolRow.kind)) continue;
+      const symbolNeedle = symbolRow.fq_name || symbolRow.simple_name;
+      if (!symbolNeedle || seenSymbols.has(symbolNeedle)) continue;
+      seenSymbols.add(symbolNeedle);
+
+      const endLine = symbolRow.end_line ?? symbolRow.line;
+      const lineCount = endLine - symbolRow.line + 1;
+      if (lineCount > LONG_METHOD_LINE_THRESHOLD) {
+        longMethods.push({ symbol: symbolNeedle, simpleName: symbolRow.simple_name, file: resolvedFile, line: symbolRow.line, endLine, lineCount });
+      }
+
+      // parameter_types_json is only populated by the Java extractor today;
+      // fall back to counting top-level commas in the signature (works for
+      // TS/JS/Python too) when it's empty. Skip rather than guess when the
+      // signature itself is truncated (multi-line declarations only keep
+      // their first source line).
+      const jsonParamCount = symbolRow.parameter_types_json ? parseJson<unknown[]>(symbolRow.parameter_types_json, []).length : 0;
+      const paramCount = jsonParamCount > 0 ? jsonParamCount : countSignatureParams(symbolRow.signature);
+      if (paramCount !== undefined && paramCount > TOO_MANY_PARAMS_THRESHOLD) {
+        tooManyParams.push({ symbol: symbolNeedle, simpleName: symbolRow.simple_name, file: resolvedFile, line: symbolRow.line, paramCount });
+      }
+
+      // Callers outside the diff: the reviewer cannot see these from the diff
+      // alone, but the call graph already knows every call site.
+      if (hunk.removedLines.length > 0) { // only meaningful for existing (modified) symbols
+        const callers = ((await this.getCallers(snapshotId, { symbol: symbolNeedle, limit: 25 })) as { callers: CallEdgeRow[] }).callers;
+        const externalCallers = callers.filter(caller => !changedFileSet.has(caller.file));
+        if (externalCallers.length > 0) {
+          staleCallers.push({
+            symbol: symbolNeedle,
+            simpleName: symbolRow.simple_name,
+            file: resolvedFile,
+            line: symbolRow.line,
+            callerCount: externalCallers.length,
+            callers: externalCallers.slice(0, 5).map(compactCallEdge),
+          });
+        }
+      }
+
+      // Dead code: scoped to symbols that cannot be reached from outside this
+      // codebase — 'private' (class members) and 'internal' (package-private
+      // Java, non-exported TS/JS/Python module functions) — the safe range
+      // for automated unused-symbol detection. Skip anything annotated or
+      // framework-attached (@Override, @EventListener, controllers, ...)
+      // since those are invoked outside the static call graph.
+      const hasAnnotations = symbolRow.kind !== 'constructor'
+        && symbolRow.annotations_json
+        && parseJson<unknown[]>(symbolRow.annotations_json, []).length > 0;
+      if (
+        symbolRow.kind !== 'constructor'
+        && (symbolRow.visibility === 'private' || symbolRow.visibility === 'internal')
+        && !hasAnnotations
+        && !symbolRow.framework_role
+        && symbolRow.simple_name !== 'main'
+      ) {
+        const callResult = (await this.getCallers(snapshotId, { symbol: symbolNeedle, limit: 1, includeLowSignal: true })) as { totalCount: number };
+        if (callResult.totalCount === 0) {
+          deadCode.push({ symbol: symbolNeedle, simpleName: symbolRow.simple_name, file: resolvedFile, line: symbolRow.line });
+        }
+      }
+    }
+    return { staleCallers, longMethods, tooManyParams, deadCode };
   }
 
   private async patchReviewTargets(
@@ -8311,6 +8398,87 @@ interface PatchHunk {
   changeKinds: string[];
 }
 
+interface StaleCallerGroup {
+  symbol: string;
+  simpleName: string;
+  file: string;
+  line: number;
+  callerCount: number;
+  callers: Array<Record<string, unknown>>;
+}
+
+interface LongMethodCandidate {
+  symbol: string;
+  simpleName: string;
+  file: string;
+  line: number;
+  endLine: number;
+  lineCount: number;
+}
+
+interface TooManyParamsCandidate {
+  symbol: string;
+  simpleName: string;
+  file: string;
+  line: number;
+  paramCount: number;
+}
+
+interface DeadCodeCandidate {
+  symbol: string;
+  simpleName: string;
+  file: string;
+  line: number;
+}
+
+interface ChangedSymbolFindings {
+  staleCallers: StaleCallerGroup[];
+  longMethods: LongMethodCandidate[];
+  tooManyParams: TooManyParamsCandidate[];
+  deadCode: DeadCodeCandidate[];
+}
+
+const LONG_METHOD_LINE_THRESHOLD = 80;
+const TOO_MANY_PARAMS_THRESHOLD = 5;
+
+// Counts top-level parameters in a signature string by splitting on commas
+// that are not nested inside (), [], {}, or <>. Returns undefined (skip,
+// don't guess) when the parameter list isn't balanced in this string — the
+// analyzer only keeps the first source line of multi-line declarations, so a
+// wrapped parameter list is truncated here rather than malformed.
+function countSignatureParams(signature: string): number | undefined {
+  const openIndex = signature.indexOf('(');
+  if (openIndex === -1) return undefined;
+  let depth = 0;
+  let closeIndex = -1;
+  for (let i = openIndex; i < signature.length; i++) {
+    const ch = signature[i];
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) { closeIndex = i; break; }
+    }
+  }
+  if (closeIndex === -1) return undefined;
+  const inner = signature.slice(openIndex + 1, closeIndex).trim();
+  if (inner === '') return 0;
+  const parts: string[] = [];
+  let current = '';
+  let bracketDepth = 0;
+  for (const ch of inner) {
+    if (ch === '(' || ch === '[' || ch === '{' || ch === '<') bracketDepth++;
+    else if (ch === ')' || ch === ']' || ch === '}' || ch === '>') bracketDepth--;
+    if (ch === ',' && bracketDepth === 0) {
+      parts.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  parts.push(current);
+  return parts.filter(part => part.trim() !== '').length;
+}
+
 interface ReviewFinding {
   id: string;
   priority: 'P0' | 'P1' | 'P2';
@@ -8487,12 +8655,77 @@ function reviewFindingsForPatch(input: {
   riskFlags: Array<Record<string, unknown>>;
   testsCount: number;
   summary: Record<string, unknown>;
+  staleCallers?: StaleCallerGroup[];
+  longMethods?: LongMethodCandidate[];
+  tooManyParams?: TooManyParamsCandidate[];
+  deadCode?: DeadCodeCandidate[];
 }): ReviewFinding[] {
   const findings: ReviewFinding[] = [];
   const add = (finding: ReviewFinding) => {
     if (findings.some(existing => existing.id === finding.id)) return;
     findings.push(finding);
   };
+
+  for (const group of input.staleCallers ?? []) {
+    add({
+      id: `review-stale-caller-${group.symbol}`,
+      priority: 'P1',
+      category: 'impact',
+      title: `${group.callerCount} call site(s) outside this diff may need updating`,
+      file: group.file,
+      line: group.line,
+      why: `${group.simpleName} is modified by this patch, and the call graph shows ${group.callerCount} caller(s) in file(s) not touched by the diff. Those call sites were written against the old behavior/signature.`,
+      evidence: group.callers,
+      suggestedCheck: 'Confirm each caller still compiles/behaves correctly against the new implementation, or update them in this patch.',
+      suggestedFix: 'Update the callers listed in evidence to match the new behavior/signature, or add an overload/adapter that preserves the old contract.',
+      confidence: 0.74,
+    });
+  }
+
+  for (const candidate of input.longMethods ?? []) {
+    add({
+      id: `review-long-method-${candidate.symbol}`,
+      priority: 'P2',
+      category: 'correctness',
+      title: `${candidate.simpleName} is ${candidate.lineCount} lines long`,
+      file: candidate.file,
+      line: candidate.line,
+      why: `Methods/functions over ${LONG_METHOD_LINE_THRESHOLD} lines are harder to review, test, and change safely; ${candidate.simpleName} spans lines ${candidate.line}-${candidate.endLine}.`,
+      suggestedCheck: 'Check whether this method does one thing; look for natural extraction points (validation, mapping, side effects).',
+      suggestedFix: 'Extract cohesive blocks (validation, mapping, I/O) into smaller named methods.',
+      confidence: 0.55,
+    });
+  }
+
+  for (const candidate of input.tooManyParams ?? []) {
+    add({
+      id: `review-too-many-params-${candidate.symbol}`,
+      priority: 'P2',
+      category: 'correctness',
+      title: `${candidate.simpleName} takes ${candidate.paramCount} parameters`,
+      file: candidate.file,
+      line: candidate.line,
+      why: `More than ${TOO_MANY_PARAMS_THRESHOLD} parameters is a common signal of a missing parameter object or a method doing more than one job.`,
+      suggestedCheck: 'Check whether related parameters belong on a single request/options object.',
+      suggestedFix: 'Group related parameters into a request/options object or split the method by responsibility.',
+      confidence: 0.5,
+    });
+  }
+
+  for (const candidate of input.deadCode ?? []) {
+    add({
+      id: `review-dead-code-${candidate.symbol}`,
+      priority: 'P2',
+      category: 'correctness',
+      title: `${candidate.simpleName} has no callers in the indexed graph`,
+      file: candidate.file,
+      line: candidate.line,
+      why: 'This private method/function has zero call sites in the call graph and is not annotated or framework-attached, which usually means it is unused.',
+      suggestedCheck: 'Confirm it is truly unused (not called via reflection, generics, or a language feature the indexer cannot resolve) before removing it.',
+      suggestedFix: 'Remove the unused method, or wire it in if it was meant to be called.',
+      confidence: 0.45,
+    });
+  }
 
   if (input.changedFiles.length === 0) {
     add({
