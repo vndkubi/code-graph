@@ -26,6 +26,7 @@ codegraph <command> [options]
 | `upgrade-audit --root <repo> [policy/threshold flags]` | Readiness + query-log audit with an `A+`–`F` grade. |
 | `affected-tests --root <repo> --base <ref> [--format json\|list\|maven\|gradle]` | CI test selection over a git range; `ALL` = safety fallback. `--changed <file[,file…]>` still works for explicit lists. |
 | `review --root <repo> --base <ref> [--format json\|sarif\|markdown\|text] [--min-priority P0\|P1\|P2] [--fail-on P0\|P1\|P2\|none] [--out <path>]` | Deterministic PR review over a git range: graph-fact findings (stale callers, untested change, duplication, design smells) as SARIF for GitHub code scanning or markdown for a sticky PR comment. Exit code gates on `--fail-on`. |
+| `onboard --root <repo> [--profile architecture\|claude\|both] [--dry-run]` | Generate `ARCHITECTURE.md` (humans) and `CLAUDE.md` (agents) from index facts. Marker-based: only the `<!-- codegraph:begin/end generated -->` block is rewritten, hand-written content survives regeneration. |
 | `benchmark <sub>` | Deterministic harnesses (see below). |
 
 ### Common MCP flags

@@ -31,6 +31,14 @@ import {
   type CiReviewFormat,
   type CiReviewPriority,
 } from './v2/query/ci-review.js';
+import {
+  applyGeneratedBlock,
+  buildDirectoryStats,
+  composeArchitectureMarkdown,
+  composeClaudeMarkdown,
+  detectBuildCommands,
+  normalizeOnboardProfile,
+} from './v2/query/onboard.js';
 import { runAffectedTestsEval } from './v2/benchmark/affected-tests-eval.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 import { buildLocalArtifactIndex } from './v2/mcp/local-artifact.js';
@@ -101,6 +109,9 @@ async function main(): Promise<void> {
       return;
     case 'review':
       await runReviewCommand(parsed);
+      return;
+    case 'onboard':
+      await runOnboardCommand(parsed);
       return;
     case 'benchmark':
       await runBenchmarkCommand(subcommand, parsed);
@@ -460,6 +471,60 @@ async function runAffectedTestsCommand(parsed: ParsedArgs): Promise<void> {
       limit: getNumberFlag(parsed, 'limit'),
     });
     console.log(JSON.stringify(result, null, 2));
+  } finally {
+    await db.close();
+  }
+}
+
+/**
+ * `codegraph onboard`: generate ARCHITECTURE.md (humans) and CLAUDE.md
+ * (agents) from index facts. Marker-based: only the generated block is ever
+ * rewritten; hand-written content survives regeneration.
+ */
+async function runOnboardCommand(parsed: ParsedArgs): Promise<void> {
+  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const profile = normalizeOnboardProfile(getFlag(parsed, 'profile'));
+  const dryRun = parsed.flags.get('dry-run') === true;
+  const { db } = await openCodeGraphDb(root);
+  try {
+    const index = await new V2Indexer(db).indexWorkspace({ root });
+    const service = new V2QueryService(db);
+    const atlas = await service.query({
+      workspaceId: index.workspaceId,
+      toolName: 'generate_repo_atlas',
+      args: { format: 'json', profile: 'full', includeTests: true, warnStale: false },
+    }) as Record<string, unknown>;
+    const files = await db.prepare(
+      'SELECT path, file_role FROM files WHERE snapshot_id = ?',
+    ).all(index.snapshotId) as Array<{ path: string; file_role: string }>;
+    const inputs = {
+      atlas,
+      directories: buildDirectoryStats(files),
+      commands: detectBuildCommands(root),
+      toolVersion: cliPackageVersion(),
+    };
+    const targets: Array<{ file: string; body: string }> = [];
+    if (profile === 'architecture' || profile === 'both') {
+      targets.push({ file: 'ARCHITECTURE.md', body: composeArchitectureMarkdown(inputs) });
+    }
+    if (profile === 'claude' || profile === 'both') {
+      targets.push({ file: 'CLAUDE.md', body: composeClaudeMarkdown(inputs) });
+    }
+    const written: Array<Record<string, unknown>> = [];
+    for (const target of targets) {
+      const filePath = path.join(root, target.file);
+      const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : undefined;
+      const next = applyGeneratedBlock(existing, target.body);
+      const mode = existing === undefined ? 'created' : existing.includes('codegraph:begin') ? 'updated-block' : 'appended-block';
+      if (dryRun) {
+        console.log(`\n===== ${target.file} (${mode}, dry run) =====\n`);
+        console.log(next);
+      } else {
+        fs.writeFileSync(filePath, next);
+      }
+      written.push({ file: target.file, mode, bytes: next.length });
+    }
+    console.error(JSON.stringify({ root, profile, dryRun, documents: written }, null, 2));
   } finally {
     await db.close();
   }
@@ -2352,6 +2417,8 @@ Usage:
                                          Select the tests a git range can affect (ALL = safety fallback)
   codegraph review --root <workspace> --base <ref> [--format json|sarif|markdown|text] [--min-priority P0|P1|P2] [--fail-on P0|P1|P2|none] [--out <path>]
                                          Deterministic PR review: graph-fact findings for CI (SARIF/comment)
+  codegraph onboard --root <workspace> [--profile architecture|claude|both] [--dry-run]
+                                         Generate ARCHITECTURE.md/CLAUDE.md from index facts (marker-based regeneration)
   codegraph route-inspect --task <text>  Explain codegraph_context routing and stop/follow-up gate policy
   codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|copilot-e2e|codex-e2e|competitive-compare
                                              Generate synthetic repos, measure indexing, run evals, or prove context/review savings
