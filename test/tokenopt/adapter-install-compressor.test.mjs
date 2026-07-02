@@ -69,7 +69,7 @@ test("Codex hook config uses absolute node command style", () => {
   const hooks = buildCodexHooksConfig(path.resolve("dist/tokenopt/cli.js"));
   const command = hooks.hooks.PreToolUse[0].hooks[0].command;
   const commandWindows = hooks.hooks.PreToolUse[0].hooks[0].commandWindows;
-  assert.match(command, /node(?:\.exe)?"/i);
+  assert.match(command, /node(?:\.exe)?["']/i);
   assert.match(command, /hook/);
   assert.equal(commandWindows, command);
   assert.doesNotMatch(command, /\bnpm\b/);
