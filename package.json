@@ -24,6 +24,7 @@
     "build": "npm run clean && tsc",
     "ci": "npm run lint && npm run build && npm test && npm run quality-gate",
     "prepack": "npm run build",
+    "prepare": "npm run build",
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
     "hooks:install": "node .githooks/install-hooks.js",
