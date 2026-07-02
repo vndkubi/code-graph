@@ -10,6 +10,7 @@ import { V2QueryService } from '../../src/v2/query/service.js';
 import {
   CI_REVIEW_COMMENT_MARKER,
   ciReviewExitCode,
+  filterIgnorableDiff,
   formatCiReview,
   reviewForCi,
   ruleIdForFinding,
@@ -58,6 +59,7 @@ function sampleResult(overrides: Partial<CiReviewResult> = {}): CiReviewResult {
     baseRef: 'origin/main',
     headRef: 'HEAD',
     changedFiles: ['src/app.ts'],
+    ignoredFiles: [],
     reviewStatus: 'needs-attention',
     findings: [
       {
@@ -160,6 +162,24 @@ describe('formatCiReview markdown', () => {
   });
 });
 
+describe('filterIgnorableDiff', () => {
+  const codeBlock = 'diff --git a/src/app.ts b/src/app.ts\nindex 111..222 100644\n--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1 +1 @@\n-old\n+new\n';
+  const docsBlock = 'diff --git a/README.md b/README.md\nindex 333..444 100644\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-a\n+b\n';
+
+  it('drops docs blocks and keeps code blocks', () => {
+    const { diff, ignoredFiles } = filterIgnorableDiff(docsBlock + codeBlock);
+    expect(ignoredFiles).toEqual(['README.md']);
+    expect(diff).toContain('a/src/app.ts');
+    expect(diff).not.toContain('README.md');
+  });
+
+  it('returns an empty diff for docs-only changes', () => {
+    const { diff, ignoredFiles } = filterIgnorableDiff(docsBlock);
+    expect(diff.trim()).toBe('');
+    expect(ignoredFiles).toEqual(['README.md']);
+  });
+});
+
 describe('reviewForCi (temp git repo)', () => {
   async function setupRepo(): Promise<{ repo: string; service: V2QueryService; workspaceId: string }> {
     const repo = tempDir('codegraph-ci-review-');
@@ -205,6 +225,19 @@ describe('reviewForCi (temp git repo)', () => {
     const result = await reviewForCi(service, workspaceId, repo, { baseRef: 'HEAD' });
     expect(result.reviewStatus).toBe('no-changes');
     expect(result.findings).toHaveLength(0);
+  });
+
+  it('reports docs-only ranges as no-reviewable-changes with zero findings', async () => {
+    if (!hasGit()) return;
+    const { repo, service, workspaceId } = await setupRepo();
+    writeFile(repo, 'README.md', '# updated docs\n');
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'docs only');
+
+    const result = await reviewForCi(service, workspaceId, repo, { baseRef: 'HEAD~1' });
+    expect(result.reviewStatus).toBe('no-reviewable-changes');
+    expect(result.findings).toHaveLength(0);
+    expect(result.ignoredFiles).toEqual(['README.md']);
   });
 
   it('drops findings below the min-priority filter and counts them', async () => {

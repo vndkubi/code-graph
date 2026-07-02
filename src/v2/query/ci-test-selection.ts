@@ -113,6 +113,11 @@ const IGNORABLE_PATH_PATTERNS: RegExp[] = [
 
 const matchesAny = (file: string, patterns: RegExp[]): boolean => patterns.some(p => p.test(file));
 
+/** True when a changed path can never affect code under review or test. */
+export function isIgnorableChangedPath(file: string): boolean {
+  return matchesAny(file, IGNORABLE_PATH_PATTERNS);
+}
+
 /**
  * Select tests for a CI run over a git ref range. Indexing must already have
  * produced `snapshotId` for the HEAD state of `root`.

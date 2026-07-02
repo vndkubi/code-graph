@@ -6,6 +6,7 @@
  * always produces the same report.
  */
 import { execFileSync } from 'node:child_process';
+import { isIgnorableChangedPath } from './ci-test-selection.js';
 import { V2QueryService } from './service.js';
 
 export type CiReviewFormat = 'json' | 'sarif' | 'markdown' | 'text';
@@ -42,6 +43,8 @@ export interface CiReviewResult {
   baseRef: string;
   headRef: string;
   changedFiles: string[];
+  /** Changed paths excluded from review (docs, licenses, index artifacts…). */
+  ignoredFiles: string[];
   reviewStatus?: string;
   diffStats?: Record<string, unknown>;
   findings: CiReviewFinding[];
@@ -98,16 +101,41 @@ function normalizePriority(value: unknown): CiReviewPriority {
   return value === 'P0' || value === 'P1' || value === 'P2' ? value : 'P2';
 }
 
-function emptyResult(baseRef: string, headRef: string, reviewStatus: string): CiReviewResult {
+function emptyResult(baseRef: string, headRef: string, reviewStatus: string, ignoredFiles: string[] = []): CiReviewResult {
   return {
     baseRef,
     headRef,
     changedFiles: [],
+    ignoredFiles,
     reviewStatus,
     findings: [],
     priorityCounts: { P0: 0, P1: 0, P2: 0 },
     droppedBelowMinPriority: 0,
   };
+}
+
+/**
+ * Strip per-file diff blocks whose path can never affect reviewable code
+ * (docs, licenses, CodeGraph's own artifacts). Without this, a README-only PR
+ * earns a P1 "unresolved inputs" finding because markdown is not indexed.
+ * A block whose header cannot be parsed is KEPT — over-reviewing is safe,
+ * silently skipping code is not.
+ */
+export function filterIgnorableDiff(diff: string): { diff: string; ignoredFiles: string[] } {
+  const blocks = diff.split(/^(?=diff --git )/m);
+  const kept: string[] = [];
+  const ignoredFiles: string[] = [];
+  for (const block of blocks) {
+    if (block.trim() === '') continue;
+    const header = /^diff --git a\/(.+?) b\/(.+)$/m.exec(block);
+    const file = (header?.[2] ?? '').trim();
+    if (file !== '' && isIgnorableChangedPath(file)) {
+      ignoredFiles.push(file);
+      continue;
+    }
+    kept.push(block);
+  }
+  return { diff: kept.join(''), ignoredFiles };
 }
 
 /**
@@ -121,9 +149,13 @@ export async function reviewForCi(
   options: CiReviewOptions,
 ): Promise<CiReviewResult> {
   const headRef = options.headRef ?? 'HEAD';
-  const diff = gitUnifiedDiff(root, options.baseRef, headRef);
-  if (diff.trim() === '') {
+  const rawDiff = gitUnifiedDiff(root, options.baseRef, headRef);
+  if (rawDiff.trim() === '') {
     return emptyResult(options.baseRef, headRef, 'no-changes');
+  }
+  const { diff, ignoredFiles } = filterIgnorableDiff(rawDiff);
+  if (diff.trim() === '') {
+    return emptyResult(options.baseRef, headRef, 'no-reviewable-changes', ignoredFiles);
   }
   const response = await service.query({
     workspaceId,
@@ -166,6 +198,7 @@ export async function reviewForCi(
     baseRef: options.baseRef,
     headRef,
     changedFiles: Array.isArray(response.changedFiles) ? response.changedFiles.map(String) : [],
+    ignoredFiles,
     reviewStatus: typeof response.reviewStatus === 'string' ? response.reviewStatus : undefined,
     diffStats: typeof response.diffStats === 'object' && response.diffStats !== null
       ? response.diffStats as Record<string, unknown>
