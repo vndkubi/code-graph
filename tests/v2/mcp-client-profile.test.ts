@@ -119,6 +119,8 @@ describe('MCP full tool mode', () => {
 
   it('infers context mode from task shape', () => {
     expect(inferCodeGraphContextMode('Review this patch', {})).toBe('review');
+    expect(inferCodeGraphContextMode('Review my changes for correctness', {})).toBe('review');
+    expect(inferCodeGraphContextMode('Review the pull request', {})).toBe('review');
     expect(inferCodeGraphContextMode('Trace POST /checkout flow', {})).toBe('flow');
     expect(inferCodeGraphContextMode('Trace PATCH /checkout flow', {})).toBe('flow');
     expect(inferCodeGraphContextMode('Investigate this bug: GET /api/refunds returns duplicate refunds after timeout. Trace the request flow and propose the safest fix.', {})).toBe('change');
@@ -126,6 +128,12 @@ describe('MCP full tool mode', () => {
     expect(inferCodeGraphContextMode('Collect evidence with rubric coverage', {})).toBe('evidence');
     expect(inferCodeGraphContextMode('Analyze PBI acceptance criteria against code', {})).toBe('evidence');
     expect(inferCodeGraphContextMode('Understand the architecture', {})).toBe('research');
+    // Domain nouns that merely contain "review"/"risk"/"finding" must not be hijacked into
+    // diff-anchored review mode (regression: these returned a blocked no-resolved-patch-input
+    // packet because there was no diff to resolve).
+    expect(inferCodeGraphContextMode('Where is the spaced repetition review scheduling that decides which notes are due for review?', {})).toBe('research');
+    expect(inferCodeGraphContextMode('Explain how the risk scoring is calculated', {})).toBe('research');
+    expect(inferCodeGraphContextMode('Where are the audit findings surfaced to the user?', {})).toBe('research');
   });
 
   it('explains route gate policy for client facade calls', () => {

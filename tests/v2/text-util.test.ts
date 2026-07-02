@@ -7,6 +7,7 @@ import {
   isBroadSearchTerm,
   stemWord,
   wordsShareStem,
+  isLibraryCallOwner,
 } from '../../src/v2/query/text-util.js';
 
 describe('text-util (extracted from service.ts)', () => {
@@ -61,5 +62,27 @@ describe('text-util (extracted from service.ts)', () => {
     // remainder must be a real inflection, not arbitrary letters.
     expect(wordsShareStem('call', 'callback')).toBe(false);
     expect(wordsShareStem('test', 'testament')).toBe(false);
+  });
+
+  it('flags JDK/stdlib call owners as library noise, keeps domain symbols', () => {
+    // The high-frequency stdlib callees observed in the doughnut index that
+    // pass the primary/provider signal gate yet carry no domain-flow meaning.
+    expect(isLibraryCallOwner('Arrays.stream')).toBe(true);
+    expect(isLibraryCallOwner('Integer.valueOf')).toBe(true);
+    expect(isLibraryCallOwner('Collectors.toList')).toBe(true);
+    expect(isLibraryCallOwner('List.of')).toBe(true);
+    expect(isLibraryCallOwner('Map.put')).toBe(true);
+    expect(isLibraryCallOwner('StringBuilder.append')).toBe(true);
+    expect(isLibraryCallOwner('Strings.isEmpty')).toBe(true);
+    // fully-qualified java.* is noise regardless of simple name
+    expect(isLibraryCallOwner('java.util.Arrays.stream')).toBe(true);
+    // domain symbols must be kept
+    expect(isLibraryCallOwner('Note.getId')).toBe(false);
+    expect(isLibraryCallOwner('AuthorizationService.assertAuthorize')).toBe(false);
+    expect(isLibraryCallOwner('currentUser.getUser')).toBe(false);
+    expect(isLibraryCallOwner('NotebookController.createNotebook')).toBe(false);
+    // unqualified callees (no owner) are kept — constructors / local calls
+    expect(isLibraryCallOwner('createNote')).toBe(false);
+    expect(isLibraryCallOwner('')).toBe(false);
   });
 });

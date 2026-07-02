@@ -3,6 +3,7 @@ dist/
 .codegraph/
 .claude/
 *.mjs
+!test/**/*.mjs
 scripts/
 .tmp-debug-home/
 .tmp/

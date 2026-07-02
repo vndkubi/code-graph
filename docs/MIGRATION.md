@@ -1,151 +1,96 @@
-# Migration Guide: No Daemon, Per-Repo SQLite
+# Migration Guide: Two MCP Servers → One Fused Server
 
-This release removes the daemon/Postgres runtime and stores each workspace in its own SQLite database:
+TokenOpt/ContextGate was **fused into CodeGraph**: one npm package, one MCP
+server, one CLI, with CodeGraph as the base. This guide covers moving an existing
+setup that ran CodeGraph and TokenOpt as two separate MCP servers onto the single
+fused server.
 
-```text
-<repo>/.codegraph/graph.sqlite
-```
+> This reverses the earlier separation plan. The old
+> `tokenopt-separation-and-mcp-plan.md` carries a SUPERSEDED banner.
 
-## Breaking Changes
+## Why
 
-### Daemon Commands Removed
+On a host with several MCP servers, two overlapping servers (CodeGraph +
+TokenOpt) caused:
 
-Removed:
+- **Decision overload** — the agent faced two overlapping toolsets and defaulted
+  to native file reads, so token savings never materialized.
+- **Double-spend** — both servers served overlapping evidence for the same files
+  (file-level vs symbol-level of the same files), doubling tokens and tool
+  descriptions in the system prompt.
 
-```bash
-codegraph daemon start
-codegraph daemon stop
-codegraph daemon status
-codegraph daemon run
-```
+The root cause was *instruction + duplicate evidence slot*, not the raw number of
+servers. Fusing them yields **one evidence slot per source** and a single tool
+surface. The ContextGate broker now calls the CodeGraph query engine in-process,
+so there is no subprocess spawn and no second server to install.
 
-Use direct MCP instead:
+## What changed
 
-```bash
-codegraph mcp --root /path/to/repo
-```
+| Before (two servers) | After (fused) |
+| --- | --- |
+| Separate `codegraph` and `tokenopt`/`contextgate` MCP servers | One `codegraph mcp` server exposing both surfaces |
+| ContextGate spawned the `codegraph` CLI as a subprocess to enrich packets | ContextGate calls `V2QueryService` **in-process** (subprocess kept only as a standalone-hook fallback) |
+| `tokenopt mcp` to run the gate server | `codegraph mcp` runs both; `codegraph gate mcp` is rejected |
+| `tokenopt <…>` CLI for hooks/instructions/doctor | `codegraph gate <…>` (the `tokenopt` bin alias is preserved) |
+| Two sets of tool descriptions in the system prompt | One combined `tools/list` and one merged instruction block |
 
-The MCP process opens `.codegraph/graph.sqlite` directly and calls `V2QueryService` in-process.
+## Steps
 
-### Postgres Removed
+### 1. Update MCP client config
 
-Removed runtime requirements:
-
-- `CODEGRAPH_DATABASE_URL`
-- Docker Compose Postgres
-- `pg`
-- `pg-copy-streams`
-- Postgres schema migrations
-
-Use:
-
-```bash
-codegraph setup --root /path/to/repo
-codegraph index --root /path/to/repo
-```
-
-### Global Home Removed
-
-The old global home layout is no longer used for graph data. `CODEGRAPH_HOME` is ignored by graph storage.
-
-Old:
-
-```bash
-codegraph index --root /path/to/repo --home ~/.codegraph
-```
-
-New:
-
-```bash
-codegraph index --root /path/to/repo
-```
-
-Generated files live under the repository:
-
-```text
-.codegraph/
-  graph.sqlite
-  artifacts/
-  logs/
-  setup-state.json
-```
-
-Add `.codegraph/` to `.gitignore`.
-
-## New Daily Flow
-
-```bash
-npm ci
-npm run build
-codegraph setup --root /path/to/repo
-codegraph mcp --root /path/to/repo
-```
-
-Refresh after edits or branch changes:
-
-```bash
-codegraph index --root /path/to/repo
-```
-
-Inspect health:
-
-```bash
-codegraph doctor --root /path/to/repo
-```
-
-Read query logs:
-
-```bash
-codegraph logs --root /path/to/repo --tail 50
-```
-
-## MCP Client Config
-
-Most clients keep the same command shape:
+Register **only** `codegraph`. Remove the separate `tokenopt` / `contextgate`
+server entry:
 
 ```json
 {
   "mcpServers": {
     "codegraph": {
-      "command": "codegraph",
-      "args": ["mcp", "--root", "${workspaceFolder}"]
+      "command": "node",
+      "args": ["D:/path/to/code-graph/dist/cli.js", "mcp", "--root", "D:/path/to/repo"]
     }
   }
 }
 ```
 
-Run `codegraph setup --root <repo>` before starting the client for the fastest startup. Use `--prewarm` only when you explicitly want MCP to index a missing workspace during startup/runtime.
+If you keep a stale second server, you reintroduce exactly the decision-overload
+and double-spend this fusion removes.
 
-## Data Migration
+### 2. Map the gate CLI
 
-There is no automatic migration from old Postgres/global data.
+| Old | New |
+| --- | --- |
+| `tokenopt hook codex pre-tool-use` | `codegraph gate hook codex pre-tool-use` |
+| `tokenopt instructions install` | `codegraph gate instructions install` |
+| `tokenopt doctor` | `codegraph gate doctor` |
+| `tokenopt mcp` | `codegraph mcp` (the fused server) |
 
-1. Leave old data in place or delete it manually.
-2. Run `codegraph setup --root /path/to/repo`.
-3. Confirm `codegraph doctor --root /path/to/repo` reports `backend: sqlite` and `state: ready`.
+Existing hook installs that call the `tokenopt` binary still work — the alias maps
+to `dist/tokenopt/cli.js`. New installs should use `codegraph gate …`.
 
-## Troubleshooting
+### 3. Profiles and modes
 
-### Workspace is not indexed yet
+Tool exposure is unified under the CodeGraph profile, with a TokenOpt override:
 
-Run:
+- `--mcp-profile client` (default) → CodeGraph context/slice/status + the
+  ContextGate lite gate (**7 tools**).
+- `--mcp-profile full` → full CodeGraph + full TokenOpt surface (**45 tools**).
+- `TOKENOPT_MCP_MODE=lite|full|broker` overrides the gate set (`broker` =
+  `contextgate_get_context` only).
 
-```bash
-codegraph setup --root /path/to/repo
+### 4. Verify
+
+```powershell
+node dist/cli.js mcp --root "<repo>"        # one server, both surfaces
+node dist/cli.js gate doctor                # gate wiring OK
 ```
 
-### Database is locked
+In `client` profile, `tools/list` should show both `codegraph_context` and
+`contextgate_get_context`.
 
-SQLite WAL handles normal read/write concurrency, but only one writer can index at a time.
+## Note on the earlier SQLite migration
 
-- Ensure only one `codegraph index`, `setup`, or MCP auto-refresh writer is active for the same repo.
-- Stop stale Node processes if a previous index was interrupted.
-
-### Benchmark scans local artifacts
-
-Keep generated folders ignored:
-
-```gitignore
-.codegraph/
-.tmp/
-```
+The pre-fusion CodeGraph already removed its daemon, localhost HTTP API, and
+Postgres dependency in favor of a per-repo SQLite database at
+`<repo>/.codegraph/graph.sqlite` (`better-sqlite3`). That is the current and only
+runtime model — see [Architecture](ARCHITECTURE.md). Nothing in the fusion
+changes it; the gate simply queries that same engine in-process.

@@ -1,0 +1,29 @@
+{
+  "_comment": "Relevance recall suite for the doughnut corpus (Spring/Java). Derived from live MCP probes across distinct task types (where-is, endpoint-flow, scheduling). Run with: codegraph benchmark recall --root <doughnut> --tasks examples/doughnut-recall-suite.example.json . expectedFiles are matched as path substrings.",
+  "tasks": [
+    {
+      "id": "auth-login",
+      "task": "Where is user authentication and login handled in the backend?",
+      "expectedFiles": [
+        "services/AuthorizationService.java",
+        "controllers/currentUser/CurrentUserFetcherFromRequest.java"
+      ]
+    },
+    {
+      "id": "note-create-flow",
+      "task": "Trace what happens when a user creates a new note through the REST API, from controller to database.",
+      "expectedFiles": [
+        "controllers/NoteController.java",
+        "entities/repositories/NoteRepository.java"
+      ]
+    },
+    {
+      "id": "spaced-repetition-due",
+      "task": "Where is the spaced repetition review scheduling that decides which notes are due for review?",
+      "expectedFiles": [
+        "algorithms/SpacedRepetitionAlgorithm.java",
+        "services/RecallService.java"
+      ]
+    }
+  ]
+}

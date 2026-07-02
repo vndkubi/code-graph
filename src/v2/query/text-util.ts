@@ -93,6 +93,36 @@ export const RESEARCH_STOP_WORDS = new Set([
   'where',
   'work',
   'works',
+  // Instruction/interrogative framing verbs and pronouns. These carry NO
+  // repository-identity signal but, left in, leak through researchSeedTerms as
+  // symbol seeds and exact-match unrelated methods — e.g. "Identify the algorithm"
+  // matched ApplicationController.identify() and ranked the auth endpoint #1 for a
+  // spaced-repetition query, polluting topFiles/flowSteps AND wasting evidence
+  // tokens on an irrelevant slice. Dropping them improves recall and cuts tokens.
+  // Deliberately NOT included: create/update/delete/save/load/build/search — those
+  // map to real domain method names (createNote, etc.) and carry signal.
+  'identify',
+  'find',
+  'locate',
+  'trace',
+  'show',
+  'describe',
+  'determine',
+  'decide',
+  'decides',
+  'responsible',
+  'which',
+  'that',
+  'handled',
+  // 'fix'/'bug' are the same framing-verb problem, but with a sharper failure
+  // mode when they reach fieldImpactSeeds (get_change_pack): that path matches
+  // seeds as a bare SQL substring (`simple_name LIKE '%fix%'`), so the word
+  // "fix" in an ordinary "Fix a bug in ..." debug task matched every field
+  // whose name merely CONTAINS "fix" as a substring — suffix, objectPrefix,
+  // ATTACHMENT_IMAGE_PATH_PREFIX, extraPrefixesMap.$body_ — none related to the
+  // actual bug, at ~40% of the packet's size for one unrelated task.
+  'fix',
+  'bug',
 ]);
 
 export const FILE_SEARCH_STOP_WORDS = new Set([
@@ -153,15 +183,30 @@ export function isBroadSearchTerm(value: string): boolean {
 
 export function tokenizeSearchQuery(query: string): string[] {
   if (!query || query === '*') return [];
-  const withCamelBoundaries = query
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
-  const tokens = withCamelBoundaries
-    .toLowerCase()
-    .split(/[^a-z0-9]+/g)
+  const tokens: string[] = [];
+  for (const rawWord of query.split(/[^A-Za-z0-9]+/g)) {
+    if (!rawWord) continue;
+    const fragments = rawWord
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+      .toLowerCase()
+      .split(/\s+/g)
+      .filter(Boolean);
+    for (const fragment of fragments) tokens.push(fragment);
+    // Rescue acronym-words like "SQLite" -> ["sq","lite"], "OAuth" -> ["o","auth"]:
+    // the camel split produces a <3-char fragment that the FTS prefix builder drops,
+    // silently losing the whole-word signal (a 10-word "...SQLite snapshot" query
+    // collapsed to a single file). Emit the joined whole word too so "sqlite*" still
+    // runs. Only fires on the short-fragment case, so ordinary camelCase tokenization
+    // (PaymentService -> payment, service) is unchanged.
+    const whole = rawWord.toLowerCase();
+    if (whole.length >= 3 && fragments.length > 1 && fragments.some(fragment => fragment.length < 3)) {
+      tokens.push(whole);
+    }
+  }
+  return [...new Set(tokens
     .map(token => token.trim())
-    .filter(token => token.length >= 2 && !SEARCH_STOP_WORDS.has(token));
-  return [...new Set(tokens)];
+    .filter(token => token.length >= 2 && !SEARCH_STOP_WORDS.has(token)))];
 }
 
 export function identifierSearchTerms(query: string): string[] {
@@ -248,4 +293,47 @@ export function wordsShareStem(a: string, b: string): boolean {
   const [shorter, longer] = sa.length <= sb.length ? [sa, sb] : [sb, sa];
   if (shorter.length < 4 || !longer.startsWith(shorter)) return false;
   return INFLECTIONAL_REMAINDER.test(longer.slice(shorter.length));
+}
+
+// JDK / standard-library owner types whose calls are noise in a research/flow
+// packet. A call to `Arrays.stream`, `Integer.valueOf`, or `Optional.of` tells a
+// reviewer nothing about the domain flow (controller -> service -> repository)
+// yet these edges are the majority of a method's call list and were ~22% of the
+// investigate packet. The set is intentionally conservative — only unambiguous
+// java.lang / java.util / java.util.stream utility types — so a domain class is
+// never dropped by a name collision. Framework calls (Spring, JPA) are kept:
+// they can carry flow meaning (e.g. profile gating, repository queries).
+const LIBRARY_CALL_OWNERS = new Set([
+  // java.lang
+  'String', 'Integer', 'Long', 'Double', 'Float', 'Boolean', 'Byte', 'Short',
+  'Character', 'Number', 'Math', 'System', 'Object', 'Objects', 'Class',
+  'Thread', 'Void', 'Enum', 'Throwable', 'Exception', 'RuntimeException',
+  'StringBuilder', 'StringBuffer', 'Iterable', 'Comparable',
+  // java.util (+ .stream, .function)
+  'List', 'ArrayList', 'LinkedList', 'Map', 'HashMap', 'LinkedHashMap', 'TreeMap',
+  'Set', 'HashSet', 'LinkedHashSet', 'TreeSet', 'Collection', 'Collections',
+  'Arrays', 'Optional', 'OptionalInt', 'OptionalLong', 'Stream', 'IntStream',
+  'LongStream', 'DoubleStream', 'Collectors', 'Comparator', 'Iterator',
+  'Spliterator', 'Deque', 'ArrayDeque', 'Queue', 'PriorityQueue', 'Stack',
+  'EnumSet', 'EnumMap', 'BitSet', 'UUID', 'Random', 'Scanner', 'StringJoiner',
+  'Function', 'Supplier', 'Consumer', 'Predicate', 'BiFunction',
+  // apache-commons / guava utility surfaces that read as stdlib noise
+  'Strings', 'StringUtils', 'CollectionUtils', 'Preconditions', 'ObjectUtils',
+]);
+
+/**
+ * Whether a call edge target (a `Owner.method` string, possibly fully-qualified)
+ * points at a JDK/standard-library utility type rather than a domain symbol.
+ * Used to strip stdlib noise from research/flow call lists. Returns false for
+ * unqualified callees (no owner) so constructors and local calls are kept.
+ */
+export function isLibraryCallOwner(callee: string): boolean {
+  if (!callee) return false;
+  const segments = callee.split('.');
+  if (segments.length < 2) return false;
+  const owner = segments[segments.length - 2] ?? '';
+  if (!owner) return false;
+  // Explicit JDK/stdlib packages are always noise regardless of the simple name.
+  if (/(^|[.])java[x]?[.]/.test(callee)) return true;
+  return LIBRARY_CALL_OWNERS.has(owner);
 }

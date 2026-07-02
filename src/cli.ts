@@ -26,6 +26,7 @@ import { runAffectedTestsEval } from './v2/benchmark/affected-tests-eval.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 import { buildLocalArtifactIndex } from './v2/mcp/local-artifact.js';
 import { inspectWorkspaceReadiness } from './v2/workspace-health.js';
+import { main as tokenoptMain } from './tokenopt/cli.js';
 
 interface ParsedArgs {
   command: string[];
@@ -92,6 +93,9 @@ async function main(): Promise<void> {
     case 'benchmark':
       await runBenchmarkCommand(subcommand, parsed);
       return;
+    case 'gate':
+      await runGateCommand(process.argv.slice(3));
+      return;
     case 'help':
     case undefined:
       printHelp();
@@ -99,6 +103,19 @@ async function main(): Promise<void> {
     default:
       throw new Error(`Unknown command: ${command}`);
   }
+}
+
+/**
+ * `codegraph gate <...>` delegates to the TokenOpt/ContextGate CLI surface
+ * (install/hook/exec/instructions/report/doctor). The MCP gate tools are served
+ * by the fused `codegraph mcp` server, so `gate mcp` is intentionally rejected.
+ */
+async function runGateCommand(args: string[]): Promise<void> {
+  if (args[0] === 'mcp') {
+    throw new Error('Use `codegraph mcp` — the fused server already exposes the TokenOpt/ContextGate gate tools. There is no separate gate MCP server.');
+  }
+  const code = await tokenoptMain(args);
+  if (code !== 0) process.exitCode = code;
 }
 
 async function runBenchmarkCommand(subcommand: string | undefined, parsed: ParsedArgs): Promise<void> {

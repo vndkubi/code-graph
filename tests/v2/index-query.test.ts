@@ -1301,8 +1301,7 @@ public class PaymentService {
       };
       compressedEvidence: {
         factCards: Array<{ kind: string; subject?: string; file?: string }>;
-        callGraphEdges: Array<{ caller?: string; callee?: string }>;
-        sourceSliceRefs: Array<{ file?: string; textPreview?: string }>;
+        sourceSliceRefs: Array<{ file?: string; symbol?: string }>;
         compressionRatio: number;
       };
       budget: {
@@ -1635,6 +1634,37 @@ public class OrderService {
       },
     }) as { callees: Array<{ callee: string }> };
     expect(directCallees.callees.some(edge => edge.callee.includes('OrderService.listOrders'))).toBe(true);
+
+    // Keyword endpoint fallback: a natural-language flow question that names no
+    // explicit "/path" still resolves the endpoint by matching the domain token
+    // ("orders") against indexed endpoint paths/handlers, so impactedEndpoints is
+    // populated instead of left empty.
+    const keywordEndpointPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_flow_pack',
+      args: {
+        target: 'How does the orders REST API return order data to the caller?',
+        profile: 'full',
+        tokenBudget: 6000,
+      },
+    }) as { impactedEndpoints: Array<{ method: string; path: string; handlerSymbol: string }> };
+    expect(keywordEndpointPack.impactedEndpoints).toContainEqual(expect.objectContaining({
+      method: 'GET',
+      path: '/api/orders',
+    }));
+
+    // The same fallback must NOT fire for a plain architecture question with no
+    // endpoint/flow intent — that would pollute the packet with unrelated routes.
+    const archPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_research_pack',
+      args: {
+        target: 'Summarize the overall module structure of this project.',
+        profile: 'full',
+        tokenBudget: 6000,
+      },
+    }) as { impactedEndpoints: Array<{ path: string }> };
+    expect(archPack.impactedEndpoints).toHaveLength(0);
   });
 
   it('packs endpoint downstream service side effects into the first flow packet', async () => {
@@ -2249,6 +2279,158 @@ public class OrderServiceTest {
     expect(matchingReview.firstFollowUpToolCall?.tool).toBe('get_file_slice');
     expect(matchingReview.firstFollowUpToolCall?.args.slices?.some(slice => slice.file?.endsWith('OrderController.java'))).toBe(true);
     expect(matchingReview.agentGuidance?.sourceInspection?.firstTool).toBe('get_file_slice');
+  });
+
+  it('detects design-quality (Clean Code) smells alongside risk findings in review_patch', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-design-smells-');
+
+    // Build the class body as a line array so hunk line ranges can be computed
+    // programmatically (mark() records the 1-based start line of each section)
+    // instead of hand-counting — every method here is designed to trip exactly
+    // one design-quality check.
+    const lines: string[] = [];
+    const sections: Record<string, number> = {};
+    const mark = (name: string) => { sections[name] = lines.length + 1; };
+
+    lines.push('package com.example.smells;', '', 'public class LegacyBillingService {');
+    lines.push('  private final HelperUtil helper = new HelperUtil();', '');
+
+    // Too-many-params smell: 6 parameters.
+    mark('chargeCustomer');
+    lines.push(
+      '  public int chargeCustomer(',
+      '      int accountId, int amount, String currency, boolean recurring, String promoCode, String taxRegion) {',
+      '    int total = amount;',
+      '    if (recurring) {',
+      '      total = total + 10;',
+      '    }',
+      '    return total;',
+      '  }',
+    );
+    sections.chargeCustomerEnd = lines.length;
+    lines.push('');
+
+    // Long-method smell: body well past the 60-line threshold. First 7 lines
+    // (StringBuilder decl + 5 appends + return) are deliberately duplicated
+    // verbatim in ReportBuilder.buildReportPreamble below (duplication smell).
+    mark('buildInvoiceSummary');
+    lines.push('  public String buildInvoiceSummary() {', '    StringBuilder sb = new StringBuilder();');
+    for (let i = 1; i <= 5; i++) lines.push(`    sb.append("line${String(i).padStart(2, '0')}\\n");`);
+    for (let i = 1; i <= 58; i++) lines.push(`    sb.append("pad${String(i).padStart(2, '0')}\\n");`);
+    lines.push('    return sb.toString();', '  }');
+    sections.buildInvoiceSummaryEnd = lines.length;
+    lines.push('');
+
+    // Dead-code smell: private, zero callers anywhere in the indexed workspace.
+    mark('neverCalledHelper');
+    lines.push('  private int neverCalledHelper() {', '    return 42;', '  }');
+    sections.neverCalledHelperEnd = lines.length;
+    lines.push('');
+
+    // Feature-envy smell: all calls go to HelperUtil, none to its own class.
+    mark('delegateHeavily');
+    lines.push(
+      '  public void delegateHeavily() {',
+      '    helper.stepOne();',
+      '    helper.stepTwo();',
+      '    helper.stepThree();',
+      '    helper.stepFour();',
+      '  }',
+    );
+    sections.delegateHeavilyEnd = lines.length;
+    lines.push('');
+
+    // Large-class smell: pad the file past the method-count threshold. These
+    // stubs are never referenced in the diff — the check queries the indexed
+    // file's total symbol count, not just the touched hunks.
+    for (let i = 0; i < 22; i++) lines.push(`  public void method${i}() {}`);
+    lines.push('}', '');
+
+    const billingSource = lines.join('\n');
+    writeFile(repo, 'src/main/java/com/example/smells/LegacyBillingService.java', billingSource);
+    writeFile(repo, 'src/main/java/com/example/smells/HelperUtil.java', `package com.example.smells;
+
+public class HelperUtil {
+  public void stepOne() {}
+  public void stepTwo() {}
+  public void stepThree() {}
+  public void stepFour() {}
+}
+`);
+    // Duplicate counterpart: the same StringBuilder-decl + 5 appends + return
+    // block as buildInvoiceSummary above, in an unrelated file/method.
+    writeFile(repo, 'src/main/java/com/example/smells/ReportBuilder.java', `package com.example.smells;
+
+public class ReportBuilder {
+  public String buildReportPreamble() {
+    StringBuilder sb = new StringBuilder();
+    sb.append("line01\\n");
+    sb.append("line02\\n");
+    sb.append("line03\\n");
+    sb.append("line04\\n");
+    sb.append("line05\\n");
+    return sb.toString();
+  }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const billingLines = billingSource.split('\n');
+    const addedHunk = (file: string, startLine: number, endLine: number): string => {
+      const count = endLine - startLine + 1;
+      const body = [];
+      for (let n = startLine; n <= endLine; n++) body.push(`+${billingLines[n - 1] ?? ''}`);
+      return [
+        `diff --git a/${file} b/${file}`,
+        `--- a/${file}`,
+        `+++ b/${file}`,
+        `@@ -${startLine},0 +${startLine},${count} @@`,
+        ...body,
+      ].join('\n');
+    };
+    const diff = [
+      addedHunk('src/main/java/com/example/smells/LegacyBillingService.java', sections.chargeCustomer!, sections.chargeCustomerEnd!),
+      addedHunk('src/main/java/com/example/smells/LegacyBillingService.java', sections.buildInvoiceSummary!, sections.buildInvoiceSummaryEnd!),
+      addedHunk('src/main/java/com/example/smells/LegacyBillingService.java', sections.neverCalledHelper!, sections.neverCalledHelperEnd!),
+      addedHunk('src/main/java/com/example/smells/LegacyBillingService.java', sections.delegateHeavily!, sections.delegateHeavilyEnd!),
+      [
+        'diff --git a/src/main/java/com/example/smells/ReportBuilder.java b/src/main/java/com/example/smells/ReportBuilder.java',
+        '--- a/src/main/java/com/example/smells/ReportBuilder.java',
+        '+++ b/src/main/java/com/example/smells/ReportBuilder.java',
+        '@@ -4,0 +4,7 @@',
+        '+    StringBuilder sb = new StringBuilder();',
+        '+    sb.append("line01\\n");',
+        '+    sb.append("line02\\n");',
+        '+    sb.append("line03\\n");',
+        '+    sb.append("line04\\n");',
+        '+    sb.append("line05\\n");',
+        '+    return sb.toString();',
+      ].join('\n'),
+    ].join('\n');
+
+    const review = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'review_patch',
+      args: { diff, outputMode: 'full', limit: 50 },
+    }) as {
+      reviewFindings: Array<{ id: string; category?: string; title: string; why: string }>;
+    };
+
+    const byPrefix = (prefix: string) => review.reviewFindings.filter(f => f.id.startsWith(prefix));
+    expect(byPrefix('review-long-method-').length).toBeGreaterThan(0);
+    expect(byPrefix('review-long-method-').every(f => f.category === 'design-quality')).toBe(true);
+    expect(byPrefix('review-long-param-list-').length).toBeGreaterThan(0);
+    expect(byPrefix('review-dead-code-').length).toBeGreaterThan(0);
+    expect(byPrefix('review-feature-envy-').some(f => f.why.includes('HelperUtil'))).toBe(true);
+    expect(byPrefix('review-large-class-').some(f => f.title.includes('LegacyBillingService.java'))).toBe(true);
+    expect(byPrefix('review-duplicated-code-').length).toBeGreaterThan(0);
+    // A genuinely used, appropriately-sized method must NOT be flagged.
+    expect(review.reviewFindings.some(f => f.id.includes('chargeCustomer') && f.id.startsWith('review-long-method-'))).toBe(false);
   });
 
   it('indexes XML, JSON, YAML, and properties config evidence', async () => {

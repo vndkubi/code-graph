@@ -122,7 +122,10 @@ function inferExpectedModeForRouteGate(task: string, input: RouteGateTask): Code
   if (input.expectedMode) return input.expectedMode;
   if (input.diff) return 'review';
   const text = task.toLowerCase();
-  if (/\b(review|diff|pr|risk|finding)\b|\bpatch\b(?!\s*\/)/.test(text)) return 'review';
+  if (/\bpull requests?\b|\bpatch(?:es)?\b(?!\s*\/)/.test(text)
+    || /\breview\b[\s\w]{0,24}?\b(?:changes?|diffs?|prs?|pull requests?|patch(?:es)?|commits?|edits?)\b/.test(text)) {
+    return 'review';
+  }
   if (/\b(evidence|answerable|rubric|coverage|pbi|ticket|story|acceptance criteria)\b/.test(text)) return 'evidence';
   if (hasExpectedChangeIntent(text)) return 'change';
   if (hasExpectedFlowIntent(text)) return 'flow';

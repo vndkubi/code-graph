@@ -21,6 +21,12 @@ export interface ContextProofTask {
   includeSnippets?: boolean;
   rightSize?: boolean;
   keepRatio?: number;
+  // Which context tool to measure. Defaults to get_context_packet for back-compat,
+  // but recall measurement should pass 'get_research_pack' — that is the SHIPPED
+  // client path (codegraph_context routes there); get_context_packet is a full-profile
+  // legacy tool no default client ever calls, so measuring it under-reports the real
+  // user experience.
+  tool?: string;
 }
 
 export interface ContextProofResult {
@@ -393,9 +399,10 @@ async function runMcpProof(
   const packetStart = Date.now();
   const packet = await queryService.query({
     workspaceId,
-    toolName: 'get_context_packet',
+    toolName: task.tool ?? 'get_context_packet',
     args: {
       task: task.task,
+      target: task.task,
       domain: task.domain,
       tokenBudget: task.tokenBudget ?? 4000,
       maxFiles: task.maxFiles ?? 6,

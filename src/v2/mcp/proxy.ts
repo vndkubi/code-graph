@@ -11,6 +11,18 @@ import { openCodeGraphDb, type CodeGraphDb } from '../storage/database.js';
 import { inspectWorkspaceReadiness } from '../workspace-health.js';
 import { isLocalMcpFallbackTool, runLocalMcpFallback } from './local-fallback.js';
 import { V2_TOOL_DEFINITIONS, mcpToolNamesForProfile, parseToolArgs } from './tools.js';
+import {
+  TOKENOPT_TOOL_DEFINITIONS,
+  dispatchTokenoptTool,
+  getExposedMcpToolNames,
+  normalizeMcpMode,
+  SERVER_INSTRUCTIONS as TOKENOPT_SERVER_INSTRUCTIONS,
+  type McpMode,
+  type TokenoptCodeGraphProvider,
+} from '../../tokenopt/mcp.js';
+import { parseCodeGraphResult } from '../../tokenopt/codegraph-bridge.js';
+
+const TOKENOPT_TOOL_NAMES = new Set(TOKENOPT_TOOL_DEFINITIONS.map(tool => tool.name));
 
 export interface RunMcpProxyOptions {
   root: string;
@@ -49,9 +61,21 @@ class McpStructuredError extends Error {
 export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
   const activeMcpProfile = options.mcpProfile ?? 'client';
   const allowedToolNames = mcpToolNamesForProfile(activeMcpProfile);
-  const toolDefinitions = allowedToolNames
+  const codegraphToolDefinitions = allowedToolNames
     ? V2_TOOL_DEFINITIONS.filter(tool => allowedToolNames.has(tool.name))
     : V2_TOOL_DEFINITIONS;
+  // TokenOpt/ContextGate gate tools are exposed alongside the CodeGraph pack
+  // tools in the single fused server. TOKENOPT_MCP_MODE (lite|full|broker) is an
+  // explicit override; otherwise the codegraph profile picks the tokenopt set
+  // (full profile -> full toolset, everything else -> lite).
+  const tokenoptMode: McpMode = process.env.TOKENOPT_MCP_MODE
+    ? normalizeMcpMode()
+    : activeMcpProfile === 'full'
+      ? 'full'
+      : 'lite';
+  const tokenoptExposed = getExposedMcpToolNames(tokenoptMode);
+  const tokenoptToolDefinitions = TOKENOPT_TOOL_DEFINITIONS.filter(tool => tokenoptExposed.has(tool.name));
+  const toolDefinitions = [...codegraphToolDefinitions, ...tokenoptToolDefinitions] as typeof V2_TOOL_DEFINITIONS;
   const providerOptions = {
     indexProviders: options.indexProviders,
     scipIndexPath: options.scipIndexPath,
@@ -156,9 +180,36 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
     { name: 'codegraph', version: '2.1.0' },
     {
       capabilities: { tools: {} },
-      instructions: MCP_SERVER_INSTRUCTIONS,
+      instructions: `${MCP_SERVER_INSTRUCTIONS}\n\n${TOKENOPT_SERVER_INSTRUCTIONS}`,
     },
   );
+
+  // In-process CodeGraph provider for the TokenOpt ContextGate broker. Replaces
+  // the codegraph-bridge.ts subprocess spawn: contextgate_get_context enriches a
+  // packet by querying the shared V2QueryService directly (no child process,
+  // no double-spend).
+  const codeGraphProvider: TokenoptCodeGraphProvider = async (task, budgetTokens) => {
+    try {
+      const current = await readyRuntime();
+      const cgArgs: Record<string, unknown> = {
+        task,
+        budgetTokens,
+        profile: 'compact',
+        responseMode: 'agent',
+        includeSnippets: true,
+        warnStale: false,
+      };
+      const routed = routeMcpTool('codegraph_context', cgArgs);
+      const result = await current.queries.query({
+        workspaceId: current.workspace.workspaceId,
+        toolName: routed.toolName,
+        args: routed.args,
+      });
+      return parseCodeGraphResult({ content: [{ type: 'text', text: JSON.stringify(result) }] });
+    } catch {
+      return null;
+    }
+  };
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: toolDefinitions,
@@ -168,6 +219,33 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
     let args: Record<string, unknown> | undefined;
     const startedAt = Date.now();
     try {
+      if (TOKENOPT_TOOL_NAMES.has(request.params.name)) {
+        if (!tokenoptExposed.has(request.params.name)) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify({
+                error: {
+                  code: 'tool_not_available_in_profile',
+                  message: `Tool ${request.params.name} is not exposed in tokenopt mode ${tokenoptMode}. Run with --mcp-profile full or set TOKENOPT_MCP_MODE=full.`,
+                },
+              }),
+            }],
+            isError: true,
+          };
+        }
+        const tokenoptArgs = (request.params.arguments ?? {}) as Record<string, unknown>;
+        const tokenoptResult = await dispatchTokenoptTool(request.params.name, tokenoptArgs, tokenoptMode, { codeGraphProvider });
+        logQueryEvent(getWorkspacePaths(options.root).queryLogPath, {
+          event: 'query',
+          toolName: request.params.name,
+          routedToolName: request.params.name,
+          durationMs: Date.now() - startedAt,
+          responseChars: JSON.stringify(tokenoptResult).length,
+          args: summarizeArgs(tokenoptArgs),
+        });
+        return tokenoptResult;
+      }
       if (allowedToolNames && !allowedToolNames.has(request.params.name)) {
         return {
           content: [{
@@ -448,11 +526,21 @@ export function inferCodeGraphContextMode(task: string, args: Record<string, unk
   }
   const text = `${task}\n${typeof args.diff === 'string' ? args.diff.slice(0, 2000) : ''}`.toLowerCase();
   if (typeof args.diff === 'string' && args.diff.trim().length > 0) return 'review';
-  if (/\b(review|diff|pr|risk|finding)\b|\bpatch\b(?!\s*\/)/.test(text)) return 'review';
+  if (hasReviewIntent(text)) return 'review';
   if (/\b(evidence|answerable|rubric|coverage|pbi|ticket|story|acceptance criteria)\b/.test(text)) return 'evidence';
   if (hasChangeIntent(text)) return 'change';
   if (hasExplicitFlowIntent(text)) return 'flow';
   return 'research';
+}
+
+function hasReviewIntent(text: string): boolean {
+  // Review mode produces a diff-anchored packet; without changed material to resolve it
+  // can only return a blocked "no-resolved-patch-input" packet. So route to review only on
+  // an explicit changed-code artifact, or "review" used as an imperative command on changed
+  // material. A bare mention of "review"/"risk"/"finding" as a domain noun (e.g. "spaced
+  // repetition review", "due for review", "risk scoring") must not hijack routing.
+  if (/\bpull requests?\b|\bpatch(?:es)?\b(?!\s*\/)/.test(text)) return true;
+  return /\breview\b[\s\w]{0,24}?\b(?:changes?|diffs?|prs?|pull requests?|patch(?:es)?|commits?|edits?)\b/.test(text);
 }
 
 function hasChangeIntent(text: string): boolean {

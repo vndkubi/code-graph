@@ -116,6 +116,9 @@ export async function runRecallBench(
       maxFiles,
       includeSnippets: false,
       rightSize,
+      // Measure the SHIPPED client path (codegraph_context -> get_research_pack), not
+      // the full-profile-only get_context_packet legacy tool.
+      tool: 'get_research_pack',
       ...(keepRatio != null ? { keepRatio } : {}),
     }));
 
