@@ -4,10 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadConfig } from "../../dist/tokenopt/config.js";
-import { adaptDecisionToCopilot, normalizeCopilotEvent } from "../../dist/tokenopt/copilot-adapter.js";
 import { evaluatePolicy } from "../../dist/tokenopt/policy-core.js";
 import { evaluateHardGate } from "../../dist/tokenopt/hard-gate.js";
-import { buildInstructionGraph } from "../../dist/tokenopt/instruction-audit.js";
 import { compressText } from "../../dist/tokenopt/log-compressor.js";
 import { linkBusinessContracts } from "../../dist/tokenopt/processors/business-contract-linker.js";
 import { analyzeImpact } from "../../dist/tokenopt/processors/impact-analysis.js";
@@ -111,26 +109,6 @@ test("business contract linker and impact analyzer return scoped evidence", () =
   });
   assert.equal(impact.definitions.some((item) => item.includes("OrderService.java")), true);
   assert.equal(impact.likelyTests.some((item) => item.endsWith("OrderServiceTest.java")), true);
-});
-
-test("Copilot adapter normalizes events and adapts decisions", () => {
-  const event = normalizeCopilotEvent({
-    hookEventName: "PreToolUse",
-    cwd: process.cwd(),
-    toolName: "Bash",
-    toolInput: { command: "rg --files" }
-  });
-  assert.equal(event.eventName, "pre-tool-use");
-  assert.equal(event.toolName, "Bash");
-
-  const output = adaptDecisionToCopilot("pre-tool-use", {
-    action: "deny",
-    reason: "blocked"
-  });
-  assert.deepEqual(output, {
-    permissionDecision: "deny",
-    permissionDecisionReason: "blocked"
-  });
 });
 
 test("policy gateway requires ContextGate for PBI plus code tasks", () => {
@@ -243,25 +221,4 @@ test("policy gateway leaves requirement-only prompts alone and shadows before ha
   assert.match(shadowSearch.reason, /shadow policy would deny/);
 });
 
-test("instruction graph planner emits root and path-specific files", () => {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "tokenopt-instruction-graph-"));
-  const plan = buildInstructionGraph(repo);
-  const files = plan.files.map((file) => file.path.replace(/\\/g, "/"));
-  assert.equal(files.some((file) => file.endsWith(".github/copilot-instructions.md")), true);
-  assert.equal(files.some((file) => file.endsWith("tokenopt-review.instructions.md")), true);
-  assert.equal(files.some((file) => file.endsWith("tokenopt-runtime.instructions.md")), true);
-  const reviewInstructions = plan.files.find((file) => file.path.endsWith(path.join(".github", "instructions", "tokenopt-review.instructions.md")));
-  assert.match(reviewInstructions.content, /two phases/i);
-  assert.match(reviewInstructions.content, /branch pair/);
-  assert.match(reviewInstructions.content, /tokenopt_compile_evidence/);
-  assert.match(reviewInstructions.content, /codegraph_context/);
-  assert.match(reviewInstructions.content, /review broker is available/);
-  assert.match(reviewInstructions.content, /direct attachment summaries/);
-  assert.match(reviewInstructions.content, /Do not ask the user to paste full content/);
-  assert.match(reviewInstructions.content, /business\/test coverage review/);
-  assert.match(reviewInstructions.content, /effective config\/policy math/);
-  assert.match(reviewInstructions.content, /ISTQB dimensions/);
-  assert.match(reviewInstructions.content, /user provides a review checklist/);
-  assert.match(reviewInstructions.content, /pass, fail, gap, or not_applicable/);
-  assert.ok(plan.totalEstimatedTokens > 0);
-});
+

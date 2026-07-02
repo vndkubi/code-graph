@@ -61,19 +61,15 @@ codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|
 
 ## `gate` subcommands
 
-`codegraph gate <…>` delegates to the TokenOpt CLI. It covers hook adapters,
-instruction emission/installation, exec wrapping, reporting, and gate doctors.
+`codegraph gate <…>` delegates to the TokenOpt CLI. It covers config
+scaffolding, exec wrapping, reporting, and the gate doctor.
 
 | Subcommand | Purpose |
 | --- | --- |
 | `gate init` | Scaffold TokenOpt config in the current repo. |
-| `gate install codex` / `gate install copilot` / `gate setup copilot` | Install hook/instruction integration for an agent host. |
-| `gate hook codex <event>` / `gate hook copilot <event>` | Hook adapters (e.g. `pre-tool-use`) invoked by the agent host. |
 | `gate exec -- <command>` | Run a command through the gate's exec wrapper. |
-| `gate instructions audit\|emit\|graph\|prompts\|install\|install-graph\|install-prompts` | Inspect or install agent instruction files. |
 | `gate report` | Emit a gate/session report. |
-| `gate doctor [codex-hooks\|copilot]` | Diagnose gate wiring for a host. |
-| `gate benchmark workflow-ab\|suite\|codex-daily` | TokenOpt benchmark harnesses. |
+| `gate doctor` | Diagnose gate wiring. |
 
 > `codegraph gate mcp` is intentionally **rejected**. The fused `codegraph mcp`
 > server already exposes the TokenOpt/ContextGate gate tools — there is no

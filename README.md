@@ -43,7 +43,7 @@ For exact file/symbol tasks where the owner is already known, skip the gate and 
 
 **Tool exposure** is controlled by `--mcp-profile` (default `client` → CodeGraph context/slice/status + the ContextGate lite gate; `full` → every tool on both surfaces). `TOKENOPT_MCP_MODE=lite|full|broker` overrides the gate set.
 
-**CLI:** the TokenOpt surface (hooks, instructions, exec, doctor) lives under `codegraph gate <…>` (e.g. `codegraph gate hook codex pre-tool-use`, `codegraph gate doctor`). The legacy `tokenopt` binary alias is preserved for existing hook installs.
+**CLI:** the TokenOpt gate surface (init, exec, report, doctor) lives under `codegraph gate <…>` (e.g. `codegraph gate doctor`). The legacy `tokenopt` binary alias maps to the same commands.
 
 ## Quick Start
 

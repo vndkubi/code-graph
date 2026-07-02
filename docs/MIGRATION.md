@@ -59,13 +59,16 @@ and double-spend this fusion removes.
 
 | Old | New |
 | --- | --- |
-| `tokenopt hook codex pre-tool-use` | `codegraph gate hook codex pre-tool-use` |
-| `tokenopt instructions install` | `codegraph gate instructions install` |
 | `tokenopt doctor` | `codegraph gate doctor` |
+| `tokenopt report` | `codegraph gate report` |
+| `tokenopt exec -- <command>` | `codegraph gate exec -- <command>` |
 | `tokenopt mcp` | `codegraph mcp` (the fused server) |
 
-Existing hook installs that call the `tokenopt` binary still work — the alias maps
-to `dist/tokenopt/cli.js`. New installs should use `codegraph gate …`.
+The standalone-era agent integrations (`hook codex|copilot`, `install codex`,
+`setup copilot`, `instructions …`) and the TokenOpt benchmark harnesses
+(`benchmark suite|workflow-ab|codex-daily`) were removed after the fusion:
+agents connect to the fused MCP server directly instead of being wired through
+per-host hooks, and measurement lives in `codegraph benchmark …`.
 
 ### 3. Profiles and modes
 
