@@ -24,7 +24,8 @@ codegraph <command> [options]
 | `status --root <repo> [--json] [--require-ready] [--require-fresh]` | Human/machine-readable status; non-zero exit for CI gating. |
 | `logs --root <repo> --tail <n> [--summary\|--all\|--since\|--until\|--tool\|--event\|--invalid]` | Print recent query events or a compact summary. |
 | `upgrade-audit --root <repo> [policy/threshold flags]` | Readiness + query-log audit with an `A+`–`F` grade. |
-| `affected-tests --root <repo> --changed <file[,file…]> [--max-depth N] [--limit N]` | Tests reachable from changed files via the reverse local-import graph. |
+| `affected-tests --root <repo> --base <ref> [--format json\|list\|maven\|gradle]` | CI test selection over a git range; `ALL` = safety fallback. `--changed <file[,file…]>` still works for explicit lists. |
+| `review --root <repo> --base <ref> [--format json\|sarif\|markdown\|text] [--min-priority P0\|P1\|P2] [--fail-on P0\|P1\|P2\|none] [--out <path>]` | Deterministic PR review over a git range: graph-fact findings (stale callers, untested change, duplication, design smells) as SARIF for GitHub code scanning or markdown for a sticky PR comment. Exit code gates on `--fail-on`. |
 | `benchmark <sub>` | Deterministic harnesses (see below). |
 
 ### Common MCP flags

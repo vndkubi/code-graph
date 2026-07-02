@@ -23,6 +23,14 @@ import { runEvidenceAudit } from './v2/benchmark/evidence-audit.js';
 import { runRecallBench } from './v2/benchmark/recall-bench.js';
 import { findAffectedTests } from './v2/query/affected-tests.js';
 import { formatCiSelection, selectTestsForCi, type CiSelectionFormat } from './v2/query/ci-test-selection.js';
+import {
+  ciReviewExitCode,
+  formatCiReview,
+  reviewForCi,
+  type CiReviewFailOn,
+  type CiReviewFormat,
+  type CiReviewPriority,
+} from './v2/query/ci-review.js';
 import { runAffectedTestsEval } from './v2/benchmark/affected-tests-eval.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 import { buildLocalArtifactIndex } from './v2/mcp/local-artifact.js';
@@ -90,6 +98,9 @@ async function main(): Promise<void> {
       return;
     case 'affected-tests':
       await runAffectedTestsCommand(parsed);
+      return;
+    case 'review':
+      await runReviewCommand(parsed);
       return;
     case 'benchmark':
       await runBenchmarkCommand(subcommand, parsed);
@@ -452,6 +463,86 @@ async function runAffectedTestsCommand(parsed: ParsedArgs): Promise<void> {
   } finally {
     await db.close();
   }
+}
+
+/**
+ * `codegraph review --base <ref>`: deterministic PR review over a git range.
+ * stdout carries the rendered report (json/sarif/markdown/text); the audit
+ * summary goes to stderr so pipes stay clean, mirroring affected-tests.
+ */
+async function runReviewCommand(parsed: ParsedArgs): Promise<void> {
+  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const baseRef = getFlag(parsed, 'base');
+  if (!baseRef) {
+    throw new Error('review requires --base <git ref> (e.g. --base origin/main).');
+  }
+  const format = normalizeCiReviewFormat(getFlag(parsed, 'format'));
+  const failOn = normalizeCiReviewFailOn(getFlag(parsed, 'fail-on'));
+  const minPriority = normalizeCiReviewPriority(getFlag(parsed, 'min-priority'), 'P2');
+  const { db } = await openCodeGraphDb(root);
+  try {
+    const index = await new V2Indexer(db).indexWorkspace({ root });
+    const service = new V2QueryService(db);
+    const result = await reviewForCi(service, index.workspaceId, root, {
+      baseRef,
+      headRef: getFlag(parsed, 'head'),
+      focus: getFlag(parsed, 'focus'),
+      limit: getNumberFlag(parsed, 'limit'),
+      minPriority,
+    });
+    const output = formatCiReview(result, format, cliPackageVersion());
+    const outPath = getFlag(parsed, 'out');
+    if (outPath) {
+      fs.writeFileSync(path.resolve(root, outPath), `${output}\n`);
+    } else {
+      console.log(output);
+    }
+    console.error(JSON.stringify({
+      baseRef: result.baseRef,
+      headRef: result.headRef,
+      changedFiles: result.changedFiles.length,
+      reviewStatus: result.reviewStatus,
+      findings: result.findings.length,
+      priorityCounts: result.priorityCounts,
+      droppedBelowMinPriority: result.droppedBelowMinPriority,
+      ...(outPath ? { wrote: outPath, format } : {}),
+    }, null, 2));
+    const exitCode = ciReviewExitCode(result, failOn);
+    if (exitCode !== 0) process.exitCode = exitCode;
+  } finally {
+    await db.close();
+  }
+}
+
+function normalizeCiReviewFormat(value: string | undefined): CiReviewFormat {
+  const format = (value ?? 'text').trim().toLowerCase();
+  if (format === 'json' || format === 'sarif' || format === 'markdown' || format === 'text') return format;
+  throw new Error(`Unknown review format: ${value}. Use json, sarif, markdown, or text.`);
+}
+
+function normalizeCiReviewFailOn(value: string | undefined): CiReviewFailOn {
+  const failOn = (value ?? 'none').trim();
+  if (failOn === 'none') return 'none';
+  return normalizeCiReviewPriority(failOn, 'P0');
+}
+
+function normalizeCiReviewPriority(value: string | undefined, fallback: CiReviewPriority): CiReviewPriority {
+  const priority = (value ?? fallback).trim().toUpperCase();
+  if (priority === 'P0' || priority === 'P1' || priority === 'P2') return priority;
+  throw new Error(`Unknown review priority: ${value}. Use P0, P1, or P2.`);
+}
+
+let cachedCliVersion: string | undefined;
+function cliPackageVersion(): string {
+  if (cachedCliVersion === undefined) {
+    try {
+      const packagePath = path.resolve(fileURLToPath(import.meta.url), '..', '..', 'package.json');
+      cachedCliVersion = String(JSON.parse(fs.readFileSync(packagePath, 'utf-8')).version ?? '0.0.0');
+    } catch {
+      cachedCliVersion = '0.0.0';
+    }
+  }
+  return cachedCliVersion;
 }
 
 function normalizeCiSelectionFormat(value: string | undefined): CiSelectionFormat {
@@ -2257,6 +2348,10 @@ Usage:
                                          Run a readiness + log health audit for super-VIP readiness
   codegraph logs --root <workspace> --tail <number> [--summary|--all]
                                          Print recent workspace query events or an aggregate summary
+  codegraph affected-tests --root <workspace> --base <ref> [--format json|list|maven|gradle]
+                                         Select the tests a git range can affect (ALL = safety fallback)
+  codegraph review --root <workspace> --base <ref> [--format json|sarif|markdown|text] [--min-priority P0|P1|P2] [--fail-on P0|P1|P2|none] [--out <path>]
+                                         Deterministic PR review: graph-fact findings for CI (SARIF/comment)
   codegraph route-inspect --task <text>  Explain codegraph_context routing and stop/follow-up gate policy
   codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|copilot-e2e|codex-e2e|competitive-compare
                                              Generate synthetic repos, measure indexing, run evals, or prove context/review savings
