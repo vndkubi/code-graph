@@ -21,6 +21,7 @@ import {
   type TokenoptCodeGraphProvider,
 } from '../../tokenopt/mcp.js';
 import { parseCodeGraphResult } from '../../tokenopt/codegraph-bridge.js';
+import { createGraphSymbolProvider, type GraphSymbolProvider } from '../../tokenopt/coding/graph-symbol-provider.js';
 
 const TOKENOPT_TOOL_NAMES = new Set(TOKENOPT_TOOL_DEFINITIONS.map(tool => tool.name));
 
@@ -211,6 +212,19 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
     }
   };
 
+  // In-process accelerator for the TokenOpt coding layer (symbol search, symbol
+  // packets, test neighbors, tracebug). Replaces per-call regex-lite repo scans
+  // with the shared V2QueryService symbol table when it has the answer; the
+  // regex-lite scanner remains the fallback (see coding/graph-symbol-provider.ts).
+  const graphSymbolProvider: GraphSymbolProvider = createGraphSymbolProvider(async (toolName, toolArgs) => {
+    const current = await readyRuntime();
+    return current.queries.query({
+      workspaceId: current.workspace.workspaceId,
+      toolName,
+      args: toolArgs,
+    });
+  });
+
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: toolDefinitions,
   }));
@@ -235,7 +249,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
           };
         }
         const tokenoptArgs = (request.params.arguments ?? {}) as Record<string, unknown>;
-        const tokenoptResult = await dispatchTokenoptTool(request.params.name, tokenoptArgs, tokenoptMode, { codeGraphProvider });
+        const tokenoptResult = await dispatchTokenoptTool(request.params.name, tokenoptArgs, tokenoptMode, { codeGraphProvider, graphSymbolProvider });
         logQueryEvent(getWorkspacePaths(options.root).queryLogPath, {
           event: 'query',
           toolName: request.params.name,

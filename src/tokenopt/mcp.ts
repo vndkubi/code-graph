@@ -10,6 +10,7 @@ import { resolveCodeGraphCli } from "./codegraph-discovery.js";
 import { assembleSpringContext } from "./assemblers/spring-context-assembler.js";
 import { compileCodingCoverageEvidence } from "./coding/coverage-contract.js";
 import { parseFailurePacket } from "./coding/failure-packet.js";
+import type { GraphSymbolProvider } from "./coding/graph-symbol-provider.js";
 import { buildSymbolPacket, collectCodingFiles, findCodingSymbols } from "./coding/symbol-index.js";
 import { findTestNeighbors } from "./coding/test-neighbors.js";
 import { loadConfig } from "./config.js";
@@ -646,6 +647,8 @@ export type TokenoptCodeGraphProvider = (task: string, budgetTokens: number) => 
 
 export interface TokenoptToolContext {
   codeGraphProvider?: TokenoptCodeGraphProvider;
+  /** In-process accelerator for the coding layer; see coding/graph-symbol-provider.ts. */
+  graphSymbolProvider?: GraphSymbolProvider;
 }
 
 export async function runMcpServer(): Promise<void> {
@@ -700,7 +703,7 @@ export async function dispatchTokenoptTool(
       case "contextgate_get_context":
         return await contextGateGetContextTool(args, mcpMode, ctx);
       case "tokenopt_compile_evidence":
-        return compileEvidenceTool(args, mcpMode);
+        return await compileEvidenceTool(args, mcpMode, ctx);
       case "tokenopt_run_command":
         return await runCommandTool(args);
       case "tokenopt_search":
@@ -720,15 +723,15 @@ export async function dispatchTokenoptTool(
       case "tokenopt_impact_analysis":
         return impactAnalysisTool(args);
       case "tokenopt_symbols_find":
-        return symbolsFindTool(args);
+        return await symbolsFindTool(args, ctx);
       case "tokenopt_symbol_packet":
-        return symbolPacketTool(args);
+        return await symbolPacketTool(args, ctx);
       case "tokenopt_test_neighbors":
-        return testNeighborsTool(args);
+        return await testNeighborsTool(args, ctx);
       case "tokenopt_failure_packet":
         return failurePacketTool(args);
       case "tokenopt_tracebug_packet":
-        return tracebugPacketTool(args);
+        return await tracebugPacketTool(args, ctx);
       case "tokenopt_session_stats":
         return sessionStatsTool();
       default:
@@ -751,10 +754,10 @@ async function contextGateGetContextTool(args: Record<string, unknown>, mcpMode:
     ...optionalStringArray(args, "quality_rubric"),
     ...requiredSlots.map((slot) => `Cover evidence slot: ${slot}`)
   ].slice(0, 12);
-  const result = compileEvidenceTool({
+  const result = await compileEvidenceTool({
     ...args,
     quality_rubric: qualityRubric
-  }, mcpMode);
+  }, mcpMode, ctx);
   const originalText = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
   const baseStrictGaps = contextGateStrictGaps(result.structuredContent, requiredSlots);
   const inlineEvidence = buildContextGateInlineEvidence(result.structuredContent, loaded.repoRoot, taskWithExternalArtifacts, requiredSlots, optionalNumber(args, "budget_tokens"), qualityRubric);
@@ -1874,7 +1877,7 @@ function applyContextGateStrictOverride(text: string, strictGaps: string[]): str
     .replace(/Because answerable=true, answer from the packet and do not gather redundant evidence\./g, "Because strict required slots remain partial, refill only those slots before the final answer.");
 }
 
-function compileEvidenceTool(args: Record<string, unknown>, mcpMode: McpMode = "lite") {
+async function compileEvidenceTool(args: Record<string, unknown>, mcpMode: McpMode = "lite", ctx: TokenoptToolContext = {}) {
   const baseTask = sanitizeTaskPrompt(requiredString(args, "task"));
   const externalArtifacts = parseExternalArtifacts(args);
   const task = appendExternalArtifactContext(baseTask, externalArtifacts);
@@ -2038,10 +2041,11 @@ function compileEvidenceTool(args: Record<string, unknown>, mcpMode: McpMode = "
     evidence.push(buildExternalArtifactEvidenceItem(`E${evidence.length + 1}`, externalArtifacts));
   }
 
-  const taskSpecific = compileTaskSpecificEvidence(taskType, task, loaded.repoRoot, evidence.length + 1, evidenceContext, {
+  const taskSpecific = await compileTaskSpecificEvidence(taskType, task, loaded.repoRoot, evidence.length + 1, evidenceContext, {
     hasBuildFacts,
     codingToolsAvailable: mcpMode === "full",
-    qualityRubric
+    qualityRubric,
+    graphProvider: ctx.graphSymbolProvider
   });
   if (taskSpecific) {
     evidence.push(...taskSpecific.evidence);
@@ -3348,16 +3352,17 @@ function impactAnalysisTool(args: Record<string, unknown>) {
   return textResult(text, false, { ...result });
 }
 
-function symbolsFindTool(args: Record<string, unknown>) {
+async function symbolsFindTool(args: Record<string, unknown>, ctx: TokenoptToolContext = {}) {
   const cwd = optionalString(args, "cwd") ?? process.cwd();
   const loaded = loadConfig({ cwd });
   const query = optionalString(args, "query") ?? "";
-  const symbols = findCodingSymbols({
+  const symbols = await findCodingSymbols({
     repoRoot: loaded.repoRoot,
     query,
     language: normalizeSymbolLanguage(optionalString(args, "language")),
     kind: normalizeSymbolKind(optionalString(args, "kind")),
-    limit: clampInteger(optionalNumber(args, "limit") ?? 20, 1, 50)
+    limit: clampInteger(optionalNumber(args, "limit") ?? 20, 1, 50),
+    graphProvider: ctx.graphSymbolProvider
   });
   const text = [
     "TokenOpt coding symbols",
@@ -3372,7 +3377,7 @@ function symbolsFindTool(args: Record<string, unknown>) {
   return textResult(text, false, { symbols });
 }
 
-function symbolPacketTool(args: Record<string, unknown>) {
+async function symbolPacketTool(args: Record<string, unknown>, ctx: TokenoptToolContext = {}) {
   const cwd = optionalString(args, "cwd") ?? process.cwd();
   const loaded = loadConfig({ cwd });
   const symbolId = optionalString(args, "symbol_id");
@@ -3380,22 +3385,23 @@ function symbolPacketTool(args: Record<string, unknown>) {
   if (!symbolId && !query) {
     return textResult("TokenOpt symbol packet requires symbol_id or query.", true);
   }
-  const packet = buildSymbolPacket({ repoRoot: loaded.repoRoot, symbolId, query });
+  const packet = await buildSymbolPacket({ repoRoot: loaded.repoRoot, symbolId, query, graphProvider: ctx.graphSymbolProvider });
   if (!packet) {
     return textResult(`TokenOpt symbol packet found no symbol for ${symbolId ?? query ?? "<missing>"}.`, true);
   }
   return textResult(formatSymbolPacket(packet), false, { packet });
 }
 
-function testNeighborsTool(args: Record<string, unknown>) {
+async function testNeighborsTool(args: Record<string, unknown>, ctx: TokenoptToolContext = {}) {
   const cwd = optionalString(args, "cwd") ?? process.cwd();
   const loaded = loadConfig({ cwd });
   const target = requiredString(args, "target");
-  const packet = findTestNeighbors({
+  const packet = await findTestNeighbors({
     repoRoot: loaded.repoRoot,
     target,
     symbolName: optionalString(args, "symbol_name"),
-    limit: clampInteger(optionalNumber(args, "limit") ?? 12, 1, 50)
+    limit: clampInteger(optionalNumber(args, "limit") ?? 12, 1, 50),
+    graphProvider: ctx.graphSymbolProvider
   });
   return textResult(formatTestNeighborPacket(packet), false, { packet });
 }
@@ -3406,7 +3412,7 @@ function failurePacketTool(args: Record<string, unknown>) {
   return textResult(formatFailurePacket(packet), false, { packet });
 }
 
-function tracebugPacketTool(args: Record<string, unknown>) {
+async function tracebugPacketTool(args: Record<string, unknown>, ctx: TokenoptToolContext = {}) {
   const cwd = optionalString(args, "cwd") ?? process.cwd();
   const loaded = loadConfig({ cwd });
   const query = requiredString(args, "query");
@@ -3414,25 +3420,27 @@ function tracebugPacketTool(args: Record<string, unknown>) {
   const maxCandidates = clampInteger(optionalNumber(args, "max_candidates") ?? 8, 1, 12);
   const includeTests = optionalBoolean(args, "include_tests") ?? true;
   const includeCallers = optionalBoolean(args, "include_callers") ?? true;
-  const packet = buildTracebugPacket({
+  const packet = await buildTracebugPacket({
     repoRoot: loaded.repoRoot,
     query,
     output,
     maxCandidates,
     includeTests,
-    includeCallers
+    includeCallers,
+    graphProvider: ctx.graphSymbolProvider
   });
   return textResult(formatTracebugPacket(packet), false, { packet });
 }
 
-function buildTracebugPacket(input: {
+async function buildTracebugPacket(input: {
   repoRoot: string;
   query: string;
   output: string;
   maxCandidates: number;
   includeTests: boolean;
   includeCallers: boolean;
-}): TracebugPacket {
+  graphProvider?: GraphSymbolProvider;
+}): Promise<TracebugPacket> {
   const failurePacket = parseFailurePacket({ output: input.output });
   const evidence: TracebugEvidenceLine[] = [];
   const anchors = extractTracebugAnchors(input.query, failurePacket);
@@ -3462,7 +3470,9 @@ function buildTracebugPacket(input: {
   }
 
   const symbolQuery = buildTracebugSymbolQuery(input.query, failurePacket);
-  const symbolPacket = symbolQuery ? buildSymbolPacket({ repoRoot: input.repoRoot, query: symbolQuery }) : undefined;
+  const symbolPacket = symbolQuery
+    ? await buildSymbolPacket({ repoRoot: input.repoRoot, query: symbolQuery, graphProvider: input.graphProvider })
+    : undefined;
   if (symbolPacket && !evidence.some((item) => item.path === symbolPacket.symbol.file && item.role === "candidate_definition")) {
     evidence.push({
       path: symbolPacket.definition_slice.file,
@@ -3471,7 +3481,9 @@ function buildTracebugPacket(input: {
       symbol: symbolPacket.symbol.name,
       role: "candidate_definition",
       confidence: symbolPacket.symbol.confidence,
-      why: "Best regex-lite symbol candidate for the tracebug anchor.",
+      why: symbolPacket.symbol.source === "graph"
+        ? "Best graph-indexed symbol candidate for the tracebug anchor."
+        : "Best regex-lite symbol candidate for the tracebug anchor.",
       snippet: symbolPacket.definition_slice.text.split(/\r?\n/).slice(0, 42).join("\n")
     });
   }
@@ -3494,11 +3506,12 @@ function buildTracebugPacket(input: {
 
   const targetForTests = symbolPacket?.symbol.file ?? firstResolvedFailureFile(input.repoRoot, failurePacket) ?? symbolQuery;
   if (input.includeTests && targetForTests) {
-    const neighbors = findTestNeighbors({
+    const neighbors = await findTestNeighbors({
       repoRoot: input.repoRoot,
       target: targetForTests,
       symbolName: symbolPacket?.symbol.name,
-      limit: 4
+      limit: 4,
+      graphProvider: input.graphProvider
     });
     for (const testFile of neighbors.test_files.slice(0, 2)) {
       const slice = readTracebugSlice(input.repoRoot, testFile, 1, 30);
@@ -4002,14 +4015,14 @@ interface FlowProfile {
   hasNamedTarget: boolean;
 }
 
-function compileTaskSpecificEvidence(
+async function compileTaskSpecificEvidence(
   taskType: EvidenceTaskType,
   task: string,
   repoRoot: string,
   firstEvidenceIndex: number,
   context: EvidenceContext,
-  options: { hasBuildFacts: boolean; codingToolsAvailable: boolean; qualityRubric?: string[] }
-): TaskSpecificEvidence | undefined {
+  options: { hasBuildFacts: boolean; codingToolsAvailable: boolean; qualityRubric?: string[]; graphProvider?: GraphSymbolProvider }
+): Promise<TaskSpecificEvidence | undefined> {
   if (taskType === "review_diff") {
     return compileReviewDiffEvidence(task, repoRoot, firstEvidenceIndex);
   }
@@ -4019,14 +4032,15 @@ function compileTaskSpecificEvidence(
   if (taskType === "api_flow") {
     return compileFlowEvidence(task, repoRoot, firstEvidenceIndex, context);
   }
-  const coding = compileCodingCoverageEvidence({
+  const coding = await compileCodingCoverageEvidence({
     repoRoot,
     task,
     taskType,
     qualityRubric: options.qualityRubric,
     firstEvidenceIndex,
     hasBuildFacts: options.hasBuildFacts,
-    codingToolsAvailable: options.codingToolsAvailable
+    codingToolsAvailable: options.codingToolsAvailable,
+    graphProvider: options.graphProvider
   });
   if (coding) {
     return {

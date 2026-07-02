@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { TestNeighborPacket } from "../types.js";
+import type { GraphSymbolProvider } from "./graph-symbol-provider.js";
 import { collectCodingFiles, isTestPath, tokenizeQuery } from "./symbol-index.js";
 
 export interface TestNeighborInput {
@@ -8,19 +9,39 @@ export interface TestNeighborInput {
   target: string;
   symbolName?: string;
   limit?: number;
+  graphProvider?: GraphSymbolProvider;
 }
 
-export function findTestNeighbors(input: TestNeighborInput): TestNeighborPacket {
+export async function findTestNeighbors(input: TestNeighborInput): Promise<TestNeighborPacket> {
   const files = collectCodingFiles(input.repoRoot);
   const testFiles = files.filter(isTestPath);
   const sourceFiles = findSourceFiles(files, input.target, input.symbolName).slice(0, 12);
   const queryTokens = buildNeighborTokens(input.target, input.symbolName, sourceFiles);
-  const rankedTests = testFiles
+  const heuristicTests = testFiles
     .map((file) => ({ file, score: scoreTestFile(file, queryTokens, sourceFiles) }))
     .filter((entry) => entry.score > 0)
     .sort((a, b) => b.score - a.score || a.file.localeCompare(b.file))
-    .slice(0, input.limit ?? 12)
     .map((entry) => entry.file);
+
+  // Graph-reachable tests (reverse dependency walk, works for Java) are precise
+  // where naming fails entirely, e.g. a test that only exercises the target
+  // through an intermediate service. List them first when available, then fill
+  // in with naming-heuristic tests not already present.
+  const limit = input.limit ?? 12;
+  let rankedTests: string[];
+  if (input.graphProvider) {
+    const graphTests = (await input.graphProvider.findTestsFor({ target: input.symbolName ?? input.target, files: [input.target] })) ?? [];
+    const seen = new Set<string>();
+    rankedTests = [];
+    for (const file of [...graphTests, ...heuristicTests]) {
+      if (seen.has(file)) continue;
+      seen.add(file);
+      rankedTests.push(file);
+    }
+    rankedTests = rankedTests.slice(0, limit);
+  } else {
+    rankedTests = heuristicTests.slice(0, limit);
+  }
 
   const frameworkHints = inferFrameworkHints(input.repoRoot, rankedTests);
   const mockingHints = inferMockingHints(input.repoRoot, rankedTests);

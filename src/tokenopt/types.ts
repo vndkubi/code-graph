@@ -198,6 +198,10 @@ export interface CodingSymbol {
   language: "typescript" | "javascript" | "java" | "python" | "unknown";
   file: string;
   line: number;
+  /** Exact end line, known only when resolved from the graph-backed symbol table. */
+  endLine?: number;
+  /** Which index answered this lookup; absent means the regex-lite scanner (pre-fusion default). */
+  source?: "graph" | "regex";
   signature: string;
   confidence: number;
 }

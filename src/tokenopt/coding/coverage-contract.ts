@@ -10,6 +10,7 @@ import type {
   TestNeighborPacket
 } from "../types.js";
 import { parseFailurePacket } from "./failure-packet.js";
+import type { GraphSymbolProvider } from "./graph-symbol-provider.js";
 import { buildSymbolPacket, findCodingSymbolsWithStats, tokenizeQuery } from "./symbol-index.js";
 import { findTestNeighbors } from "./test-neighbors.js";
 
@@ -21,6 +22,7 @@ export interface CompileCodingCoverageInput {
   firstEvidenceIndex: number;
   hasBuildFacts: boolean;
   codingToolsAvailable: boolean;
+  graphProvider?: GraphSymbolProvider;
 }
 
 export interface CodingEvidenceResult {
@@ -34,20 +36,28 @@ export interface CodingEvidenceResult {
   metadata: Record<string, unknown>;
 }
 
-export function compileCodingCoverageEvidence(input: CompileCodingCoverageInput): CodingEvidenceResult | undefined {
+export async function compileCodingCoverageEvidence(input: CompileCodingCoverageInput): Promise<CodingEvidenceResult | undefined> {
   const taskKind = inferCodingTaskKind(input.taskType, input.task);
   if (!taskKind) {
     return undefined;
   }
 
   const query = extractCodingQuery([input.task, ...(input.qualityRubric ?? [])].join(" "));
-  const search = findCodingSymbolsWithStats({ repoRoot: input.repoRoot, query, limit: 12 });
+  const search = await findCodingSymbolsWithStats({ repoRoot: input.repoRoot, query, limit: 12, graphProvider: input.graphProvider });
   const candidates = search.symbols;
-  const symbolPacket = candidates[0] ? buildSymbolPacket({ repoRoot: input.repoRoot, symbolId: candidates[0].id }) : undefined;
+  const symbolPacket = candidates[0]
+    ? await buildSymbolPacket({
+        repoRoot: input.repoRoot,
+        resolvedSymbol: candidates[0],
+        graphProvider: input.graphProvider
+      })
+    : undefined;
   const failurePacket = shouldParseFailure(input.task) ? parseFailurePacket({ output: input.task }) : undefined;
   const exactTargets = extractExactTargetNames(input.task);
   const target = symbolPacket?.symbol.file ?? symbolPacket?.symbol.name ?? query;
-  const testNeighbors = target ? findTestNeighbors({ repoRoot: input.repoRoot, target, symbolName: symbolPacket?.symbol.name }) : undefined;
+  const testNeighbors = target
+    ? await findTestNeighbors({ repoRoot: input.repoRoot, target, symbolName: symbolPacket?.symbol.name, graphProvider: input.graphProvider })
+    : undefined;
   const coverage = buildCodingCoverage({
     taskKind,
     hasBuildFacts: input.hasBuildFacts,
@@ -82,7 +92,8 @@ export function compileCodingCoverageEvidence(input: CompileCodingCoverageInput)
     metadata: {
       symbol_index_hit: search.indexStats.cacheHit,
       symbol_index_file_count: search.indexStats.fileCount,
-      symbol_index_symbol_count: search.indexStats.symbolCount
+      symbol_index_symbol_count: search.indexStats.symbolCount,
+      symbol_index_source: search.indexStats.source ?? "regex"
     }
   };
 

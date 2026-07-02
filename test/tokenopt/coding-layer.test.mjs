@@ -96,17 +96,17 @@ function makeCodingFixture() {
   return repo;
 }
 
-test("regex-lite symbol scanner extracts TS, Java, and Python symbols", () => {
+test("regex-lite symbol scanner extracts TS, Java, and Python symbols", async () => {
   const repo = makeCodingFixture();
-  const orderSymbols = findCodingSymbols({ repoRoot: repo, query: "OrderService authorizePayment" });
+  const orderSymbols = await findCodingSymbols({ repoRoot: repo, query: "OrderService authorizePayment" });
   assert.equal(orderSymbols.some((symbol) => symbol.name === "OrderService" && symbol.kind === "class"), true);
   assert.equal(orderSymbols.some((symbol) => symbol.name === "authorizePayment" && symbol.kind === "method"), true);
 
-  const javaSymbols = findCodingSymbols({ repoRoot: repo, query: "PaymentGateway authorize" });
+  const javaSymbols = await findCodingSymbols({ repoRoot: repo, query: "PaymentGateway authorize" });
   assert.equal(javaSymbols.some((symbol) => symbol.name === "PaymentGateway" && symbol.language === "java"), true);
   assert.equal(javaSymbols.some((symbol) => symbol.name === "authorize" && symbol.kind === "method"), true);
 
-  const pythonSymbols = findCodingSymbols({ repoRoot: repo, query: "IntegrationBase normalize_key" });
+  const pythonSymbols = await findCodingSymbols({ repoRoot: repo, query: "IntegrationBase normalize_key" });
   assert.equal(pythonSymbols.some((symbol) => symbol.name === "IntegrationBase" && symbol.language === "python"), true);
   assert.equal(pythonSymbols.some((symbol) => symbol.name === "normalize_key" && symbol.kind === "function"), true);
 });
@@ -139,20 +139,20 @@ test("persistent symbol index reuses cache and rebuilds after source changes", (
   assert.ok(rebuilt.symbolCount > first.symbolCount);
 });
 
-test("symbol search returns cache-hit metadata without a second index load", () => {
+test("symbol search returns cache-hit metadata without a second index load", async () => {
   const repo = makeCodingFixture();
-  const first = findCodingSymbolsWithStats({ repoRoot: repo, query: "OrderService authorizePayment" });
+  const first = await findCodingSymbolsWithStats({ repoRoot: repo, query: "OrderService authorizePayment" });
   assert.equal(first.indexStats.cacheHit, false);
   assert.ok(first.symbols.length > 0);
 
-  const second = findCodingSymbolsWithStats({ repoRoot: repo, query: "OrderService authorizePayment" });
+  const second = await findCodingSymbolsWithStats({ repoRoot: repo, query: "OrderService authorizePayment" });
   assert.equal(second.indexStats.cacheHit, true);
   assert.equal(second.indexStats.symbolCount, first.indexStats.symbolCount);
 });
 
-test("symbol packet includes definition, dependencies, callers, callees, and nearby tests", () => {
+test("symbol packet includes definition, dependencies, callers, callees, and nearby tests", async () => {
   const repo = makeCodingFixture();
-  const packet = buildSymbolPacket({ repoRoot: repo, query: "OrderService" });
+  const packet = await buildSymbolPacket({ repoRoot: repo, query: "OrderService" });
   assert.ok(packet);
   assert.equal(packet.symbol.name, "OrderService");
   assert.match(packet.definition_slice.text, /authorizePayment/);
@@ -161,9 +161,9 @@ test("symbol packet includes definition, dependencies, callers, callees, and nea
   assert.equal(packet.coverage.nearby_tests, "covered");
 });
 
-test("test neighbor finder maps source files to test style and mocking hints", () => {
+test("test neighbor finder maps source files to test style and mocking hints", async () => {
   const repo = makeCodingFixture();
-  const neighbors = findTestNeighbors({ repoRoot: repo, target: "src/orders/OrderService.ts", symbolName: "OrderService" });
+  const neighbors = await findTestNeighbors({ repoRoot: repo, target: "src/orders/OrderService.ts", symbolName: "OrderService" });
   assert.deepEqual(neighbors.test_files, ["test/orders/OrderService.test.ts"]);
   assert.equal(neighbors.framework_hints.some((hint) => /vitest/.test(hint)), true);
   assert.equal(neighbors.mocking_hints.some((hint) => /vi\.mock|vi\.fn/.test(hint)), true);
@@ -183,9 +183,9 @@ test("failure packet extracts compiler and test failure locations", () => {
   assert.equal(packet.suggested_slices.some((slice) => slice.file === "src/orders/OrderService.ts"), true);
 });
 
-test("coding coverage contract prevents early answerability when exact coverage is missing", () => {
+test("coding coverage contract prevents early answerability when exact coverage is missing", async () => {
   const repo = makeCodingFixture();
-  const result = compileCodingCoverageEvidence({
+  const result = await compileCodingCoverageEvidence({
     repoRoot: repo,
     task: "Write unit tests for UnknownBillingService",
     taskType: "write_unittest",
@@ -202,9 +202,9 @@ test("coding coverage contract prevents early answerability when exact coverage 
   assert.equal(result.allowedFollowups.some((followup) => followup.tool === "tokenopt_symbols_find"), true);
 });
 
-test("coding coverage uses quality rubric anchors for symbol discovery", () => {
+test("coding coverage uses quality rubric anchors for symbol discovery", async () => {
   const repo = makeCodingFixture();
-  const result = compileCodingCoverageEvidence({
+  const result = await compileCodingCoverageEvidence({
     repoRoot: repo,
     task: "Create an implementation handoff for improving natural benchmark prompt quality.",
     taskType: "implement",

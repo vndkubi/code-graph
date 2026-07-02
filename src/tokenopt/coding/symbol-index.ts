@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { CodingSymbol, SymbolPacket } from "../types.js";
+import type { GraphSymbolProvider } from "./graph-symbol-provider.js";
 import { findTestNeighbors } from "./test-neighbors.js";
 import { loadOrBuildSymbolIndex, type SymbolIndexSnapshot } from "./symbol-index-persistent.js";
 
@@ -10,12 +11,17 @@ export interface SymbolSearchInput {
   language?: CodingSymbol["language"];
   kind?: CodingSymbol["kind"];
   limit?: number;
+  /** When set, try the in-process graph symbol table before the regex-lite scanner. */
+  graphProvider?: GraphSymbolProvider;
 }
 
 export interface SymbolPacketInput {
   repoRoot: string;
   symbolId?: string;
   query?: string;
+  graphProvider?: GraphSymbolProvider;
+  /** Skip resolution entirely and build the packet for this already-resolved symbol. */
+  resolvedSymbol?: CodingSymbol;
 }
 
 export interface CodingSymbolIndexStats {
@@ -23,6 +29,7 @@ export interface CodingSymbolIndexStats {
   cachePath: string;
   fileCount: number;
   symbolCount: number;
+  source?: "graph" | "regex";
 }
 
 export interface CodingSymbolSearchResult {
@@ -62,12 +69,32 @@ const CONTROL_WORDS = new Set([
   "do"
 ]);
 
-export function findCodingSymbols(input: SymbolSearchInput): CodingSymbol[] {
-  return findCodingSymbolsWithStats(input).symbols;
+export async function findCodingSymbols(input: SymbolSearchInput): Promise<CodingSymbol[]> {
+  return (await findCodingSymbolsWithStats(input)).symbols;
 }
 
-export function findCodingSymbolsWithStats(input: SymbolSearchInput): CodingSymbolSearchResult {
+export async function findCodingSymbolsWithStats(input: SymbolSearchInput): Promise<CodingSymbolSearchResult> {
   const query = input.query?.trim() ?? "";
+
+  if (input.graphProvider && query) {
+    const graphSymbols = await input.graphProvider.searchSymbols({ query, kind: input.kind, limit: input.limit ?? 20 });
+    if (graphSymbols && graphSymbols.length > 0) {
+      const filtered = graphSymbols.filter((symbol) => !input.language || symbol.language === input.language);
+      if (filtered.length > 0) {
+        return {
+          symbols: filtered.slice(0, input.limit ?? 20),
+          indexStats: {
+            cacheHit: true,
+            cachePath: "in-process:graph",
+            fileCount: -1,
+            symbolCount: -1,
+            source: "graph"
+          }
+        };
+      }
+    }
+  }
+
   const queryTokens = tokenizeQuery(query);
   const indexResult = loadCodingSymbolIndexResult(input.repoRoot);
   const symbols = indexResult.snapshot.symbols
@@ -81,13 +108,15 @@ export function findCodingSymbolsWithStats(input: SymbolSearchInput): CodingSymb
   return {
     symbols: symbols.map(({ symbol, score }) => ({
       ...symbol,
+      source: "regex" as const,
       confidence: Math.max(symbol.confidence, Math.min(0.96, 0.35 + score / 10))
     })),
     indexStats: {
       cacheHit: indexResult.cacheHit,
       cachePath: indexResult.cachePath,
       fileCount: indexResult.snapshot.files.length,
-      symbolCount: indexResult.snapshot.symbols.length
+      symbolCount: indexResult.snapshot.symbols.length,
+      source: "regex"
     }
   };
 }
@@ -106,23 +135,39 @@ export function getCodingSymbolIndexStats(repoRoot: string, options: { forceRebu
   };
 }
 
-export function buildSymbolPacket(input: SymbolPacketInput): SymbolPacket | undefined {
-  const symbol = resolveSymbol(input);
+export async function buildSymbolPacket(input: SymbolPacketInput): Promise<SymbolPacket | undefined> {
+  const symbol = input.resolvedSymbol ?? (await resolveSymbol(input));
   if (!symbol) {
     return undefined;
   }
 
+  // A graph-resolved symbol carries an exact end line from the tree-sitter-backed
+  // symbol table, so the slice can hug the real definition instead of the fixed
+  // -12/+80 heuristic window the regex scanner needs (it has no boundary info).
+  const isGraphBacked = symbol.source === "graph";
   const absolute = path.join(input.repoRoot, symbol.file);
   const lines = safeReadLines(absolute);
-  const startLine = Math.max(1, symbol.line - 12);
-  const endLine = Math.min(lines.length, symbol.line + 80);
+  const startLine = Math.max(1, symbol.line - (isGraphBacked ? 3 : 12));
+  const endLine = Math.min(lines.length, isGraphBacked && symbol.endLine ? symbol.endLine : symbol.line + 80);
   const selected = lines.slice(startLine - 1, endLine);
   const sliceText = selected.join("\n");
   const imports = extractImports(lines, symbol.language);
   const dependencies = extractDependencies(symbol, imports, sliceText);
-  const callers = findSymbolReferences(input.repoRoot, symbol).slice(0, 24);
-  const callees = extractCallees(sliceText).filter((name) => name !== symbol.name).slice(0, 32);
-  const neighbors = findTestNeighbors({ repoRoot: input.repoRoot, target: symbol.file, symbolName: symbol.name });
+
+  // Trust the graph's caller/callee edges once it has actually indexed this
+  // symbol (even an empty result is real signal there); the expensive
+  // whole-repo regex scan is the fallback for symbols the graph doesn't have.
+  const graphProvider = isGraphBacked ? input.graphProvider : undefined;
+  const graphCallers = graphProvider ? await graphProvider.getCallers({ symbol: symbol.name }) : undefined;
+  const graphCallees = graphProvider ? await graphProvider.getCallees({ symbol: symbol.name }) : undefined;
+  const callers = (graphCallers ?? findSymbolReferences(input.repoRoot, symbol)).slice(0, 24);
+  const callees = (graphCallees ?? extractCallees(sliceText).filter((name) => name !== symbol.name)).slice(0, 32);
+  const neighbors = await findTestNeighbors({
+    repoRoot: input.repoRoot,
+    target: symbol.file,
+    symbolName: symbol.name,
+    graphProvider: input.graphProvider
+  });
 
   return {
     symbol,
@@ -253,7 +298,7 @@ export function tokenizeQuery(query: string): string[] {
   return [...tokens].slice(0, 12);
 }
 
-function resolveSymbol(input: SymbolPacketInput): CodingSymbol | undefined {
+async function resolveSymbol(input: SymbolPacketInput): Promise<CodingSymbol | undefined> {
   if (input.symbolId) {
     const parsed = parseSymbolId(input.symbolId);
     if (parsed) {
@@ -264,7 +309,10 @@ function resolveSymbol(input: SymbolPacketInput): CodingSymbol | undefined {
       }
     }
   }
-  return findCodingSymbols({ repoRoot: input.repoRoot, query: input.query ?? input.symbolId ?? "", limit: 1 })[0];
+  const query = input.query ?? input.symbolId ?? "";
+  return (
+    await findCodingSymbols({ repoRoot: input.repoRoot, query, limit: 1, graphProvider: input.graphProvider })
+  )[0];
 }
 
 function parseSymbolId(symbolId: string): { file: string; line: number; kind: string; name: string } | undefined {
