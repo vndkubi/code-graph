@@ -22,6 +22,7 @@ import { runQualityTrend, appendQualityTrend } from './v2/benchmark/quality-tren
 import { runEvidenceAudit } from './v2/benchmark/evidence-audit.js';
 import { runRecallBench } from './v2/benchmark/recall-bench.js';
 import { findAffectedTests } from './v2/query/affected-tests.js';
+import { formatCiSelection, selectTestsForCi, type CiSelectionFormat } from './v2/query/ci-test-selection.js';
 import { runAffectedTestsEval } from './v2/benchmark/affected-tests-eval.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 import { buildLocalArtifactIndex } from './v2/mcp/local-artifact.js';
@@ -411,12 +412,38 @@ async function runSetupCommand(parsed: ParsedArgs): Promise<void> {
 async function runAffectedTestsCommand(parsed: ParsedArgs): Promise<void> {
   const root = getFlag(parsed, 'root') ?? process.cwd();
   const changed = splitCsv(getFlag(parsed, 'changed') ?? getFlag(parsed, 'files')) ?? [];
-  if (changed.length === 0) {
-    throw new Error('affected-tests requires --changed <file[,file...]> (repo-relative paths).');
+  const baseRef = getFlag(parsed, 'base');
+  if (changed.length === 0 && !baseRef) {
+    throw new Error('affected-tests requires --base <git ref> (CI selection) or --changed <file[,file...]> (repo-relative paths).');
   }
   const { db } = await openCodeGraphDb(root);
   try {
     const index = await new V2Indexer(db).indexWorkspace({ root });
+    if (baseRef) {
+      const format = normalizeCiSelectionFormat(getFlag(parsed, 'format'));
+      const selection = await selectTestsForCi(db, root, index.snapshotId, {
+        baseRef,
+        headRef: getFlag(parsed, 'head'),
+        maxDepth: getNumberFlag(parsed, 'max-depth'),
+        limit: getNumberFlag(parsed, 'limit'),
+      });
+      if (format !== 'json') {
+        // stderr carries the audit trail; stdout stays a pure runner argument.
+        console.error(JSON.stringify({
+          baseRef: selection.baseRef,
+          headRef: selection.headRef,
+          changedFiles: selection.changedInput.length,
+          ignoredChanged: selection.ignoredChanged,
+          selected: selection.tests.map(t => t.file),
+          totalTests: selection.totalTests,
+          reductionPct: selection.reductionPct,
+          runAll: selection.runAll,
+          runAllReasons: selection.runAllReasons,
+        }, null, 2));
+      }
+      console.log(formatCiSelection(selection, format));
+      return;
+    }
     const result = await findAffectedTests(db, index.snapshotId, changed, {
       maxDepth: getNumberFlag(parsed, 'max-depth'),
       limit: getNumberFlag(parsed, 'limit'),
@@ -425,6 +452,12 @@ async function runAffectedTestsCommand(parsed: ParsedArgs): Promise<void> {
   } finally {
     await db.close();
   }
+}
+
+function normalizeCiSelectionFormat(value: string | undefined): CiSelectionFormat {
+  const format = (value ?? 'json').trim().toLowerCase();
+  if (format === 'json' || format === 'list' || format === 'maven' || format === 'gradle') return format;
+  throw new Error(`Unknown affected-tests format: ${value}. Use json, list, maven, or gradle.`);
 }
 
 async function runIndexCommand(parsed: ParsedArgs): Promise<void> {
