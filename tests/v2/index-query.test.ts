@@ -2433,6 +2433,110 @@ public class ReportBuilder {
     expect(review.reviewFindings.some(f => f.id.includes('chargeCustomer') && f.id.startsWith('review-long-method-'))).toBe(false);
   });
 
+  it('detects new code duplicating EXISTING code outside the diff (cross-file clone)', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-cross-dup-');
+
+    // The block RefundService copies below. Distinctive, non-trivial lines so
+    // the overlap is unambiguous.
+    const clonedBody = [
+      '    int subtotal = amountCents + taxCents;',
+      '    int discount = computeLoyaltyDiscount(subtotal);',
+      '    int rounded = Math.max(0, subtotal - discount);',
+      '    auditTrail.record("settle", rounded);',
+      '    notifyLedger(rounded, "invoice-settled");',
+      '    return rounded;',
+    ];
+    writeFile(repo, 'src/main/java/com/example/dup/PaymentService.java', [
+      'package com.example.dup;',
+      '',
+      'public class PaymentService {',
+      '  public int settleInvoice(int amountCents, int taxCents) {',
+      ...clonedBody,
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+
+    // Working-tree state of the changed file: the diff below is already
+    // applied (the common case when reviewing local changes).
+    const refundLines = [
+      'package com.example.dup;',
+      '',
+      'public class RefundService {',
+      '  public int processRefund(int amountCents, int taxCents) {', // line 4
+      ...clonedBody,
+      '  }',                                                          // line 11
+      '',
+      '  public String uniqueRefundNote() {',                         // line 13
+      '    String note = "refund issued at counter";',
+      '    String stamp = "printed by clerk on demand";',
+      '    String extra = "no matching ledger anywhere";',
+      '    String more = "totally novel logic here";',
+      '    return note + stamp + extra + more;',
+      '  }',                                                          // line 19
+      '}',
+      '',
+    ];
+    writeFile(repo, 'src/main/java/com/example/dup/RefundService.java', refundLines.join('\n'));
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const addedHunk = (startLine: number, endLine: number): string => [
+      'diff --git a/src/main/java/com/example/dup/RefundService.java b/src/main/java/com/example/dup/RefundService.java',
+      '--- a/src/main/java/com/example/dup/RefundService.java',
+      '+++ b/src/main/java/com/example/dup/RefundService.java',
+      `@@ -${startLine},0 +${startLine},${endLine - startLine + 1} @@`,
+      ...refundLines.slice(startLine - 1, endLine).map(line => `+${line}`),
+    ].join('\n');
+    // A file the diff CREATES (not yet indexed, not on disk) that also copies
+    // the same block — the most common real home of pasted code.
+    const newFileDiff = [
+      'diff --git a/src/main/java/com/example/dup/CaptureService.java b/src/main/java/com/example/dup/CaptureService.java',
+      '--- /dev/null',
+      '+++ b/src/main/java/com/example/dup/CaptureService.java',
+      '@@ -0,0 +1,10 @@',
+      '+package com.example.dup;',
+      '+',
+      '+public class CaptureService {',
+      '+  public int captureCharge(int amountCents, int taxCents) {',
+      ...clonedBody.map(line => `+${line}`),
+      '+  }',
+      '+}',
+    ].join('\n');
+    // Hunk 1 copies PaymentService.settleInvoice; hunk 2 is genuinely novel.
+    const diff = [addedHunk(4, 11), addedHunk(13, 19), newFileDiff].join('\n');
+
+    const review = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'review_patch',
+      args: { diff, outputMode: 'full', limit: 50 },
+    }) as {
+      reviewFindings: Array<{ id: string; category?: string; title: string; why: string; evidence?: Array<{ file?: string; line?: number }> }>;
+    };
+
+    const crossFile = review.reviewFindings.filter(f => f.id.startsWith('review-duplicated-code-existing-'));
+    // Both the edited file's copy and the brand-new file's copy are flagged
+    // against the file they were copied from...
+    expect(crossFile.length).toBe(2);
+    expect(crossFile.every(f => f.category === 'design-quality')).toBe(true);
+    expect(crossFile.every(f => f.why.includes('PaymentService.java'))).toBe(true);
+    expect(crossFile.some(f => f.id.includes('RefundService.java'))).toBe(true);
+    expect(crossFile.some(f => f.id.includes('CaptureService.java'))).toBe(true);
+    expect(crossFile[0]!.evidence?.some(e => e.file?.endsWith('PaymentService.java'))).toBe(true);
+    // ...the novel hunk is not flagged...
+    expect(crossFile.some(f => f.id.includes('-13-'))).toBe(false);
+    // ...and the diff-local check, while correctly pairing the two in-diff
+    // copies with each other, cannot see the ORIGINAL the code was copied
+    // from — only the cross-file check names PaymentService.
+    const inDiffOnly = review.reviewFindings.filter(f =>
+      f.id.startsWith('review-duplicated-code-') && !f.id.startsWith('review-duplicated-code-existing-'));
+    expect(inDiffOnly.some(f => f.id.includes('PaymentService.java'))).toBe(false);
+  });
+
   it('indexes XML, JSON, YAML, and properties config evidence', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-config-files-');

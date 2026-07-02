@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { CodeGraphDb } from '../storage/database.js';
 import { estimateTextTokens } from '../token-estimator.js';
 import { V2Indexer, type IndexWorkspaceOptions } from '../index/indexer.js';
-import { roleRank, type FileRole } from '../index/file-role.js';
+import { classifyFile, roleRank, type FileRole } from '../index/file-role.js';
 import {
   EXPLICIT_FILENAME_STOP_WORDS,
   SEARCH_STOP_WORDS,
@@ -2893,6 +2893,148 @@ export class V2QueryService {
     }
 
     findings.push(...detectDuplicateHunks(hunks));
+    findings.push(...await this.crossFileDuplicateFindings(snapshotId, targetHunks));
+    return findings;
+  }
+
+  /**
+   * Copy-paste signal against EXISTING code: a hunk's added lines substantially
+   * duplicate code already present in a graph-adjacent file. Complements
+   * detectDuplicateHunks, which only sees duplication BETWEEN hunks of the same
+   * diff — the more common review case is "this re-implements a helper that
+   * already exists next door", invisible to any diff-local check. Candidates
+   * are bounded to the graph neighborhood (same directory + 1-hop dependency
+   * neighbors) rather than a full-corpus clone search: real-world copy-paste
+   * overwhelmingly comes from a sibling or an already-imported file, and the
+   * bound keeps the scan to a couple dozen cached file reads per review.
+   */
+  private async crossFileDuplicateFindings(snapshotId: string, hunks: PatchHunk[]): Promise<ReviewFinding[]> {
+    const root = await this.workspaceRootForSnapshot(snapshotId);
+    if (!root) return [];
+
+    // Lines the diff itself introduced, per resolved file. When the working
+    // tree already contains the applied diff, a changed candidate file would
+    // otherwise "contain" the very lines under review — those must never
+    // count as pre-existing code.
+    const addedTextsByFile = new Map<string, Set<string>>();
+    const resolvedByHunk = new Map<PatchHunk, string>();
+    for (const hunk of hunks) {
+      const resolved = await this.resolveFile(snapshotId, hunk.file) ?? hunk.file;
+      resolvedByHunk.set(hunk, resolved);
+      let texts = addedTextsByFile.get(resolved);
+      if (!texts) { texts = new Set(); addedTextsByFile.set(resolved, texts); }
+      for (const text of normalizedAddedLines(hunk)) texts.add(text);
+    }
+
+    const fileRoleCache = new Map<string, string | undefined>();
+    const fileRole = async (file: string): Promise<string | undefined> => {
+      if (!fileRoleCache.has(file)) {
+        const row = await this.db.prepare('SELECT file_role FROM files WHERE snapshot_id = ? AND path = ?')
+          .get(snapshotId, file) as { file_role?: string } | undefined;
+        // A file the diff CREATES is not in the snapshot yet — classify it by
+        // path so brand-new files (the most common home of copy-pasted code)
+        // still get checked against their neighbors.
+        fileRoleCache.set(file, row?.file_role ?? classifyFile(file).role);
+      }
+      return fileRoleCache.get(file);
+    };
+
+    // normalized line text -> first line number, minus trivial lines and the
+    // diff's own added lines for that file.
+    const fileLineCache = new Map<string, Map<string, number> | undefined>();
+    const loadFileLines = (candidate: string): Map<string, number> | undefined => {
+      if (fileLineCache.has(candidate)) return fileLineCache.get(candidate);
+      let index: Map<string, number> | undefined;
+      const absolutePath = safeResolve(root, candidate);
+      try {
+        if (absolutePath && fs.statSync(absolutePath).size <= CROSS_FILE_DUPLICATE_MAX_FILE_BYTES) {
+          const excluded = addedTextsByFile.get(candidate);
+          index = new Map();
+          const lines = fs.readFileSync(absolutePath, 'utf-8').split(/\r?\n/);
+          for (let i = 0; i < lines.length; i++) {
+            const text = lines[i]!.trim();
+            if (isTrivialDuplicateLine(text) || excluded?.has(text) || index.has(text)) continue;
+            index.set(text, i + 1);
+          }
+        }
+      } catch { index = undefined; }
+      fileLineCache.set(candidate, index);
+      return index;
+    };
+
+    const candidateCache = new Map<string, string[]>();
+    const candidatesFor = async (resolved: string): Promise<string[]> => {
+      const cached = candidateCache.get(resolved);
+      if (cached) return cached;
+      const dir = path.posix.dirname(resolved.replace(/\\/g, '/'));
+      const rows = await this.db.prepare(`
+        SELECT DISTINCT f.path
+        FROM files f
+        WHERE f.snapshot_id = ? AND f.file_role = 'main_source' AND f.path != ?
+          AND (
+            f.path LIKE ? ESCAPE '\\'
+            OR f.path IN (SELECT to_file FROM dependency_edges WHERE snapshot_id = ? AND from_file = ?)
+            OR f.path IN (SELECT from_file FROM dependency_edges WHERE snapshot_id = ? AND to_file = ?)
+          )
+        ORDER BY LENGTH(f.path)
+        LIMIT ?
+      `).all(
+        snapshotId, resolved, `${escapeLike(dir)}/%`,
+        snapshotId, resolved, snapshotId, resolved,
+        CROSS_FILE_DUPLICATE_MAX_CANDIDATES,
+      ) as Array<{ path: string }>;
+      const candidates = rows.map(row => row.path);
+      candidateCache.set(resolved, candidates);
+      return candidates;
+    };
+
+    const findings: ReviewFinding[] = [];
+    const reportedPairs = new Set<string>();
+    for (const hunk of hunks) {
+      const resolved = resolvedByHunk.get(hunk) ?? hunk.file;
+      // Test/generated fixtures duplicate each other by design; keep this
+      // check on production source only, like the other design-quality checks.
+      if (await fileRole(resolved) !== 'main_source') continue;
+      const addedLines = normalizedAddedLines(hunk);
+      if (addedLines.size < DUPLICATE_MIN_SHARED_LINES) continue;
+
+      let best: { file: string; line: number; shared: number; ratio: number } | undefined;
+      for (const candidate of await candidatesFor(resolved)) {
+        const candidateLines = loadFileLines(candidate);
+        if (!candidateLines || candidateLines.size === 0) continue;
+        let shared = 0;
+        let firstLine: number | undefined;
+        for (const text of addedLines) {
+          const line = candidateLines.get(text);
+          if (line === undefined) continue;
+          shared++;
+          if (firstLine === undefined || line < firstLine) firstLine = line;
+        }
+        if (shared < DUPLICATE_MIN_SHARED_LINES) continue;
+        const ratio = shared / addedLines.size;
+        if (ratio < DUPLICATE_MIN_OVERLAP_RATIO) continue;
+        if (!best || shared > best.shared) best = { file: candidate, line: firstLine ?? 1, shared, ratio };
+      }
+      if (!best) continue;
+      const pairKey = `${resolved}::${best.file}`;
+      if (reportedPairs.has(pairKey)) continue;
+      reportedPairs.add(pairKey);
+      findings.push({
+        id: `review-duplicated-code-existing-${resolved}-${hunk.newStart}-${best.file}`,
+        priority: 'P2',
+        category: 'design-quality',
+        file: resolved,
+        line: hunk.newStart,
+        title: `New code duplicates existing ${path.posix.basename(best.file)}:${best.line}`,
+        why: `${best.shared} added line(s) (${Math.round(best.ratio * 100)}% of this hunk) already exist in ${best.file} — the change may re-implement logic that could be reused instead.`,
+        evidence: [
+          { file: resolved, line: hunk.newStart },
+          { file: best.file, line: best.line },
+        ],
+        suggestedCheck: `Check whether the existing code in ${path.posix.basename(best.file)} can be reused (or extracted into a shared helper) instead of duplicated.`,
+        confidence: 0.45,
+      });
+    }
     return findings;
   }
 
@@ -8963,6 +9105,11 @@ const FEATURE_ENVY_MIN_FOREIGN_CALLS = 3;
 const FEATURE_ENVY_FOREIGN_RATIO = 2;
 const DUPLICATE_MIN_SHARED_LINES = 4;
 const DUPLICATE_MIN_OVERLAP_RATIO = 0.6;
+// Cross-file (existing-code) duplication scan bounds: candidates come from the
+// graph neighborhood of each hunk, and every candidate file is read at most
+// once per review call, so the worst case stays a couple dozen bounded reads.
+const CROSS_FILE_DUPLICATE_MAX_CANDIDATES = 24;
+const CROSS_FILE_DUPLICATE_MAX_FILE_BYTES = 400_000;
 
 function symbolLineCount(symbol: SymbolRow): number | undefined {
   if (symbol.end_line === undefined || symbol.end_line === null) return undefined;
