@@ -31,7 +31,7 @@ describe('review_patch: graph-only findings', () => {
       /* 6  */ '        return name;',
       /* 7  */ '    }',
       /* 8  */ '',
-      /* 9  */ '    @Deprecated',
+      /* 9  */ '    @PostConstruct',
       /* 10 */ '    private void legacyUnusedCleanup() {',
       /* 11 */ '        System.out.println("noop");',
       /* 12 */ '    }',
@@ -101,7 +101,7 @@ public class StringUtilsCaller {
     const findingIds = review.reviewFindings.map(finding => finding.id);
 
     // Too many params (buildLabel has 6, via parameter_types_json for Java).
-    expect(findingIds.some(id => id.startsWith('review-too-many-params-') && id.includes('buildLabel'))).toBe(true);
+    expect(findingIds.some(id => id.startsWith('review-long-param-list-') && id.includes('buildLabel'))).toBe(true);
 
     // Dead code: buildLabel is private, unannotated, and never called.
     expect(findingIds.some(id => id.startsWith('review-dead-code-') && id.includes('buildLabel'))).toBe(true);
@@ -188,9 +188,9 @@ test('creates order', () => {
       args: { files: ['src/widget.ts'], diff, limit: 50 },
     }) as { reviewFindings: Array<{ id: string; title: string }> };
 
-    const finding = review.reviewFindings.find(f => f.id.startsWith('review-too-many-params-') && f.id.includes('buildWidgetConfig'));
+    const finding = review.reviewFindings.find(f => f.id.startsWith('review-long-param-list-') && f.id.includes('buildWidgetConfig'));
     expect(finding).toBeDefined();
-    expect(finding?.title).toContain('6 parameters');
+    expect(finding?.title).toContain('6 params');
   });
 });
 

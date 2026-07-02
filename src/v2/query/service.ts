@@ -2309,14 +2309,40 @@ export class V2QueryService {
             WHEN fq_name LIKE ? ESCAPE '\\' THEN 2
             ELSE 3
           END,
-          file_role,
+          -- Explicit role rank, not the incidental alphabetical order of the
+          -- file_role string. A generic-schema file (a JSON report/config with
+          -- deliberately generic field names like id/file/line/endpoint) is far
+          -- more likely to substring-match an arbitrary task word than real
+          -- domain code is, precisely because its schema is generic on purpose —
+          -- so without this it can outrank genuine main_source matches just by
+          -- which seed happened to be processed first (observed: a stray
+          -- resource_config JSON report's endpoint field beat every real
+          -- source file for a new-endpoint task).
+          CASE file_role
+            WHEN 'main_source' THEN 0
+            WHEN 'test_source' THEN 1
+            WHEN 'mock_source' THEN 2
+            WHEN 'build_config' THEN 3
+            WHEN 'resource_config' THEN 4
+            WHEN 'generated' THEN 5
+            WHEN 'external_stub' THEN 6
+            WHEN 'vendored' THEN 7
+            ELSE 8
+          END,
           file,
           line
         LIMIT ?
       `).all(snapshotId, simple, seed, `%${escapeLike(simple)}%`, like, seed, simple, like, limit) as SymbolRow[]);
-      if (rows.length >= limit) break;
     }
-    return uniqueRecordsBy(rows, row => `${row.fq_name}\0${row.file}\0${row.line}`).slice(0, limit);
+    // Sort the FULL cross-seed pool by the same role priority as the per-seed
+    // SQL ORDER BY above before deduping/capping. Without this, whichever seed
+    // happened to be processed first (i.e. whichever word appears earliest in
+    // the task sentence) determined which files made the final cut, regardless
+    // of role — a generic-schema resource_config file matching an early seed
+    // could fill the entire limit before a later seed ever got a real
+    // main_source match a chance to compete.
+    const sorted = [...rows].sort((a, b) => fieldImpactRoleRank(a.file_role) - fieldImpactRoleRank(b.file_role));
+    return uniqueRecordsBy(sorted, row => `${row.fq_name}\0${row.file}\0${row.line}`).slice(0, limit);
   }
 
   private async fieldUsagesForTargets(
@@ -2426,11 +2452,11 @@ export class V2QueryService {
         evidenceOmittedCount: Math.max(0, changedMainSource.length - 5),
       });
     }
-    // Graph-only checks on symbols this patch touches: callers outside the
-    // diff, method length, parameter count, and dead private methods. None of
-    // these are visible from reading the diff alone.
-    const changedSymbolFindings = await this.changedSymbolFindingsForHunks(snapshotId, hunks, changedFiles);
-    const allFindings = reviewFindingsForPatch({
+    // Callers outside the diff of a method/function this patch modifies: the
+    // reviewer cannot see these from the diff alone, but the call graph
+    // already knows every call site.
+    const staleCallers = await this.staleCallersForHunks(snapshotId, hunks, changedFiles);
+    const riskFindings = reviewFindingsForPatch({
       focus,
       diff,
       hunks,
@@ -2438,8 +2464,11 @@ export class V2QueryService {
       riskFlags,
       testsCount: tests.length,
       summary: isPlainObject(impact.summary) ? impact.summary : {},
-      ...changedSymbolFindings,
+      staleCallers,
     });
+    const designQualityFindings = await this.designQualityFindingsForPatch(snapshotId, hunks);
+    const allFindings = [...riskFindings, ...designQualityFindings]
+      .sort((a, b) => reviewPriorityRank(a.priority) - reviewPriorityRank(b.priority) || b.confidence - a.confidence);
     const findings = allFindings
       .slice(0, budget.maxFindings)
       .map(finding => compactReviewFinding(finding, budget.maxEvidencePerFinding));
@@ -2609,86 +2638,39 @@ export class V2QueryService {
     return result;
   }
 
-  // One pass over the changed-hunk symbols backing several graph-only review
-  // checks: stale callers, long method, too many params, and dead code. Each
-  // symbol is resolved and deduped once and shared across all four checks
-  // instead of re-querying per check.
-  private async changedSymbolFindingsForHunks(
+  // For each hunk that modifies (not just adds) a method/function/constructor,
+  // find its callers via the call graph and flag any caller file the diff does
+  // not touch. Those call sites were written against the old behavior/signature
+  // and cannot be seen by reading the diff alone.
+  private async staleCallersForHunks(
     snapshotId: string,
     hunks: PatchHunk[],
     changedFiles: string[],
-  ): Promise<ChangedSymbolFindings> {
+  ): Promise<StaleCallerGroup[]> {
     const changedFileSet = new Set(changedFiles);
     const seenSymbols = new Set<string>();
-    const staleCallers: StaleCallerGroup[] = [];
-    const longMethods: LongMethodCandidate[] = [];
-    const tooManyParams: TooManyParamsCandidate[] = [];
-    const deadCode: DeadCodeCandidate[] = [];
+    const groups: StaleCallerGroup[] = [];
     for (const hunk of hunks) {
+      if (hunk.removedLines.length === 0) continue; // pure addition: nothing existing changed behavior
       const resolvedFile = await this.resolveFile(snapshotId, hunk.file) ?? hunk.file;
       const symbolRow = await this.symbolForPatchHunk(snapshotId, resolvedFile, hunk);
       if (!symbolRow || !['method', 'function', 'constructor'].includes(symbolRow.kind)) continue;
       const symbolNeedle = symbolRow.fq_name || symbolRow.simple_name;
       if (!symbolNeedle || seenSymbols.has(symbolNeedle)) continue;
       seenSymbols.add(symbolNeedle);
-
-      const endLine = symbolRow.end_line ?? symbolRow.line;
-      const lineCount = endLine - symbolRow.line + 1;
-      if (lineCount > LONG_METHOD_LINE_THRESHOLD) {
-        longMethods.push({ symbol: symbolNeedle, simpleName: symbolRow.simple_name, file: resolvedFile, line: symbolRow.line, endLine, lineCount });
-      }
-
-      // parameter_types_json is only populated by the Java extractor today;
-      // fall back to counting top-level commas in the signature (works for
-      // TS/JS/Python too) when it's empty. Skip rather than guess when the
-      // signature itself is truncated (multi-line declarations only keep
-      // their first source line).
-      const jsonParamCount = symbolRow.parameter_types_json ? parseJson<unknown[]>(symbolRow.parameter_types_json, []).length : 0;
-      const paramCount = jsonParamCount > 0 ? jsonParamCount : countSignatureParams(symbolRow.signature);
-      if (paramCount !== undefined && paramCount > TOO_MANY_PARAMS_THRESHOLD) {
-        tooManyParams.push({ symbol: symbolNeedle, simpleName: symbolRow.simple_name, file: resolvedFile, line: symbolRow.line, paramCount });
-      }
-
-      // Callers outside the diff: the reviewer cannot see these from the diff
-      // alone, but the call graph already knows every call site.
-      if (hunk.removedLines.length > 0) { // only meaningful for existing (modified) symbols
-        const callers = ((await this.getCallers(snapshotId, { symbol: symbolNeedle, limit: 25 })) as { callers: CallEdgeRow[] }).callers;
-        const externalCallers = callers.filter(caller => !changedFileSet.has(caller.file));
-        if (externalCallers.length > 0) {
-          staleCallers.push({
-            symbol: symbolNeedle,
-            simpleName: symbolRow.simple_name,
-            file: resolvedFile,
-            line: symbolRow.line,
-            callerCount: externalCallers.length,
-            callers: externalCallers.slice(0, 5).map(compactCallEdge),
-          });
-        }
-      }
-
-      // Dead code: scoped to symbols that cannot be reached from outside this
-      // codebase — 'private' (class members) and 'internal' (package-private
-      // Java, non-exported TS/JS/Python module functions) — the safe range
-      // for automated unused-symbol detection. Skip anything annotated or
-      // framework-attached (@Override, @EventListener, controllers, ...)
-      // since those are invoked outside the static call graph.
-      const hasAnnotations = symbolRow.kind !== 'constructor'
-        && symbolRow.annotations_json
-        && parseJson<unknown[]>(symbolRow.annotations_json, []).length > 0;
-      if (
-        symbolRow.kind !== 'constructor'
-        && (symbolRow.visibility === 'private' || symbolRow.visibility === 'internal')
-        && !hasAnnotations
-        && !symbolRow.framework_role
-        && symbolRow.simple_name !== 'main'
-      ) {
-        const callResult = (await this.getCallers(snapshotId, { symbol: symbolNeedle, limit: 1, includeLowSignal: true })) as { totalCount: number };
-        if (callResult.totalCount === 0) {
-          deadCode.push({ symbol: symbolNeedle, simpleName: symbolRow.simple_name, file: resolvedFile, line: symbolRow.line });
-        }
-      }
+      const callers = ((await this.getCallers(snapshotId, { symbol: symbolNeedle, limit: 25 })) as { callers: CallEdgeRow[] }).callers;
+      const externalCallers = callers.filter(caller => !changedFileSet.has(caller.file));
+      if (externalCallers.length === 0) continue;
+      groups.push({
+        symbol: symbolNeedle,
+        simpleName: symbolRow.simple_name,
+        file: resolvedFile,
+        line: symbolRow.line,
+        callerCount: externalCallers.length,
+        callers: externalCallers.slice(0, 5).map(compactCallEdge),
+      });
     }
-    return { staleCallers, longMethods, tooManyParams, deadCode };
+    return groups;
   }
 
   private async patchReviewTargets(
@@ -2775,6 +2757,143 @@ export class V2QueryService {
       });
     }
     return targets;
+  }
+
+  /**
+   * Clean-Code / design-quality findings, alongside reviewFindingsForPatch's
+   * risk/safety findings — long methods, long parameter lists, likely-dead
+   * private methods, feature envy, and oversized classes. Supplementary
+   * "worth a second look" signals (P2, moderate confidence), not blockers:
+   * a smaller threshold would drown genuine review in false positives on
+   * already-large legacy code the patch merely touches in passing.
+   */
+  private async designQualityFindingsForPatch(
+    snapshotId: string,
+    hunks: PatchHunk[],
+  ): Promise<ReviewFinding[]> {
+    const findings: ReviewFinding[] = [];
+    // Bound DB round-trips the same way patchReviewTargets does; a diff with
+    // many hunks still only pays for a handful of symbol/call-graph lookups.
+    const targetHunks = hunks.slice(0, 12);
+    const seenSymbols = new Set<string>();
+    const filesSeen = new Set<string>();
+    for (const hunk of targetHunks) {
+      const resolvedFile = await this.resolveFile(snapshotId, hunk.file) ?? hunk.file;
+      if (!filesSeen.has(resolvedFile)) {
+        filesSeen.add(resolvedFile);
+        const classRow = await this.db.prepare(`
+          SELECT COUNT(*) AS count FROM symbols
+          WHERE snapshot_id = ? AND file = ? AND kind IN ('method', 'constructor') AND file_role = 'main_source'
+        `).get(snapshotId, resolvedFile) as { count: number } | undefined;
+        const methodCount = Number(classRow?.count ?? 0);
+        if (methodCount > LARGE_CLASS_METHOD_THRESHOLD) {
+          findings.push({
+            id: `review-large-class-${resolvedFile}`,
+            priority: 'P2',
+            category: 'design-quality',
+            file: resolvedFile,
+            title: `Large class: ${path.posix.basename(resolvedFile)} (${methodCount} methods)`,
+            why: `This file defines ${methodCount} methods/constructors — often a sign of more than one responsibility (Clean Code: a class should have one reason to change).`,
+            suggestedCheck: `Consider whether ${path.posix.basename(resolvedFile)} could be split by responsibility.`,
+            confidence: 0.4,
+          });
+        }
+      }
+
+      const symbol = await this.symbolForPatchHunk(snapshotId, resolvedFile, hunk);
+      if (!symbol || symbol.file_role !== 'main_source') continue;
+      if (symbol.kind !== 'method' && symbol.kind !== 'function' && symbol.kind !== 'constructor') continue;
+      if (seenSymbols.has(symbol.fq_name)) continue;
+      seenSymbols.add(symbol.fq_name);
+      const lineEvidence = firstLineEvidence(hunk);
+
+      const lineCount = symbolLineCount(symbol);
+      if (lineCount !== undefined && lineCount > LONG_METHOD_LINE_THRESHOLD) {
+        findings.push({
+          id: `review-long-method-${symbol.fq_name}`,
+          priority: 'P2',
+          category: 'design-quality',
+          file: symbol.file,
+          line: symbol.line,
+          title: `Long method: ${symbol.simple_name} (${lineCount} lines)`,
+          why: `Methods beyond ~${LONG_METHOD_LINE_THRESHOLD} lines usually mix multiple responsibilities and are harder to test or understand in one pass (Clean Code: keep functions small).`,
+          evidence: lineEvidence,
+          suggestedCheck: `Consider extracting cohesive steps of ${symbol.simple_name} into smaller, named helper methods.`,
+          confidence: 0.55,
+        });
+      }
+
+      if (symbol.kind !== 'constructor') {
+        const paramCount = symbolParameterCount(symbol);
+        if (paramCount !== undefined && paramCount > TOO_MANY_PARAMS_THRESHOLD) {
+          findings.push({
+            id: `review-long-param-list-${symbol.fq_name}`,
+            priority: 'P2',
+            category: 'design-quality',
+            file: symbol.file,
+            line: symbol.line,
+            title: `Long parameter list: ${symbol.simple_name} (${paramCount} params)`,
+            why: 'More than a handful of parameters is a common sign the method should receive one cohesive object instead, or should be split.',
+            evidence: lineEvidence,
+            suggestedCheck: `Consider grouping related parameters of ${symbol.simple_name} into a parameter object.`,
+            confidence: 0.5,
+          });
+        }
+      }
+
+      if (!isDeadCodeExempt(symbol)) {
+        const callerResult = (await this.getCallers(snapshotId, { symbol: symbol.fq_name, limit: 1 })) as { callers: CallEdgeRow[] };
+        if (callerResult.callers.length === 0) {
+          findings.push({
+            id: `review-dead-code-${symbol.fq_name}`,
+            priority: 'P2',
+            category: 'design-quality',
+            file: symbol.file,
+            line: symbol.line,
+            title: `No indexed callers: ${symbol.simple_name}`,
+            why: 'A private method with zero indexed call sites may be leftover dead code from an earlier refactor.',
+            evidence: lineEvidence,
+            suggestedCheck: `Confirm ${symbol.simple_name} is still reachable (e.g. via reflection/DI) before merging, or remove it.`,
+            confidence: 0.45,
+          });
+        }
+      }
+
+      const calleeResult = (await this.getCallees(snapshotId, { symbol: symbol.fq_name, limit: 30 })) as { callees: CallEdgeRow[] };
+      const domainCallees = calleeResult.callees.filter(edge => !isLibraryCallOwner(edge.callee));
+      if (domainCallees.length >= FEATURE_ENVY_MIN_FOREIGN_CALLS) {
+        const ownOwner = symbolOwnerFromFqName(symbol.fq_name);
+        const ownerCounts = new Map<string, number>();
+        for (const edge of domainCallees) {
+          const owner = callEdgeOwner(edge.callee);
+          if (!owner) continue;
+          ownerCounts.set(owner, (ownerCounts.get(owner) ?? 0) + 1);
+        }
+        const ownCount = ownerCounts.get(ownOwner) ?? 0;
+        let topForeign: [string, number] | undefined;
+        for (const [owner, count] of ownerCounts) {
+          if (owner === ownOwner) continue;
+          if (!topForeign || count > topForeign[1]) topForeign = [owner, count];
+        }
+        if (topForeign && topForeign[1] >= FEATURE_ENVY_MIN_FOREIGN_CALLS && topForeign[1] >= ownCount * FEATURE_ENVY_FOREIGN_RATIO) {
+          findings.push({
+            id: `review-feature-envy-${symbol.fq_name}`,
+            priority: 'P2',
+            category: 'design-quality',
+            file: symbol.file,
+            line: symbol.line,
+            title: `Possible feature envy: ${symbol.simple_name} calls ${topForeign[0]} more than its own class`,
+            why: `${topForeign[1]} call(s) into ${topForeign[0]} vs ${ownCount} within its own class suggest this logic may belong on ${topForeign[0]} instead.`,
+            evidence: lineEvidence,
+            suggestedCheck: `Consider moving this logic onto ${topForeign[0]}, or extracting a method there and calling it.`,
+            confidence: 0.4,
+          });
+        }
+      }
+    }
+
+    findings.push(...detectDuplicateHunks(hunks));
+    return findings;
   }
 
   private async symbolForPatchHunk(snapshotId: string, file: string, hunk: PatchHunk): Promise<SymbolRow | undefined> {
@@ -4355,8 +4474,28 @@ export class V2QueryService {
     timing.checkpoint('architecture_context');
     const packedTestsLikelyRelevant = slimTestsForPack(testsLikelyRelevant, profile);
     const packedTaskOracle = slimTaskOracleForPack(taskOracle, profile);
+    // `expectedVerification` (commands/targetedTestFiles/fallback/redGreenRequired)
+    // and `likelyTests` are already exposed as sibling top-level fields in this
+    // pack (`expectedVerification`, `testsLikelyRelevant`) — nesting them again
+    // inside taskOracle here is a verbatim duplicate (measured: the same command
+    // string + test file list appearing twice in every get_change_pack response,
+    // ~1.2KB). Strip them from the copy embedded in the result; get_research_pack
+    // and get_context_packet keep the full taskOracle since they have no such
+    // sibling fields to duplicate.
+    const { expectedVerification: _oracleExpectedVerification, likelyTests: _oracleLikelyTests, ...packedTaskOracleForResult } = packedTaskOracle;
     const packedPatchImpact = patchImpact ? compactReviewObject(patchImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined;
-    const packedFieldImpact = fieldImpact ? compactReviewObject(fieldImpact, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined;
+    // A 'debug' task is inherently narrow in scope (fix the one behavior named in
+    // the task, not audit every place a field is touched), but fieldImpact's fetch
+    // limit is NOT scaled by changeType (Math.max(20, maxFiles*4) regardless) — a
+    // field genuinely used in 90+ places across the codebase produces a packet
+    // section that can outweigh the raw source of every file actually relevant to
+    // the bug (measured: 32KB packet vs 3KB of raw file content for a real 2-file
+    // fix). Cap the OUTPUT array width tighter for debug specifically, without
+    // touching the underlying fetch/analysis (still finds every usage for
+    // usageCount/confidence) — 'refactor'/'implement' keep the full width since
+    // broad field-impact is exactly what those task types need.
+    const fieldImpactArrayCap = changeType === 'debug' ? Math.min(3, packProfileValue(profile, 4, 6, 8)) : packProfileValue(profile, 4, 6, 8);
+    const packedFieldImpact = fieldImpact ? compactReviewObject(fieldImpact, fieldImpactArrayCap, profile === 'micro' ? 2 : 3) : undefined;
     const packedArchitectureContext = architectureContext ? compactReviewObject(architectureContext, packProfileValue(profile, 4, 6, 8), profile === 'micro' ? 2 : 3) : undefined;
     const changeTokenBudget = typeof contextBudget.tokenBudget === 'number'
       ? contextBudget.tokenBudget
@@ -4368,7 +4507,7 @@ export class V2QueryService {
       evidenceHandles,
       testsLikelyRelevant: packedTestsLikelyRelevant,
       commands,
-      taskOracle: packedTaskOracle,
+      taskOracle: packedTaskOracleForResult,
       patchImpact: packedPatchImpact,
       fieldImpact: packedFieldImpact,
       calculationImpact,
@@ -4411,7 +4550,7 @@ export class V2QueryService {
         ? taskOracle.expectedVerification
         : { commands, targetedTestFiles: stringArray(validation.targetedTestFiles) },
       commands,
-      taskOracle: packedTaskOracle,
+      taskOracle: packedTaskOracleForResult,
       patchImpact: packedPatchImpact,
       fieldImpact: packedFieldImpact,
       calculationImpact,
@@ -8407,40 +8546,6 @@ interface StaleCallerGroup {
   callers: Array<Record<string, unknown>>;
 }
 
-interface LongMethodCandidate {
-  symbol: string;
-  simpleName: string;
-  file: string;
-  line: number;
-  endLine: number;
-  lineCount: number;
-}
-
-interface TooManyParamsCandidate {
-  symbol: string;
-  simpleName: string;
-  file: string;
-  line: number;
-  paramCount: number;
-}
-
-interface DeadCodeCandidate {
-  symbol: string;
-  simpleName: string;
-  file: string;
-  line: number;
-}
-
-interface ChangedSymbolFindings {
-  staleCallers: StaleCallerGroup[];
-  longMethods: LongMethodCandidate[];
-  tooManyParams: TooManyParamsCandidate[];
-  deadCode: DeadCodeCandidate[];
-}
-
-const LONG_METHOD_LINE_THRESHOLD = 80;
-const TOO_MANY_PARAMS_THRESHOLD = 5;
-
 // Counts top-level parameters in a signature string by splitting on commas
 // that are not nested inside (), [], {}, or <>. Returns undefined (skip,
 // don't guess) when the parameter list isn't balanced in this string — the
@@ -8656,9 +8761,6 @@ function reviewFindingsForPatch(input: {
   testsCount: number;
   summary: Record<string, unknown>;
   staleCallers?: StaleCallerGroup[];
-  longMethods?: LongMethodCandidate[];
-  tooManyParams?: TooManyParamsCandidate[];
-  deadCode?: DeadCodeCandidate[];
 }): ReviewFinding[] {
   const findings: ReviewFinding[] = [];
   const add = (finding: ReviewFinding) => {
@@ -8679,51 +8781,6 @@ function reviewFindingsForPatch(input: {
       suggestedCheck: 'Confirm each caller still compiles/behaves correctly against the new implementation, or update them in this patch.',
       suggestedFix: 'Update the callers listed in evidence to match the new behavior/signature, or add an overload/adapter that preserves the old contract.',
       confidence: 0.74,
-    });
-  }
-
-  for (const candidate of input.longMethods ?? []) {
-    add({
-      id: `review-long-method-${candidate.symbol}`,
-      priority: 'P2',
-      category: 'correctness',
-      title: `${candidate.simpleName} is ${candidate.lineCount} lines long`,
-      file: candidate.file,
-      line: candidate.line,
-      why: `Methods/functions over ${LONG_METHOD_LINE_THRESHOLD} lines are harder to review, test, and change safely; ${candidate.simpleName} spans lines ${candidate.line}-${candidate.endLine}.`,
-      suggestedCheck: 'Check whether this method does one thing; look for natural extraction points (validation, mapping, side effects).',
-      suggestedFix: 'Extract cohesive blocks (validation, mapping, I/O) into smaller named methods.',
-      confidence: 0.55,
-    });
-  }
-
-  for (const candidate of input.tooManyParams ?? []) {
-    add({
-      id: `review-too-many-params-${candidate.symbol}`,
-      priority: 'P2',
-      category: 'correctness',
-      title: `${candidate.simpleName} takes ${candidate.paramCount} parameters`,
-      file: candidate.file,
-      line: candidate.line,
-      why: `More than ${TOO_MANY_PARAMS_THRESHOLD} parameters is a common signal of a missing parameter object or a method doing more than one job.`,
-      suggestedCheck: 'Check whether related parameters belong on a single request/options object.',
-      suggestedFix: 'Group related parameters into a request/options object or split the method by responsibility.',
-      confidence: 0.5,
-    });
-  }
-
-  for (const candidate of input.deadCode ?? []) {
-    add({
-      id: `review-dead-code-${candidate.symbol}`,
-      priority: 'P2',
-      category: 'correctness',
-      title: `${candidate.simpleName} has no callers in the indexed graph`,
-      file: candidate.file,
-      line: candidate.line,
-      why: 'This private method/function has zero call sites in the call graph and is not annotated or framework-attached, which usually means it is unused.',
-      suggestedCheck: 'Confirm it is truly unused (not called via reflection, generics, or a language feature the indexer cannot resolve) before removing it.',
-      suggestedFix: 'Remove the unused method, or wire it in if it was meant to be called.',
-      confidence: 0.45,
     });
   }
 
@@ -8895,6 +8952,130 @@ function reviewFindingsForPatch(input: {
   }
 
   return findings.sort((a, b) => reviewPriorityRank(a.priority) - reviewPriorityRank(b.priority) || b.confidence - a.confidence);
+}
+
+// Design-quality (Clean Code / code-smell) thresholds for designQualityFindingsForPatch.
+// Deliberately generous: these are supplementary signals, not hard blockers.
+const LONG_METHOD_LINE_THRESHOLD = 60;
+const TOO_MANY_PARAMS_THRESHOLD = 5;
+const LARGE_CLASS_METHOD_THRESHOLD = 25;
+const FEATURE_ENVY_MIN_FOREIGN_CALLS = 3;
+const FEATURE_ENVY_FOREIGN_RATIO = 2;
+const DUPLICATE_MIN_SHARED_LINES = 4;
+const DUPLICATE_MIN_OVERLAP_RATIO = 0.6;
+
+function symbolLineCount(symbol: SymbolRow): number | undefined {
+  if (symbol.end_line === undefined || symbol.end_line === null) return undefined;
+  return symbol.end_line - symbol.line + 1;
+}
+
+// parameter_types_json is only populated by the Java extractor today; fall
+// back to counting top-level commas in the signature (works for TS/JS/Python
+// too) when it's empty. Returns undefined (skip, don't guess) when the
+// signature's parameter list is truncated (multi-line declarations only keep
+// their first source line).
+function symbolParameterCount(symbol: SymbolRow): number | undefined {
+  const params = parseJson<unknown[]>(symbol.parameter_types_json, []);
+  const jsonCount = Array.isArray(params) ? params.length : 0;
+  return jsonCount > 0 ? jsonCount : countSignatureParams(symbol.signature);
+}
+
+// Same Owner.method(...) convention as isLibraryCallOwner/researchEdgeNeedles:
+// owner is the second-to-last dot/hash-separated segment.
+function symbolOwnerFromFqName(fqName: string): string {
+  const parts = fqName.split(/[.#]/g).filter(Boolean);
+  return parts.length >= 2 ? parts[parts.length - 2] ?? '' : '';
+}
+
+function callEdgeOwner(edge: string): string {
+  const withoutParams = edge.replace(/\([^)]*\)$/, '');
+  const parts = withoutParams.split(/[.#]/g).filter(Boolean);
+  return parts.length >= 2 ? parts[parts.length - 2] ?? '' : '';
+}
+
+const DEAD_CODE_EXEMPT_ANNOTATIONS = new Set([
+  'Test', 'BeforeEach', 'AfterEach', 'BeforeAll', 'AfterAll', 'Override',
+  'GetMapping', 'PostMapping', 'PutMapping', 'PatchMapping', 'DeleteMapping', 'RequestMapping',
+  'Bean', 'EventListener', 'Scheduled', 'PostConstruct', 'PreDestroy',
+]);
+
+/**
+ * Whether a zero-caller reading is expected rather than a dead-code smell.
+ * Framework-invoked methods (endpoint handlers, test methods, lifecycle hooks,
+ * DI-managed beans) are called through reflection/the framework, never through
+ * a traceable call edge — flagging those would be pure noise. Restricted to
+ * symbols unreachable from outside this codebase — `private` (class members)
+ * and `internal` (package-private Java, non-exported TS/JS/Python module
+ * functions): a public/protected method with zero indexed callers is
+ * routinely part of a public API surface used by consumers outside this
+ * codebase, which is a far weaker signal and would flood reviews with noise.
+ */
+function isDeadCodeExempt(symbol: SymbolRow): boolean {
+  if (symbol.visibility !== 'private' && symbol.visibility !== 'internal') return true;
+  if (symbol.framework_role) return true;
+  const annotations = parseJson<string[]>(symbol.annotations_json, []);
+  if (annotations.some(a => DEAD_CODE_EXEMPT_ANNOTATIONS.has(a))) return true;
+  const simple = symbol.simple_name.toLowerCase();
+  // Implicitly invoked by the language/collections runtime, not by a traceable call.
+  if (simple === 'equals' || simple === 'hashcode' || simple === 'tostring' || simple === 'compareto' || simple === 'main') return true;
+  return false;
+}
+
+// Lines too short/generic to count as duplication signal on their own (braces,
+// blank, single-word closers) — otherwise every hunk "shares" these trivially.
+function isTrivialDuplicateLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (trimmed.length < 8) return true;
+  if (/^[{}();]+$/.test(trimmed)) return true;
+  return false;
+}
+
+function normalizedAddedLines(hunk: PatchHunk): Set<string> {
+  return new Set(hunk.addedLines
+    .map(line => line.text.trim())
+    .filter(text => !isTrivialDuplicateLine(text)));
+}
+
+/**
+ * Copy-paste signal WITHIN the diff being reviewed: two different hunks whose
+ * added lines substantially overlap. Deliberately scoped to the diff itself
+ * (not a full-corpus clone search across the whole indexed codebase, which
+ * would need a fingerprinting/similarity index built at indexing time) —
+ * this is the cheap, high-signal case a reviewer would actually flag: "you
+ * pasted this block twice instead of extracting a helper."
+ */
+function detectDuplicateHunks(hunks: PatchHunk[]): ReviewFinding[] {
+  const findings: ReviewFinding[] = [];
+  const normalized = hunks.map(hunk => ({ hunk, lines: normalizedAddedLines(hunk) }));
+  for (let i = 0; i < normalized.length; i++) {
+    for (let j = i + 1; j < normalized.length; j++) {
+      const a = normalized[i]!;
+      const b = normalized[j]!;
+      if (a.lines.size === 0 || b.lines.size === 0) continue;
+      let shared = 0;
+      for (const line of a.lines) if (b.lines.has(line)) shared++;
+      if (shared < DUPLICATE_MIN_SHARED_LINES) continue;
+      const smaller = Math.min(a.lines.size, b.lines.size);
+      const ratio = shared / smaller;
+      if (ratio < DUPLICATE_MIN_OVERLAP_RATIO) continue;
+      findings.push({
+        id: `review-duplicated-code-${a.hunk.file}-${a.hunk.newStart}-${b.hunk.file}-${b.hunk.newStart}`,
+        priority: 'P2',
+        category: 'design-quality',
+        file: a.hunk.file,
+        line: a.hunk.newStart,
+        title: `Possible duplicated code: ${path.posix.basename(a.hunk.file)}:${a.hunk.newStart} and ${path.posix.basename(b.hunk.file)}:${b.hunk.newStart}`,
+        why: `${shared} near-identical added lines (${Math.round(ratio * 100)}% overlap) appear in both hunks — likely copy-pasted rather than extracted into a shared function.`,
+        evidence: [
+          { file: a.hunk.file, line: a.hunk.newStart },
+          { file: b.hunk.file, line: b.hunk.newStart },
+        ],
+        suggestedCheck: 'Consider extracting the shared logic into one reusable function instead of duplicating it.',
+        confidence: 0.5,
+      });
+    }
+  }
+  return findings;
 }
 
 function reviewFocusForPatch(
@@ -9132,7 +9313,9 @@ function reviewSeverityForPriority(priority: ReviewFinding['priority']): 'blocke
 }
 
 function reviewFindingCategory(finding: ReviewFinding): string {
+  if (finding.category === 'design-quality') return 'design-quality';
   const text = `${finding.id} ${finding.title}`.toLowerCase();
+  if (/^review-(long-method|long-param-list|dead-code|feature-envy|large-class|duplicated-code)-/.test(finding.id)) return 'design-quality';
   if (/(secret|sql|command|security|auth|credential|token)/.test(text)) return 'security';
   if (/(endpoint|api|contract|public)/.test(text)) return 'api-contract';
   if (/(test|validation|assertion)/.test(text)) return 'tests';
@@ -9794,13 +9977,19 @@ function groupFieldUsages(usages: Array<Record<string, unknown>>, keyName: strin
     bucket.push(usage);
     groups.set(key, bucket);
   }
+  // No nested `usages` here on purpose: this is 2 levels deep inside
+  // fieldImpact.groups, and compactReviewObject's depth budget always runs out
+  // before reaching these row objects — they degraded to a repeated, content-free
+  // "[object omitted]" placeholder string per row (measured: ~2.3KB of pure
+  // waste across byAccess/byMethod/byClass in one packet). key/count/accessKinds/
+  // files already summarize each group; the raw rows are available at the
+  // top-level fieldImpact.usages sample.
   return [...groups.entries()]
     .map(([key, rows]) => ({
       key,
       count: rows.length,
       accessKinds: [...new Set(rows.map(row => String(row.fieldAccess ?? 'unknown')))],
       files: rankFiles(rows.map(row => String(row.file ?? ''))).slice(0, 8),
-      usages: rows.slice(0, 8),
     }))
     .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
 }
@@ -9901,9 +10090,20 @@ function kindFilterFor(kind: string): { sql: string; params: unknown[] } {
 
 
 function fieldImpactSeeds(args: Record<string, unknown>): string[] {
-  const values = [
+  // Explicit identifiers the caller named directly — never stop-word filtered,
+  // since a user-supplied `symbols`/`symbol` value is intentional even if it
+  // happens to collide with a common English word.
+  const explicitValues = [
     ...stringArray(args.symbols),
     stringOrUndefined(args.symbol),
+  ].filter((value): value is string => Boolean(value));
+  // Natural-language sources (task/target text, diff). A word here is only a
+  // hint, not a request — and fieldDefinitionsForSeeds matches seeds as a bare
+  // SQL substring (`simple_name LIKE '%seed%'`), so a common English word like
+  // "fix" (from "Fix a bug in...") false-positive-matches any field whose name
+  // merely CONTAINS it (suffix, objectPrefix, ATTACHMENT_IMAGE_PATH_PREFIX) —
+  // filter these the same way researchSeedTerms already does.
+  const naturalLanguageValues = [
     stringOrUndefined(args.target),
     stringOrUndefined(args.task),
     stringOrUndefined(args.diff),
@@ -9915,17 +10115,41 @@ function fieldImpactSeeds(args: Record<string, unknown>): string[] {
     'byte', 'short', 'if', 'else', 'for', 'while', 'switch', 'case', 'try', 'catch',
     'true', 'false', 'null', 'this', 'super', 'package', 'import',
   ]);
-  for (const value of values) {
+  const extractSeeds = (value: string, filterStopWords: boolean) => {
     for (const match of value.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)?\b/g)) {
       const token = match[0] ?? '';
       const simple = token.split('.').pop() ?? token;
       if (simple.length < 2 || keyword.has(simple)) continue;
+      // A hand-curated stop-word list can never enumerate every short, generic
+      // English word ("so", "it", "at", "is"...) that would false-positive-match
+      // as a bare SQL substring, so also floor the length for NL-derived seeds —
+      // a real field/domain identifier worth searching for is essentially never
+      // 2-3 chars. Explicit args.symbols/args.symbol values are exempt (user intent).
+      if (filterStopWords && !token.includes('.') && (simple.length < 4 || RESEARCH_STOP_WORDS.has(simple.toLowerCase()))) continue;
       if (/^[A-Z0-9_]+$/.test(simple) && !token.includes('.')) continue;
       seeds.push(token);
       if (token.includes('.')) seeds.push(simple);
     }
-  }
+  };
+  for (const value of explicitValues) extractSeeds(value, false);
+  for (const value of naturalLanguageValues) extractSeeds(value, true);
   return uniqueStrings(seeds).slice(0, 80);
+}
+
+// Mirrors the file_role CASE order in fieldDefinitionsForSeeds' SQL so the
+// cross-seed JS-side sort and the per-seed SQL ORDER BY agree.
+function fieldImpactRoleRank(role: string): number {
+  switch (role) {
+    case 'main_source': return 0;
+    case 'test_source': return 1;
+    case 'mock_source': return 2;
+    case 'build_config': return 3;
+    case 'resource_config': return 4;
+    case 'generated': return 5;
+    case 'external_stub': return 6;
+    case 'vendored': return 7;
+    default: return 8;
+  }
 }
 
 function fieldImpactConfidence(definitionCount: number, usageCount: number): number {

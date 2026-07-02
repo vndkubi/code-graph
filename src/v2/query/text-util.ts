@@ -114,6 +114,15 @@ export const RESEARCH_STOP_WORDS = new Set([
   'which',
   'that',
   'handled',
+  // 'fix'/'bug' are the same framing-verb problem, but with a sharper failure
+  // mode when they reach fieldImpactSeeds (get_change_pack): that path matches
+  // seeds as a bare SQL substring (`simple_name LIKE '%fix%'`), so the word
+  // "fix" in an ordinary "Fix a bug in ..." debug task matched every field
+  // whose name merely CONTAINS "fix" as a substring — suffix, objectPrefix,
+  // ATTACHMENT_IMAGE_PATH_PREFIX, extraPrefixesMap.$body_ — none related to the
+  // actual bug, at ~40% of the packet's size for one unrelated task.
+  'fix',
+  'bug',
 ]);
 
 export const FILE_SEARCH_STOP_WORDS = new Set([
