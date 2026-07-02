@@ -59,11 +59,11 @@ npm ci
 npm run build
 ```
 
-The package is prepared for npm distribution. Until a release is published, use the local checkout commands above. After publication, the intended entrypoint is:
+Install from npm (published as `@vndkubi/codegraph-mcp`):
 
 ```powershell
-npx mcp-code-graph@latest setup --root "<repo>"
-npx mcp-code-graph@latest mcp --root "<repo>"
+npx @vndkubi/codegraph-mcp@latest setup --root "<repo>"
+npx @vndkubi/codegraph-mcp@latest mcp --root "<repo>"
 ```
 
 Set up a workspace:
