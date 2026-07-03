@@ -4920,7 +4920,7 @@ class Worker:
     }));
   });
 
-  it('writes parse context and empty-safe fact shards when result spooling is disabled', () => {
+  it('writes parse context and empty-safe fact shards when result spooling is disabled', async () => {
     const repo = tempDir('codegraph-shard-files-');
     writeFile(repo, 'src/main/java/com/example/One.java', `package com.example;
 
@@ -4953,7 +4953,7 @@ public class Two {
       },
     ];
 
-    const spool = parseFilesBatchToSpool(workItems, {
+    const spool = await parseFilesBatchToSpool(workItems, {
       workers: 1,
       spoolResults: false,
       factShard: {

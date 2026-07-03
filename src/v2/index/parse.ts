@@ -22,6 +22,38 @@ import {
 
 const analyzer = new TreeSitterAnalyzer();
 
+/** Exit code a parse worker uses to say "retiring healthy, spawn my replacement". */
+export const PARSE_WORKER_RECYCLE_EXIT_CODE = 86;
+
+// Atomics.waitAsync exists in Node >=16 but our tsconfig lib predates its
+// typings (ES2024). Runtime feature, compile-time shim.
+const atomicsWaitAsync = (Atomics as unknown as {
+  waitAsync(view: Int32Array, index: number, value: number, timeout?: number):
+    { async: false; value: 'not-equal' | 'timed-out' } | { async: true; value: Promise<'ok' | 'timed-out'> };
+}).waitAsync;
+
+/**
+ * Files a worker may parse before it retires. The node tree-sitter binding
+ * leaks native memory per visited node (~0.4MB per hadoop-sized Java file,
+ * measured; gc() cannot reclaim it, isolate teardown can). 400 files bounds a
+ * worker's footprint to roughly 200MB while keeping respawn overhead trivial.
+ */
+export const PARSE_WORKER_RECYCLE_FILES = (() => {
+  const parsed = Number(process.env.CODEGRAPH_PARSE_WORKER_RECYCLE_FILES);
+  return Number.isFinite(parsed) && parsed >= 25 ? Math.floor(parsed) : 400;
+})();
+
+/**
+ * Source-byte budget before a worker retires. The leak scales with bytes
+ * visited (~45x source size), not file count — and the dynamic queue hands
+ * out the LARGEST files first, so a count-only threshold lets a worker chew
+ * through gigabytes of leak on a big repo before it ever hits 400 files.
+ */
+export const PARSE_WORKER_RECYCLE_BYTES = (() => {
+  const parsed = Number(process.env.CODEGRAPH_PARSE_WORKER_RECYCLE_BYTES);
+  return Number.isFinite(parsed) && parsed >= 1024 * 1024 ? Math.floor(parsed) : 16 * 1024 * 1024;
+})();
+
 export interface ParseWorkItem {
   key: string;
   absPath: string;
@@ -234,9 +266,9 @@ function countBraceDelta(line: string): number {
   return (withoutStrings.match(/{/g)?.length ?? 0) - (withoutStrings.match(/}/g)?.length ?? 0);
 }
 
-export function parseFilesBatch(workItems: ParseWorkItem[], options: ParseBatchOptions = {}): ParseWorkResult[] {
+export async function parseFilesBatch(workItems: ParseWorkItem[], options: ParseBatchOptions = {}): Promise<ParseWorkResult[]> {
   if (workItems.length === 0) return [];
-  const spool = parseFilesBatchToSpool(workItems, options);
+  const spool = await parseFilesBatchToSpool(workItems, options);
   try {
     const results: ParseWorkResult[] = [];
     for (const shardPath of spool.shardPaths) {
@@ -251,7 +283,7 @@ export function parseFilesBatch(workItems: ParseWorkItem[], options: ParseBatchO
   }
 }
 
-export function parseFilesBatchToSpool(workItems: ParseWorkItem[], options: ParseBatchOptions = {}): ParseSpool {
+export async function parseFilesBatchToSpool(workItems: ParseWorkItem[], options: ParseBatchOptions = {}): Promise<ParseSpool> {
   const start = Date.now();
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-parse-'));
   const close = () => fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -318,31 +350,30 @@ export function parseFilesBatchToSpool(workItems: ParseWorkItem[], options: Pars
     const factShardPaths: FactShardPaths[] = [];
     const factStatsPaths: string[] = [];
     const workerShardFiles: ParseWorkerShardFiles[] = [];
-    for (let index = 0; index < activeWorkerCount; index++) {
-      const outputPath = path.join(tmpDir, `${index}.json`);
-      const contextPath = path.join(tmpDir, `${index}.context.json`);
-      const factPaths = options.factShard ? factShardPathsForWorker(tmpDir, index) : undefined;
-      const factStatsPath = options.factShard ? path.join(tmpDir, `${index}.fact.stats.json`) : undefined;
+    // Every worker generation gets its own shard id (and thus its own shard
+    // files): a recycled worker's replacement must never truncate the files
+    // its predecessor already wrote.
+    let shardSeq = 0;
+
+    const spawnParseWorker = (slot: number): void => {
+      const shardId = shardSeq++;
+      const outputPath = path.join(tmpDir, `${shardId}.json`);
+      const contextPath = path.join(tmpDir, `${shardId}.context.json`);
+      const errorPath = path.join(tmpDir, `${shardId}.error.json`);
+      const factPaths = options.factShard ? factShardPathsForWorker(tmpDir, shardId) : undefined;
+      const factStatsPath = options.factShard ? path.join(tmpDir, `${shardId}.fact.stats.json`) : undefined;
       if (spoolResults) shardPaths.push(outputPath);
       contextShardPaths.push(contextPath);
       if (factPaths) factShardPaths.push(factPaths);
       if (factStatsPath) factStatsPaths.push(factStatsPath);
       workerShardFiles.push({
-        index,
+        index: shardId,
         outputPath: spoolResults ? outputPath : undefined,
         contextPath,
         factPaths,
         factStatsPath,
       });
-    }
-
-    for (let index = 0; index < activeWorkerCount; index++) {
-      const outputPath = path.join(tmpDir, `${index}.json`);
-      const contextPath = path.join(tmpDir, `${index}.context.json`);
-      const errorPath = path.join(tmpDir, `${index}.error.json`);
-      const factPaths = options.factShard ? factShardPathsForWorker(tmpDir, index) : undefined;
-      const factStatsPath = options.factShard ? path.join(tmpDir, `${index}.fact.stats.json`) : undefined;
-      const tasks = workerTaskGroups[index] ?? [];
+      const tasks = workerTaskGroups[slot] ?? [];
       const worker = new Worker(workerRuntime.workerPath, {
         execArgv: workerRuntime.execArgv,
         workerData: {
@@ -355,15 +386,34 @@ export function parseFilesBatchToSpool(workItems: ParseWorkItem[], options: Pars
           factShardPaths: factPaths,
           factStatsPath,
           shared,
+          // The tree-sitter binding leaks native memory per visited node
+          // (measured ~0.4MB/file on hadoop-sized Java, unrecoverable by GC —
+          // only isolate teardown frees it). Workers therefore retire after a
+          // bounded number of files and a fresh replacement takes over the
+          // shared queue. Only meaningful for the dynamic scheduler.
+          recycleAfterFiles: useDynamicQueue ? PARSE_WORKER_RECYCLE_FILES : undefined,
+          recycleAfterBytes: useDynamicQueue ? PARSE_WORKER_RECYCLE_BYTES : undefined,
         },
       });
       worker.once('error', error => {
-        markWorkerExitedEarly(index, `worker ${index} error: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+        markWorkerExitedEarly(slot, `worker ${slot} error: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
       });
       worker.once('exit', code => {
-        if (code !== 0) markWorkerExitedEarly(index, `worker ${index} exited with code ${code}`);
+        if (code === PARSE_WORKER_RECYCLE_EXIT_CODE) {
+          try {
+            spawnParseWorker(slot);
+          } catch (error) {
+            markWorkerExitedEarly(slot, `worker ${slot} recycle respawn failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          return;
+        }
+        if (code !== 0) markWorkerExitedEarly(slot, `worker ${slot} exited with code ${code}`);
       });
       workers.push(worker);
+    };
+
+    for (let slot = 0; slot < activeWorkerCount; slot++) {
+      spawnParseWorker(slot);
     }
 
     const deadline = Date.now() + Math.max(30_000, workItems.length * 15_000);
@@ -383,7 +433,16 @@ export function parseFilesBatchToSpool(workItems: ParseWorkItem[], options: Pars
           elapsedMs: now - start,
         });
       }
-      Atomics.wait(counter, 1, completed, 1000);
+      // MUST yield to the event loop while waiting: worker 'exit' events carry
+      // the recycle signal, and a synchronous Atomics.wait here starves them —
+      // retired workers never get replacements and the batch deadlocks until
+      // the deadline (observed as a frozen 3-hour hadoop index).
+      const waitResult = atomicsWaitAsync(counter, 1, completed, 1000);
+      if (waitResult.async) {
+        await waitResult.value;
+      } else {
+        await new Promise(resolve => setImmediate(resolve));
+      }
     }
 
     for (let index = 0; index < activeWorkerCount; index++) {

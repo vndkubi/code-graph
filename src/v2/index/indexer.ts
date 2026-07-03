@@ -1374,7 +1374,7 @@ export class V2Indexer {
       details: { parseCacheHits, queuedForParse: workItems.length, phaseElapsedMs: Date.now() - start },
     });
 
-    const parsed = providerSet.parseFiles(workItems, {
+    const parsed = await providerSet.parseFiles(workItems, {
       workers: requestedWorkers,
       progress: event => progress?.({
         phase: 'parse',
@@ -1482,7 +1482,7 @@ export class V2Indexer {
       details: { parseCacheHits, queuedForParse: workItems.length, phaseElapsedMs: Date.now() - start, streaming: true },
     });
 
-    const spool = parseFilesBatchToSpool(workItems, {
+    const spool = await parseFilesBatchToSpool(workItems, {
       workers: requestedWorkers,
       progress: event => progress?.({
         phase: 'parse',
@@ -1562,7 +1562,7 @@ export class V2Indexer {
       details: { parseCacheHits, queuedForParse: workItems.length, phaseElapsedMs: Date.now() - start, sharded: true },
     });
 
-    const spool = parseFilesBatchToSpool(workItems, {
+    const spool = await parseFilesBatchToSpool(workItems, {
       workers: requestedWorkers,
       spoolResults: false,
       factShard: {
@@ -2094,11 +2094,39 @@ export class V2Indexer {
           });
         }
 
-        await this.resolveUniqueNameCallEdges(args.snapshotId);
-        if (!args.skipSnapshotStats) {
-          await this.refreshSnapshotStats(args.snapshotId);
-        }
-        await this.rebuildSearchIndexForSnapshot(args.snapshotId);
+      });
+
+      await tx();
+
+      // The steps below deliberately run OUTSIDE the bulk-load transaction.
+      // Inside it they scan a multi-GB uncommitted WAL through a small page
+      // cache — measured at 76 minutes on hadoop versus ~30 seconds against
+      // the committed database. The snapshot only becomes visible when the
+      // final small transaction flips status='ready', so intermediate commits
+      // are invisible to readers; a crash leaves an 'indexing' snapshot that
+      // pruning cleans up.
+      const resolveStart = Date.now();
+      await this.resolveUniqueNameCallEdges(args.snapshotId);
+      if (!args.skipSnapshotStats) {
+        await this.refreshSnapshotStats(args.snapshotId);
+      }
+      args.progress?.({
+        phase: 'edges',
+        status: 'complete',
+        message: 'unique-name call edges resolved, snapshot stats refreshed',
+        elapsedMs: Date.now() - args.start,
+        details: { phaseElapsedMs: Date.now() - resolveStart, sharded: true },
+      });
+      const searchIndexStart = Date.now();
+      await this.rebuildSearchIndexForSnapshot(args.snapshotId);
+      args.progress?.({
+        phase: 'write',
+        status: 'complete',
+        message: 'search index rebuilt',
+        elapsedMs: Date.now() - args.start,
+        details: { phaseElapsedMs: Date.now() - searchIndexStart, sharded: true },
+      });
+      const publish = this.db.transaction(async () => {
         await this.db.prepare(`
           UPDATE snapshots
           SET status = 'ready',
@@ -2114,8 +2142,7 @@ export class V2Indexer {
         `).run(args.snapshotId, args.git.headCommit, args.now, args.workspaceId);
         await this.pruneOldSnapshots(args.workspaceId, args.snapshotId);
       });
-
-      await tx();
+      await publish();
     } finally {
       fs.rmSync(callShardDir, { recursive: true, force: true });
     }

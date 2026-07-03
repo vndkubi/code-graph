@@ -89,7 +89,24 @@ const DEFAULT_SKIP_DIRS = new Set([
   'obj',
   '.gradle',
   '__pycache__',
+  'vendor',
+  'third_party',
+  'third-party',
 ]);
+
+// Vendored build artifacts checked into source trees (d3.min.js and friends).
+// Parsing one of these floods the graph with thousands of junk symbols and
+// call edges nobody will ever edit or review.
+const MINIFIED_ARTIFACT_FILE = /(\.min\.(js|mjs|cjs|css)|\.bundle\.(js|mjs)|-min\.js)(\.map)?$/i;
+
+const GENERATED_PARSE_MAX_BYTES = (() => {
+  const parsed = Number(process.env.CODEGRAPH_GENERATED_PARSE_MAX_BYTES);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 256 * 1024;
+})();
+
+function shouldSkipManifestFileName(name: string): boolean {
+  return MINIFIED_ARTIFACT_FILE.test(name);
+}
 
 const EMBEDDED_REPO_SEARCH_DEPTH = 4;
 const EMBEDDED_REPO_SEARCH_ENTRIES = 2000;
@@ -220,6 +237,7 @@ function walk(
     }
 
     if (!entry.isFile()) continue;
+    if (shouldSkipManifestFileName(entry.name)) continue;
 
     let stat: fs.Stats;
     try {
@@ -313,7 +331,11 @@ function manifestFileForPath(
     blobHash,
     language: classification.language,
     role: classification.role,
-    parseable: classification.parseable,
+    // Large machine-generated sources (protobuf Java runs to 600KB+) cost
+    // real parse time and flood the graph with symbols nobody edits. Keep the
+    // file row (role/counts stay correct) but skip parsing above the cap.
+    parseable: classification.parseable
+      && !(classification.role === 'generated' && stat.size > GENERATED_PARSE_MAX_BYTES),
   };
 }
 
@@ -499,7 +521,9 @@ function shouldSkipDirByDefault(name: string): boolean {
 }
 
 function shouldSkipPathByDefault(relPath: string): boolean {
-  return normalizePath(relPath).split('/').some(part => shouldSkipDirByDefault(part));
+  const normalized = normalizePath(relPath);
+  if (shouldSkipManifestFileName(path.posix.basename(normalized))) return true;
+  return normalized.split('/').some(part => shouldSkipDirByDefault(part));
 }
 
 function normalizeRepoDir(value: string): string {

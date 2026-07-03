@@ -323,8 +323,10 @@ function configurePragmas(db: DatabaseType, walMode: boolean): void {
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
   db.pragma('temp_store = MEMORY');
-  db.pragma('cache_size = -64000');
-  db.pragma('mmap_size = 268435456');
+  // Large-repo graphs run to gigabytes; a too-small page cache turns the
+  // bulk-load phases into WAL-scan thrash. cache_size is negative KiB.
+  db.pragma(`cache_size = -${boundedEnvInt(process.env.CODEGRAPH_SQLITE_CACHE_KIB, 262_144, 16_000, 2_097_152)}`);
+  db.pragma(`mmap_size = ${boundedEnvInt(process.env.CODEGRAPH_SQLITE_MMAP_BYTES, 1_073_741_824, 268_435_456, 8_589_934_592)}`);
 }
 
 function migrate(db: DatabaseType): void {

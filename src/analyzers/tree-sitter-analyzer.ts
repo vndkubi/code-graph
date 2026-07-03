@@ -117,6 +117,45 @@ function getGrammar(lang: SupportedLanguage): unknown | undefined {
 /**
  * Tree-sitter based code analyzer supporting Java, TypeScript, Python.
  */
+// Method/constructor bodies cannot contain class-level field declarations,
+// imports, or endpoint annotations. Pruning them turns the Java pre-walks
+// from whole-tree traversals into declaration-skeleton scans — significant
+// because every node access crosses the JS/native tree-sitter boundary and
+// unmarshalling dominates parse cost (measured ~66% of a large-file parse).
+const JAVA_BODY_PRUNE_TYPES = new Set(['block', 'constructor_body', 'lambda_expression']);
+
+// The external-Java lookup caches grow with every distinct imported class a
+// worker encounters. Unbounded, a large monorepo (hadoop: 12k+ java files)
+// drags most of the repo's type members into every parse worker — measured as
+// multi-GB RSS growth during the parse phase. FIFO eviction keeps the hit
+// rate for import clusters while bounding worst-case memory.
+const EXTERNAL_JAVA_CACHE_MAX_ENTRIES = 512;
+
+// Node types the call/reference extractor actually acts on. The cursor walk
+// materializes a SyntaxNode ONLY for these; everything else advances via
+// cursor.nodeType (a plain string) — no JS/native node unmarshalling, which
+// the profiler showed was ~half of total parse time.
+const CALL_EXTRACTION_TYPES = new Set([
+  'field_access', 'identifier', 'member_expression', 'attribute',
+  'method_declaration', 'constructor_declaration', 'lambda_expression',
+  'arrow_function', 'function_expression', 'lambda',
+  'object_creation_expression', 'method_invocation', 'method_reference',
+  'call_expression', 'call',
+]);
+
+const LOCAL_VARIABLE_TYPES = new Set([
+  'enhanced_for_statement', 'catch_formal_parameter', 'type_pattern',
+  'instanceof_expression', 'resource', 'local_variable_declaration',
+]);
+
+function boundedCacheSet<K, V>(cache: Map<K, V>, key: K, value: V): void {
+  if (cache.size >= EXTERNAL_JAVA_CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, value);
+}
+
 export class TreeSitterAnalyzer implements CodeAnalyzer {
   readonly supportedExtensions = ['.java', '.ts', '.tsx', '.js', '.jsx', '.py'];
   private parser = new Parser();
@@ -795,7 +834,9 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           }
         }
       }
-      for (const child of node.children) visit(child);
+      for (const child of node.children) {
+        if (!JAVA_BODY_PRUNE_TYPES.has(child.type)) visit(child);
+      }
     };
     visit(root);
 
@@ -855,22 +896,23 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           }
         }
       }
-      for (const child of node.children) visit(child);
+      for (const child of node.children) {
+        if (!JAVA_BODY_PRUNE_TYPES.has(child.type)) visit(child);
+      }
     };
     visit(root);
     return classNames;
   }
 
   private collectJavaImportPaths(root: SyntaxNode): string[] {
+    // Java import declarations are direct children of the compilation unit —
+    // no recursion needed, and each avoided node access saves a native call.
     const imports: string[] = [];
-    const visit = (node: SyntaxNode): void => {
-      if (node.type === 'import_declaration') {
-        const match = node.text.match(/^import\s+(?:static\s+)?([\w.*]+)\s*;/);
-        if (match?.[1]) imports.push(match[1]);
-      }
-      for (const child of node.children) visit(child);
-    };
-    visit(root);
+    for (const child of root.children) {
+      if (child.type !== 'import_declaration') continue;
+      const match = child.text.match(/^import\s+(?:static\s+)?([\w.*]+)\s*;/);
+      if (match?.[1]) imports.push(match[1]);
+    }
     return imports;
   }
 
@@ -953,7 +995,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       constants = undefined;
     }
 
-    this.externalJavaConstantCache.set(absolute, constants);
+    boundedCacheSet(this.externalJavaConstantCache, absolute, constants);
     return constants;
   }
 
@@ -973,7 +1015,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       members = undefined;
     }
 
-    this.externalJavaTypeMembersCache.set(absolute, members);
+    boundedCacheSet(this.externalJavaTypeMembersCache, absolute, members);
     return members;
   }
 
@@ -1051,7 +1093,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           if (body) visit(body);
           continue;
         }
-        visit(child);
+        if (!JAVA_BODY_PRUNE_TYPES.has(child.type)) visit(child);
       }
     };
 
@@ -1129,10 +1171,10 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       if (path.resolve(candidatePath) === path.resolve(currentFilePath)) continue;
       const members = this.readJavaTypeMembersFromFile(candidatePath);
       if (!members || !javaTypeMembersContainClass(members, className)) continue;
-      this.externalJavaClassLookupCache.set(cacheKey, members);
+      boundedCacheSet(this.externalJavaClassLookupCache, cacheKey, members);
       return pick(members);
     }
-    this.externalJavaClassLookupCache.set(cacheKey, undefined);
+    boundedCacheSet(this.externalJavaClassLookupCache, cacheKey, undefined);
     return undefined;
   }
 
@@ -1449,8 +1491,36 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
   }
 
   /** Add local Java variable declarations to the receiver type scope. */
+  /** Cursor-driven: only the six declaration node types are materialized. */
   private collectJavaLocalVariableTypes(
     node: SyntaxNode,
+    receiverTypes: Map<string, string>,
+    file: string,
+    shadowedNames?: Set<string>,
+    enclosingClass?: string,
+  ): void {
+    const cursor = node.walk();
+    const rootDepth = cursor.currentDepth;
+    if (LOCAL_VARIABLE_TYPES.has(cursor.nodeType)) {
+      this.handleLocalVariableNode(node, cursor.nodeType, receiverTypes, file, shadowedNames, enclosingClass);
+    }
+    while (true) {
+      if (!cursor.gotoFirstChild()) {
+        while (!cursor.gotoNextSibling()) {
+          if (!cursor.gotoParent()) return;
+          if (cursor.currentDepth <= rootDepth) return;
+        }
+      }
+      const nodeType = cursor.nodeType;
+      if (LOCAL_VARIABLE_TYPES.has(nodeType)) {
+        this.handleLocalVariableNode(cursor.currentNode, nodeType, receiverTypes, file, shadowedNames, enclosingClass);
+      }
+    }
+  }
+
+  private handleLocalVariableNode(
+    node: SyntaxNode,
+    nodeType: string,
     receiverTypes: Map<string, string>,
     file: string,
     shadowedNames?: Set<string>,
@@ -1470,44 +1540,47 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       }
     };
 
-    if (node.type === 'enhanced_for_statement') {
+    if (nodeType === 'enhanced_for_statement') {
       const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
       const nameNode = node.childForFieldName('name')
         ?? [...node.namedChildren].find(child => child.type === 'identifier');
       bindReceiverType(typeName, nameNode);
     }
 
-    if (node.type === 'catch_formal_parameter') {
-      const catchTypeNode = node.namedChildren.find(child => child.type === 'catch_type');
+    if (nodeType === 'catch_formal_parameter') {
+      const namedChildren = node.namedChildren;
+      const catchTypeNode = namedChildren.find(child => child.type === 'catch_type');
       const typeName = catchTypeNode
         ? this.extractJavaTypeName(catchTypeNode.namedChildren[0] ?? catchTypeNode)
         : undefined;
       const nameNode = node.childForFieldName('name')
-        ?? [...node.namedChildren].reverse().find(child => child.type === 'identifier');
+        ?? [...namedChildren].reverse().find(child => child.type === 'identifier');
       bindReceiverType(typeName, nameNode);
     }
 
-    if (node.type === 'type_pattern') {
-      const typeName = this.extractJavaTypeName(node.childForFieldName('type') ?? node.namedChildren[0]);
+    if (nodeType === 'type_pattern') {
+      const namedChildren = node.namedChildren;
+      const typeName = this.extractJavaTypeName(node.childForFieldName('type') ?? namedChildren[0]);
       const nameNode = node.childForFieldName('name')
-        ?? [...node.namedChildren].reverse().find(child => child.type === 'identifier');
+        ?? [...namedChildren].reverse().find(child => child.type === 'identifier');
       bindReceiverType(typeName, nameNode);
     }
 
-    if (node.type === 'instanceof_expression') {
-      const typeIndex = node.namedChildren.findIndex(child =>
+    if (nodeType === 'instanceof_expression') {
+      const namedChildren = node.namedChildren;
+      const typeIndex = namedChildren.findIndex(child =>
         child.type === 'type_identifier'
         || child.type === 'generic_type'
         || child.type === 'scoped_type_identifier'
       );
-      const typeNode = typeIndex >= 0 ? node.namedChildren[typeIndex] : undefined;
+      const typeNode = typeIndex >= 0 ? namedChildren[typeIndex] : undefined;
       const nameNode = typeIndex >= 0
-        ? node.namedChildren.slice(typeIndex + 1).find(child => child.type === 'identifier')
+        ? namedChildren.slice(typeIndex + 1).find(child => child.type === 'identifier')
         : undefined;
       bindReceiverType(this.extractJavaTypeName(typeNode), nameNode);
     }
 
-    if (node.type === 'resource') {
+    if (nodeType === 'resource') {
       const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
       const rawTypeName = this.extractJavaTypeText(node.childForFieldName('type'));
       const nameNode = node.childForFieldName('name');
@@ -1530,7 +1603,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       }
     }
 
-    if (node.type === 'local_variable_declaration') {
+    if (nodeType === 'local_variable_declaration') {
       const typeName = this.extractJavaTypeName(node.childForFieldName('type'));
       const rawTypeName = this.extractJavaTypeText(node.childForFieldName('type'));
       if (typeName) {
@@ -1554,9 +1627,6 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           });
         }
       }
-    }
-    for (const child of node.children) {
-      this.collectJavaLocalVariableTypes(child, receiverTypes, file, shadowedNames, enclosingClass);
     }
   }
 
@@ -2087,6 +2157,11 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     return false;
   }
 
+  /**
+   * Cursor-driven walk over `node`'s subtree. Only nodes whose type is in
+   * CALL_EXTRACTION_TYPES are materialized and dispatched; the rest of the
+   * traversal moves the native cursor without unmarshalling anything.
+   */
   private extractCallsFromNode(
     node: SyntaxNode,
     file: string,
@@ -2099,32 +2174,91 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     enclosingClass?: string,
     callbackContext?: ScriptCallbackContext,
   ): void {
-    if (this.maybeExtractJavaFieldUsageFromNode(node, file, lines, fieldUsageContext)) {
-      return;
+    // Identifiers are the most common named node; materializing each one
+    // costs an unmarshal. cursor.nodeText is a cheap string, so pre-screen:
+    // an identifier only matters when it names a known class field (field
+    // usage) or a known callable (callback reference).
+    const classFields = fieldUsageContext
+      ? this.javaFieldsByClass.get(fieldUsageContext.enclosingClass)
+      : undefined;
+    const classMethods = callbackContext && enclosingClass
+      ? callbackContext.classMethods.get(enclosingClass)
+      : undefined;
+    const identifierIsInteresting = (text: string): boolean => {
+      if (classFields?.has(text)) return true;
+      if (!callbackContext) return false;
+      return (classMethods?.has(text) ?? false)
+        || callbackContext.callableSymbols.has(text)
+        || callbackContext.importedSymbols.has(text);
+    };
+
+    const cursor = node.walk();
+    const rootDepth = cursor.currentDepth;
+    let descend = true;
+    const rootType = cursor.nodeType;
+    if (CALL_EXTRACTION_TYPES.has(rootType)) {
+      descend = !this.handleCallExtractionNode(node, rootType, file, lines, calls, references, callerName, receiverTypes, fieldUsageContext, enclosingClass, callbackContext);
+    }
+    while (true) {
+      if (!(descend && cursor.gotoFirstChild())) {
+        while (!cursor.gotoNextSibling()) {
+          if (!cursor.gotoParent()) return;
+          if (cursor.currentDepth <= rootDepth) return;
+        }
+      }
+      const nodeType = cursor.nodeType;
+      if (CALL_EXTRACTION_TYPES.has(nodeType)
+        && (nodeType !== 'identifier' || identifierIsInteresting(cursor.nodeText))) {
+        descend = !this.handleCallExtractionNode(cursor.currentNode, nodeType, file, lines, calls, references, callerName, receiverTypes, fieldUsageContext, enclosingClass, callbackContext);
+      } else {
+        descend = true;
+      }
+    }
+  }
+
+  /** @returns true when the node's subtree is fully handled (do not descend). */
+  private handleCallExtractionNode(
+    node: SyntaxNode,
+    nodeType: string,
+    file: string,
+    lines: string[],
+    calls: CallInfo[],
+    references: ReferenceInfo[],
+    callerName: string,
+    receiverTypes?: Map<string, string>,
+    fieldUsageContext?: JavaFieldUsageContext,
+    enclosingClass?: string,
+    callbackContext?: ScriptCallbackContext,
+  ): boolean {
+    if ((nodeType === 'field_access' || nodeType === 'identifier')
+      && this.maybeExtractJavaFieldUsageFromNode(node, file, lines, fieldUsageContext)) {
+      return true;
     }
 
-    const callbackReference = this.resolveCallbackReferenceCallee(node, enclosingClass, callbackContext);
-    if (callbackReference && isCallbackValuePosition(node)) {
-      calls.push({
-        caller: callerName,
-        callee: callbackReference,
-        file,
-        line: node.startPosition.row + 1,
-        confidence: 0.7,
-        resolutionKind: 'callback-reference',
-      });
-      references.push({
-        file,
-        line: node.startPosition.row + 1,
-        column: node.startPosition.column + 1,
-        kind: 'call',
-        context: this.getContextLines(lines, node.startPosition.row, 0),
-        symbolName: callbackReference,
-      });
-      return;
+    if (nodeType === 'member_expression' || nodeType === 'attribute' || nodeType === 'identifier') {
+      const callbackReference = this.resolveCallbackReferenceCallee(node, enclosingClass, callbackContext);
+      if (callbackReference && isCallbackValuePosition(node)) {
+        calls.push({
+          caller: callerName,
+          callee: callbackReference,
+          file,
+          line: node.startPosition.row + 1,
+          confidence: 0.7,
+          resolutionKind: 'callback-reference',
+        });
+        references.push({
+          file,
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column + 1,
+          kind: 'call',
+          context: this.getContextLines(lines, node.startPosition.row, 0),
+          symbolName: callbackReference,
+        });
+        return true;
+      }
     }
 
-    if (node.type === 'method_declaration' || node.type === 'constructor_declaration') {
+    if (nodeType === 'method_declaration' || nodeType === 'constructor_declaration') {
       const nameNode = node.childForFieldName('name') ?? node.children.find(child => child.type === 'identifier');
       const body = node.childForFieldName('body');
       if (nameNode && body) {
@@ -2142,11 +2276,11 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           }
           : fieldUsageContext;
         this.extractCallsFromNode(body, file, lines, calls, references, nestedCallerName, nestedReceiverTypes, nestedFieldUsageContext, enclosingClass, callbackContext);
-        return;
+        return true;
       }
     }
 
-    if (node.type === 'lambda_expression') {
+    if (nodeType === 'lambda_expression') {
       const callbackName = `${callerName}.lambda${node.startPosition.row + 1}_${node.startPosition.column + 1}`;
       const lambdaReceiverTypes = this.extendJavaLambdaReceiverTypes(node, receiverTypes, enclosingClass);
       const lambdaFieldUsageContext = fieldUsageContext
@@ -2175,10 +2309,10 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       for (const child of node.children) {
         this.extractCallsFromNode(child, file, lines, calls, references, callbackName, lambdaReceiverTypes, lambdaFieldUsageContext, enclosingClass, callbackContext);
       }
-      return;
+      return true;
     }
 
-    if ((node.type === 'arrow_function' || node.type === 'function_expression' || node.type === 'lambda') && isCallbackValuePosition(node)) {
+    if ((nodeType === 'arrow_function' || nodeType === 'function_expression' || nodeType === 'lambda') && isCallbackValuePosition(node)) {
       const callbackName = `${callerName}.lambda${node.startPosition.row + 1}_${node.startPosition.column + 1}`;
       calls.push({
         caller: callerName,
@@ -2199,11 +2333,11 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       for (const child of node.children) {
         this.extractCallsFromNode(child, file, lines, calls, references, callbackName, receiverTypes, fieldUsageContext, enclosingClass, callbackContext);
       }
-      return;
+      return true;
     }
 
     // Java: method invocation — obj.method(args)
-    if (node.type === 'object_creation_expression') {
+    if (nodeType === 'object_creation_expression') {
       const typeNode = node.childForFieldName('type')
         ?? node.namedChildren.find(child =>
           child.type === 'type_identifier'
@@ -2225,7 +2359,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       }
     }
 
-    if (node.type === 'method_invocation') {
+    if (nodeType === 'method_invocation') {
       const funcNode = node.childForFieldName('name') ?? node.children[0];
       if (funcNode) {
         let calleeName = '';
@@ -2262,7 +2396,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     }
 
     // Java: method reference — ClassName::methodName or instance::method
-    if (node.type === 'method_reference') {
+    if (nodeType === 'method_reference') {
       const children = node.children.filter(c => c.type !== '::');
       if (children.length >= 2) {
         const typePart = children[0].text;
@@ -2289,7 +2423,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     }
 
     // TypeScript/JavaScript: call expression — fn(args) or obj.method(args)
-    if (node.type === 'call_expression') {
+    if (nodeType === 'call_expression') {
       const funcNode = node.childForFieldName('function');
       if (funcNode) {
         const calleeName = this.resolveScriptCallCallee(funcNode, enclosingClass) ?? funcNode.text;
@@ -2308,7 +2442,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
     }
 
     // Python: call
-    if (node.type === 'call') {
+    if (nodeType === 'call') {
       const funcNode = node.childForFieldName('function');
       if (funcNode) {
         const calleeName = this.resolveScriptCallCallee(funcNode, enclosingClass) ?? funcNode.text;
@@ -2326,9 +2460,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
       }
     }
 
-    for (const child of node.children) {
-      this.extractCallsFromNode(child, file, lines, calls, references, callerName, receiverTypes, fieldUsageContext, enclosingClass, callbackContext);
-    }
+    return false;
   }
 
   private resolveJavaMethodReferenceReceiver(

@@ -33,6 +33,7 @@ import {
 } from './v2/query/ci-review.js';
 import {
   applyGeneratedBlock,
+  buildComponentStats,
   buildDirectoryStats,
   composeArchitectureMarkdown,
   composeClaudeMarkdown,
@@ -485,9 +486,10 @@ async function runOnboardCommand(parsed: ParsedArgs): Promise<void> {
   const root = getFlag(parsed, 'root') ?? process.cwd();
   const profile = normalizeOnboardProfile(getFlag(parsed, 'profile'));
   const dryRun = parsed.flags.get('dry-run') === true;
-  const { db } = await openCodeGraphDb(root);
+  const { db, dbPath } = await openCodeGraphDb(root);
   try {
-    const index = await new V2Indexer(db).indexWorkspace({ root });
+    const progress = parsed.flags.get('quiet') === true ? undefined : createIndexProgressReporter(dbPath);
+    const index = await new V2Indexer(db).indexWorkspace({ root, progress });
     const service = new V2QueryService(db);
     const atlas = await service.query({
       workspaceId: index.workspaceId,
@@ -495,12 +497,17 @@ async function runOnboardCommand(parsed: ParsedArgs): Promise<void> {
       args: { format: 'json', profile: 'full', includeTests: true, warnStale: false },
     }) as Record<string, unknown>;
     const files = await db.prepare(
-      'SELECT path, file_role FROM files WHERE snapshot_id = ?',
-    ).all(index.snapshotId) as Array<{ path: string; file_role: string }>;
+      'SELECT path, file_role, language FROM files WHERE snapshot_id = ?',
+    ).all(index.snapshotId) as Array<{ path: string; file_role: string; language?: string }>;
+    const endpointFiles = (await db.prepare(
+      "SELECT file FROM endpoints WHERE snapshot_id = ? AND file_role = 'main_source'",
+    ).all(index.snapshotId) as Array<{ file: string }>).map(row => row.file);
+    const components = buildComponentStats(files, endpointFiles);
     const inputs = {
       atlas,
       directories: buildDirectoryStats(files),
-      commands: detectBuildCommands(root),
+      components,
+      commands: detectBuildCommands(root, components.map(c => c.component)),
       toolVersion: cliPackageVersion(),
     };
     const targets: Array<{ file: string; body: string }> = [];
@@ -2533,7 +2540,10 @@ function createIndexProgressReporter(dbPath: string): (event: IndexProgressEvent
     const message = event.message ? ` ${shorten(event.message, 140)}` : '';
     const details = formatProgressDetails(event.details);
     const db = event.phase === 'start' ? ` db=${dbPath}` : '';
-    process.stderr.write(`[codegraph:index] ${elapsed} ${event.phase}:${event.status}${count}${message}${details}${db}\n`);
+    // rss makes OOM hunts one-log-read: the last line before a crash names
+    // the phase that was eating memory.
+    const rss = ` rss=${Math.round(process.memoryUsage().rss / (1024 * 1024))}MB`;
+    process.stderr.write(`[codegraph:index] ${elapsed} ${event.phase}:${event.status}${count}${message}${details}${rss}${db}\n`);
   };
 }
 

@@ -25,7 +25,7 @@ export interface IndexProviderOptions {
 export interface IndexProvider {
   id: string;
   version: string;
-  parseFiles(workItems: ParseWorkItem[], options: ParseBatchOptions): ParseWorkResult[];
+  parseFiles(workItems: ParseWorkItem[], options: ParseBatchOptions): Promise<ParseWorkResult[]>;
 }
 
 export interface IndexProviderSet {
@@ -37,7 +37,7 @@ export interface IndexProviderSet {
     indexProviders: string[];
     scipIndexPath?: string;
   };
-  parseFiles(workItems: ParseWorkItem[], options: ParseBatchOptions): ParseWorkResult[];
+  parseFiles(workItems: ParseWorkItem[], options: ParseBatchOptions): Promise<ParseWorkResult[]>;
 }
 
 interface ScipIndex {
@@ -130,11 +130,11 @@ export function buildIndexProviderSet(options: IndexProviderOptions): IndexProvi
         ? resolveScipIndexPath(options.root, options.scipIndexPath)
         : undefined,
     },
-    parseFiles(workItems, batchOptions) {
+    async parseFiles(workItems, batchOptions) {
       if (workItems.length === 0) return [];
       const merged = new Map<string, ParseResult>();
       for (const provider of providers) {
-        const results = provider.parseFiles(workItems, provider.id === TREE_SITTER_PROVIDER_ID ? batchOptions : {});
+        const results = await provider.parseFiles(workItems, provider.id === TREE_SITTER_PROVIDER_ID ? batchOptions : {});
         for (const item of results) {
           const existing = merged.get(item.key);
           merged.set(item.key, existing ? mergeParseResults(existing, item.result) : item.result);
@@ -166,7 +166,7 @@ class TreeSitterIndexProvider implements IndexProvider {
     ? TREE_SITTER_PROVIDER_VERSION
     : TREE_SITTER_FIELD_USAGE_DISABLED_PROVIDER_VERSION;
 
-  parseFiles(workItems: ParseWorkItem[], options: ParseBatchOptions): ParseWorkResult[] {
+  parseFiles(workItems: ParseWorkItem[], options: ParseBatchOptions): Promise<ParseWorkResult[]> {
     return parseFilesBatch(workItems, options);
   }
 }
@@ -182,7 +182,7 @@ class ScipIndexProvider implements IndexProvider {
     this.resultsByPath = scipResultsByPath(loadScipIndex(absolute));
   }
 
-  parseFiles(workItems: ParseWorkItem[]): ParseWorkResult[] {
+  async parseFiles(workItems: ParseWorkItem[]): Promise<ParseWorkResult[]> {
     const results: ParseWorkResult[] = [];
     for (const item of workItems) {
       const result = this.resultsByPath.get(item.key);

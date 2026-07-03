@@ -84,9 +84,11 @@ function isVendored(lowerPath: string): boolean {
 }
 
 function isGenerated(lowerPath: string): boolean {
-  return lowerPath.includes('/generated/')
-    || lowerPath.includes('/generated-sources/')
-    || lowerPath.includes('/build/generated/')
+  // Segment-aware with optional prefix/suffix so machine-output trees like
+  // `proto2-generated/`, `generated-sources/`, or `target_generated/` all
+  // match. A separator is required before "generated" to avoid false hits on
+  // words that merely contain it.
+  return /(^|\/)([^/]*[-_.])?generated([-_.][^/]*)?(\/|$)/.test(lowerPath)
     || lowerPath.endsWith('.g.java');
 }
 
