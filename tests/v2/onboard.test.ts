@@ -6,7 +6,9 @@ import {
   ONBOARD_BEGIN_MARKER,
   ONBOARD_END_MARKER,
   applyGeneratedBlock,
+  buildComponentStats,
   buildDirectoryStats,
+  componentForPath,
   composeArchitectureMarkdown,
   composeClaudeMarkdown,
   detectBuildCommands,
@@ -76,6 +78,86 @@ describe('buildDirectoryStats', () => {
   });
 });
 
+describe('componentForPath / buildComponentStats', () => {
+  it('maps paths to top-level components, expanding monorepo containers', () => {
+    expect(componentForPath('backend/src/main/java/A.java')).toBe('backend');
+    expect(componentForPath('packages/ui/src/index.ts')).toBe('packages/ui');
+    expect(componentForPath('.github/workflows/ci.yml')).toBeUndefined();
+    expect(componentForPath('README.md')).toBeUndefined();
+  });
+
+  it('drops layout dirs (src, test-only trees) but keeps test trees with main sources', () => {
+    const files = [
+      { path: 'src/a.ts', file_role: 'main_source', language: 'typescript' },
+      { path: 'src/b.ts', file_role: 'main_source', language: 'typescript' },
+      { path: 'src/c.ts', file_role: 'main_source', language: 'typescript' },
+      { path: 'tests/a.test.ts', file_role: 'test_source', language: 'typescript' },
+      { path: 'tests/b.test.ts', file_role: 'test_source', language: 'typescript' },
+      { path: 'tests/c.test.ts', file_role: 'test_source', language: 'typescript' },
+      { path: 'test/framework/F.java', file_role: 'main_source', language: 'java' },
+      { path: 'test/framework/G.java', file_role: 'main_source', language: 'java' },
+      { path: 'test/framework/H.java', file_role: 'main_source', language: 'java' },
+    ];
+    const stats = buildComponentStats(files, [], 3);
+    expect(stats.map(s => s.component)).toEqual(['test']);
+  });
+
+  it('aggregates components with language mix and endpoint counts', () => {
+    const files = [
+      { path: 'backend/src/A.java', file_role: 'main_source', language: 'java' },
+      { path: 'backend/src/B.java', file_role: 'main_source', language: 'java' },
+      { path: 'backend/src/ATest.java', file_role: 'test_source', language: 'java' },
+      { path: 'backend/config.yaml', file_role: 'main_source', language: 'yaml' },
+      { path: 'frontend/src/a.ts', file_role: 'main_source', language: 'typescript' },
+      { path: 'frontend/src/b.ts', file_role: 'main_source', language: 'typescript' },
+      { path: 'frontend/src/a.spec.ts', file_role: 'test_source', language: 'typescript' },
+    ];
+    const stats = buildComponentStats(files, ['backend/src/A.java'], 3);
+    expect(stats).toEqual([
+      { component: 'backend', mainFiles: 3, testFiles: 1, endpoints: 1, languages: ['java'] },
+      { component: 'frontend', mainFiles: 2, testFiles: 1, endpoints: 0, languages: ['typescript'] },
+    ]);
+  });
+});
+
+describe('component-aware composers', () => {
+  const componentInputs = {
+    ...FIXTURE_INPUTS,
+    components: [
+      { component: 'backend', mainFiles: 10, testFiles: 5, endpoints: 2, languages: ['java'] },
+      { component: 'frontend', mainFiles: 8, testFiles: 3, endpoints: 0, languages: ['typescript'] },
+    ],
+  };
+
+  it('renders a Components table in ARCHITECTURE.md for multi-component repos', () => {
+    const doc = composeArchitectureMarkdown(componentInputs);
+    expect(doc).toContain('## Components');
+    expect(doc).toContain('| `backend` | java | 10 | 5 | 2 |');
+    expect(doc).toContain('| `frontend` | typescript | 8 | 3 | — |');
+  });
+
+  it('omits the Components section for single-component repos', () => {
+    expect(composeArchitectureMarkdown(FIXTURE_INPUTS)).not.toContain('## Components');
+  });
+
+  it('attributes endpoints to their component in the CLAUDE.md one-liner', () => {
+    const doc = composeClaudeMarkdown(componentInputs);
+    expect(doc).toContain('2 spring endpoints (in `backend`)');
+    expect(doc).toContain('- `backend` — java, 10 main / 5 test files, 2 endpoints');
+  });
+
+  it('labels a polyglot repo with both top code languages', () => {
+    const atlas = JSON.parse(JSON.stringify(FIXTURE_ATLAS)) as Record<string, any>;
+    atlas.summary.languages = [
+      { language: 'typescript', files: 616 },
+      { language: 'java', files: 531 },
+      { language: 'json', files: 900 },
+    ];
+    const doc = composeClaudeMarkdown({ ...componentInputs, atlas });
+    expect(doc).toContain('typescript + java codebase');
+  });
+});
+
 describe('detectBuildCommands', () => {
   it('detects maven with wrapper', () => {
     const root = tempDir();
@@ -85,6 +167,18 @@ describe('detectBuildCommands', () => {
     expect(commands.build).toContain('./mvnw -ntp verify');
     expect(commands.test).toContain('./mvnw -ntp test');
     expect(commands.sources[0]).toContain('mvnw wrapper');
+  });
+
+  it('scans component dirs so a backend gradle is not shadowed by a root package.json', () => {
+    const root = tempDir();
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ scripts: { test: 'vitest' } }));
+    fs.mkdirSync(path.join(root, 'backend'));
+    fs.writeFileSync(path.join(root, 'backend', 'build.gradle'), '');
+    fs.writeFileSync(path.join(root, 'backend', 'gradlew'), '#!/bin/sh');
+    const commands = detectBuildCommands(root, ['backend', 'missing-dir']);
+    expect(commands.test).toContain('npm test');
+    expect(commands.test).toContain('cd backend && ./gradlew test');
+    expect(commands.sources).toContain('backend/build.gradle + gradlew wrapper');
   });
 
   it('detects npm scripts', () => {
@@ -159,6 +253,7 @@ const FIXTURE_ATLAS: Record<string, unknown> = {
 const FIXTURE_INPUTS = {
   atlas: FIXTURE_ATLAS,
   directories: [{ dir: 'src', mainFiles: 12, testFiles: 0 }],
+  components: [],
   commands: { build: ['./mvnw -ntp verify'], test: ['./mvnw -ntp test'], lint: [], sources: ['pom.xml + mvnw wrapper'] },
   toolVersion: '9.9.9',
 };

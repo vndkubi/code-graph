@@ -30,6 +30,15 @@ export interface OnboardDirectoryStat {
   testFiles: number;
 }
 
+export interface OnboardComponentStat {
+  component: string;
+  mainFiles: number;
+  testFiles: number;
+  endpoints: number;
+  /** Top code languages in this component (config formats excluded). */
+  languages: string[];
+}
+
 export interface OnboardBuildCommands {
   build: string[];
   test: string[];
@@ -40,8 +49,19 @@ export interface OnboardBuildCommands {
 export interface OnboardInputs {
   atlas: Record<string, unknown>;
   directories: OnboardDirectoryStat[];
+  /** Top-level component aggregation; empty for single-component repos. */
+  components: OnboardComponentStat[];
   commands: OnboardBuildCommands;
   toolVersion: string;
+}
+
+/** `typescript + java` for a polyglot repo, single label otherwise. */
+function codeLanguageSummary(languages: Array<{ language: string; files: number }>): string {
+  const code = languages.filter(l => !NON_CODE_LANGUAGES.has(l.language.toLowerCase()));
+  if (code.length === 0) return languages[0]?.language ?? 'unknown';
+  const [first, second] = code;
+  if (second && second.files >= first!.files * 0.3) return `${first!.language} + ${second.language}`;
+  return first!.language;
 }
 
 /**
@@ -70,39 +90,113 @@ export function buildDirectoryStats(
     .slice(0, limit);
 }
 
+const NON_CODE_LANGUAGES = new Set([
+  'json', 'yaml', 'xml', 'properties', 'toml', 'ini', 'markdown', 'html', 'css', 'scss', 'svg', 'text', 'unknown', '',
+]);
+
+// Monorepo container dirs whose direct children are the real components.
+const COMPONENT_CONTAINER_DIRS = /^(packages|apps|services|modules|libs|crates)$/;
+
+/** Top-level component a file belongs to (e.g. `backend`, `packages/ui`). */
+export function componentForPath(file: string): string | undefined {
+  const parts = file.replace(/\\/g, '/').split('/').filter(Boolean);
+  if (parts.length < 2) return undefined; // repo-root file, not a component
+  const head = parts[0]!;
+  if (head.startsWith('.')) return undefined;
+  if (COMPONENT_CONTAINER_DIRS.test(head) && parts.length >= 3) return `${head}/${parts[1]}`;
+  return head;
+}
+
+/**
+ * Aggregate indexed files into top-level components (backend, frontend, cli,
+ * packages/x…). This is the architecture view a polyglot or multi-module repo
+ * actually needs — leaf-directory stats alone bury it.
+ */
+export function buildComponentStats(
+  files: Array<{ path: string; file_role: string; language?: string }>,
+  endpointFiles: string[] = [],
+  minFiles = 3,
+  limit = 12,
+): OnboardComponentStat[] {
+  const byComponent = new Map<string, OnboardComponentStat & { langCounts: Map<string, number> }>();
+  for (const file of files) {
+    if (file.file_role !== 'main_source' && file.file_role !== 'test_source') continue;
+    const component = componentForPath(file.path);
+    if (!component) continue;
+    let entry = byComponent.get(component);
+    if (!entry) {
+      entry = { component, mainFiles: 0, testFiles: 0, endpoints: 0, languages: [], langCounts: new Map() };
+      byComponent.set(component, entry);
+    }
+    if (file.file_role === 'main_source') entry.mainFiles++;
+    else entry.testFiles++;
+    const language = (file.language ?? '').toLowerCase();
+    if (!NON_CODE_LANGUAGES.has(language)) {
+      entry.langCounts.set(language, (entry.langCounts.get(language) ?? 0) + 1);
+    }
+  }
+  for (const file of endpointFiles) {
+    const component = componentForPath(file);
+    if (!component) continue;
+    const entry = byComponent.get(component);
+    if (entry) entry.endpoints++;
+  }
+  return [...byComponent.values()]
+    .filter(entry => entry.mainFiles + entry.testFiles >= minFiles)
+    // Layout dirs are not components: `src` is the single app itself, and a
+    // top-level test/docs tree only mirrors it. A test tree that contains
+    // main-source files (e.g. a published test framework) IS a component.
+    .filter(entry => !/^(src|source|docs?|examples?|samples?)$/.test(entry.component))
+    .filter(entry => !(/^(tests?|spec|__tests__)$/.test(entry.component) && entry.mainFiles === 0))
+    .sort((a, b) => (b.mainFiles + b.testFiles) - (a.mainFiles + a.testFiles) || a.component.localeCompare(b.component))
+    .slice(0, limit)
+    .map(({ langCounts, ...entry }) => ({
+      ...entry,
+      languages: [...langCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 2).map(([lang]) => lang),
+    }));
+}
+
 /**
  * Detect build/test/lint commands from build-tool files actually present on
  * disk — the atlas oracle only understands package.json, which leaves Maven
- * and Gradle repos with no commands at all.
+ * and Gradle repos with no commands at all. Component dirs are scanned too:
+ * a polyglot repo's backend/gradle must not be shadowed by a root package.json.
  */
-export function detectBuildCommands(root: string): OnboardBuildCommands {
+export function detectBuildCommands(root: string, componentDirs: string[] = []): OnboardBuildCommands {
   const commands: OnboardBuildCommands = { build: [], test: [], lint: [], sources: [] };
-  const has = (rel: string): boolean => fs.existsSync(path.join(root, rel));
-  if (has('pom.xml')) {
-    const mvn = has('mvnw') || has('mvnw.cmd') ? './mvnw' : 'mvn';
-    commands.build.push(`${mvn} -ntp verify`);
-    commands.test.push(`${mvn} -ntp test`);
-    commands.sources.push(has('mvnw') ? 'pom.xml + mvnw wrapper' : 'pom.xml');
-  }
-  if (has('build.gradle') || has('build.gradle.kts')) {
-    const gradle = has('gradlew') ? './gradlew' : 'gradle';
-    commands.build.push(`${gradle} build`);
-    commands.test.push(`${gradle} test`);
-    commands.sources.push(has('gradlew') ? 'build.gradle + gradlew wrapper' : 'build.gradle');
-  }
-  if (has('package.json')) {
-    try {
-      const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf-8')) as { scripts?: Record<string, string> };
-      const scripts = pkg.scripts ?? {};
-      if (scripts.build) commands.build.push('npm run build');
-      if (scripts.test) commands.test.push('npm test');
-      if (scripts.lint) commands.lint.push('npm run lint');
-      if (scripts.typecheck) commands.lint.push('npm run typecheck');
-      if (scripts.build || scripts.test || scripts.lint || scripts.typecheck) {
-        commands.sources.push('package.json scripts');
+  const scopes = ['', ...componentDirs.filter(dir => dir !== '' && !dir.includes('..'))];
+  for (const scope of scopes) {
+    const base = scope === '' ? root : path.join(root, scope);
+    if (scope !== '' && !fs.existsSync(base)) continue;
+    const has = (rel: string): boolean => fs.existsSync(path.join(base, rel));
+    const prefix = scope === '' ? '' : `cd ${scope} && `;
+    const label = (file: string): string => (scope === '' ? file : `${scope}/${file}`);
+    if (has('pom.xml')) {
+      const mvn = has('mvnw') || has('mvnw.cmd') ? './mvnw' : 'mvn';
+      commands.build.push(`${prefix}${mvn} -ntp verify`);
+      commands.test.push(`${prefix}${mvn} -ntp test`);
+      commands.sources.push(label(has('mvnw') ? 'pom.xml + mvnw wrapper' : 'pom.xml'));
+    }
+    if (has('build.gradle') || has('build.gradle.kts')) {
+      const gradle = has('gradlew') ? './gradlew' : fs.existsSync(path.join(root, 'gradlew')) ? `${scope === '' ? './' : '../'}gradlew` : 'gradle';
+      commands.build.push(`${prefix}${gradle} build`);
+      commands.test.push(`${prefix}${gradle} test`);
+      commands.sources.push(label(has('gradlew') || fs.existsSync(path.join(root, 'gradlew')) ? 'build.gradle + gradlew wrapper' : 'build.gradle'));
+    }
+    if (has('package.json')) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(base, 'package.json'), 'utf-8')) as { scripts?: Record<string, string> };
+        const scripts = pkg.scripts ?? {};
+        if (scripts.build) commands.build.push(`${prefix}npm run build`);
+        if (scripts.test) commands.test.push(`${prefix}npm test`);
+        if (scripts.lint) commands.lint.push(`${prefix}npm run lint`);
+        if (scripts.typecheck) commands.lint.push(`${prefix}npm run typecheck`);
+        if (scripts.build || scripts.test || scripts.lint || scripts.typecheck) {
+          commands.sources.push(label('package.json scripts'));
+        }
+      } catch {
+        // Unreadable package.json: report nothing rather than guessing.
       }
-    } catch {
-      // Unreadable package.json: report nothing rather than guessing.
     }
   }
   return commands;
@@ -192,11 +286,20 @@ function shortHandler(symbol: unknown): string {
 }
 
 /** Main-source hotspots only: test files dominate raw risk scores but are not
- * what a newcomer must be careful with. */
+ * what a newcomer must be careful with; vendored/minified assets are indexed
+ * as main_source yet nobody edits them. */
 function mainHotspots(view: AtlasView, limit: number): Array<Record<string, unknown>> {
   return view.hotspots
     .filter(h => String(h.fileRole ?? '') === 'main_source')
+    .filter(h => !/(\.min\.\w+$)|((^|\/)(vendor|node_modules|webapps\/static)\/)/.test(String(h.file ?? '')))
     .slice(0, limit);
+}
+
+/** Flow headings inherit the full handler signature; WebHDFS-style handlers
+ * carry 30+ params. Keep the heading scannable. */
+function flowTitle(flow: Record<string, unknown>): string {
+  const name = String(flow.name ?? flow.id ?? 'Flow');
+  return name.length > 90 ? `${name.slice(0, 87)}…` : name;
 }
 
 function flowConfidence(flow: Record<string, unknown>): number {
@@ -270,6 +373,16 @@ export function composeArchitectureMarkdown(inputs: OnboardInputs): string {
     lines.push(`- Indexed at ${view.branch ?? '?'} @ ${(view.headCommit ?? '').slice(0, 10)}.`);
   }
   lines.push('');
+  if (inputs.components.length >= 2) {
+    lines.push('## Components');
+    lines.push('');
+    lines.push('| Component | Languages | Main files | Test files | Endpoints |');
+    lines.push('|---|---|---:|---:|---:|');
+    for (const component of inputs.components) {
+      lines.push(`| \`${md(component.component)}\` | ${md(component.languages.join(', ') || '—')} | ${component.mainFiles} | ${component.testFiles} | ${component.endpoints > 0 ? component.endpoints : '—'} |`);
+    }
+    lines.push('');
+  }
   lines.push('## Key directories');
   lines.push('');
   lines.push('| Directory | Main files | Test files |');
@@ -301,7 +414,7 @@ export function composeArchitectureMarkdown(inputs: OnboardInputs): string {
     for (const flow of flows) {
       const entry = isPlainObject(flow.entrypoint) ? flow.entrypoint : {};
       const tests = realTestFiles(arrayRecords(flow.likelyTests), String(entry.file ?? ''));
-      lines.push(`### ${md(flow.name ?? flow.id)}`);
+      lines.push(`### ${md(flowTitle(flow))}`);
       lines.push('');
       lines.push(`- Entry: \`${md(entry.file)}:${md(entry.line)}\``);
       const callees = flowCallees(flow);
@@ -347,11 +460,21 @@ export function composeClaudeMarkdown(inputs: OnboardInputs): string {
   const lines: string[] = [];
   const mainCount = view.fileRoles.get('main_source') ?? 0;
   const testCount = view.fileRoles.get('test_source') ?? 0;
-  const primaryLanguage = view.languages[0]?.language ?? 'unknown';
+  const apiComponent = inputs.components.length >= 2
+    ? inputs.components.reduce((best, c) => (c.endpoints > (best?.endpoints ?? 0) ? c : best), undefined as OnboardComponentStat | undefined)
+    : undefined;
   lines.push('# Project facts (generated by codegraph onboard)');
   lines.push('');
-  lines.push(`${primaryLanguage} codebase: ${mainCount} main-source files, ${testCount} test files${view.entrypoints.length > 0 ? `, ${view.apiEndpointCount} ${view.framework ?? 'HTTP'} endpoints` : ''}.`);
+  lines.push(`${codeLanguageSummary(view.languages)} codebase: ${mainCount} main-source files, ${testCount} test files${view.entrypoints.length > 0 ? `, ${view.apiEndpointCount} ${view.framework ?? 'HTTP'} endpoints${apiComponent && apiComponent.endpoints > 0 ? ` (in \`${apiComponent.component}\`)` : ''}` : ''}.`);
   lines.push('');
+  if (inputs.components.length >= 2) {
+    lines.push('## Components');
+    lines.push('');
+    for (const component of inputs.components.slice(0, 8)) {
+      lines.push(`- \`${component.component}\` — ${component.languages.join('+') || 'config'}, ${component.mainFiles} main / ${component.testFiles} test files${component.endpoints > 0 ? `, ${component.endpoints} endpoints` : ''}`);
+    }
+    lines.push('');
+  }
   if (inputs.commands.sources.length > 0) {
     lines.push('## Commands');
     lines.push('');
