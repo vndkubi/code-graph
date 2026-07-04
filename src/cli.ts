@@ -21,6 +21,7 @@ import { runRouteGateBenchmark } from './v2/benchmark/route-gate.js';
 import { runQualityTrend, appendQualityTrend } from './v2/benchmark/quality-trend.js';
 import { runEvidenceAudit } from './v2/benchmark/evidence-audit.js';
 import { runRecallBench } from './v2/benchmark/recall-bench.js';
+import { runTrustSignalProof } from './v2/benchmark/trust-signal-proof.js';
 import { findAffectedTests } from './v2/query/affected-tests.js';
 import { formatCiSelection, selectTestsForCi, type CiSelectionFormat } from './v2/query/ci-test-selection.js';
 import {
@@ -325,6 +326,17 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
         dryRun: parsed.flags.get('dry-run') === true,
       }), null, 2));
       return;
+    case 'trust-signal-proof': {
+      const result = await runTrustSignalProof({
+        repeats: getNumberFlag(parsed, 'repeats'),
+        agentCommand: getFlag(parsed, 'agent-command'),
+        timeoutSeconds: getNumberFlag(parsed, 'timeout-seconds'),
+        runDir: getFlag(parsed, 'run-dir'),
+        dryRun: parsed.flags.get('dry-run') === true,
+      });
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
     case 'competitive-compare':
       const comparison = compareCodexE2eReports({
         oursPath: requiredFlag(parsed, 'ours'),
@@ -339,7 +351,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e|competitive-compare');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e|trust-signal-proof|competitive-compare');
   }
 }
 
