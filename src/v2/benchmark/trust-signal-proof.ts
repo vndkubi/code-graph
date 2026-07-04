@@ -21,11 +21,32 @@ import { V2QueryService } from '../query/service.js';
  *    not just the single hand-written unit-test fixture.
  * 2. Live agent-behavior check (needs `claude` CLI + ANTHROPIC_API_KEY or a
  *    logged-in session): feed the SAME packet twice — once with
- *    verifyBudget/trustPosture present, once with those two keys stripped
- *    (simulating pre-change behavior) — to a real Claude call, and score
- *    whether the response hedges/offers to verify the flagged fact. If no
+ *    verifyBudget/trustPosture present, once with BOTH those fields AND the
+ *    underlying per-edge confidence/resolutionKind/signalTier/signalReasons
+ *    stripped (stripTrustSignals) — to a real Claude call, and score whether
+ *    the response hedges unprompted (the prompt itself never asks the model
+ *    to comment on certainty; asking directly turned out to saturate hedging
+ *    in both arms in an earlier run and made the A/B undetectable). If no
  *    agent command is available, this step is skipped and reported as such
  *    rather than faked.
+ *
+ * Earlier version of this harness only deleted verifyBudget/trustPosture for
+ * the "without" arm and asked the model directly "would you double-check
+ * anything" — that confounded the comparison two ways: the leading question
+ * primed hedging regardless of packet content (86.7% in both arms), and the
+ * raw per-edge confidence/resolutionKind was still present either way (a
+ * capable model reads it directly and hedges from that alone). Both are
+ * fixed here.
+ *
+ * A second, subtler leak surfaced after that fix: the shallow stripTrustSignals
+ * only cleared callers[]/callees[]/flowSteps(kind=call), but the real packet
+ * duplicates confidence into definitionCandidates[], evidenceSlices[],
+ * flowSteps entries of kind 'definition'/'file', compressedEvidence.factCards[],
+ * and the packet's own top-level confidence/confidenceNotes (which spelled out
+ * "ambiguous Java call edges remain confidence-scored" in plain English). A
+ * transcript audit caught the model citing "confidence 0.4" verbatim in the
+ * "without_field" arm, proving the leak. stripTrustSignals now recurses over
+ * every key at every depth instead of enumerating containers by hand.
  */
 
 export interface TrustSignalFixtureTask {
@@ -73,10 +94,18 @@ public class ${callerName} {
   };
 }
 
-/** 5 distinct fixtures, same ambiguous-name-only-call shape, different names. */
+/**
+ * 5 distinct fixtures, same ambiguous-name-only-call shape, different names.
+ * Caller class names deliberately avoid any substring the HEDGE_PATTERN below
+ * matches (e.g. NOT "AmbiguousCaller" — that leaked into the prompt/output
+ * verbatim as a quoted identifier and made HEDGE_PATTERN's `ambiguous\w*` false
+ * -positive-match "AmbiguousCaller" via the camelCase run-on, with no word
+ * boundary between "Ambiguous" and "Caller" for \w purposes. That inflated
+ * the "without_field" hedge rate with zero actual hedging in the response.
+ */
 export function defaultTrustSignalTasks(): TrustSignalFixtureTask[] {
   return [
-    ambiguousCallTask('t1', 'compute', 'AlphaHelper', 'BetaHelper', 'AmbiguousCaller'),
+    ambiguousCallTask('t1', 'compute', 'AlphaHelper', 'BetaHelper', 'DualPathCaller'),
     ambiguousCallTask('t2', 'transform', 'ShapeA', 'ShapeB', 'TransformRunner'),
     ambiguousCallTask('t3', 'normalize', 'FormatterOne', 'FormatterTwo', 'NormalizeInvoker'),
     ambiguousCallTask('t4', 'resolve', 'ResolverX', 'ResolverY', 'ResolveDispatcher'),
@@ -125,12 +154,50 @@ export interface TrustSignalProofResult {
   };
 }
 
-const HEDGE_PATTERN = /\b(verify|double[- ]check|not certain|not sure|uncertain|ambiguous|might be wrong|cannot confirm|can't confirm|low confidence)\b/i;
+// Broadened to catch inflected forms (double-checking, verifying, confirmed)
+// that the original pattern's trailing \b missed after a "-check"/"-firm" stem.
+const HEDGE_PATTERN = /\b(verif\w*|double[- ]?check\w*|not (?:certain|100% sure|fully sure|sure)|uncertain\w*|ambiguous\w*|might be wrong|cannot confirm|can'?t confirm|low[- ]confidence|name-only|worth (?:a )?(?:double[- ]?check|verif\w*)|would (?:want|need) to (?:verify|confirm|check)|not (?:completely |fully )?confident)\b/i;
 
-function stripVerifyBudget(packet: Record<string, unknown>): Record<string, unknown> {
+/**
+ * Removes every trust/confidence-carrying key anywhere in the packet tree,
+ * not just on callers/callees edges. A first version of this function only
+ * touched callers[], callees[], and flowSteps entries with kind === 'call' —
+ * but the real get_research_pack output duplicates the same confidence
+ * number and "ambiguous" framing into at least six other places:
+ * definitionCandidates[].confidence, evidenceSlices[].confidence,
+ * flowSteps[] entries of kind 'definition'/'file' (not just 'call'),
+ * compressedEvidence.factCards[].confidence, and — the biggest leak — the
+ * packet's own top-level confidence/confidenceNotes, where confidenceNotes
+ * literally states in English that "ambiguous Java call edges remain
+ * confidence-scored". Deleting only the first location left the other five
+ * intact, so the "without_field" arm was never actually signal-free: a
+ * transcript audit showed the model citing "confidence 0.4" verbatim in
+ * that arm. Recursing over every key at every depth (rather than
+ * enumerating known containers by hand) is the only way to be sure nothing
+ * new added to the packet shape re-opens this leak.
+ */
+const TRUST_SIGNAL_KEYS = new Set(['verifyBudget', 'trustPosture', 'confidence', 'confidenceNotes', 'resolutionKind', 'signalTier', 'signalReasons']);
+
+function stripTrustSignalsDeep(value: unknown): void {
+  if (Array.isArray(value)) {
+    value.forEach(stripTrustSignalsDeep);
+    return;
+  }
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    for (const key of Object.keys(obj)) {
+      if (TRUST_SIGNAL_KEYS.has(key)) {
+        delete obj[key];
+      } else {
+        stripTrustSignalsDeep(obj[key]);
+      }
+    }
+  }
+}
+
+function stripTrustSignals(packet: Record<string, unknown>): Record<string, unknown> {
   const clone = JSON.parse(JSON.stringify(packet)) as Record<string, unknown>;
-  delete clone.verifyBudget;
-  delete clone.trustPosture;
+  stripTrustSignalsDeep(clone);
   return clone;
 }
 
@@ -142,10 +209,14 @@ function resolveAgentCommand(command?: string): { command: string; args: string[
 }
 
 function promptFor(task: TrustSignalFixtureTask, packet: Record<string, unknown>): string {
+  // Deliberately does NOT ask "would you want to verify/double-check anything" —
+  // that framing is a leading question that elicits hedging regardless of
+  // packet content (confirmed empirically: it saturated both A/B arms at the
+  // same rate). Ask only for a direct final answer; hedging is scored only
+  // if the model volunteers it unprompted.
   return [
     `Task: ${task.target}`,
-    'You are given a CodeGraph research-pack JSON below. Answer the task from the packet.',
-    'Explicitly say whether there is anything in the packet you would want to double-check or verify before treating your answer as certain, and why.',
+    'You are given a CodeGraph research-pack JSON below. Give a direct, final answer to the task, based only on the packet.',
     '',
     'Packet:',
     JSON.stringify(packet, null, 2),
@@ -197,7 +268,7 @@ export async function runTrustSignalProof(options: TrustSignalProofOptions = {})
         harnessOk: sufficientForAnswer && verifyBudget.length > 0 && flaggedFileMatches,
       });
 
-      packetsByTask.push({ id: task.id, withField: packet, withoutField: stripVerifyBudget(packet) });
+      packetsByTask.push({ id: task.id, withField: packet, withoutField: stripTrustSignals(packet) });
     } finally {
       if (db) await db.close();
       fs.rmSync(repoRoot, { recursive: true, force: true });

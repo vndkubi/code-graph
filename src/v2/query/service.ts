@@ -3618,9 +3618,15 @@ export class V2QueryService {
       ? 'Answer the user directly from flowSteps and evidenceSlices.'
       : `Resolve missing fact: ${missingFacts[0]}`;
     const confidence = sufficientForAnswer ? 0.82 : relevantSymbols.length > 0 ? 0.62 : 0.35;
+    // The former middle note ("ambiguous Java call edges remain confidence-scored")
+    // was a static, always-present disclaimer that verifyBudget/trustPosture below
+    // now supersedes with a precise, per-edge signal that only costs tokens when
+    // there is actually something to flag. Keeping both would tax every packet
+    // twice for the same fact; the vague blanket note is dropped in favor of the
+    // targeted one, which pays for the verifyBudget/trustPosture addition instead
+    // of stacking on top of it.
     const confidenceNotes = [
       'The pack intentionally includes capped source evidence so architecture answers do not need many follow-up slice calls.',
-      'Flow steps are ranked from indexed symbols, call edges, endpoints, and file evidence; ambiguous Java call edges remain confidence-scored.',
       'Use granular tools only for explicit missing facts, not for broad rediscovery.',
     ];
     const slimTaskOracle = slimTaskOracleForPack(taskOracle, profile);
@@ -3682,7 +3688,7 @@ export class V2QueryService {
         answerGuidance: compactAnswerGuidance,
         nextAction,
         confidence,
-        confidenceNotes: confidenceNotes.slice(0, 2),
+        confidenceNotes,
         verifyBudget,
         trustPosture,
         budget: {
