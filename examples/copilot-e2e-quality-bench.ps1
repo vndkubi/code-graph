@@ -6,6 +6,10 @@ param(
   [string[]]$TaskIds = @(),
   [string[]]$Modes = @(),
   [string[]]$DisabledMcpServers = @('codegraph', 'codegraph-hadoop', 'codegraph-elasticsearch', 'codegraph-bench'),
+  # Path to the standalone Copilot CLI JS entry (npm-loader.js). When set, runs
+  # `node <CopilotCli> <args>` instead of `gh copilot -- <args>` — for machines
+  # with the npm `copilot` package but no gh CLI on PATH.
+  [string]$CopilotCli = '',
   [int]$ParseWorkers = 4,
   [int]$CopilotTimeoutSeconds = 600,
   [switch]$SkipIndex,
@@ -183,7 +187,7 @@ function Initialize-Workspace([pscustomobject]$Task, [string]$TaskRunDir, [strin
   }
 }
 
-function Write-McpConfig([string]$Path, [string]$Workspace, [string]$WorkspaceKey, [string]$CodeGraphRoot, [string[]]$McpTools = @()) {
+function Write-McpConfig([string]$Path, [string]$Workspace, [string]$WorkspaceKey, [string]$CodeGraphRoot, [string[]]$McpTools = @(), [bool]$ServerDefaultSurface = $false) {
   $cliPath = Join-Path $CodeGraphRoot 'dist\cli.js'
   $defaultMcpTools = @(
     'get_change_pack',
@@ -196,23 +200,27 @@ function Write-McpConfig([string]$Path, [string]$Workspace, [string]$WorkspaceKe
     'get_file_slice',
     'find_tests_for'
   )
-  $toolsToExpose = if ($McpTools -and $McpTools.Count -gt 0) { @($McpTools) } else { $defaultMcpTools }
+  $args = @(
+    $cliPath,
+    'mcp',
+    '--root',
+    $Workspace,
+    '--workspace-key',
+    $WorkspaceKey,
+    '--no-prewarm'
+  )
+  # Organic adoption runs must see the server's real default tool surface —
+  # overriding it with --mcp-tools would erase the very variable being measured.
+  if (-not $ServerDefaultSurface) {
+    $toolsToExpose = if ($McpTools -and $McpTools.Count -gt 0) { @($McpTools) } else { $defaultMcpTools }
+    $args += @('--mcp-tools', ($toolsToExpose -join ','))
+  }
   $config = @{
     mcpServers = @{
       'codegraph-bench' = @{
         type = 'stdio'
         command = 'node'
-        args = @(
-          $cliPath,
-          'mcp',
-          '--root',
-          $Workspace,
-          '--workspace-key',
-          $WorkspaceKey,
-          '--no-prewarm',
-          '--mcp-tools',
-          ($toolsToExpose -join ',')
-        )
+        args = $args
       }
     }
   }
@@ -316,6 +324,8 @@ function Invoke-CopilotTask(
 
   $promptTemplate = if ($Mode -eq 'baseline' -and $Task.baselinePrompt) {
     [string]$Task.baselinePrompt
+  } elseif ($Mode -eq 'organic' -and $Task.organicPrompt) {
+    [string]$Task.organicPrompt
   } else {
     [string]$Task.prompt
   }
@@ -323,6 +333,13 @@ function Invoke-CopilotTask(
     $promptTemplate = $promptTemplate -replace 'Use only CodeGraph MCP server \$\{mcpServer\}[^.]*\.', 'Use normal repository tools.'
     $promptTemplate = $promptTemplate -replace 'Use only CodeGraph MCP server \$\{mcpServer\}', 'Use normal repository tools'
     $promptTemplate = $promptTemplate + ' Do not use CodeGraph or any MCP tool.'
+  }
+  if ($Mode -eq 'organic' -and -not $Task.organicPrompt) {
+    # Organic adoption measurement: MCP stays available but the prompt must not
+    # steer toward or away from it. Strip the forced-usage directive, add nothing.
+    $promptTemplate = $promptTemplate -replace 'Use only CodeGraph MCP server \$\{mcpServer\}[^.]*\.', ''
+    $promptTemplate = $promptTemplate -replace 'Use only CodeGraph MCP server \$\{mcpServer\}', ''
+    $promptTemplate = ($promptTemplate -replace '\s{2,}', ' ').Trim()
   }
   $prompt = (Expand-BenchTemplate $promptTemplate @{
       mcpServer = 'codegraph-bench'
@@ -332,6 +349,9 @@ function Invoke-CopilotTask(
     Replace("`r", ' ').
     Replace("`n", ' \n ')
 
+  # codegraph = MCP available + prompt forces usage; organic = MCP available,
+  # neutral prompt (measures whether the model picks the tool on its own).
+  $mcpEnabled = ($Mode -eq 'codegraph' -or $Mode -eq 'organic')
   $copilotArgs = @(
     'copilot',
     '--',
@@ -339,47 +359,28 @@ function Invoke-CopilotTask(
     '--allow-all-tools',
     "--add-dir=$Workspace",
     '--disable-builtin-mcps',
-    '--no-custom-instructions',
     '--no-ask-user',
     "--session-id=$sessionId",
     "--log-dir=$logDir",
     '--log-level=all',
-    "--model=$($Model.id)",
-    "--prompt=$prompt"
+    "--model=$($Model.id)"
   )
-  foreach ($server in @($DisabledMcpServers)) {
-    if (-not $server) { continue }
-    if ($Mode -eq 'codegraph' -and $server -eq 'codegraph-bench') { continue }
-    $copilotArgs += @('--disable-mcp-server', $server)
-  }
-  if ($Mode -eq 'codegraph') {
-    $copilotArgs += "--additional-mcp-config=@$McpConfigPath"
+  if ($Mode -ne 'organic') {
+    # Organic runs keep workspace instruction files (.github/copilot-instructions.md)
+    # loaded — that file is one of the adoption levers being measured.
+    $copilotArgs += '--no-custom-instructions'
   }
   if ($Model.effort) {
-    $copilotArgs = @(
-      'copilot',
-      '--',
-      '--output-format=json',
-      '--allow-all-tools',
-      "--add-dir=$Workspace",
-      '--disable-builtin-mcps',
-      '--no-custom-instructions',
-      '--no-ask-user',
-      "--session-id=$sessionId",
-      "--log-dir=$logDir",
-      '--log-level=all',
-      "--model=$($Model.id)",
-      "--effort=$($Model.effort)",
-      "--prompt=$prompt"
-    )
-    foreach ($server in @($DisabledMcpServers)) {
-      if (-not $server) { continue }
-      if ($Mode -eq 'codegraph' -and $server -eq 'codegraph-bench') { continue }
-      $copilotArgs += @('--disable-mcp-server', $server)
-    }
-    if ($Mode -eq 'codegraph') {
-      $copilotArgs += "--additional-mcp-config=@$McpConfigPath"
-    }
+    $copilotArgs += "--effort=$($Model.effort)"
+  }
+  $copilotArgs += "--prompt=$prompt"
+  foreach ($server in @($DisabledMcpServers)) {
+    if (-not $server) { continue }
+    if ($mcpEnabled -and $server -eq 'codegraph-bench') { continue }
+    $copilotArgs += @('--disable-mcp-server', $server)
+  }
+  if ($mcpEnabled) {
+    $copilotArgs += "--additional-mcp-config=@$McpConfigPath"
   }
   $denyTools = if ($Mode -eq 'codegraph') {
     Get-TaskStringArray $Task 'codegraphDenyTools'
@@ -394,7 +395,11 @@ function Invoke-CopilotTask(
   }
 
   $started = Get-Date
-  $run = Invoke-CheckedNative 'gh' $copilotArgs $Workspace $stdout $stderr $TimeoutSeconds
+  $run = if ($CopilotCli) {
+    Invoke-CheckedNative 'node' (@($CopilotCli) + @($copilotArgs | Select-Object -Skip 2)) $Workspace $stdout $stderr $TimeoutSeconds
+  } else {
+    Invoke-CheckedNative 'gh' $copilotArgs $Workspace $stdout $stderr $TimeoutSeconds
+  }
   $ended = Get-Date
 
   return [pscustomobject]@{
@@ -710,8 +715,8 @@ $modesToRun = if ($Modes.Count -gt 0) {
   @('codegraph')
 }
 foreach ($mode in $modesToRun) {
-  if ($mode -ne 'codegraph' -and $mode -ne 'baseline') {
-    throw "Unsupported mode '$mode'. Use codegraph or baseline."
+  if ($mode -ne 'codegraph' -and $mode -ne 'baseline' -and $mode -ne 'organic') {
+    throw "Unsupported mode '$mode'. Use codegraph, baseline, or organic."
   }
 }
 
@@ -736,7 +741,7 @@ $runMeta = [pscustomobject]@{
   models = @($modelsToRun | ForEach-Object { $_.id })
   modes = @($modesToRun)
   taskIds = @($tasksToRun | ForEach-Object { $_.id })
-  methodology = 'Fresh workspace and fresh Copilot session per prompt. Quality is validator pass/fail from diff, commands, tests, and golden facts/findings. Token usage is read from Copilot session.shutdown modelMetrics.'
+  methodology = 'Fresh workspace and fresh Copilot session per prompt. Quality is validator pass/fail from diff, commands, tests, and golden facts/findings. Token usage is read from Copilot session.shutdown modelMetrics. Modes: codegraph = MCP + forced-usage prompt; baseline = no MCP; organic = MCP available, neutral prompt, workspace instruction files loaded (adoption measurement; score with scripts/adoption-score.mjs).'
 }
 $runMeta | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $RunDir 'run-meta.json') -Encoding UTF8
 
@@ -780,7 +785,7 @@ foreach ($model in $modelsToRun) {
         }
         $prePassed = (@($preChecks | Where-Object { -not $_.passed }).Count -eq 0)
 
-        if ($mode -eq 'codegraph') {
+        if ($mode -eq 'codegraph' -or $mode -eq 'organic') {
           if (-not $SkipIndex) {
             $indexRun = Invoke-CodeGraphIndex $mcpWorkspace $workspaceKey $taskRunDir $CodeGraphRoot $ParseWorkers
             if ($indexRun.exitCode -ne 0) {
@@ -788,7 +793,7 @@ foreach ($model in $modelsToRun) {
             }
           }
           $taskMcpTools = Get-TaskStringArray $task 'mcpTools'
-          Write-McpConfig $mcpConfigPath $mcpWorkspace $workspaceKey $CodeGraphRoot $taskMcpTools
+          Write-McpConfig $mcpConfigPath $mcpWorkspace $workspaceKey $CodeGraphRoot $taskMcpTools ($mode -eq 'organic')
         }
 
         $copilot = Invoke-CopilotTask $task $model $mode $workspaceInfo.workspace $mcpConfigPath $taskRunDir $DisabledMcpServers $CopilotTimeoutSeconds
@@ -806,12 +811,12 @@ foreach ($model in $modelsToRun) {
           family = if ($task.family) { [string]$task.family } else { $null }
           promptStrategy = if ($task.promptStrategy) { [string]$task.promptStrategy } else { $null }
           toolset = if ($task.toolset) { [string]$task.toolset } else { $null }
-          mcpTools = if ($mode -eq 'codegraph') { @(Get-TaskStringArray $task 'mcpTools') } else { @() }
+          mcpTools = if ($mode -eq 'codegraph' -or $mode -eq 'organic') { @(Get-TaskStringArray $task 'mcpTools') } else { @() }
           mode = $mode
           model = $model.id
           workspace = $workspaceInfo.workspace
-          mcpWorkspace = if ($mode -eq 'codegraph') { $mcpWorkspace } else { $null }
-          mcpWorkspaceKey = if ($mode -eq 'codegraph') { $workspaceKey } else { $null }
+          mcpWorkspace = if ($mode -eq 'codegraph' -or $mode -eq 'organic') { $mcpWorkspace } else { $null }
+          mcpWorkspaceKey = if ($mode -eq 'codegraph' -or $mode -eq 'organic') { $workspaceKey } else { $null }
           baselineCommit = $workspaceInfo.baselineCommit
           sessionId = $copilot.sessionId
           exitCode = $copilot.exitCode

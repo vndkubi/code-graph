@@ -4,6 +4,7 @@ dist/
 .claude/
 *.mjs
 !test/**/*.mjs
-scripts/
+scripts/*
+!scripts/adoption-score.mjs
 .tmp-debug-home/
 .tmp/
