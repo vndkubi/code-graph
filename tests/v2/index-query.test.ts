@@ -1294,6 +1294,8 @@ public class PaymentService {
       nextAction: string;
       definitionCandidates: Array<{ symbol: string; file: string }>;
       flowSteps: unknown[];
+      verifyBudget: Array<{ fact: string; confidence?: number; resolutionKind?: string; verify?: { tool: string } }>;
+      trustPosture?: string;
       taskOracle: {
         successCriteria: string[];
         expectedVerification: { fallback: string };
@@ -1333,6 +1335,8 @@ public class PaymentService {
     expect(researchPack.answerGuidance.join(' ')).toContain('Answer directly');
     expect(researchPack.nextAction).toContain('Answer');
     expect(researchPack.flowSteps.length).toBeGreaterThan(0);
+    expect(researchPack.verifyBudget).toEqual([]);
+    expect(researchPack.trustPosture).toBe('act_directly');
     expect(researchPack.taskOracle.successCriteria.join(' ')).toContain('file and line evidence');
     expect(researchPack.taskOracle.goldenFacts.some(fact => String(fact.value ?? fact.file).includes('PaymentService'))).toBe(true);
     expect(researchPack.compressedEvidence.factCards.some(card => String(card.subject ?? card.file).includes('PaymentService'))).toBe(true);
@@ -1446,6 +1450,77 @@ public class PaymentService {
     expect(compiled.budget.requestedTokenBudget).toBe(5000);
     expect(compiled.budget.estimatedFullResponseTokens).toBeGreaterThanOrEqual(compiled.budget.estimatedResponseTokens);
     expect(compiled.budget.sourceTool).toBe('get_research_pack');
+  });
+
+  it('flags low-confidence name-only call edges in verifyBudget with spot_check_recommended trustPosture', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-verify-budget-');
+    // Two different classes define a same-named method. A third, unrelated
+    // class calls the bare (unqualified) name from a different file. This
+    // defeats both same-file promotion (Pass 1) and global-unique promotion
+    // (Pass 2, since the name resolves to 2 candidates project-wide), so the
+    // call edge is left at resolution_kind='name-only', confidence 0.4 —
+    // exactly the "ambiguous match" case verifyBudget exists to flag.
+    writeFile(repo, 'src/main/java/com/example/util/AlphaHelper.java', `package com.example.util;
+
+public class AlphaHelper {
+    int compute(int x) {
+        return x + 1;
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/util/BetaHelper.java', `package com.example.util;
+
+public class BetaHelper {
+    int compute(int x) {
+        return x * 2;
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/util/AmbiguousCaller.java', `package com.example.util;
+
+public class AmbiguousCaller {
+    int run(int x) {
+        return compute(x);
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const researchPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_research_pack',
+      args: {
+        target: 'How does AmbiguousCaller run call compute?',
+        taskType: 'architecture',
+        tokenBudget: 5000,
+      },
+    }) as {
+      completeness: { sufficientForAnswer: boolean };
+      verifyBudget: Array<{
+        fact: string;
+        file?: string;
+        confidence?: number;
+        resolutionKind?: string;
+        signalTier?: string;
+        reason: string;
+        verify?: { tool: string; args: { file?: string } };
+      }>;
+      trustPosture?: string;
+    };
+
+    expect(researchPack.completeness.sufficientForAnswer).toBe(true);
+    expect(researchPack.verifyBudget.length).toBeGreaterThanOrEqual(1);
+    const flagged = researchPack.verifyBudget.find(item => item.resolutionKind === 'name-only');
+    expect(flagged).toBeDefined();
+    expect(flagged?.confidence).toBeLessThan(0.5);
+    expect(flagged?.reason).toContain('ambiguous name-only match');
+    expect(flagged?.verify?.tool).toBe('get_file_slice');
+    expect(researchPack.trustPosture).toBe('spot_check_recommended');
   });
 
   it('enriches route-gate compile evidence with exact methods and tests', async () => {

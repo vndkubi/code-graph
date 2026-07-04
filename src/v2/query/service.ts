@@ -60,6 +60,8 @@ import {
   evidenceHandleForObject,
   evidenceHandlesForObjects,
   slimEvidenceSlicesForPack,
+  verifyBudgetForFlowSteps,
+  trustPostureFor,
 } from './evidence.js';
 import {
   slimTestsForPack,
@@ -3489,6 +3491,13 @@ export class V2QueryService {
     });
     const sufficientForAnswer = missingFacts.length === 0;
     const returnedFlowSteps = flowSteps.slice(0, packProfileValue(profile, 5, 6, 8));
+    // Scored from the FULL flowSteps (pre-display-cap), not returnedFlowSteps:
+    // 'call' steps are appended last in researchFlowSteps, so a compact-profile
+    // cap can silently drop exactly the low-confidence fact this budget exists
+    // to flag. verifyBudget entries are self-contained (carry their own file/
+    // line/reason), so they don't need to also appear in the displayed flowSteps.
+    const verifyBudget = verifyBudgetForFlowSteps(flowSteps);
+    const trustPosture = trustPostureFor(sufficientForAnswer, verifyBudget.length);
     const returnedDefinitions = flowRelevantSymbols.slice(0, packProfileValue(profile, 3, 5, 8));
     const returnedCallers = callers.slice(0, packProfileValue(profile, 3, 5, 8)).map(compactCallEdge);
     const returnedCallees = callees.slice(0, packProfileValue(profile, 6, 10, 14)).map(compactCallEdge);
@@ -3674,6 +3683,8 @@ export class V2QueryService {
         nextAction,
         confidence,
         confidenceNotes: confidenceNotes.slice(0, 2),
+        verifyBudget,
+        trustPosture,
         budget: {
           ...responseBudgetReport({
             profile,
@@ -3728,6 +3739,8 @@ export class V2QueryService {
       nextAction,
       confidence,
       confidenceNotes,
+      verifyBudget,
+      trustPosture,
       budget: {
         ...responseBudgetReport({
           profile,
