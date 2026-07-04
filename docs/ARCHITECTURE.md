@@ -16,8 +16,8 @@ same stdio connection:
 
 | Surface | Representative tools | Role |
 | --- | --- | --- |
-| **ContextGate gate** | `contextgate_get_context`, `tokenopt_compile_evidence`, `tokenopt_search`, `tokenopt_read_file` | PRIMARY evidence router. Call first for broad / unknown-owner tasks. Returns a bounded packet and names any remaining evidence gaps. |
-| **CodeGraph packs** | `codegraph_context`, `codegraph_slice`, `codegraph_status` (+ direct packs in `full`) | Fills the `code_graph` gaps named by the gate packet, using the indexed SQLite graph. |
+| **CodeGraph gate** (default `client` profile) | `codegraph_context`, `codegraph_slice`, `codegraph_status` | PRIMARY entry point. `codegraph_context` classifies the task, routes to the right pack, and folds TokenOpt-style evidence into one bounded packet. |
+| **ContextGate/TokenOpt gate** (`full` profile or `TOKENOPT_MCP_MODE`) | `contextgate_get_context`, `tokenopt_compile_evidence`, `tokenopt_search`, `tokenopt_read_file` | Direct evidence-router surface for benchmark/power-user flows. Hidden by default so exactly one tool claims the first call. |
 
 The gate enriches its own packets by calling the CodeGraph query engine
 **in-process** (no subprocess, no second server). When `codegraph.enabled` is set,

@@ -26,7 +26,8 @@ codegraph <command> [options]
 | `upgrade-audit --root <repo> [policy/threshold flags]` | Readiness + query-log audit with an `A+`–`F` grade. |
 | `affected-tests --root <repo> --base <ref> [--format json\|list\|maven\|gradle]` | CI test selection over a git range; `ALL` = safety fallback. `--changed <file[,file…]>` still works for explicit lists. |
 | `review --root <repo> --base <ref> [--format json\|sarif\|markdown\|text] [--min-priority P0\|P1\|P2] [--fail-on P0\|P1\|P2\|none] [--out <path>]` | Deterministic PR review over a git range: graph-fact findings (stale callers, untested change, duplication, design smells) as SARIF for GitHub code scanning or markdown for a sticky PR comment. Exit code gates on `--fail-on`. |
-| `onboard --root <repo> [--profile architecture\|claude\|both] [--dry-run]` | Generate `ARCHITECTURE.md` (humans) and `CLAUDE.md` (agents) from index facts. Marker-based: only the `<!-- codegraph:begin/end generated -->` block is rewritten, hand-written content survives regeneration. |
+| `onboard --root <repo> [--profile architecture\|claude\|copilot\|both] [--dry-run]` | Generate `ARCHITECTURE.md` (humans), `CLAUDE.md` (agents), and `.github/copilot-instructions.md` (Copilot) from index facts. The agent files include an MCP-routing block (call `codegraph_context` first, hedged on the tools being available in-session). Marker-based: only the `<!-- codegraph:begin/end generated -->` block is rewritten, hand-written content survives regeneration. |
+| `adoption-report --root <repo> [--since <ISO>] [--until <ISO>] [--format json\|text]` | Aggregate the MCP call ledger (`.codegraph/logs/query.jsonl`) into real-usage adoption numbers: calls by tool/day, conversations (distinct `sessionId`), % starting with the `codegraph_context` gate, answerable-rate. Dogfood instrumentation for [the adoption plan](mcp-adoption-plan.md). |
 | `benchmark <sub>` | Deterministic harnesses (see below). |
 
 ### Common MCP flags

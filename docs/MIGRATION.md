@@ -74,11 +74,14 @@ per-host hooks, and measurement lives in `codegraph benchmark …`.
 
 Tool exposure is unified under the CodeGraph profile, with a TokenOpt override:
 
-- `--mcp-profile client` (default) → CodeGraph context/slice/status + the
-  ContextGate lite gate (**7 tools**).
-- `--mcp-profile full` → full CodeGraph + full TokenOpt surface (**45 tools**).
-- `TOKENOPT_MCP_MODE=lite|full|broker` overrides the gate set (`broker` =
-  `contextgate_get_context` only).
+- `--mcp-profile client` (default) → **3 tools**: `codegraph_context`,
+  `codegraph_slice`, `codegraph_status`. Single-gate surface —
+  `codegraph_context` routes into the TokenOpt evidence flow internally.
+- `--mcp-profile full` → full CodeGraph + full TokenOpt surface.
+- `TOKENOPT_MCP_MODE` — unset (default): embedded TokenOpt gate tools hidden on
+  every profile except `full`; `lite|full|broker` forces that gate set on any
+  profile (`broker` = `contextgate_get_context` only); `off` hides it even on
+  `full`.
 
 ### 4. Verify
 
@@ -87,8 +90,9 @@ node dist/cli.js mcp --root "<repo>"        # one server, both surfaces
 node dist/cli.js gate doctor                # gate wiring OK
 ```
 
-In `client` profile, `tools/list` should show both `codegraph_context` and
-`contextgate_get_context`.
+In `client` profile, `tools/list` should show exactly `codegraph_context`,
+`codegraph_slice`, and `codegraph_status`; `contextgate_get_context` appears
+only on `full` profile or with `TOKENOPT_MCP_MODE` set.
 
 ## Note on the earlier SQLite migration
 

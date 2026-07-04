@@ -76,26 +76,27 @@ If `codegraph` is on `PATH`:
 ## Tool exposure: profiles and modes
 
 The exposed `tools/list` surface is controlled by the MCP profile and an optional
-TokenOpt mode override.
+TokenOpt mode override. The default is a **single-gate surface**: one entry point
+(`codegraph_context`) instead of several competing "call me first" tools — models
+pick tools more reliably when exactly one claims the first call
+(docs/mcp-adoption-plan.md, Phase 2).
 
 | Control | Values | Effect |
 | --- | --- | --- |
 | `--mcp-profile` | `client` (default), `minimal`, `research`, `change`, `review`, `full` | Width of the CodeGraph surface. `client` exposes `codegraph_context` / `codegraph_slice` / `codegraph_status`; `full` exposes every direct pack and follow-up tool. |
-| TokenOpt mode | derived: `client`/narrow profiles → `lite`; `full` → `full` | Width of the gate surface bundled in. |
-| `TOKENOPT_MCP_MODE` | `lite`, `full`, `broker` | Overrides the gate set. `broker` exposes only `contextgate_get_context`. |
+| `TOKENOPT_MCP_MODE` | unset (default), `lite`, `full`, `broker`, `off` | Embedded TokenOpt/ContextGate gate tools. Unset → hidden on every profile except `full`; `lite`/`full`/`broker` force that gate set on any profile; `off` hides it even on `full`. |
 
 Observed surfaces:
 
-- **`client` profile** (default) → **7 tools**: 3 CodeGraph (`codegraph_context`,
-  `codegraph_slice`, `codegraph_status`) + the ContextGate lite gate
-  (`contextgate_get_context`, `tokenopt_compile_evidence`, `tokenopt_search`,
-  `tokenopt_read_file`).
-- **`full` profile** → **45 tools**: the full CodeGraph pack/follow-up surface +
-  the full TokenOpt surface (17 gate tools incl. `tokenopt_session_stats`,
-  `tokenopt_project_facts`, `tokenopt_run_command`, …).
+- **`client` profile** (default) → **3 tools**: `codegraph_context`,
+  `codegraph_slice`, `codegraph_status`. The TokenOpt evidence flow still runs —
+  `codegraph_context` routes into the same packs internally.
+- **`full` profile** → the full CodeGraph pack/follow-up surface + the full
+  TokenOpt gate surface (`contextgate_get_context`, `tokenopt_*`).
 
-Use `full` only for benchmarks or power-user clients that intentionally need
-direct pack tools; agents should prefer the default `client` profile.
+Use `full` (or `TOKENOPT_MCP_MODE`) only for benchmarks or power-user clients
+that intentionally need direct pack/gate tools; agents should get the default
+`client` profile.
 
 ## Useful flags
 
@@ -111,28 +112,25 @@ direct pack tools; agents should prefer the default `client` profile.
 
 ## Recommended agent tool flow
 
-Because both surfaces live in one server, the agent picks the entry tool by
-intent — it does not coordinate two servers.
+One entry point, by design:
 
-**Broad / unknown-owner tasks** (investigation, architecture, PBI impact, planning,
-request-flow tracing, review):
+1. Any repo question, or before any edit → `codegraph_context` with the user's
+   task verbatim (it classifies the task and routes to the right pack —
+   research, flow, change, review, evidence — internally).
+2. `answerable=true` / `sufficientForAnswer=true` → answer from the packet; do
+   not re-verify the same ground with grep/read/shell.
+3. Packet names an exact missing file/line/symbol → `codegraph_slice` (batch
+   multiple ranges via `slices[]`).
+4. Pass the same `sessionId` on every call of a conversation so
+   already-delivered evidence is not re-sent.
 
-1. Call `contextgate_get_context` with the full natural task.
-2. If `answerable=true` (or the broker says `answer_now`), answer from the packet.
-3. Otherwise fill the named gaps: `code_graph` gap → `codegraph_context`;
-   `file_read` gap → `codegraph_slice` with the known path; `search` gap →
-   `search_symbol` / `tokenopt_search`. The gate already folds in `code_graph`
-   evidence when `codegraph.enabled`.
+**Exact known file/symbol:** skip the gate and read directly — a narrow read is
+the cheapest path.
 
-**Concrete diff / PR / changed-file review:**
-
-1. Round 1 (business): `contextgate_get_context` + `get_change_pack` for
-   requirement/impact evidence.
-2. Round 2 (technical YAGNI/KISS): direct diff review, no MCP.
-3. Round 3 (checklist): `get_change_pack` only for changed-file coverage.
-
-**Exact known file/symbol:** skip the gate and read directly — a narrow read is the
-cheapest path.
+**Full profile only** (benchmarks/power users): the direct pack tools and the
+ContextGate flow (`contextgate_get_context` first, then gap-filling) are
+available, but `codegraph_context` remains the recommended first call for broad
+tasks.
 
 `codegraph_context` includes stale-index warnings by default. Pass
 `warnStale: false` only for the smallest possible packet. For slow composite
