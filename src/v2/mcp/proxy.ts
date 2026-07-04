@@ -10,13 +10,12 @@ import { V2QueryService } from '../query/service.js';
 import { openCodeGraphDb, type CodeGraphDb } from '../storage/database.js';
 import { inspectWorkspaceReadiness } from '../workspace-health.js';
 import { isLocalMcpFallbackTool, runLocalMcpFallback } from './local-fallback.js';
-import { V2_TOOL_DEFINITIONS, mcpToolNamesForProfile, parseToolArgs } from './tools.js';
+import { buildV2ToolDefinitionsForProfile, mcpToolNamesForProfile, parseToolArgs } from './tools.js';
 import {
   TOKENOPT_TOOL_DEFINITIONS,
   dispatchTokenoptTool,
   getExposedMcpToolNames,
   normalizeMcpMode,
-  SERVER_INSTRUCTIONS as TOKENOPT_SERVER_INSTRUCTIONS,
   type McpMode,
   type TokenoptCodeGraphProvider,
 } from '../../tokenopt/mcp.js';
@@ -62,21 +61,22 @@ class McpStructuredError extends Error {
 export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
   const activeMcpProfile = options.mcpProfile ?? 'client';
   const allowedToolNames = mcpToolNamesForProfile(activeMcpProfile);
-  const codegraphToolDefinitions = allowedToolNames
-    ? V2_TOOL_DEFINITIONS.filter(tool => allowedToolNames.has(tool.name))
-    : V2_TOOL_DEFINITIONS;
-  // TokenOpt/ContextGate gate tools are exposed alongside the CodeGraph pack
-  // tools in the single fused server. TOKENOPT_MCP_MODE (lite|full|broker) is an
-  // explicit override; otherwise the codegraph profile picks the tokenopt set
-  // (full profile -> full toolset, everything else -> lite).
-  const tokenoptMode: McpMode = process.env.TOKENOPT_MCP_MODE
-    ? normalizeMcpMode()
-    : activeMcpProfile === 'full'
-      ? 'full'
-      : 'lite';
-  const tokenoptExposed = getExposedMcpToolNames(tokenoptMode);
+  const codegraphToolDefinitions = buildV2ToolDefinitionsForProfile(activeMcpProfile);
+  // Single-gate surface (docs/mcp-adoption-plan.md P2): the embedded
+  // TokenOpt/ContextGate tools are opt-in. Advertising three near-identical
+  // "call FIRST" gates makes the model arbitrate between our own tools before
+  // it arbitrates against grep, so the default client surface exposes exactly
+  // one entry point — codegraph_context. Full profile keeps the whole toolset;
+  // TOKENOPT_MCP_MODE=lite|full|broker restores the tokenopt surface on any
+  // profile, TOKENOPT_MCP_MODE=off hides it even on full.
+  const tokenoptEnv = process.env.TOKENOPT_MCP_MODE?.trim();
+  const tokenoptOff = tokenoptEnv
+    ? /^(off|none|0|false|disabled)$/i.test(tokenoptEnv)
+    : activeMcpProfile !== 'full';
+  const tokenoptMode: McpMode = tokenoptEnv && !tokenoptOff ? normalizeMcpMode(tokenoptEnv) : 'full';
+  const tokenoptExposed = tokenoptOff ? new Set<string>() : getExposedMcpToolNames(tokenoptMode);
   const tokenoptToolDefinitions = TOKENOPT_TOOL_DEFINITIONS.filter(tool => tokenoptExposed.has(tool.name));
-  const toolDefinitions = [...codegraphToolDefinitions, ...tokenoptToolDefinitions] as typeof V2_TOOL_DEFINITIONS;
+  const toolDefinitions = [...codegraphToolDefinitions, ...tokenoptToolDefinitions];
   const providerOptions = {
     indexProviders: options.indexProviders,
     scipIndexPath: options.scipIndexPath,
@@ -177,11 +177,18 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
     return current;
   };
 
+  // Clients truncate long initialize instructions (observed cutoff ≈1,900
+  // chars in Claude Code), so the base text stays under 1,500 and the tokenopt
+  // addendum only ships when those tools are actually exposed. Appending the
+  // full TokenOpt instructions would also reintroduce a second "call FIRST"
+  // gate claim — exactly the ambiguity the single-gate surface removes.
   const server = new Server(
     { name: 'codegraph', version: '2.1.0' },
     {
       capabilities: { tools: {} },
-      instructions: `${MCP_SERVER_INSTRUCTIONS}\n\n${TOKENOPT_SERVER_INSTRUCTIONS}`,
+      instructions: tokenoptExposed.size > 0
+        ? `${MCP_SERVER_INSTRUCTIONS}\n\n${FULL_PROFILE_INSTRUCTIONS_SUFFIX}`
+        : MCP_SERVER_INSTRUCTIONS,
     },
   );
 
@@ -241,7 +248,8 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
               text: JSON.stringify({
                 error: {
                   code: 'tool_not_available_in_profile',
-                  message: `Tool ${request.params.name} is not exposed in tokenopt mode ${tokenoptMode}. Run with --mcp-profile full or set TOKENOPT_MCP_MODE=full.`,
+                  message: `Tool ${request.params.name} is not exposed in this profile.`,
+                  next: 'Call codegraph_context with the full task instead — it runs the same evidence flow. To expose the TokenOpt gate tools, run with --mcp-profile full or set TOKENOPT_MCP_MODE=lite|full|broker.',
                 },
               }),
             }],
@@ -617,7 +625,15 @@ function errorPayload(error: unknown): Record<string, unknown> {
       },
     };
   }
-  return { error: { code: 'tool_failed', message } };
+  return {
+    error: {
+      code: 'tool_failed',
+      message,
+      // Errors must never dead-end: always name the recovery path so one bad
+      // call does not teach the agent to abandon the server for the session.
+      next: 'Retry once. If it persists, run `codegraph doctor --root <workspace>`; for a known exact file/line, codegraph_slice still works directly.',
+    },
+  };
 }
 
 function isFallbackEligible(payload: Record<string, unknown>): boolean {
@@ -639,7 +655,9 @@ function logQueryEvent(logPath: string, event: Record<string, unknown>): void {
 
 function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
   const summary: Record<string, unknown> = {};
-  for (const key of ['target', 'symbol', 'source', 'module', 'file', 'query', 'task', 'taskType', 'tokenBudget', 'method', 'path']) {
+  // sessionId keeps the query log usable as an adoption ledger: it groups the
+  // calls of one conversation (see `codegraph adoption-report`).
+  for (const key of ['target', 'symbol', 'source', 'module', 'file', 'query', 'task', 'taskType', 'tokenBudget', 'method', 'path', 'sessionId']) {
     const value = args[key];
     if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
       summary[key] = typeof value === 'string' && value.length > 240 ? `${value.slice(0, 237)}...` : value;
@@ -807,113 +825,35 @@ function addResponseMeta(
   if (symbolCount !== undefined) meta.symbols_returned = symbolCount;
   if (callEdgeCount !== undefined) meta.call_edges_returned = callEdgeCount;
   if (fileCount !== undefined) meta.files_returned = fileCount;
+  // Terminal-packet nudge: the stop rule travels with the packet itself, not
+  // only in (truncatable) server instructions.
+  if (result.answerable === true || result.sufficientForAnswer === true) {
+    meta.next = 'answerable=true — answer from this packet; do not re-search or re-read the same ground.';
+  }
   return { ...result, _codegraph_meta: meta };
 }
 
-export const MCP_SERVER_INSTRUCTIONS = `# CodeGraph usage
+export const MCP_SERVER_INSTRUCTIONS = `# CodeGraph — pre-indexed repository context
 
-These MCP initialize instructions are the single source of truth for how an AI
-agent should use CodeGraph tools. The agent also sees the active tools/list
-descriptions; together they are how it knows what it can call.
+The workspace is pre-indexed into a code graph (symbols, calls, dependencies, endpoints). One codegraph_context call returns a bounded evidence packet — ranked files, call/dependency edges, line-numbered source — for a whole task, replacing a grep->read->grep loop (benchmarked: ~20% fewer tokens, ~5x fewer tool round-trips than raw file reads).
 
-## Role when TokenOpt MCP is also connected
+Session reuse first: pass the same sessionId string on EVERY call in a conversation. Already-delivered slices then return reusedFromEarlierCall=true with no text body — you already have that source; do NOT re-open it with other tools. Re-fetch one slice via codegraph_slice (or freshEvidence=true) only if it truly left your context.
 
-CodeGraph is the \`code_graph\` provider in a TokenOpt evidence workflow.
-Do NOT call codegraph_context first for broad tasks when TokenOpt is present — let contextgate_get_context run first.
+Routing:
+- Any repository question, or before any edit -> codegraph_context with the user's task verbatim.
+- answerable=true or sufficientForAnswer=true -> answer from the packet; no grep/read/shell re-verification of the same ground.
+- Packet names an exact missing file/line/symbol -> codegraph_slice (batch via slices[]).
+- codegraph_status is diagnostic only.
 
-After contextgate_get_context returns an evidence packet:
-- evidence_gap with tool_categories containing "code_graph" → call codegraph_context with the gap description as the task
-- evidence_gap with tool_categories containing "file_read" → call codegraph_slice with the known file path
-- evidence_gap with tool_categories containing "search" → call search_symbol or tokenopt_search
-- answerable=true → do not call codegraph_context at all; answer from the packet
+Trust the packet: evidenceSlices are already-read source; when facts are missing the packet lists its own followups — use those, not broad search. Index missing/stale errors name the exact fix command (codegraph index); run it once, retry. Do not set autoRefresh=true unless the user asks for a fresh index.`;
 
-## Role when TokenOpt MCP is NOT connected
-
-CodeGraph is the PRIMARY local repository context server. It combines a
-pre-indexed SQLite code graph with TokenOpt-style evidence packets so you do
-not need to rediscover structure through grep/read loops.
-Call codegraph_context first with the user's full task text for any broad repo question.
-
-## Tool surface
-
-Default/client profile exposes only codegraph_context, codegraph_slice, and codegraph_status.
-If unsure, call codegraph_context first with the user's full task text.
-Full profile exposes direct pack tools for benchmark/power-user flows, but the
-same first-tool rules still apply.
-
-## Tool selection by intent
-
-- Almost any repository question or pre-edit investigation:
-  call codegraph_context first with the user's full task text.
-- Endpoint/API/route/request-flow/startup-flow questions:
-  codegraph_context routes to get_flow_pack; in full profile call
-  get_flow_pack only for explicit endpoint/API/request-flow tracing.
-- Architecture, onboarding, "where/what is X", or "how does X work":
-  codegraph_context routes to get_research_pack.
-- Implement, fix, debug, refactor, test, modify, or "what should I change":
-  codegraph_context routes to get_change_pack before editing; in full profile
-  use get_change_pack for implement/fix/debug/refactor/test/edit tasks even
-  when they mention a request flow.
-- Review with a unified diff:
-  codegraph_context routes to review_patch.
-- Compact evidence, answerability, rubric, PBI, or coverage gate:
-  codegraph_context routes to compile_evidence.
-- Reading source:
-  use codegraph_slice/get_file_slice only after a pack identifies exact
-  file/line/symbol evidence or a specific missing fact.
-- FOLLOW-UP ONLY tools:
-  search_symbol, search_files, search_code, find_references, get_callers,
-  get_callees, get_dependencies, get_dependents, and get_file_slice are not
-  first calls for broad repo work. Use them only for exact missing facts named
-  by the context packet or when the user asks for that exact known symbol/path.
-
-## Follow-up policy
-
-- Treat evidenceSlices as already-read source. They include file paths, line
-  ranges, and capped source text.
-- After get_flow_pack or get_research_pack returns answerable=true or
-  sufficientForAnswer=true, answer from the packet; do not call rg, shell
-  search, search_code, search_symbol, or read loops unless the user explicitly
-  asks for more detail.
-- For natural prompts such as "trace api /a please", codegraph_context routes
-  flow/research to answer-mode by default. Treat answer-mode packets as terminal
-  when answerable=true.
-- After codegraph_slice/get_file_slice returns requested source, answer from
-  that slice plus the prior packet; do not call shell, do not call rg, and do
-  not start another search/read loop for the same file or symbol.
-- If sufficientForAnswer or answerable is true, answer from the packet and stop.
-- If the packet lists missingFacts or allowed follow-ups, use only the named
-  exact follow-up tools such as codegraph_slice, search_symbol, search_files, or
-  search_code.
-
-## Evidence reuse (avoid duplicate tokens)
-
-- Pass a stable \`sessionId\` (any constant string for this conversation, e.g.
-  the conversation/thread id) on EVERY codegraph_context / pack call. This lets
-  CodeGraph remember which source bodies it already gave you and skip resending
-  them, which is the single biggest saver of duplicate tokens across an
-  investigate -> trace -> change -> review sequence. Without a sessionId every
-  packet re-sends full source.
-- With a sessionId, a slice you already received comes back on later calls with
-  \`reusedFromEarlierCall: true\` and NO \`text\` field (only file/lines/symbol).
-  That is intentional: reuse the source you were already given earlier in the
-  conversation. Do NOT re-open it with get_file_slice, rg, or Read just because
-  the body is absent from this packet.
-- \`completeness.reusedEvidenceCount\` tells you how many slices were deduped.
-- Only if a reused slice genuinely scrolled out of your context window, re-fetch
-  that one exact slice with codegraph_slice/get_file_slice, or pass
-  \`freshEvidence: true\` to get full bodies again.
-- Preserve HTTP methods and paths exactly, for example GET /ws/v1/cluster/apps.
-- Do not set autoRefresh=true unless the user explicitly asks for a fresh index.
-- Avoid forcing warnStale=true for every tool during exploration benchmarks unless freshness is part of the benchmark objective.
-
-## Anti-patterns
-
-- Do not grep/read first for broad repo investigation.
-- Do not call many small slice/search tools after an answer-ready packet.
-- Do not use shell search to rediscover files already listed in evidenceSlices.
-- Do not chain search_code, search_symbol, and slices as a substitute for the
-  primary context packet. Prefer one bounded packet, then exact follow-ups.`;
+/**
+ * Appended to the base instructions only when the TokenOpt/pack tool surface is
+ * actually exposed (full profile or explicit TOKENOPT_MCP_MODE). Kept to a
+ * single paragraph so the combined text still survives client truncation, and
+ * phrased so codegraph_context stays the one first-call gate.
+ */
+export const FULL_PROFILE_INSTRUCTIONS_SUFFIX = `Full profile addendum: direct pack tools (get_research_pack, get_flow_pack, get_change_pack, review_patch, compile_evidence) and the TokenOpt/ContextGate gate tools (contextgate_get_context, tokenopt_compile_evidence, tokenopt_search, tokenopt_read_file) are exposed for benchmark and power-user flows. codegraph_context remains the first call for broad tasks; it routes to the same packs.`;
 
 function isAnswerPackTool(name: string): boolean {
   return name === 'get_flow_pack' || name === 'get_research_pack';

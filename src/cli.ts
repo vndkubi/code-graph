@@ -37,9 +37,11 @@ import {
   buildDirectoryStats,
   composeArchitectureMarkdown,
   composeClaudeMarkdown,
+  composeCopilotMarkdown,
   detectBuildCommands,
   normalizeOnboardProfile,
 } from './v2/query/onboard.js';
+import { buildAdoptionReport, formatAdoptionReportText } from './v2/query/adoption-report.js';
 import { runAffectedTestsEval } from './v2/benchmark/affected-tests-eval.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 import { buildLocalArtifactIndex } from './v2/mcp/local-artifact.js';
@@ -113,6 +115,9 @@ async function main(): Promise<void> {
       return;
     case 'onboard':
       await runOnboardCommand(parsed);
+      return;
+    case 'adoption-report':
+      runAdoptionReportCommand(parsed);
       return;
     case 'benchmark':
       await runBenchmarkCommand(subcommand, parsed);
@@ -517,6 +522,9 @@ async function runOnboardCommand(parsed: ParsedArgs): Promise<void> {
     if (profile === 'claude' || profile === 'both') {
       targets.push({ file: 'CLAUDE.md', body: composeClaudeMarkdown(inputs) });
     }
+    if (profile === 'copilot' || profile === 'both') {
+      targets.push({ file: path.join('.github', 'copilot-instructions.md'), body: composeCopilotMarkdown(inputs) });
+    }
     const written: Array<Record<string, unknown>> = [];
     for (const target of targets) {
       const filePath = path.join(root, target.file);
@@ -527,6 +535,7 @@ async function runOnboardCommand(parsed: ParsedArgs): Promise<void> {
         console.log(`\n===== ${target.file} (${mode}, dry run) =====\n`);
         console.log(next);
       } else {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
         fs.writeFileSync(filePath, next);
       }
       written.push({ file: target.file, mode, bytes: next.length });
@@ -535,6 +544,29 @@ async function runOnboardCommand(parsed: ParsedArgs): Promise<void> {
   } finally {
     await db.close();
   }
+}
+
+/**
+ * `codegraph adoption-report`: aggregate the workspace MCP call ledger
+ * (.codegraph/logs/query.jsonl) into real-usage adoption numbers — how often
+ * agents actually call CodeGraph, with how many distinct conversations, and
+ * whether conversations start with the codegraph_context gate. Dogfood
+ * instrumentation for docs/mcp-adoption-plan.md.
+ */
+function runAdoptionReportCommand(parsed: ParsedArgs): void {
+  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const logPath = getWorkspacePaths(root).queryLogPath;
+  const lines = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf-8').split(/\r?\n/) : [];
+  const report = buildAdoptionReport(lines, {
+    since: getFlag(parsed, 'since'),
+    until: getFlag(parsed, 'until'),
+  });
+  if (getFlag(parsed, 'format') === 'json') {
+    console.log(JSON.stringify({ logPath, ...report }, null, 2));
+    return;
+  }
+  console.log(`Ledger: ${logPath}`);
+  console.log(formatAdoptionReportText(report));
 }
 
 /**
@@ -2424,8 +2456,10 @@ Usage:
                                          Select the tests a git range can affect (ALL = safety fallback)
   codegraph review --root <workspace> --base <ref> [--format json|sarif|markdown|text] [--min-priority P0|P1|P2] [--fail-on P0|P1|P2|none] [--out <path>]
                                          Deterministic PR review: graph-fact findings for CI (SARIF/comment)
-  codegraph onboard --root <workspace> [--profile architecture|claude|both] [--dry-run]
-                                         Generate ARCHITECTURE.md/CLAUDE.md from index facts (marker-based regeneration)
+  codegraph onboard --root <workspace> [--profile architecture|claude|copilot|both] [--dry-run]
+                                         Generate ARCHITECTURE.md/CLAUDE.md/.github/copilot-instructions.md from index facts (marker-based regeneration)
+  codegraph adoption-report --root <workspace> [--since <ISO>] [--until <ISO>] [--format json|text]
+                                         Aggregate the MCP call ledger (.codegraph/logs/query.jsonl) into adoption numbers
   codegraph route-inspect --task <text>  Explain codegraph_context routing and stop/follow-up gate policy
   codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|copilot-e2e|codex-e2e|competitive-compare
                                              Generate synthetic repos, measure indexing, run evals, or prove context/review savings
@@ -2496,7 +2530,7 @@ Options:
   --mcp-profile <client|minimal|research|change|review|full>
                                              Tool surface for MCP. Default/client exposes facade tools; full exposes every tool.
   --models <a,b,c>                       Copilot E2E model list for benchmark copilot-e2e
-  --modes <codegraph,baseline>           Copilot E2E comparison modes
+  --modes <codegraph,baseline,organic>   Copilot E2E comparison modes (organic = MCP available, neutral prompt; adoption measurement)
   --modes <baseline,terse-no-mcp,natural-tool-use,mcp-first,mcp-only,compiled-packet,compiled-packet+gate,oracle-packet>
                                              Codex E2E comparison modes
   --task-ids <a,b,c>                     Copilot/Codex E2E task ids

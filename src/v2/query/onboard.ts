@@ -16,12 +16,12 @@ import { arrayRecords, isPlainObject, stringArray } from './util.js';
 export const ONBOARD_BEGIN_MARKER = '<!-- codegraph:begin generated -->';
 export const ONBOARD_END_MARKER = '<!-- codegraph:end generated -->';
 
-export type OnboardProfile = 'architecture' | 'claude' | 'both';
+export type OnboardProfile = 'architecture' | 'claude' | 'copilot' | 'both';
 
 export function normalizeOnboardProfile(value: string | undefined): OnboardProfile {
   const profile = (value ?? 'both').trim().toLowerCase();
-  if (profile === 'architecture' || profile === 'claude' || profile === 'both') return profile;
-  throw new Error(`Unknown onboard profile: ${value}. Use architecture, claude, or both.`);
+  if (profile === 'architecture' || profile === 'claude' || profile === 'copilot' || profile === 'both') return profile;
+  throw new Error(`Unknown onboard profile: ${value}. Use architecture, claude, copilot, or both.`);
 }
 
 export interface OnboardDirectoryStat {
@@ -455,6 +455,28 @@ export function composeArchitectureMarkdown(inputs: OnboardInputs): string {
   return lines.join('\n');
 }
 
+/**
+ * MCP routing policy for agent instruction files (CLAUDE.md and
+ * .github/copilot-instructions.md). This is the highest-authority channel an
+ * agent reads — tool descriptions get deferred/truncated by clients, this
+ * file does not. Hedged on availability so it stays harmless when the MCP
+ * server is not configured. Keep it ≤10 lines.
+ */
+function composeMcpRoutingLines(): string[] {
+  return [
+    '## Repo context: use the codegraph MCP first',
+    '',
+    'When the codegraph MCP tools are available in this session:',
+    '',
+    '- Any repo question, or before any edit → call `codegraph_context` with the task verbatim.',
+    '- The response says `answerable=true` → answer from that packet; do not re-grep/re-read the same ground.',
+    '- Need more source at an exact file/line the packet named → `codegraph_slice`.',
+    '- Pass the same `sessionId` string on every call in a conversation (dedupes evidence, saves tokens).',
+    '- `workspace_not_indexed` error → run `codegraph index --root .` once, then retry.',
+    '',
+  ];
+}
+
 export function composeClaudeMarkdown(inputs: OnboardInputs): string {
   const view = viewAtlas(inputs.atlas);
   const lines: string[] = [];
@@ -467,6 +489,7 @@ export function composeClaudeMarkdown(inputs: OnboardInputs): string {
   lines.push('');
   lines.push(`${codeLanguageSummary(view.languages)} codebase: ${mainCount} main-source files, ${testCount} test files${view.entrypoints.length > 0 ? `, ${view.apiEndpointCount} ${view.framework ?? 'HTTP'} endpoints${apiComponent && apiComponent.endpoints > 0 ? ` (in \`${apiComponent.component}\`)` : ''}` : ''}.`);
   lines.push('');
+  lines.push(...composeMcpRoutingLines());
   if (inputs.components.length >= 2) {
     lines.push('## Components');
     lines.push('');
@@ -511,4 +534,13 @@ export function composeClaudeMarkdown(inputs: OnboardInputs): string {
   }
   lines.push('Regenerate this block with `codegraph onboard`; content outside the markers is never touched.');
   return lines.join('\n');
+}
+
+/**
+ * `.github/copilot-instructions.md` — Copilot auto-attaches this file to every
+ * Chat/agent request; with no hook system on that client, it is the main
+ * adoption lever there. Same facts + routing policy as CLAUDE.md.
+ */
+export function composeCopilotMarkdown(inputs: OnboardInputs): string {
+  return composeClaudeMarkdown(inputs);
 }

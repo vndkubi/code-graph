@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { buildV2ToolDefinitions, mcpToolNamesForProfile, parseToolArgs, V2_TOOL_DEFINITIONS, V2_TOOL_PROFILES } from '../../src/v2/mcp/tools.js';
-import { MCP_SERVER_INSTRUCTIONS, inferCodeGraphContextMode, inspectCodeGraphRoute, routeCodeGraphContext } from '../../src/v2/mcp/proxy.js';
+import { buildV2ToolDefinitions, buildV2ToolDefinitionsForProfile, mcpToolNamesForProfile, parseToolArgs, V2_TOOL_DEFINITIONS, V2_TOOL_PROFILES } from '../../src/v2/mcp/tools.js';
+import { FULL_PROFILE_INSTRUCTIONS_SUFFIX, MCP_SERVER_INSTRUCTIONS, inferCodeGraphContextMode, inspectCodeGraphRoute, routeCodeGraphContext } from '../../src/v2/mcp/proxy.js';
 import { runRouteGateBenchmark } from '../../src/v2/benchmark/route-gate.js';
 import { estimateTextTokens } from '../../src/v2/token-estimator.js';
 
@@ -27,21 +27,26 @@ describe('MCP full tool mode', () => {
     ]));
   });
 
-  it('publishes a compact first-tool rule map in MCP server instructions', () => {
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('single source of truth');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('Default/client profile exposes only');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('codegraph_context, codegraph_slice, and codegraph_status');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('If unsure, call codegraph_context');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('Full profile exposes direct pack tools');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('get_flow_pack only for explicit endpoint/API/request-flow tracing');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('get_change_pack for implement/fix/debug/refactor/test/edit tasks');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('FOLLOW-UP ONLY');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('After codegraph_slice/get_file_slice returns requested source');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('do not call shell');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('do not call rg');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('After get_flow_pack or get_research_pack returns answerable=true');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('natural prompts');
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('answer-mode by default');
+  it('publishes compact single-gate instructions that survive client truncation', () => {
+    // Observed client cutoff ≈1,900 chars (Claude Code): the base text must
+    // stay well under it, with the sessionId reuse rule in the first 5 lines
+    // rather than a truncated tail.
+    expect(MCP_SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(1500);
+    const lines = MCP_SERVER_INSTRUCTIONS.split('\n');
+    expect(lines.findIndex(line => line.includes('sessionId'))).toBeLessThan(5);
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('codegraph_context');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('codegraph_slice');
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('answerable=true');
+    // No ghost tools: the client profile exposes exactly three tools, so the
+    // base instructions must not tell the model to call anything else.
+    for (const ghost of ['search_symbol', 'get_flow_pack', 'get_research_pack', 'get_change_pack', 'search_code', 'get_file_slice', 'contextgate_get_context', 'tokenopt_search', 'compile_evidence']) {
+      expect(MCP_SERVER_INSTRUCTIONS).not.toContain(ghost);
+    }
+    // The full-profile addendum names the wider surface but keeps one gate,
+    // and the combined text still fits under the observed truncation budget.
+    expect(FULL_PROFILE_INSTRUCTIONS_SUFFIX).toContain('get_research_pack');
+    expect(FULL_PROFILE_INSTRUCTIONS_SUFFIX).toContain('codegraph_context remains the first call');
+    expect(MCP_SERVER_INSTRUCTIONS.length + 2 + FULL_PROFILE_INSTRUCTIONS_SUFFIX.length).toBeLessThanOrEqual(1900);
   });
 
   it('keeps named MCP profiles on the facade surface to avoid duplicate low-level choices', () => {
@@ -210,15 +215,48 @@ describe('MCP full tool mode', () => {
 
     expect(compact.map(tool => tool.name)).toEqual(normal.map(tool => tool.name));
     expect(compact.map(tool => tool.inputSchema)).toEqual(normal.map(tool => tool.inputSchema));
-    expect(compact.find(tool => tool.name === 'codegraph_context')?.description).toContain('PRIMARY TOOL - call FIRST');
-    expect(compact.find(tool => tool.name === 'codegraph_slice')?.description).toContain('FOLLOW-UP ONLY');
-    expect(compact.find(tool => tool.name === 'compile_evidence')?.description).toContain('TokenOpt-style');
-    expect(compact.find(tool => tool.name === 'compile_evidence')?.description).toContain('call FIRST');
-    expect(compact.find(tool => tool.name === 'review_patch')?.description).toContain('call FIRST');
-    expect(compact.find(tool => tool.name === 'get_flow_pack')?.description).toContain('ONLY for explicit');
-    expect(compact.find(tool => tool.name === 'get_flow_pack')?.description).toContain('debug');
-    expect(compact.find(tool => tool.name === 'get_flow_pack')?.description).toContain('answerable');
-    expect(compact.find(tool => tool.name === 'get_flow_pack')?.description).toContain('rg/shell');
     expect(estimatedSchemaTokens(compact)).toBeLessThan(estimatedSchemaTokens(normal));
+  });
+
+  it('gate description states capability, trigger, and payoff (not just an imperative)', () => {
+    for (const compactDescriptions of [true, false]) {
+      const description = buildV2ToolDefinitions({ compactDescriptions })
+        .find(tool => tool.name === 'codegraph_context')?.description ?? '';
+      expect(description).toContain('Call this FIRST');
+      expect(description).toMatch(/ranked files/);
+      expect(description).toMatch(/fewer tokens/);
+      expect(description).toContain('sessionId');
+      expect(description).toContain('answerable=true');
+    }
+  });
+
+  it('keeps exactly one first-call claim across advertised descriptions', () => {
+    // Three tools shouting "call FIRST" was the measured ambiguity that made
+    // the model arbitrate between our own tools; only the gate may claim it.
+    for (const compactDescriptions of [true, false]) {
+      const claimants = buildV2ToolDefinitions({ compactDescriptions })
+        .filter(tool => /call (this )?first/i.test(tool.description))
+        .map(tool => tool.name);
+      expect(claimants).toEqual(['codegraph_context']);
+    }
+  });
+
+  it('advertises a slim gate schema on client profiles and the full schema on full', () => {
+    const client = buildV2ToolDefinitionsForProfile('client');
+    expect(client.map(tool => tool.name)).toEqual(['codegraph_context', 'codegraph_slice', 'codegraph_status']);
+    const gate = client.find(tool => tool.name === 'codegraph_context')!;
+    const gateProperties = (gate.inputSchema as { properties: Record<string, unknown> }).properties;
+    expect(Object.keys(gateProperties)).toEqual(['task', 'mode', 'target', 'diff', 'sessionId']);
+    expect((gate.inputSchema as { required: string[] }).required).toEqual(['task']);
+
+    const full = buildV2ToolDefinitionsForProfile('full');
+    const fullGate = full.find(tool => tool.name === 'codegraph_context')!;
+    expect(Object.keys((fullGate.inputSchema as { properties: Record<string, unknown> }).properties).length).toBeGreaterThan(10);
+
+    // Advertised subset ⊂ accepted set: power params still parse when sent.
+    expect(parseToolArgs('codegraph_context', { task: 'x', budgetTokens: 8000, includeSnippets: true })).toMatchObject({
+      budgetTokens: 8000,
+      includeSnippets: true,
+    });
   });
 });

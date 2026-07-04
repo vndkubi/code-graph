@@ -11,6 +11,7 @@ import {
   componentForPath,
   composeArchitectureMarkdown,
   composeClaudeMarkdown,
+  composeCopilotMarkdown,
   detectBuildCommands,
   normalizeOnboardProfile,
 } from '../../src/v2/query/onboard.js';
@@ -302,6 +303,33 @@ describe('composeClaudeMarkdown', () => {
     expect(doc).toContain('`src` — 12 main / 0 test files');
     expect(doc).toContain('`POST /api/orders` → OrderResource.create');
     expect(doc).toContain('src/OrderService.java');
+  });
+
+  it('includes the MCP routing policy near the top, before project sections', () => {
+    expect(doc).toContain('## Repo context: use the codegraph MCP first');
+    expect(doc).toContain('call `codegraph_context` with the task verbatim');
+    expect(doc).toContain('`answerable=true`');
+    expect(doc).toContain('`sessionId`');
+    expect(doc).toContain('`codegraph_slice`');
+    expect(doc.indexOf('## Repo context')).toBeLessThan(doc.indexOf('## Commands'));
+    // Hedged on availability: must not read as an instruction to call a tool
+    // that does not exist in the session.
+    expect(doc).toContain('When the codegraph MCP tools are available');
+  });
+
+  it('keeps the routing block within its 10-line budget', () => {
+    const start = doc.indexOf('## Repo context: use the codegraph MCP first');
+    const section = doc.slice(start, doc.indexOf('## ', start + 10));
+    const contentLines = section.split('\n').filter(line => line.trim().length > 0);
+    expect(contentLines.length).toBeLessThanOrEqual(10);
+  });
+});
+
+describe('composeCopilotMarkdown', () => {
+  it('mirrors the CLAUDE.md facts + routing policy for .github/copilot-instructions.md', () => {
+    const doc = composeCopilotMarkdown(FIXTURE_INPUTS);
+    expect(doc).toContain('## Repo context: use the codegraph MCP first');
+    expect(doc).toContain('java codebase: 12 main-source files');
   });
 });
 

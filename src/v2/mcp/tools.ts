@@ -347,7 +347,31 @@ export const V2_TOOL_PROFILES: Record<V2ToolProfile, readonly V2ToolName[]> = {
 
 export interface V2ToolDefinitionOptions {
   compactDescriptions?: boolean;
+  /**
+   * Advertise a trimmed codegraph_context schema (client profiles): 5 params
+   * instead of 17. Fewer knobs = fewer tokens in every tools/list and less
+   * decision friction for the model. The server keeps parsing the full zod
+   * schema, so power params still work if a client sends them anyway.
+   */
+  slimClientSchemas?: boolean;
 }
+
+/**
+ * Hand-written advertised schema for the client-profile gate. Property
+ * descriptions double as usage guidance — this is the only place many models
+ * read per-parameter semantics.
+ */
+const SLIM_CODEGRAPH_CONTEXT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    task: { type: 'string', description: "The user's task, verbatim. Full sentences route better than keywords." },
+    mode: { type: 'string', enum: ['auto', 'research', 'flow', 'change', 'review', 'evidence'], description: 'Optional override; auto infers from the task.' },
+    target: { type: 'string', description: 'Optional focus: a symbol, endpoint path, or file.' },
+    diff: { type: 'string', description: 'Unified diff for review tasks.' },
+    sessionId: { type: 'string', description: 'Any constant string per conversation. Enables evidence reuse so repeated calls skip source you already received.' },
+  },
+  required: ['task'],
+};
 
 export const V2_TOOL_DEFINITIONS = buildV2ToolDefinitions({
   compactDescriptions: envFlag(process.env.CODEGRAPH_MCP_COMPACT_TOOL_DESCRIPTIONS, true),
@@ -361,8 +385,31 @@ export function buildV2ToolDefinitions(options: V2ToolDefinitionOptions = {}): A
   return Object.entries(V2ToolSchemas).map(([name, schema]) => ({
     name,
     description: descriptionFor(name as V2ToolName, options),
-    inputSchema: zodToJsonSchema(schema),
+    inputSchema: options.slimClientSchemas && name === 'codegraph_context'
+      ? SLIM_CODEGRAPH_CONTEXT_SCHEMA
+      : zodToJsonSchema(schema),
   }));
+}
+
+/**
+ * The tool list a given MCP profile advertises: profile-filtered, compact
+ * descriptions per env default, slim gate schema on every profile except full.
+ * Ordered as the profile declares (gate first) — list position is one more
+ * signal clients use when picking a tool.
+ */
+export function buildV2ToolDefinitionsForProfile(profile: string | undefined): Array<{
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}> {
+  const normalized = normalizeMcpToolProfile(profile) ?? 'client';
+  const order = V2_TOOL_PROFILES[normalized];
+  const definitions = buildV2ToolDefinitions({
+    compactDescriptions: envFlag(process.env.CODEGRAPH_MCP_COMPACT_TOOL_DESCRIPTIONS, true),
+    slimClientSchemas: normalized !== 'full',
+  });
+  const byName = new Map(definitions.map(tool => [tool.name, tool]));
+  return order.map(name => byName.get(name)).filter((tool): tool is NonNullable<typeof tool> => tool !== undefined);
 }
 
 export function parseToolArgs(name: string, args: unknown): Record<string, unknown> {
@@ -392,19 +439,19 @@ function descriptionFor(name: V2ToolName, options: V2ToolDefinitionOptions = {})
     case 'codegraph_status':
       return 'Diagnostic only. Returns workspace SQLite readiness, artifact readiness, and optional DB diagnostics. Do not use for normal code investigation.';
     case 'codegraph_context':
-      return 'PRIMARY TOOL - call FIRST for almost any repository question or before an edit: investigate code, understand how X works, explore architecture, trace endpoint/request flows, debug bugs, plan changes, assess impact, or review risk. Routes the full task to one bounded CodeGraph/TokenOpt-style packet with source evidence, stop rules, and exact follow-ups. Natural prompt default is answer-mode for flow/research so answerable packets should terminate without extra search/slice calls.';
+      return 'Call this FIRST for almost any repository question or before an edit: investigate code, understand how X works, explore architecture, trace endpoint/request flows, debug bugs, plan changes, assess impact, or review risk. One call on the pre-indexed code graph returns ranked files, call/dependency edges, and line-numbered source evidence for the whole task — replacing a grep/read/grep exploration loop (benchmarked: ~20% fewer tokens, ~5x fewer tool round-trips than raw file reads). Pass the user\'s task verbatim and reuse one sessionId per conversation. If the response says answerable=true, answer from it and stop searching.';
     case 'codegraph_slice':
-      return 'FOLLOW-UP ONLY after codegraph_context names exact missing evidence. Returns one or many bounded source slices for specific files, line ranges, or symbols; do not use as the first tool for broad repo questions.';
+      return 'Follow-up source reader: when codegraph_context names an exact file, line range, or symbol still missing, fetch just that bounded slice (batch several via slices[]). Not a first tool for broad repo questions — the packet usually already contains the source as evidenceSlices.';
     case 'get_flow_pack':
-      return 'PRIMARY endpoint/API/request-flow tool - call FIRST ONLY for explicit route, endpoint, API, request-flow, startup-flow, or handler-flow tracing. Default responseMode=agent returns ordered steps, ranked files/symbols, call evidence, capped source slices, taskOracle, evidenceHandles, answerable, allowedFollowups, disallowedFollowups, and a stopRule. If answerable=true, answer from the packet and do not use rg/shell search. For implementation, debug, refactor, bug, or spec planning prompts, use get_change_pack instead.';
+      return 'Flow pack for explicit route, endpoint, API, request-flow, startup-flow, or handler-flow tracing. Default responseMode=agent returns ordered steps, ranked files/symbols, call evidence, capped source slices, taskOracle, evidenceHandles, answerable, allowedFollowups, disallowedFollowups, and a stopRule. If answerable=true, answer from the packet and do not use rg/shell search. For implementation, debug, refactor, bug, or spec planning prompts, use get_change_pack instead. codegraph_context routes here automatically.';
     case 'get_research_pack':
-      return 'PRIMARY broad architecture/research tool - call FIRST for onboarding, surveying an area, "where/what is X", or "how does X work" when no concrete endpoint/API path or edit is named. Returns ranked definitions, flow steps, related edges, top files, bounded evidence, budget metrics, and evidenceHandles. For edit/debug/spec tasks, use get_change_pack.';
+      return 'Research pack for onboarding, surveying an area, "where/what is X", or "how does X work" when no concrete endpoint/API path or edit is named. Returns ranked definitions, flow steps, related edges, top files, bounded evidence, budget metrics, and evidenceHandles. For edit/debug/spec tasks, use get_change_pack. codegraph_context routes here automatically.';
     case 'get_context_packet':
       return 'Compact implementation/debug router for internal or legacy clients. Returns ranked files/symbols, slice/tool hints, likely tests, validation, and next action. For new edit planning, prefer codegraph_context or get_change_pack first.';
     case 'get_change_pack':
-      return 'PRIMARY change-planning tool - call FIRST before implementing, debugging, refactoring, testing, modifying files, or answering "what should I change". Default profile=compact returns scoped files/symbols, exact edit ranges, evidenceHandles, invariants, likely tests, validation commands, and optional patch impact before search_symbol/search_code.';
+      return 'Change pack for implementing, debugging, refactoring, testing, modifying files, or answering "what should I change". Default profile=compact returns scoped files/symbols, exact edit ranges, evidenceHandles, invariants, likely tests, validation commands, and optional patch impact before search_symbol/search_code. codegraph_context routes here automatically.';
     case 'compile_evidence':
-      return 'PRIMARY TokenOpt-style cost gate and evidence compiler - call FIRST when the goal is compact evidence for a repo task, PBI, investigation, review, or plan with minimal turns. Given a full task, taskType, budget, and optional rubric/diff, returns an answerability certificate, compact evidence, missing coverage, allowed exact follow-ups, disallowed broad follow-ups, and budget metadata.';
+      return 'TokenOpt-style cost gate and evidence compiler for compact evidence on a repo task, PBI, investigation, review, or plan with minimal turns. Given a full task, taskType, budget, and optional rubric/diff, returns an answerability certificate, compact evidence, missing coverage, allowed exact follow-ups, disallowed broad follow-ups, and budget metadata. codegraph_context routes here automatically.';
     case 'search_symbol':
       return 'FOLLOW-UP ONLY symbol lookup after codegraph_context or a pack names a missing symbol. Do not use as the first tool for endpoint/API/spec/implementation/review prompts. Supports intent-aware ranking, pagination, facets, and optional rank explanations.';
     case 'search_files':
@@ -436,7 +483,7 @@ function descriptionFor(name: V2ToolName, options: V2ToolDefinitionOptions = {})
     case 'simulate_patch_impact':
       return 'Simulate patch impact from changed files, symbols, or a unified diff. Default outputMode=compact/maxResponseTokens caps broad graph rows while preserving touched symbols, dependency/call counts, endpoints, likely tests, validation commands, and risk flags; use outputMode=full only when expanded evidence is needed.';
     case 'review_patch':
-      return 'PRIMARY review tool - call FIRST for code review prompts with changed files, symbols, or a unified diff: verdict, top findings, risky hunks, capped evidence, validation gaps, and next tool calls. Use outputMode=full only when the agent explicitly needs expanded evidence.';
+      return 'Review packet for code review prompts with changed files, symbols, or a unified diff: verdict, top findings, risky hunks, capped evidence, validation gaps, and next tool calls. Use outputMode=full only when the agent explicitly needs expanded evidence. codegraph_context routes here automatically for review tasks.';
     case 'find_tests_for':
       return 'Find tests likely relevant to a symbol using test file names, test symbols, and indexed call edges.';
     case 'search_code':
@@ -453,19 +500,19 @@ function compactDescriptionFor(name: V2ToolName): string {
     case 'codegraph_status':
       return 'Diagnostic only: runtime/index readiness and optional SQLite diagnostics.';
     case 'codegraph_context':
-      return 'PRIMARY TOOL - call FIRST for repo questions or before edits: investigate code, architecture, bugs, flows, impact, plan/review. Natural flow/research prompts route to answer-mode bounded packets.';
+      return 'Call this FIRST for any repo question or before any edit. One call on the pre-indexed code graph returns ranked files, call/dependency edges, and line-numbered source for the whole task — replaces a grep/read/grep loop (benchmarked: ~20% fewer tokens, ~5x fewer round-trips than raw file reads). Pass the task verbatim; reuse one sessionId per conversation. If the response says answerable=true, answer from it and stop searching.';
     case 'codegraph_slice':
-      return 'FOLLOW-UP ONLY after codegraph_context names exact missing file/line/symbol evidence. Exact bounded slice(s), batch via slices[].';
+      return 'Follow-up source reader: when codegraph_context names an exact file/line/symbol still missing, fetch just that bounded slice (batch several via slices[]). Not a first tool — the packet usually already contains the source as evidenceSlices.';
     case 'get_flow_pack':
-      return 'PRIMARY API/endpoint/request-flow pack - call FIRST ONLY for explicit route/API/request-flow tracing. Returns answerable, stopRule, and rg/shell bans; for edit/debug/spec use get_change_pack.';
+      return 'Flow pack for explicit route/API/request-flow tracing. Returns ordered steps, answerable, stopRule; for edit/debug/spec use get_change_pack. codegraph_context routes here automatically.';
     case 'get_research_pack':
-      return 'PRIMARY architecture/research pack - call FIRST for onboarding, surveying an area, where/what is X, or how X works. For edit/debug/spec use get_change_pack.';
+      return 'Research pack for onboarding, surveying an area, where/what is X, or how X works. For edit/debug/spec use get_change_pack. codegraph_context routes here automatically.';
     case 'get_context_packet':
       return 'Compact implementation/debug router: ranked files/symbols, slices, tests, validation, next action.';
     case 'get_change_pack':
-      return 'PRIMARY change pack - call FIRST before implement/debug/refactor/test/edit tasks. Returns scoped files/symbols, edit handles, risks, tests, validation.';
+      return 'Change pack for implement/debug/refactor/test/edit tasks: scoped files/symbols, edit handles, risks, tests, validation. codegraph_context routes here automatically.';
     case 'compile_evidence':
-      return 'PRIMARY TokenOpt-style evidence compiler/cost gate - call FIRST for repo tasks, PBIs, answerability, or rubric coverage. Exact follow-ups, stop rules.';
+      return 'TokenOpt-style evidence compiler/cost gate for repo tasks, PBIs, answerability, or rubric coverage. Exact follow-ups, stop rules. codegraph_context routes here automatically.';
     case 'search_symbol':
       return 'FOLLOW-UP ONLY symbol lookup after a pack names a missing symbol. Includes ranking, facets, pagination.';
     case 'search_files':
@@ -497,7 +544,7 @@ function compactDescriptionFor(name: V2ToolName): string {
     case 'simulate_patch_impact':
       return 'Capped patch impact from files/symbols/diff: touched symbols, graph impact counts, endpoints, tests, risks.';
     case 'review_patch':
-      return 'PRIMARY review packet - call FIRST for files/symbols/diff: verdict, findings, risky hunks, evidence, validation gaps.';
+      return 'Review packet for changed files/symbols/diff: verdict, findings, risky hunks, evidence, validation gaps. codegraph_context routes here automatically for review tasks.';
     case 'find_tests_for':
       return 'Find tests relevant to a symbol using names, test symbols, call edges.';
     case 'search_code':
