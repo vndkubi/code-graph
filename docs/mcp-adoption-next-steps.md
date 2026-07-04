@@ -1,10 +1,24 @@
 # MCP adoption — what's next after checkpoint 1
 
-Status: brainstorm, 2026-07-04, right after the first measured A/B
-(14.3% → 52.4% organic adoption, p = 0.0101 — see
-[mcp-adoption-plan.md](mcp-adoption-plan.md) Results log). Ordered by
-priority = (protects value already created) → (closes proof gaps) →
-(expands the win). Each item lists effort and what "done" looks like.
+Status: brainstorm 2026-07-04; execution started the same day. Progress:
+
+- ✅ **1. Commit & ship** — 3 slices + Release v1.4.0 committed, pushed,
+  published to npm (verify green, quality gate A+ after reindex).
+- ✅ **2. Real-corpus A/B** — checkpoint 2 on ecommerce-jhipter done:
+  46.7% → 80.0% adoption, tokens −9.4%, pooled p = 0.0021 (Results log).
+- ⏸ **3. Claude-side** — CLI 2.1.201 installed globally, but headless auth is
+  blocked: run `claude /login` once in a terminal (desktop-app auth is not
+  shared), or set ANTHROPIC_API_KEY. Then the A/B pattern is ready to reuse.
+- ◐ **4. Quality signal** — checkpoint 2's validators DID give a quality
+  signal (86.7%/80%), so this is less urgent; fixture re-score still open.
+- ◐ **5. Verify + dogfood** — server-side P4 contract verified via raw MCP
+  client (1,401 chars, 3 tools, 5-param schema); retro-baseline frozen (this
+  workspace's ledger: zero real-usage calls before the changes). Remaining:
+  client-side rendering check in a fresh Claude Code session + the after-week
+  adoption-report snapshot.
+
+Ordered by priority = (protects value already created) → (closes proof gaps)
+→ (expands the win). Each item lists effort and what "done" looks like.
 
 ## 1. Commit and ship the proven bundle — protect the work
 

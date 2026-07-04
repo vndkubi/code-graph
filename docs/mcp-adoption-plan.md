@@ -179,7 +179,10 @@ invalid-call regressions in benchmark logs.
 - [x] Remove references to tools not exposed in the active profile (no ghost
       tools → no failed calls → no trust loss).
 - [ ] Verify in a live Claude Code session that the full text renders without
-      `[truncated]`. (Needs a fresh session against the rebuilt server.)
+      `[truncated]`. (Needs a fresh session against the rebuilt server.
+      Server-side contract verified 2026-07-04 via raw MCP client: 1,401 chars
+      on the wire, sessionId rule on line 5, exactly 3 tools, 5-param gate
+      schema. Only the client-side rendering check remains.)
 
 Acceptance: instructions fully visible in-session; sessionId rule within the
 first 5 lines.
@@ -300,7 +303,26 @@ Synthetic A/B can get lucky; a week of real work is hard to argue with.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 2026-07-04 | baseline (HEAD 4b4f2296) | copilot organic/auto | **14.3% (3/21)** | 1 (med, when adopted) | n/m | n/m | 0/21 pass | (ref: 95k avg) |
 | 2026-07-04 | after P1–P5 (same session, working tree) | copilot organic/auto | **52.4% (11/21)** | 1 (med, when adopted) | n/m | n/m | 0/21 pass (no delta) | +8.6% raw avg |
+| 2026-07-04 | baseline, real corpus (jhipster) | copilot organic/auto | **46.7% (7/15)** | 1 (med) | n/m | n/m | 86.7% (13/15) | (ref: 175k avg) |
+| 2026-07-04 | after P1–P5, real corpus (jhipster) | copilot organic/auto | **80.0% (12/15)** | 1 (med) | n/m | n/m | 80.0% (12/15) | **−9.4%** |
 | 2026-07-__ | baseline | claude | | | | | — | — |
+
+**Checkpoint 2 (2026-07-04) — real corpus.** Same design as checkpoint 1 but
+on a copy of `ecommerce-jhipter` (220 indexed files, 60 endpoints): 5 natural
+tasks (investigate / flow / debug / review / plan) × 3 reps × 2 conditions,
+v1.4.0 dist vs commit 4b4f2296 dist. Adoption **+33.3 points** (one-sided
+Fisher p = 0.064 alone; **pooled with checkpoint 1: 10/36 → 23/36,
+p = 0.0021**). The real-corpus baseline is much higher than the fixture's
+(46.7% vs 14.3%) — on a repo where grep is expensive the model already reaches
+for the tool more, and the levers lift it to 80%. Per model: claude-haiku-4.5
+0/4 → 5/5, gpt-5-mini 7/11 → 7/10. Per task, adoption improved or held
+everywhere (debug 1/3→3/3, flow 2/3→3/3, investigate 3/3→3/3, plan 1/3→2/3,
+review 0/3→1/3). Quality had signal this time: 13/15 vs 12/15 — the whole
+delta is the seeded-review task, where BOTH conditions miss the hardest
+golden finding (NPE risk on `order.getCustomer()`); before 1/3, after 0/3,
+n=1 run, Fisher n.s. — treated as validator difficulty, watch at next
+checkpoint. Tokens per task **dropped 9.4%** with adoption up. Evidence:
+`.codegraph/adoption-ab-20260704/checkpoint2-jh-*`.
 
 **Checkpoint 1 (2026-07-04) — method & caveats.** 7 fixture tasks
 (`copilot-e2e-quality-suite.example.json`) × 3 reps × 2 conditions, organic
