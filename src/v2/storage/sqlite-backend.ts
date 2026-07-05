@@ -336,7 +336,18 @@ function configurePragmas(db: DatabaseType, walMode: boolean): void {
   // Large-repo graphs run to gigabytes; a too-small page cache turns the
   // bulk-load phases into WAL-scan thrash. cache_size is negative KiB.
   db.pragma(`cache_size = -${boundedEnvInt(process.env.CODEGRAPH_SQLITE_CACHE_KIB, 262_144, 16_000, 2_097_152)}`);
-  db.pragma(`mmap_size = ${boundedEnvInt(process.env.CODEGRAPH_SQLITE_MMAP_BYTES, 1_073_741_824, 268_435_456, 8_589_934_592)}`);
+  // Measured on a real 33.6k-file cold index: the DB file reached 6.77GB
+  // (elasticsearch) vs 2.55GB (hadoop, the corpus the old 1GB default was
+  // tuned against). With most of a 6.77GB file outside a 1GB mmap window,
+  // resolveUniqueNameCallEdges's per-row correlated subqueries (which
+  // EXPLAIN QUERY PLAN shows as index-supported, not a scan) still paid real
+  // disk I/O per lookup instead of a memory read — the same query shape at
+  // 3.9x the row count took 12.5x longer, i.e. worse than linear. mmap_size
+  // is a virtual address-space reservation on 64-bit hosts, not eagerly
+  // resident RAM — the OS only pages in what's actually touched — so raising
+  // the default costs small repos nothing, while covering large-repo DBs
+  // enough to keep this class of query memory-bound instead of disk-bound.
+  db.pragma(`mmap_size = ${boundedEnvInt(process.env.CODEGRAPH_SQLITE_MMAP_BYTES, 4_294_967_296, 268_435_456, 8_589_934_592)}`);
 }
 
 function migrate(db: DatabaseType): void {
