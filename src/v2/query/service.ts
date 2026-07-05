@@ -610,6 +610,13 @@ export class V2QueryService {
     const ftsBroadRows = await this.symbolSearchCandidateRowsFromFts(snapshotId, baseWhere, baseParams, tokens, candidateLimit);
     const broadRows = ftsBroadRows.length > 0
       ? ftsBroadRows
+      // FTS returned nothing for this token set, so this LIKE scan is the only
+      // candidate source. Without an ORDER BY, SQLite returns LIMIT rows in
+      // storage order, not relevance order — on a large repo a common name can
+      // have far more matches than candidateLimit, so whichever rows happen to
+      // be stored first silently win over the actually-best match. Order by
+      // exact-name match, then the same file_role tiering used everywhere else
+      // in this file, then shortest name as a cheap specificity proxy.
       : await this.db.prepare(`
       SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
              package_name, return_type, parameter_types_json, annotations_json,
@@ -617,8 +624,20 @@ export class V2QueryService {
       FROM symbols
       WHERE ${baseWhere}
         AND (${matchClauses.map(clause => `(${clause})`).join(' OR ')})
+      ORDER BY
+        CASE WHEN simple_name = ? COLLATE NOCASE THEN 0 ELSE 1 END,
+        CASE file_role
+          WHEN 'main_source' THEN 0
+          WHEN 'resource_config' THEN 1
+          WHEN 'build_config' THEN 2
+          WHEN 'test_source' THEN 3
+          WHEN 'mock_source' THEN 4
+          WHEN 'generated' THEN 5
+          ELSE 6
+        END,
+        LENGTH(simple_name)
       LIMIT ?
-    `).all(...baseParams, ...matchParams, candidateLimit) as SymbolRow[];
+    `).all(...baseParams, ...matchParams, query, candidateLimit) as SymbolRow[];
     const rows = mergeSymbolRows(exactRows, broadRows);
 
     const inDegree = await this.symbolCallInDegree(snapshotId, rows.map(row => row.fq_name));
@@ -4031,7 +4050,7 @@ export class V2QueryService {
             ELSE 3
           END,
           line
-        LIMIT 25
+        LIMIT 200
       `).all(snapshotId, query, query, pattern, pattern, query, query, pattern) as SymbolRow[];
       candidates.push(...rows);
     }

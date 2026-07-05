@@ -104,7 +104,7 @@ export interface ParseBatchOptions {
 
 export interface ParseBatchProgressEvent {
   phase: 'parse';
-  status: 'start' | 'progress' | 'complete' | 'fallback';
+  status: 'start' | 'progress' | 'complete' | 'fallback' | 'recycle';
   message?: string;
   completed: number;
   total: number;
@@ -362,6 +362,7 @@ export async function parseFilesBatchToSpool(workItems: ParseWorkItem[], options
       const errorPath = path.join(tmpDir, `${shardId}.error.json`);
       const factPaths = options.factShard ? factShardPathsForWorker(tmpDir, shardId) : undefined;
       const factStatsPath = options.factShard ? path.join(tmpDir, `${shardId}.fact.stats.json`) : undefined;
+      const recycleStatsPath = path.join(tmpDir, `${shardId}.recycle.json`);
       if (spoolResults) shardPaths.push(outputPath);
       contextShardPaths.push(contextPath);
       if (factPaths) factShardPaths.push(factPaths);
@@ -385,6 +386,7 @@ export async function parseFilesBatchToSpool(workItems: ParseWorkItem[], options
           factShardConfig: options.factShard,
           factShardPaths: factPaths,
           factStatsPath,
+          recycleStatsPath,
           shared,
           // The tree-sitter binding leaks native memory per visited node
           // (measured ~0.4MB/file on hadoop-sized Java, unrecoverable by GC —
@@ -400,6 +402,25 @@ export async function parseFilesBatchToSpool(workItems: ParseWorkItem[], options
       });
       worker.once('exit', code => {
         if (code === PARSE_WORKER_RECYCLE_EXIT_CODE) {
+          // Diagnostic only: reports the leak-vs-recycle-budget ratio actually
+          // observed, since the 16MB default was tuned against hadoop-sized
+          // Java files and a much larger/denser corpus can leak far more per
+          // source byte than that baseline assumed.
+          try {
+            const stats = JSON.parse(fs.readFileSync(recycleStatsPath, 'utf-8')) as { filesParsed: number; bytesParsed: number; rss: number };
+            options.progress?.({
+              phase: 'parse',
+              status: 'recycle',
+              message: `worker ${slot} recycled: files=${stats.filesParsed} bytesMB=${(stats.bytesParsed / (1024 * 1024)).toFixed(1)} rssAtRecycleMB=${Math.round(stats.rss / (1024 * 1024))}`,
+              completed: Atomics.load(counter, 1),
+              total: workItems.length,
+              workers: activeWorkerCount,
+              elapsedMs: Date.now() - start,
+            });
+          } catch {
+            // Best-effort telemetry; a missing/unreadable stats file must never
+            // block the actual recycle-and-respawn behavior below.
+          }
           try {
             spawnParseWorker(slot);
           } catch (error) {

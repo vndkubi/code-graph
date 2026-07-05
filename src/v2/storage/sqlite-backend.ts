@@ -190,17 +190,27 @@ export class SQLiteCodeGraphDb implements CodeGraphDb {
     };
   }
 
-  async runMaintenance(): Promise<void> {
+  // Returns per-step timings: a live elasticsearch run showed this whole call
+  // taking ~10 minutes with no visibility into which pragma owned the cost —
+  // optimize (planner statistics) and wal_checkpoint (WAL-to-main-file flush)
+  // scale on totally different axes (index/table size vs. WAL byte size), so
+  // the split matters for deciding what to fix.
+  async runMaintenance(): Promise<{ optimizeMs: number; checkpointMs: number }> {
+    const optimizeStart = Date.now();
     try {
       this.raw.pragma('optimize');
     } catch {
       // Best-effort planner maintenance; never load-bearing for correctness.
     }
+    const optimizeMs = Date.now() - optimizeStart;
+    const checkpointStart = Date.now();
     try {
       this.raw.pragma('wal_checkpoint(PASSIVE)');
     } catch {
       // Ignore readonly/non-WAL/locked checkpoint failures.
     }
+    const checkpointMs = Date.now() - checkpointStart;
+    return { optimizeMs, checkpointMs };
   }
 
   async close(): Promise<void> {
@@ -586,6 +596,7 @@ function createSchema(db: DatabaseType): void {
     CREATE INDEX IF NOT EXISTS idx_workspaces_root ON workspaces(root);
     CREATE INDEX IF NOT EXISTS idx_snapshots_workspace_created ON snapshots(workspace_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_files_snapshot_hash ON files(snapshot_id, blob_hash);
+    CREATE INDEX IF NOT EXISTS idx_files_role ON files(snapshot_id, file_role);
     CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(snapshot_id, simple_name, kind);
     CREATE INDEX IF NOT EXISTS idx_symbols_name_nocase ON symbols(snapshot_id, simple_name COLLATE NOCASE, kind);
     CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(snapshot_id, file);

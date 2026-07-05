@@ -2575,7 +2575,8 @@ function createIndexProgressReporter(dbPath: string): (event: IndexProgressEvent
       || event.status === 'start'
       || event.status === 'complete'
       || event.status === 'skipped'
-      || event.status === 'fallback';
+      || event.status === 'fallback'
+      || event.status === 'recycle';
     if (!force && now - lastLineAt < 5_000) return;
 
     lastLineAt = now;

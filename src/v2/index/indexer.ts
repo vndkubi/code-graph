@@ -89,7 +89,7 @@ export interface IndexWorkspaceResult {
 
 export interface IndexProgressEvent {
   phase: 'start' | 'workspace' | 'manifest' | 'diff' | 'parse-cache' | 'parse' | 'write' | 'edges' | 'analyze' | 'complete';
-  status: 'start' | 'progress' | 'complete' | 'skipped' | 'fallback';
+  status: 'start' | 'progress' | 'complete' | 'skipped' | 'fallback' | 'recycle';
   message?: string;
   current?: number;
   total?: number;
@@ -366,6 +366,7 @@ const BEAN_ANNOTATIONS = new Set([
 
 const FULL_BULK_LOAD_INDEXES: BulkLoadIndexSpec[] = [
   { name: 'idx_files_snapshot_hash', createSql: 'CREATE INDEX IF NOT EXISTS idx_files_snapshot_hash ON files(snapshot_id, blob_hash)' },
+  { name: 'idx_files_role', createSql: 'CREATE INDEX IF NOT EXISTS idx_files_role ON files(snapshot_id, file_role)' },
   { name: 'idx_symbols_name', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(snapshot_id, simple_name, kind)' },
   { name: 'idx_symbols_name_nocase', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_name_nocase ON symbols(snapshot_id, simple_name COLLATE NOCASE, kind)' },
   { name: 'idx_symbols_file', createSql: 'CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(snapshot_id, file)' },
@@ -1205,7 +1206,7 @@ export class V2Indexer {
         total: 1,
         elapsedMs: Date.now() - start,
       });
-      await this.db.runMaintenance();
+      const maintenance = await this.db.runMaintenance();
       progress?.({
         phase: 'analyze',
         status: 'complete',
@@ -1213,6 +1214,7 @@ export class V2Indexer {
         current: 1,
         total: 1,
         elapsedMs: Date.now() - start,
+        details: maintenance ? { optimizeMs: maintenance.optimizeMs, checkpointMs: maintenance.checkpointMs } : undefined,
       });
       return;
     }
@@ -2142,9 +2144,30 @@ export class V2Indexer {
         `).run(args.snapshotId, args.git.headCommit, args.now, args.workspaceId);
         await this.pruneOldSnapshots(args.workspaceId, args.snapshotId);
       });
+      // Diagnostic only: a live 8k-file elasticsearch run showed an ~8.5min
+      // gap between the FTS-rebuild-complete log and analyze:start with no
+      // progress event in between, wide enough to span either this publish
+      // transaction or the callShardDir cleanup below — timing both narrows
+      // down which one actually owns it before proposing a fix.
+      const publishStart = Date.now();
       await publish();
+      args.progress?.({
+        phase: 'write',
+        status: 'complete',
+        message: 'snapshot published',
+        elapsedMs: Date.now() - args.start,
+        details: { phaseElapsedMs: Date.now() - publishStart, sharded: true },
+      });
     } finally {
+      const cleanupStart = Date.now();
       fs.rmSync(callShardDir, { recursive: true, force: true });
+      args.progress?.({
+        phase: 'write',
+        status: 'complete',
+        message: 'call-shard temp dir cleaned up',
+        elapsedMs: Date.now() - args.start,
+        details: { phaseElapsedMs: Date.now() - cleanupStart, sharded: true },
+      });
     }
 
     await this.maintainQueryPlanner(args.progress, args.start);
@@ -3110,15 +3133,27 @@ export class V2Indexer {
       ${sourceFilter ? `AND file IN (${sourcePlaceholders})` : ''}
     `).all(...(sourceFilter ? [snapshotId, ...sourceFilter] : [snapshotId])) as Array<{ file: string; referenced_type: string }>;
 
+    // classToFile and javaTypesByFqName both come from the same type-kind
+    // symbol set (javaTypesByFqName is that set narrowed by file_role) — one
+    // query building both in a single pass avoids reading the whole snapshot's
+    // class/interface/enum/type symbols from `symbols` twice, which matters
+    // more as symbol count scales with repo size (e.g. elasticsearch's ~2.3x
+    // hadoop's file count).
     const classToFile = new Map<string, string>();
-    const symbols = await this.db.prepare(`
-      SELECT simple_name, fq_name, file FROM symbols
+    const javaTypesByFqName = new Map<string, string[]>();
+    const typeSymbols = await this.db.prepare(`
+      SELECT simple_name, fq_name, file, kind, file_role FROM symbols
       WHERE snapshot_id = ? AND kind IN ('class', 'interface', 'enum', 'type')
       ORDER BY file, line, fq_name
-    `).all(snapshotId) as Array<{ simple_name: string; fq_name: string; file: string }>;
-    for (const sym of symbols) {
+    `).all(snapshotId) as Array<{ simple_name: string; fq_name: string; file: string; kind: string; file_role: string }>;
+    for (const sym of typeSymbols) {
       if (!classToFile.has(sym.simple_name)) classToFile.set(sym.simple_name, sym.file);
       if (!classToFile.has(sym.fq_name)) classToFile.set(sym.fq_name, sym.file);
+      if ((sym.kind === 'class' || sym.kind === 'interface') && (sym.file_role === 'main_source' || sym.file_role === 'generated')) {
+        const files = javaTypesByFqName.get(sym.fq_name) ?? [];
+        files.push(sym.file);
+        javaTypesByFqName.set(sym.fq_name, files);
+      }
     }
 
     const edgeRows: SqlValue[][] = [];
@@ -3140,19 +3175,6 @@ export class V2Indexer {
       addEdge(ref.file, classToFile.get(ref.referenced_type), 'compile', 0.6, 'type-ref');
     }
 
-    const javaTypesByFqName = new Map<string, string[]>();
-    const javaTypes = await this.db.prepare(`
-      SELECT fq_name, file
-      FROM symbols
-      WHERE snapshot_id = ?
-        AND kind IN ('class', 'interface')
-        AND file_role IN ('main_source', 'generated')
-    `).all(snapshotId) as Array<{ fq_name: string; file: string }>;
-    for (const row of javaTypes) {
-      const files = javaTypesByFqName.get(row.fq_name) ?? [];
-      files.push(row.file);
-      javaTypesByFqName.set(row.fq_name, files);
-    }
 
     const mybatisXmlMappers = await this.db.prepare(`
       SELECT fq_name, file, framework_meta_json

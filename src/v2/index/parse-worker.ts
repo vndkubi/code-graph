@@ -13,6 +13,7 @@ const data = workerData as {
   factShardConfig?: FactShardConfig;
   factShardPaths?: FactShardPaths;
   factStatsPath?: string;
+  recycleStatsPath: string;
   shared: SharedArrayBuffer;
   recycleAfterFiles?: number;
   recycleAfterBytes?: number;
@@ -60,6 +61,11 @@ try {
         || (data.recycleAfterBytes !== undefined && bytesParsedByThisWorker >= data.recycleAfterBytes))
       && Atomics.load(counter, 2) < data.tasks.length) {
       if (data.factStatsPath && factWriter) fs.writeFileSync(data.factStatsPath, JSON.stringify(factWriter.stats));
+      fs.writeFileSync(data.recycleStatsPath, JSON.stringify({
+        filesParsed: parsedByThisWorker,
+        bytesParsed: bytesParsedByThisWorker,
+        rss: process.memoryUsage().rss,
+      }));
       if (output !== undefined) fs.closeSync(output);
       fs.closeSync(contextOutput);
       factWriter?.close();
