@@ -61,6 +61,7 @@ import {
   evidenceHandlesForObjects,
   slimEvidenceSlicesForPack,
   verifyBudgetForFlowSteps,
+  verifyBudgetForEndpoints,
   trustPostureFor,
 } from './evidence.js';
 import {
@@ -3515,7 +3516,12 @@ export class V2QueryService {
     // cap can silently drop exactly the low-confidence fact this budget exists
     // to flag. verifyBudget entries are self-contained (carry their own file/
     // line/reason), so they don't need to also appear in the displayed flowSteps.
-    const verifyBudget = verifyBudgetForFlowSteps(flowSteps);
+    // handlerSeedEndpoints (not the broader impactedEndpoints) is the endpoint
+    // the pack's answer is actually built from — see verifyBudgetForEndpoints.
+    const verifyBudget = [
+      ...verifyBudgetForFlowSteps(flowSteps),
+      ...verifyBudgetForEndpoints(handlerSeedEndpoints),
+    ].slice(0, 3);
     const trustPosture = trustPostureFor(sufficientForAnswer, verifyBudget.length);
     const returnedDefinitions = flowRelevantSymbols.slice(0, packProfileValue(profile, 3, 5, 8));
     const returnedCallers = callers.slice(0, packProfileValue(profile, 3, 5, 8)).map(compactCallEdge);
@@ -3586,7 +3592,9 @@ export class V2QueryService {
       }));
     const maxAdditionalCalls = allowedFollowups.length;
     const stopRule = sufficientForAnswer
-      ? 'Do not call rg, shell, search_code, search_symbol, get_file_slice, or broad file reads; answer from this get_flow_pack packet.'
+      ? (trustPosture === 'spot_check_recommended'
+        ? 'Do not call rg, shell, search_code, search_symbol, or broad file reads; answer from this packet, but first call verifyBudget[].verify (get_file_slice) to confirm any flagged fact before asserting it.'
+        : 'Do not call rg, shell, search_code, search_symbol, get_file_slice, or broad file reads; answer from this packet.')
       : 'Do not call rg or shell search. Use only allowedFollowups for the listed missingFacts, then answer or report the missing fact.';
     const returnedPayloadForBudget = {
       flowSteps: returnedFlowSteps,
@@ -3624,11 +3632,17 @@ export class V2QueryService {
       ? [`${reusedEvidenceCount} evidence slice(s) were already delivered earlier this session (marked reusedFromEarlierCall) and their source was omitted to save tokens — reuse them from prior context instead of re-opening.`]
       : [];
     const answerGuidance = (sufficientForAnswer
-      ? [
-        'Answer directly from this pack.',
-        'Treat evidenceSlices as already-read source; cite file and line ranges from them.',
-        'Do not call rg, shell search, search_code, search_symbol, get_file_slice, grep, or Read unless the user asks for more detail.',
-      ]
+      ? (trustPosture === 'spot_check_recommended'
+        ? [
+          'Answer directly from this pack.',
+          'Treat evidenceSlices as already-read source; cite file and line ranges from them.',
+          'trustPosture is spot_check_recommended: before asserting a fact listed in verifyBudget, call its verify.tool (get_file_slice) to confirm it. Do not call rg, shell search, search_code, search_symbol, grep, or Read for anything else.',
+        ]
+        : [
+          'Answer directly from this pack.',
+          'Treat evidenceSlices as already-read source; cite file and line ranges from them.',
+          'Do not call rg, shell search, search_code, search_symbol, get_file_slice, grep, or Read unless the user asks for more detail.',
+        ])
       : [
         'This pack is incomplete; perform only the targeted follow-up named in missingFacts.',
         'Prefer one allowedFollowup for a listed missing file/range over broad rg/shell/read loops.',

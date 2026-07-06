@@ -828,7 +828,9 @@ function addResponseMeta(
   // Terminal-packet nudge: the stop rule travels with the packet itself, not
   // only in (truncatable) server instructions.
   if (result.answerable === true || result.sufficientForAnswer === true) {
-    meta.next = 'answerable=true — answer from this packet; do not re-search or re-read the same ground.';
+    meta.next = result.trustPosture === 'spot_check_recommended'
+      ? 'answerable=true, trustPosture=spot_check_recommended — answer from this packet, but verify any fact listed in verifyBudget via its verify.tool before asserting it; do not re-search or re-read other ground.'
+      : 'answerable=true — answer from this packet; do not re-search or re-read the same ground.';
   }
   return { ...result, _codegraph_meta: meta };
 }

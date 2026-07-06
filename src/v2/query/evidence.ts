@@ -112,6 +112,45 @@ export function verifyBudgetForFlowSteps(
 }
 
 /**
+ * Flags endpoints whose path_resolution isn't 'exact' (composeEndpointPath
+ * couldn't resolve a class/method path literal). Scoped to the endpoint(s)
+ * that actually SEEDED the pack (handlerSeedEndpoints), not the broader
+ * impactedEndpoints/candidateEndpoints list — flagging every ranked endpoint
+ * would be noise; the route the answer is actually built from is the one
+ * worth hedging on. path_resolution/path_resolution_reason are already
+ * computed by the indexer (sqlite-backend.ts endpoints table) — this only
+ * promotes an already-known fact into the same verifyBudget contract used
+ * for call edges, it does not compute anything new.
+ */
+export function verifyBudgetForEndpoints(
+  seedEndpoints: Array<Record<string, unknown>>,
+  maxItems: number = VERIFY_BUDGET_MAX_ITEMS,
+): VerifyBudgetItem[] {
+  return seedEndpoints
+    .filter(endpoint => {
+      const pathResolution = stringOrUndefined(endpoint.pathResolution);
+      return pathResolution !== undefined && pathResolution !== 'exact';
+    })
+    .slice(0, maxItems)
+    .map(endpoint => {
+      const method = stringOrUndefined(endpoint.method) ?? 'ALL';
+      const path = stringOrUndefined(endpoint.path) ?? '';
+      const reason = stringOrUndefined(endpoint.pathResolutionReason)
+        ?? 'path could not be fully resolved from a class/method path literal';
+      return {
+        fact: `${method} ${path} (${stringOrUndefined(endpoint.handlerSymbol) ?? 'handler'})`,
+        file: stringOrUndefined(endpoint.file),
+        line: (endpoint.line as number | string | undefined) ?? stringOrUndefined(endpoint.lines),
+        confidence: undefined,
+        resolutionKind: stringOrUndefined(endpoint.pathResolution),
+        signalTier: undefined,
+        reason: `partial path resolution: ${reason}`,
+        verify: evidenceHandleForObject(endpoint),
+      };
+    });
+}
+
+/**
  * Returns undefined when the pack is not sufficientForAnswer: that branch
  * already has its own verification contract (missingFacts/allowedFollowups/
  * stopRule) and a second, competing trust signal would only add confusion.

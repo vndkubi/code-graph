@@ -504,9 +504,9 @@ function compactDescriptionFor(name: V2ToolName): string {
     case 'codegraph_slice':
       return 'Follow-up source reader: when codegraph_context names an exact file/line/symbol still missing, fetch just that bounded slice (batch several via slices[]). Not a first tool — the packet usually already contains the source as evidenceSlices.';
     case 'get_flow_pack':
-      return 'Flow pack for explicit route/API/request-flow tracing. Returns ordered steps, answerable, stopRule; for edit/debug/spec use get_change_pack. codegraph_context routes here automatically.';
+      return 'Flow pack for explicit route/API/request-flow tracing. Returns ordered steps, answerable, stopRule; for edit/debug/spec use get_change_pack. codegraph_context routes here automatically. If trustPosture=spot_check_recommended, verify the flagged fact in verifyBudget via its verify.tool handle before asserting it.';
     case 'get_research_pack':
-      return 'Research pack for onboarding, surveying an area, where/what is X, or how X works. For edit/debug/spec use get_change_pack. codegraph_context routes here automatically.';
+      return 'Research pack for onboarding, surveying an area, where/what is X, or how X works. For edit/debug/spec use get_change_pack. codegraph_context routes here automatically. If trustPosture=spot_check_recommended, verify the flagged fact in verifyBudget via its verify.tool handle before asserting it.';
     case 'get_context_packet':
       return 'Compact implementation/debug router: ranked files/symbols, slices, tests, validation, next action.';
     case 'get_change_pack':

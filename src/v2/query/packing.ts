@@ -107,6 +107,8 @@ export function compactEndpointCandidates(rows: Array<Record<string, unknown>>):
   framework?: string;
   confidence: number;
   whyRelevant: string;
+  pathResolution?: string;
+  pathResolutionReason?: string;
 }> {
   const seen = new Set<string>();
   const result: Array<{
@@ -119,6 +121,8 @@ export function compactEndpointCandidates(rows: Array<Record<string, unknown>>):
     framework?: string;
     confidence: number;
     whyRelevant: string;
+    pathResolution?: string;
+    pathResolutionReason?: string;
   }> = [];
   for (const row of rows) {
     const key = `${row.method}:${row.path}:${row.file}:${row.line}`;
@@ -140,6 +144,8 @@ export function compactEndpointCandidates(rows: Array<Record<string, unknown>>):
           : 'indexed endpoint associated with candidate files',
         240,
       ),
+      pathResolution: stringOrUndefined(row.pathResolution ?? row.path_resolution),
+      pathResolutionReason: stringOrUndefined(row.pathResolutionReason ?? row.path_resolution_reason),
     });
   }
   return result;

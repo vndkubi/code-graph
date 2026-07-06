@@ -241,6 +241,35 @@ describe('MCP full tool mode', () => {
     }
   });
 
+  it('tells the agent to verify a flagged verifyBudget fact via trustPosture, only on the two tools that emit it (compact descriptions only, per the measured MCP_SERVER_INSTRUCTIONS truncation-budget tradeoff)', () => {
+    const tools = buildV2ToolDefinitions({ compactDescriptions: true });
+    const flowPack = tools.find(tool => tool.name === 'get_flow_pack')?.description ?? '';
+    const researchPack = tools.find(tool => tool.name === 'get_research_pack')?.description ?? '';
+    expect(flowPack).toContain('spot_check_recommended');
+    expect(flowPack).toContain('verifyBudget');
+    expect(flowPack).toContain('verify.tool');
+    expect(researchPack).toContain('spot_check_recommended');
+    expect(researchPack).toContain('verifyBudget');
+    expect(researchPack).toContain('verify.tool');
+    // Only get_flow_pack/get_research_pack emit verifyBudget/trustPosture
+    // (both route to getResearchPack); other tools shouldn't reference it.
+    const mentions = tools
+      .filter(tool => tool.name !== 'get_flow_pack' && tool.name !== 'get_research_pack')
+      .filter(tool => /verifyBudget|trustPosture/.test(tool.description));
+    expect(mentions).toEqual([]);
+  });
+
+  it('does not let the trustPosture hint push get_flow_pack/get_research_pack compact descriptions anywhere near the MCP_SERVER_INSTRUCTIONS truncation ceiling', () => {
+    // Server instructions (a separate wire field) sit near a ~1,900-char
+    // client truncation ceiling; tool descriptions are a different field with
+    // no observed ceiling, but keep the compact ones reasonably short anyway.
+    const compact = buildV2ToolDefinitions({ compactDescriptions: true });
+    for (const name of ['get_flow_pack', 'get_research_pack']) {
+      const description = compact.find(tool => tool.name === name)?.description ?? '';
+      expect(description.length).toBeLessThan(400);
+    }
+  });
+
   it('advertises a slim gate schema on client profiles and the full schema on full', () => {
     const client = buildV2ToolDefinitionsForProfile('client');
     expect(client.map(tool => tool.name)).toEqual(['codegraph_context', 'codegraph_slice', 'codegraph_status']);

@@ -1291,6 +1291,7 @@ public class PaymentService {
       evidenceHandles: Array<{ tool: string; args: { file?: string; lines?: string; symbol?: string; maxChars?: number } }>;
       completeness: { sufficientForAnswer: boolean; evidenceSliceCount: number };
       answerGuidance: string[];
+      stopRule: string;
       nextAction: string;
       definitionCandidates: Array<{ symbol: string; file: string }>;
       flowSteps: unknown[];
@@ -1337,6 +1338,10 @@ public class PaymentService {
     expect(researchPack.flowSteps.length).toBeGreaterThan(0);
     expect(researchPack.verifyBudget).toEqual([]);
     expect(researchPack.trustPosture).toBe('act_directly');
+    // act_directly (no flagged facts) keeps the original blanket ban intact —
+    // only spot_check_recommended relaxes it to allow the flagged verify call.
+    expect(researchPack.stopRule).toContain('get_file_slice, or broad file reads');
+    expect(researchPack.answerGuidance.join(' ')).not.toContain('spot_check_recommended');
     expect(researchPack.taskOracle.successCriteria.join(' ')).toContain('file and line evidence');
     expect(researchPack.taskOracle.goldenFacts.some(fact => String(fact.value ?? fact.file).includes('PaymentService'))).toBe(true);
     expect(researchPack.compressedEvidence.factCards.some(card => String(card.subject ?? card.file).includes('PaymentService'))).toBe(true);
@@ -1511,6 +1516,8 @@ public class AmbiguousCaller {
         verify?: { tool: string; args: { file?: string } };
       }>;
       trustPosture?: string;
+      stopRule: string;
+      answerGuidance: string[];
     };
 
     expect(researchPack.completeness.sufficientForAnswer).toBe(true);
@@ -1520,6 +1527,79 @@ public class AmbiguousCaller {
     expect(flagged?.confidence).toBeLessThan(0.5);
     expect(flagged?.reason).toContain('ambiguous name-only match');
     expect(flagged?.verify?.tool).toBe('get_file_slice');
+    expect(researchPack.trustPosture).toBe('spot_check_recommended');
+    // Regression guard for the stopRule/answerGuidance self-contradiction: when
+    // trustPosture is spot_check_recommended, the packet must NOT blanket-ban
+    // get_file_slice (verifyBudget[].verify.tool literally IS get_file_slice),
+    // and must instead say to verify the flagged fact before asserting it.
+    expect(researchPack.stopRule).not.toContain('get_file_slice, or broad file reads');
+    expect(researchPack.stopRule).toContain('verifyBudget');
+    expect(researchPack.stopRule).toContain('get_file_slice');
+    expect(researchPack.answerGuidance.join(' ')).toContain('spot_check_recommended');
+    expect(researchPack.answerGuidance.join(' ')).toContain('verify.tool');
+  });
+
+  it('flags endpoints with partial path resolution in verifyBudget, scoped to the endpoint that seeded the pack', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-verify-budget-endpoint-');
+    // OrderController's class-level path ("/api/orders") is a plain string
+    // literal and resolves exactly, but the method-level @GetMapping argument
+    // references a constant on a class that doesn't exist anywhere in this
+    // repo (ExternalRoutes.DETAIL is never defined), so the analyzer's
+    // constant-folder can't resolve it — composeEndpointPath falls back to
+    // the class-level prefix with path_resolution='partial', exactly the
+    // "route the answer hangs on is only partially resolved" case
+    // verifyBudgetForEndpoints exists to flag.
+    writeFile(repo, 'src/main/java/com/example/orders/OrderController.java', `package com.example.orders;
+
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+    @GetMapping(ExternalRoutes.DETAIL)
+    public String getOrder(String id) {
+        return id;
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const researchPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_research_pack',
+      args: {
+        target: 'What does GET /api/orders do?',
+        taskType: 'architecture',
+        tokenBudget: 5000,
+      },
+    }) as {
+      impactedEndpoints: Array<{ pathResolution?: string; pathResolutionReason?: string }>;
+      verifyBudget: Array<{
+        fact: string;
+        file?: string;
+        resolutionKind?: string;
+        reason: string;
+        verify?: { tool: string; args: { file?: string } };
+      }>;
+      trustPosture?: string;
+    };
+
+    expect(researchPack.impactedEndpoints.some(endpoint => endpoint.pathResolution === 'partial')).toBe(true);
+    expect(researchPack.verifyBudget.length).toBeGreaterThanOrEqual(1);
+    const flagged = researchPack.verifyBudget.find(item => item.resolutionKind === 'partial');
+    expect(flagged).toBeDefined();
+    expect(flagged?.fact).toContain('GET /api/orders');
+    expect(flagged?.reason).toContain('partial path resolution');
+    expect(flagged?.reason).toContain('Could not resolve GetMapping path expression');
+    expect(flagged?.verify?.tool).toBe('get_file_slice');
+    expect(flagged?.verify?.args.file).toContain('OrderController.java');
     expect(researchPack.trustPosture).toBe('spot_check_recommended');
   });
 
