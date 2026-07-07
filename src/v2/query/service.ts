@@ -62,6 +62,7 @@ import {
   slimEvidenceSlicesForPack,
   verifyBudgetForFlowSteps,
   verifyBudgetForEndpoints,
+  verifyBudgetForCallEdges,
   trustPostureFor,
 } from './evidence.js';
 import {
@@ -3518,9 +3519,17 @@ export class V2QueryService {
     // line/reason), so they don't need to also appear in the displayed flowSteps.
     // handlerSeedEndpoints (not the broader impactedEndpoints) is the endpoint
     // the pack's answer is actually built from — see verifyBudgetForEndpoints.
+    // callersRaw/calleesRaw (the pre-restriction, pre-display-cap pool), not
+    // callers/callees: when restrictEdgesToCandidateFiles applies (explicit
+    // single-file/class questions), callers/callees are already sliced to 8
+    // by researchCallEdgeScore descending — the same score-descending-then-
+    // cap pattern that drops low-confidence edges from flowSteps, one layer
+    // earlier. Scanning the raw pool here mirrors the "score from the FULL
+    // flowSteps (pre-display-cap)" principle already used above.
     const verifyBudget = [
       ...verifyBudgetForFlowSteps(flowSteps),
       ...verifyBudgetForEndpoints(handlerSeedEndpoints),
+      ...verifyBudgetForCallEdges(callersRaw, calleesRaw),
     ].slice(0, 3);
     const trustPosture = trustPostureFor(sufficientForAnswer, verifyBudget.length);
     const returnedDefinitions = flowRelevantSymbols.slice(0, packProfileValue(profile, 3, 5, 8));
@@ -6930,9 +6939,7 @@ function referenceDto(row: Record<string, unknown>): Record<string, unknown> {
     confidence: row.confidence,
     resolutionKind: row.resolution_kind,
     signalTier: row.signal_tier,
-    signalReasons: typeof row.signal_reasons_json === 'string'
-      ? parseJson<string[]>(row.signal_reasons_json, [])
-      : undefined,
+    signalReasons: signalReasonsOrUndefined(row.signal_reasons_json),
     fieldAccess: row.field_access,
     enclosingClass: row.enclosing_class,
     enclosingSymbol: row.enclosing_symbol,
@@ -8289,6 +8296,16 @@ function endpointHandlerSymbolCandidate(endpoint: ReturnType<typeof compactEndpo
   };
 }
 
+// Omits the key entirely when there are no reasons rather than shipping an
+// empty array: every call/reference edge carries this field, and in practice
+// almost all of them have no reasons, so `"signalReasons": []` on every item
+// is a fixed per-item token tax for a value that means the same as absent.
+function signalReasonsOrUndefined(value: unknown): string[] | undefined {
+  if (typeof value !== 'string' || !value) return undefined;
+  const parsed = parseJson<string[]>(value, []);
+  return parsed.length > 0 ? parsed : undefined;
+}
+
 function compactCallEdge(edge: CallEdgeRow): Record<string, unknown> {
   return {
     caller: edge.caller,
@@ -8298,7 +8315,7 @@ function compactCallEdge(edge: CallEdgeRow): Record<string, unknown> {
     confidence: edge.confidence,
     resolutionKind: edge.resolution_kind,
     signalTier: edge.signal_tier,
-    signalReasons: edge.signal_reasons_json ? parseJson<string[]>(edge.signal_reasons_json, []) : undefined,
+    signalReasons: signalReasonsOrUndefined(edge.signal_reasons_json),
   };
 }
 

@@ -1539,6 +1539,105 @@ public class AmbiguousCaller {
     expect(researchPack.answerGuidance.join(' ')).toContain('verify.tool');
   });
 
+  it('flags a low-confidence call edge that the flowSteps top-8-by-confidence cap squeezes out', async () => {
+    const home = tempDir('codegraph-home-');
+    const repo = tempDir('codegraph-verify-budget-manycalls-');
+    // Same ambiguous name-only shape as the test above, but AmbiguousCaller
+    // ALSO makes 8 other, unambiguous, high-confidence receiver-typed calls.
+    // researchFlowSteps builds its call-kind flowSteps from
+    // `[...callees, ...callers].sort(confidence DESC).slice(0, 8)` — with 9
+    // total outgoing edges from AmbiguousCaller, the 8 high-confidence ones
+    // fill that cap and the one ambiguous (confidence 0.4) edge is squeezed
+    // out of flowSteps entirely. verifyBudgetForCallEdges must still catch it
+    // by scanning the raw callers/callees arrays instead of flowSteps.
+    writeFile(repo, 'src/main/java/com/example/util/AlphaHelper.java', `package com.example.util;
+
+public class AlphaHelper {
+    int compute(int x) {
+        return x + 1;
+    }
+}
+`);
+    writeFile(repo, 'src/main/java/com/example/util/BetaHelper.java', `package com.example.util;
+
+public class BetaHelper {
+    int compute(int x) {
+        return x * 2;
+    }
+}
+`);
+    for (let i = 1; i <= 8; i += 1) {
+      writeFile(repo, `src/main/java/com/example/util/Helper${i}.java`, `package com.example.util;
+
+public class Helper${i} {
+    int method${i}(int x) {
+        return x + ${i};
+    }
+}
+`);
+    }
+    const fields = Array.from({ length: 8 }, (_, i) => `    Helper${i + 1} helper${i + 1} = new Helper${i + 1}();`).join('\n');
+    const calls = Array.from({ length: 8 }, (_, i) => `helper${i + 1}.method${i + 1}(x)`).join(' + ');
+    writeFile(repo, 'src/main/java/com/example/util/AmbiguousCaller.java', `package com.example.util;
+
+public class AmbiguousCaller {
+${fields}
+
+    int run(int x) {
+        return compute(x);
+    }
+
+    int runAll(int x) {
+        return ${calls};
+    }
+}
+`);
+
+    const { db } = await openDb(home);
+    const indexer = new V2Indexer(db);
+    const result = await indexer.indexWorkspace({ root: repo });
+    const queries = new V2QueryService(db);
+
+    const researchPack = await queries.query({
+      workspaceId: result.workspaceId,
+      toolName: 'get_research_pack',
+      args: {
+        target: 'How does AmbiguousCaller run call compute, and what does runAll do?',
+        taskType: 'architecture',
+        tokenBudget: 5000,
+      },
+    }) as {
+      completeness: { sufficientForAnswer: boolean };
+      flowSteps: Array<{ kind: string; file?: string; confidence?: number }>;
+      verifyBudget: Array<{
+        fact: string;
+        file?: string;
+        confidence?: number;
+        resolutionKind?: string;
+        signalTier?: string;
+        reason: string;
+        verify?: { tool: string; args: { file?: string } };
+      }>;
+      trustPosture?: string;
+    };
+
+    expect(researchPack.completeness.sufficientForAnswer).toBe(true);
+    // Prove the squeeze actually happened: flowSteps has no call-kind entry
+    // for the ambiguous edge (i.e. this test is exercising the real gap, not
+    // accidentally passing because flowSteps already carried it).
+    const flowStepHasAmbiguous = researchPack.flowSteps.some(
+      step => step.kind === 'call' && (step.confidence ?? 1) < 0.5,
+    );
+    expect(flowStepHasAmbiguous).toBe(false);
+
+    expect(researchPack.verifyBudget.length).toBeGreaterThanOrEqual(1);
+    const flagged = researchPack.verifyBudget.find(item => item.resolutionKind === 'name-only');
+    expect(flagged).toBeDefined();
+    expect(flagged?.confidence).toBeLessThan(0.5);
+    expect(flagged?.verify?.tool).toBe('get_file_slice');
+    expect(researchPack.trustPosture).toBe('spot_check_recommended');
+  });
+
   it('flags endpoints with partial path resolution in verifyBudget, scoped to the endpoint that seeded the pack', async () => {
     const home = tempDir('codegraph-home-');
     const repo = tempDir('codegraph-verify-budget-endpoint-');

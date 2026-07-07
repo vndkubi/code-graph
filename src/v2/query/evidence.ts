@@ -111,6 +111,63 @@ export function verifyBudgetForFlowSteps(
     });
 }
 
+export interface CallEdgeLike {
+  caller: string;
+  callee: string;
+  file: string;
+  line: number;
+  confidence: number;
+  resolution_kind: string;
+  signal_tier?: string;
+}
+
+/**
+ * Scans the RAW callers/callees edge lists — not flowSteps — for the same
+ * low-confidence/name-only shape verifyBudgetForFlowSteps flags. Necessary
+ * because researchFlowSteps builds its call-kind steps from
+ * `[...callees, ...callers].sort(confidence DESC).slice(0, 8)`: on any task
+ * with more than ~8 total call edges, that sort+cap keeps the highest-
+ * confidence edges and is exactly what drops the low-confidence ones this
+ * budget exists to catch, before flowSteps is even built. Confirmed live: a
+ * doughnut research-pack shipped a confidence=0.4 resolutionKind='name-only'
+ * callee edge in its own returned `callees` array while trustPosture read
+ * 'act_directly' (zero hedge), because that edge never survived into
+ * flowSteps. Operating on callers/callees directly closes that gap
+ * regardless of what flowSteps decided to keep.
+ */
+export function verifyBudgetForCallEdges(
+  callers: CallEdgeLike[],
+  callees: CallEdgeLike[],
+  maxItems: number = VERIFY_BUDGET_MAX_ITEMS,
+): VerifyBudgetItem[] {
+  const candidates = [...callers, ...callees].filter(edge => {
+    if (edge.signal_tier === 'provider') return false;
+    const lowConfidence = typeof edge.confidence === 'number' && edge.confidence < VERIFY_BUDGET_CONFIDENCE_THRESHOLD;
+    return lowConfidence || edge.signal_tier === 'low_signal';
+  });
+  return candidates
+    .sort((a, b) => (a.confidence ?? 0) - (b.confidence ?? 0))
+    .slice(0, maxItems)
+    .map(edge => {
+      const reasonParts: string[] = [];
+      if (typeof edge.confidence === 'number' && edge.confidence < VERIFY_BUDGET_CONFIDENCE_THRESHOLD) {
+        reasonParts.push(`confidence ${edge.confidence.toFixed(2)} < ${VERIFY_BUDGET_CONFIDENCE_THRESHOLD}`);
+      }
+      if (edge.signal_tier === 'low_signal') reasonParts.push('low_signal edge');
+      if (edge.resolution_kind === 'name-only') reasonParts.push('ambiguous name-only match');
+      return {
+        fact: `${edge.caller} -> ${edge.callee}`,
+        file: edge.file,
+        line: edge.line,
+        confidence: edge.confidence,
+        resolutionKind: edge.resolution_kind,
+        signalTier: edge.signal_tier,
+        reason: reasonParts.join('; ') || 'flagged for low trust',
+        verify: evidenceHandleForObject({ file: edge.file, lines: String(edge.line), symbol: edge.callee }),
+      };
+    });
+}
+
 /**
  * Flags endpoints whose path_resolution isn't 'exact' (composeEndpointPath
  * couldn't resolve a class/method path literal). Scoped to the endpoint(s)
