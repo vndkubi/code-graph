@@ -8,6 +8,7 @@
     "dist/",
     "docs/ARCHITECTURE.md",
     "docs/MIGRATION.md",
+    "docs/pr-review.md",
     "docs/mcp-setup-and-usage.md",
     "docs/cli.md",
     "examples/",

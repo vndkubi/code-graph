@@ -2000,7 +2000,11 @@ export class V2QueryService {
     };
   }
 
-  private async simulatePatchImpact(snapshotId: string, args: Record<string, unknown>) {
+  private async simulatePatchImpact(
+    snapshotId: string,
+    args: Record<string, unknown>,
+    executionOptions: { bypassResponseCap?: boolean } = {},
+  ) {
     const timing = createDebugTiming(args);
     const limit = clampInt(Number(args.limit ?? 50), 1, 200);
     const outputMode = normalizePatchImpactOutputMode(args.outputMode);
@@ -2198,6 +2202,15 @@ export class V2QueryService {
         'Dependency impact follows indexed file dependency edges; call impact follows indexed call edges and may include lower-confidence name-only matches.',
       ],
     };
+    // review_patch composes this result into its own compact response. Applying
+    // the public simulate_patch_impact response cap here would discard changed
+    // files before review can compute callers/tests/coverage. Keep the cap for
+    // direct tool calls, but never let a serialization budget alter internal
+    // review semantics.
+    if (executionOptions.bypassResponseCap) {
+      timing.checkpoint('internal_full_result');
+      return withDebugTiming(fullResult, timing);
+    }
     const requestedResult = outputMode === 'full'
       ? fullResult
       : compactPatchImpactResult(fullResult, compactLimitForResponseCap(maxResponseTokens), {
@@ -2421,13 +2434,16 @@ export class V2QueryService {
     const budget = reviewBudgetFor(outputMode, args, limit);
     const diff = stringOrUndefined(args.diff) ?? '';
     const allHunks = parsePatchHunks(diff);
+    const allDiffFiles = uniqueFilesInOrder(parsePatchFilePaths(diff));
     const diffStats = patchDiffStats(allHunks, diff);
+    const impactLimit = Math.min(200, Math.max(limit, allDiffFiles.length));
     const impact = await this.simulatePatchImpact(snapshotId, {
       ...args,
-      limit,
+      limit: impactLimit,
+      outputMode: 'full',
       callSeedLimit: 0,
       skipLikelyTests: args.includeLikelyTests !== true,
-    }) as Record<string, unknown>;
+    }, { bypassResponseCap: true }) as Record<string, unknown>;
     const hunks = rankPatchHunks(allHunks).slice(0, Math.max(budget.maxLineFocus, budget.maxFindings));
     const lineMapping = await this.patchLineMappings(snapshotId, hunks);
     const changedFiles = stringArray(impact.changedFiles);
@@ -2499,6 +2515,20 @@ export class V2QueryService {
       .slice(0, budget.maxLineFocus)
       .map(hunk => compactPatchHunk(hunk, lineMapping.get(hunk)))
       .map(hunk => compactReviewObject(hunk, budget.maxEvidencePerFinding, 2) as Record<string, unknown>);
+    const changedFileSet = new Set(changedFiles);
+    const omittedGraphFiles = allDiffFiles.filter(file => !changedFileSet.has(file));
+    const reviewCoverage = {
+      complete: omittedGraphFiles.length === 0 && lineFocus.length === allHunks.length,
+      diffFileCount: allDiffFiles.length,
+      graphResolvedFileCount: changedFiles.length,
+      omittedGraphFileCount: omittedGraphFiles.length,
+      omittedGraphFiles: omittedGraphFiles.slice(0, 20),
+      omittedGraphFilesTruncated: omittedGraphFiles.length > 20,
+      diffHunkCount: allHunks.length,
+      reportedHunkCount: lineFocus.length,
+      omittedHunkCount: Math.max(0, allHunks.length - lineFocus.length),
+      batchingRequired: omittedGraphFiles.length > 0 || lineFocus.length < allHunks.length,
+    };
     const reviewTargets = await this.patchReviewTargets(
       snapshotId,
       hunks,
@@ -2544,6 +2574,7 @@ export class V2QueryService {
       fieldImpact: packedFieldImpact,
       architectureContext: packedArchitectureContext,
       diffStats,
+      reviewCoverage,
       reviewFindings: findings,
       lineFocus,
       reviewTargets,
@@ -2577,6 +2608,7 @@ export class V2QueryService {
       fieldImpact: packedFieldImpact,
       architectureContext: packedArchitectureContext,
       diffStats,
+      reviewCoverage,
       reviewPlan: reviewPlanForPatch(diffStats, findings, impact),
       seededRiskCategories: seededRiskCategoriesForReview(focus, findings, riskFlags, diffStats),
       mustCheckInvariants: mustCheckInvariantsForReview(focus, changedFiles, impact, findings),
@@ -2606,6 +2638,8 @@ export class V2QueryService {
         likelyTestCount: tests.length,
         omittedFindings: Math.max(0, allFindings.length - findings.length),
         omittedHunks: Math.max(0, allHunks.length - lineFocus.length),
+        graphResolvedChangedFileCount: changedFiles.length,
+        omittedGraphFiles: omittedGraphFiles.length,
         omittedRiskFlags: Math.max(0, riskFlags.length - cappedRiskFlags.length),
         omittedTests: Math.max(0, tests.length - cappedTests.length),
       },
@@ -2620,6 +2654,9 @@ export class V2QueryService {
       confidenceNotes: [
         'Review findings are deterministic risk hypotheses from the diff and graph impact, not proof of bugs.',
         'Default output is capped for large diffs; use outputMode=full only when expanded evidence is needed.',
+        reviewCoverage.complete
+          ? 'Every diff file was graph-resolved and every hunk is represented in lineFocus.'
+          : 'Review coverage is incomplete in this packet; follow reviewPlan batching guidance before claiming full-PR coverage.',
         'Use requiredToolCalls for exact source slices before writing final review comments.',
       ],
     };

@@ -252,4 +252,101 @@ describe('reviewForCi (temp git repo)', () => {
     expect(strict.findings.every(f => f.priority === 'P0')).toBe(true);
     expect(strict.droppedBelowMinPriority).toBe(all.findings.length - strict.findings.length);
   });
+
+  it('batches every changed file and deduplicates cross-batch findings', async () => {
+    if (!hasGit()) return;
+    const repo = tempDir('codegraph-ci-review-batches-');
+    runGit(repo, 'init');
+    runGit(repo, 'config', 'user.email', 'codegraph@example.test');
+    runGit(repo, 'config', 'user.name', 'CodeGraph Test');
+    for (let index = 0; index < 5; index += 1) writeFile(repo, `src/file-${index}.ts`, `export const value${index} = 1;\n`);
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'base');
+    for (let index = 0; index < 5; index += 1) writeFile(repo, `src/file-${index}.ts`, `export const value${index} = 2;\n`);
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'change all files');
+
+    const calls: Array<Record<string, unknown>> = [];
+    const service = {
+      async query(envelope: { args: Record<string, unknown> }): Promise<unknown> {
+        calls.push(envelope.args);
+        const batchDiff = String(envelope.args.diff ?? '');
+        const files = [...batchDiff.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)].map(match => match[2]);
+        const hunkCount = (batchDiff.match(/^@@ /gm) ?? []).length;
+        return {
+          changedFiles: files,
+          lineFocus: Array.from({ length: hunkCount }, () => ({})),
+          reviewFindings: [{
+            id: 'review-missing-tests',
+            priority: 'P1',
+            title: 'No likely tests were found',
+            why: 'The same cross-batch fact should appear once.',
+            confidence: 0.72,
+          }],
+          metrics: { omittedHunks: 0 },
+        };
+      },
+    };
+    const result = await reviewForCi(service as Pick<V2QueryService, 'query'>, 'workspace', repo, {
+      baseRef: 'HEAD~1',
+      batchSize: 2,
+      limit: 2,
+    });
+
+    expect(calls).toHaveLength(3);
+    expect(calls.map(call => [...String(call.diff).matchAll(/^diff --git /gm)].length)).toEqual([2, 2, 1]);
+    expect(result.changedFiles).toHaveLength(5);
+    expect(result.findings.filter(finding => finding.id === 'review-missing-tests')).toHaveLength(1);
+    expect(result.coverage).toMatchObject({
+      complete: true,
+      batchCount: 3,
+      reviewableFileCount: 5,
+      unparsedFileCount: 0,
+      graphEligibleFileCount: 5,
+      graphResolvedFileCount: 5,
+      reviewableHunkCount: 5,
+      reviewedHunkCount: 5,
+      omittedFiles: [],
+      omittedHunks: 0,
+    });
+  });
+
+  it('keeps internal graph coverage independent from the public response cap', async () => {
+    if (!hasGit()) return;
+    const repo = tempDir('codegraph-ci-review-cap-');
+    runGit(repo, 'init');
+    runGit(repo, 'config', 'user.email', 'codegraph@example.test');
+    runGit(repo, 'config', 'user.name', 'CodeGraph Test');
+    for (let index = 0; index < 12; index += 1) {
+      writeFile(repo, `src/service-${index}.ts`, `export function service${index}(): number { return 1; }\n`);
+    }
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'base');
+    for (let index = 0; index < 12; index += 1) {
+      writeFile(repo, `src/service-${index}.ts`, `export function service${index}(): number { return 2; }\n`);
+    }
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'change services');
+
+    const { db } = await openCodeGraphDb(tempDir('codegraph-home-'));
+    dbs.push(db);
+    const index = await new V2Indexer(db).indexWorkspace({ root: repo });
+    const diff = execFileSync('git', ['diff', '--no-renames', '--unified=3', 'HEAD~1...HEAD'], {
+      cwd: repo,
+      encoding: 'utf8',
+    });
+    const response = await new V2QueryService(db).query({
+      workspaceId: index.workspaceId,
+      toolName: 'review_patch',
+      args: { diff, outputMode: 'full', limit: 12, maxResponseTokens: 500 },
+    }) as {
+      changedFiles: string[];
+      reviewCoverage: { graphResolvedFileCount: number; omittedGraphFileCount: number };
+      metrics: { graphResolvedChangedFileCount: number; omittedGraphFiles: number };
+    };
+
+    expect(response.changedFiles).toHaveLength(12);
+    expect(response.reviewCoverage).toMatchObject({ graphResolvedFileCount: 12, omittedGraphFileCount: 0 });
+    expect(response.metrics).toMatchObject({ graphResolvedChangedFileCount: 12, omittedGraphFiles: 0 });
+  });
 });

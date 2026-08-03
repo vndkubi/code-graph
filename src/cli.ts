@@ -33,6 +33,10 @@ import {
   type CiReviewPriority,
 } from './v2/query/ci-review.js';
 import {
+  assertReviewWorkspaceAtHead,
+  preparePullRequestReviewWorkspace,
+} from './v2/query/pr-review.js';
+import {
   applyGeneratedBlock,
   buildComponentStats,
   buildDirectoryStats,
@@ -582,34 +586,54 @@ function runAdoptionReportCommand(parsed: ParsedArgs): void {
 }
 
 /**
- * `codegraph review --base <ref>`: deterministic PR review over a git range.
+ * `codegraph review --base <ref>` or `codegraph review --pr <url>`:
+ * deterministic PR review over an immutable git range.
  * stdout carries the rendered report (json/sarif/markdown/text); the audit
  * summary goes to stderr so pipes stay clean, mirroring affected-tests.
  */
 async function runReviewCommand(parsed: ParsedArgs): Promise<void> {
-  const root = getFlag(parsed, 'root') ?? process.cwd();
-  const baseRef = getFlag(parsed, 'base');
-  if (!baseRef) {
-    throw new Error('review requires --base <git ref> (e.g. --base origin/main).');
+  const sourceRoot = path.resolve(getFlag(parsed, 'root') ?? process.cwd());
+  const prUrl = getFlag(parsed, 'pr') ?? getFlag(parsed, 'pr-url');
+  let reviewRoot = sourceRoot;
+  let baseRef = getFlag(parsed, 'base');
+  let headRef = getFlag(parsed, 'head') ?? 'HEAD';
+  let workspaceKey = getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY;
+  let preparedPr: Awaited<ReturnType<typeof preparePullRequestReviewWorkspace>> | undefined;
+  if (prUrl) {
+    if (baseRef || getFlag(parsed, 'head')) {
+      throw new Error('Use either --pr <GitHub PR URL> or --base/--head, not both.');
+    }
+    preparedPr = await preparePullRequestReviewWorkspace(sourceRoot, prUrl);
+    reviewRoot = preparedPr.root;
+    baseRef = preparedPr.baseSha;
+    headRef = preparedPr.headSha;
+    workspaceKey = preparedPr.workspaceKey;
+  } else {
+    if (!baseRef) {
+      throw new Error('review requires --pr <GitHub PR URL> or --base <git ref> (e.g. --base origin/main).');
+    }
+    assertReviewWorkspaceAtHead(reviewRoot, headRef);
   }
   const format = normalizeCiReviewFormat(getFlag(parsed, 'format'));
   const failOn = normalizeCiReviewFailOn(getFlag(parsed, 'fail-on'));
   const minPriority = normalizeCiReviewPriority(getFlag(parsed, 'min-priority'), 'P2');
-  const { db } = await openCodeGraphDb(root);
+  const { db } = await openCodeGraphDb(reviewRoot);
   try {
-    const index = await new V2Indexer(db).indexWorkspace({ root });
+    const index = await new V2Indexer(db).indexWorkspace({ root: reviewRoot, workspaceKey });
     const service = new V2QueryService(db);
-    const result = await reviewForCi(service, index.workspaceId, root, {
+    const result = await reviewForCi(service, index.workspaceId, reviewRoot, {
       baseRef,
-      headRef: getFlag(parsed, 'head'),
+      headRef,
       focus: getFlag(parsed, 'focus'),
       limit: getNumberFlag(parsed, 'limit'),
+      batchSize: getNumberFlag(parsed, 'batch-size'),
+      maxHunksPerBatch: getNumberFlag(parsed, 'max-hunks-per-batch'),
       minPriority,
     });
     const output = formatCiReview(result, format, cliPackageVersion());
     const outPath = getFlag(parsed, 'out');
     if (outPath) {
-      fs.writeFileSync(path.resolve(root, outPath), `${output}\n`);
+      fs.writeFileSync(path.resolve(sourceRoot, outPath), `${output}\n`);
     } else {
       console.log(output);
     }
@@ -620,7 +644,14 @@ async function runReviewCommand(parsed: ParsedArgs): Promise<void> {
       reviewStatus: result.reviewStatus,
       findings: result.findings.length,
       priorityCounts: result.priorityCounts,
+      coverage: result.coverage,
       droppedBelowMinPriority: result.droppedBelowMinPriority,
+      ...(preparedPr ? {
+        prUrl: preparedPr.url,
+        baseSha: preparedPr.baseSha,
+        headSha: preparedPr.headSha,
+        reviewRoot: preparedPr.root,
+      } : {}),
       ...(outPath ? { wrote: outPath, format } : {}),
     }, null, 2));
     const exitCode = ciReviewExitCode(result, failOn);
@@ -2466,8 +2497,8 @@ Usage:
                                          Print recent workspace query events or an aggregate summary
   codegraph affected-tests --root <workspace> --base <ref> [--format json|list|maven|gradle]
                                          Select the tests a git range can affect (ALL = safety fallback)
-  codegraph review --root <workspace> --base <ref> [--format json|sarif|markdown|text] [--min-priority P0|P1|P2] [--fail-on P0|P1|P2|none] [--out <path>]
-                                         Deterministic PR review: graph-fact findings for CI (SARIF/comment)
+  codegraph review --root <workspace> (--pr <GitHub PR URL> | --base <ref> [--head <ref>]) [--format json|sarif|markdown|text] [--min-priority P0|P1|P2] [--fail-on P0|P1|P2|none] [--out <path>]
+                                         Deterministic, batched PR review over an immutable head worktree
   codegraph onboard --root <workspace> [--profile architecture|claude|copilot|both] [--dry-run]
                                          Generate ARCHITECTURE.md/CLAUDE.md/.github/copilot-instructions.md from index facts (marker-based regeneration)
   codegraph adoption-report --root <workspace> [--since <ISO>] [--until <ISO>] [--format json|text]
@@ -2504,6 +2535,9 @@ Options:
   --no-incremental                       Force changed-file index runs through full snapshot rebuild
   --incremental-file-limit <number>      Max changed/deleted files for incremental index path
   --workspace-key <key>                  Stable workspace identity key, useful when Docker always mounts roots at /workspace
+  --pr <GitHub PR URL>                   Resolve immutable base/head SHAs and use a managed isolated worktree
+  --batch-size <number>                  Maximum changed files per review batch (default 50, max 50)
+  --max-hunks-per-batch <number>         Maximum diff hunks targeted per review batch (default 200)
   --quiet                                Suppress index progress logs on stderr
   --auto-refresh                         Refresh stale snapshots automatically before MCP tool calls
   --refresh-on-start                     Queue a workspace refresh when MCP starts, without blocking startup

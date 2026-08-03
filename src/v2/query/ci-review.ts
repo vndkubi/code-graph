@@ -7,7 +7,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { isIgnorableChangedPath } from './ci-test-selection.js';
-import { V2QueryService } from './service.js';
+import type { V2QueryService } from './service.js';
 
 export type CiReviewFormat = 'json' | 'sarif' | 'markdown' | 'text';
 export type CiReviewPriority = 'P0' | 'P1' | 'P2';
@@ -17,9 +17,38 @@ export interface CiReviewOptions {
   baseRef: string;
   headRef?: string;
   focus?: string;
+  /** Maximum files sent to one review_patch call. Default: min(limit, 50). */
+  batchSize?: number;
+  /** Maximum hunks targeted per review_patch call. Default: 200. */
+  maxHunksPerBatch?: number;
   limit?: number;
   /** Drop findings below this priority (P0 strictest). Default: keep all. */
   minPriority?: CiReviewPriority;
+}
+
+export interface CiReviewBatchCoverage {
+  batch: number;
+  fileCount: number;
+  hunkCount: number;
+  graphResolvedFileCount: number;
+  reviewedHunkCount: number;
+  omittedFiles: string[];
+  omittedHunks: number;
+  complete: boolean;
+}
+
+export interface CiReviewCoverage {
+  complete: boolean;
+  batchCount: number;
+  reviewableFileCount: number;
+  unparsedFileCount: number;
+  graphEligibleFileCount: number;
+  graphResolvedFileCount: number;
+  reviewableHunkCount: number;
+  reviewedHunkCount: number;
+  omittedFiles: string[];
+  omittedHunks: number;
+  batches: CiReviewBatchCoverage[];
 }
 
 export interface CiReviewFinding {
@@ -47,6 +76,7 @@ export interface CiReviewResult {
   ignoredFiles: string[];
   reviewStatus?: string;
   diffStats?: Record<string, unknown>;
+  coverage?: CiReviewCoverage;
   findings: CiReviewFinding[];
   priorityCounts: Record<CiReviewPriority, number>;
   droppedBelowMinPriority: number;
@@ -138,38 +168,100 @@ export function filterIgnorableDiff(diff: string): { diff: string; ignoredFiles:
   return { diff: kept.join(''), ignoredFiles };
 }
 
-/**
- * Run the review engine over `baseRef...headRef`. The workspace must already
- * be indexed at the head state (`workspaceId` from V2Indexer.indexWorkspace).
- */
-export async function reviewForCi(
-  service: V2QueryService,
-  workspaceId: string,
-  root: string,
-  options: CiReviewOptions,
-): Promise<CiReviewResult> {
-  const headRef = options.headRef ?? 'HEAD';
-  const rawDiff = gitUnifiedDiff(root, options.baseRef, headRef);
-  if (rawDiff.trim() === '') {
-    return emptyResult(options.baseRef, headRef, 'no-changes');
-  }
-  const { diff, ignoredFiles } = filterIgnorableDiff(rawDiff);
-  if (diff.trim() === '') {
-    return emptyResult(options.baseRef, headRef, 'no-reviewable-changes', ignoredFiles);
-  }
-  const response = await service.query({
-    workspaceId,
-    toolName: 'review_patch',
-    args: {
-      diff,
-      focus: options.focus ?? 'general',
-      limit: options.limit ?? 50,
-      outputMode: 'full',
-    },
-  }) as Record<string, unknown>;
+interface ReviewDiffBlock {
+  text: string;
+  file?: string;
+  hunkCount: number;
+  deleted: boolean;
+}
 
+interface ReviewDiffBatch {
+  diff: string;
+  blocks: ReviewDiffBlock[];
+  hunkCount: number;
+}
+
+function parseReviewDiffBlocks(diff: string): ReviewDiffBlock[] {
+  return diff
+    .split(/^(?=diff --git )/m)
+    .filter(block => block.trim() !== '')
+    .map(block => ({
+      text: block,
+      file: /^diff --git a\/(.+?) b\/(.+)$/m.exec(block)?.[2]?.trim(),
+      hunkCount: (block.match(/^@@ /gm) ?? []).length,
+      deleted: /^\+\+\+ \/dev\/null$/m.test(block),
+    }));
+}
+
+function clampBatchSize(value: number | undefined, fallback: number, max: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(max, Math.floor(value!)));
+}
+
+/**
+ * Partition by complete file blocks so every changed file is assigned exactly
+ * once. Hunk count is a second guard: a 50-file batch with many methods should
+ * not silently overflow review_patch's evidence window.
+ */
+function buildReviewDiffBatches(
+  diff: string,
+  fileLimit: number,
+  hunkLimit: number,
+): ReviewDiffBatch[] {
+  const result: ReviewDiffBatch[] = [];
+  let blocks: ReviewDiffBlock[] = [];
+  let hunkCount = 0;
+  const flush = (): void => {
+    if (blocks.length === 0) return;
+    result.push({ diff: blocks.map(block => block.text).join(''), blocks, hunkCount });
+    blocks = [];
+    hunkCount = 0;
+  };
+  for (const block of parseReviewDiffBlocks(diff)) {
+    if (blocks.length > 0 && (blocks.length >= fileLimit || hunkCount + block.hunkCount > hunkLimit)) flush();
+    blocks.push(block);
+    hunkCount += block.hunkCount;
+  }
+  flush();
+  return result;
+}
+
+function fullDiffStats(diff: string, blocks: ReviewDiffBlock[]): Record<string, unknown> {
+  let addedLineCount = 0;
+  let removedLineCount = 0;
+  let inHunk = false;
+  for (const line of diff.split(/\r?\n/)) {
+    if (line.startsWith('diff --git ')) {
+      inHunk = false;
+      continue;
+    }
+    if (line.startsWith('@@ ')) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (line.startsWith('+')) addedLineCount += 1;
+    if (line.startsWith('-')) removedLineCount += 1;
+  }
+  const changedLineCount = addedLineCount + removedLineCount;
+  return {
+    fileCount: new Set(blocks.map(block => block.file).filter(Boolean)).size,
+    hunkCount: blocks.reduce((sum, block) => sum + block.hunkCount, 0),
+    addedLineCount,
+    removedLineCount,
+    changedLineCount,
+    diffChars: diff.length,
+    scale: changedLineCount >= 100_000 ? 'huge'
+      : changedLineCount >= 20_000 ? 'very-large'
+        : changedLineCount >= 2_000 ? 'large'
+          : changedLineCount >= 500 ? 'medium'
+            : 'small',
+  };
+}
+
+function findingsFromReviewResponse(response: Record<string, unknown>): CiReviewFinding[] {
   const rawFindings = Array.isArray(response.reviewFindings) ? response.reviewFindings : [];
-  const all: CiReviewFinding[] = rawFindings
+  return rawFindings
     .filter((f): f is Record<string, unknown> => typeof f === 'object' && f !== null)
     .map(f => {
       const id = String(f.id ?? 'review-finding');
@@ -188,21 +280,138 @@ export async function reviewForCi(
         evidence: f.evidence,
       };
     });
+}
+
+function uniqueFindings(findings: CiReviewFinding[]): CiReviewFinding[] {
+  const byId = new Map<string, CiReviewFinding>();
+  for (const finding of findings) {
+    const current = byId.get(finding.id);
+    if (!current
+      || PRIORITY_RANK[finding.priority] < PRIORITY_RANK[current.priority]
+      || (finding.priority === current.priority && finding.confidence > current.confidence)) {
+      byId.set(finding.id, finding);
+    }
+  }
+  return [...byId.values()]
+    .sort((a, b) => PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority] || b.confidence - a.confidence || a.id.localeCompare(b.id));
+}
+
+/**
+ * Run the review engine over `baseRef...headRef`. The workspace must already
+ * be indexed at the head state (`workspaceId` from V2Indexer.indexWorkspace).
+ */
+export async function reviewForCi(
+  service: Pick<V2QueryService, 'query'>,
+  workspaceId: string,
+  root: string,
+  options: CiReviewOptions,
+): Promise<CiReviewResult> {
+  const headRef = options.headRef ?? 'HEAD';
+  const rawDiff = gitUnifiedDiff(root, options.baseRef, headRef);
+  if (rawDiff.trim() === '') {
+    return emptyResult(options.baseRef, headRef, 'no-changes');
+  }
+  const { diff, ignoredFiles } = filterIgnorableDiff(rawDiff);
+  if (diff.trim() === '') {
+    return emptyResult(options.baseRef, headRef, 'no-reviewable-changes', ignoredFiles);
+  }
+  const requestedLimit = clampBatchSize(options.limit, 50, 200);
+  const batchSize = clampBatchSize(options.batchSize, Math.min(requestedLimit, 50), 50);
+  const maxHunksPerBatch = clampBatchSize(options.maxHunksPerBatch, 200, 200);
+  const blocks = parseReviewDiffBlocks(diff);
+  const batches = buildReviewDiffBatches(diff, batchSize, maxHunksPerBatch);
+  const allFindings: CiReviewFinding[] = [];
+  const batchCoverage: CiReviewBatchCoverage[] = [];
+  const graphResolvedFiles = new Set<string>();
+  const batchReviewStatuses: string[] = [];
+
+  for (const [index, batch] of batches.entries()) {
+    const batchLimit = Math.min(200, Math.max(requestedLimit, batch.blocks.length, batch.hunkCount));
+    const response = await service.query({
+      workspaceId,
+      toolName: 'review_patch',
+      args: {
+        diff: batch.diff,
+        focus: options.focus ?? 'general',
+        limit: batchLimit,
+        outputMode: 'full',
+      },
+    }) as Record<string, unknown>;
+    allFindings.push(...findingsFromReviewResponse(response));
+    if (typeof response.reviewStatus === 'string') batchReviewStatuses.push(response.reviewStatus);
+
+    const responseChangedFiles = Array.isArray(response.changedFiles) ? response.changedFiles.map(String) : [];
+    for (const file of responseChangedFiles) graphResolvedFiles.add(file);
+    const metrics = typeof response.metrics === 'object' && response.metrics !== null
+      ? response.metrics as Record<string, unknown>
+      : {};
+    const omittedHunks = Math.max(0, Number(metrics.omittedHunks ?? Math.max(0, batch.hunkCount - (Array.isArray(response.lineFocus) ? response.lineFocus.length : 0))));
+    const expectedGraphFiles = batch.blocks
+      .filter(block => !block.deleted)
+      .map(block => block.file)
+      .filter((file): file is string => Boolean(file));
+    const responseFileSet = new Set(responseChangedFiles);
+    const omittedFiles = [
+      ...expectedGraphFiles.filter(file => !responseFileSet.has(file)),
+      ...batch.blocks
+        .map((block, blockIndex) => block.file ? undefined : `<unparsed-diff-block:${index + 1}.${blockIndex + 1}>`)
+        .filter((file): file is string => Boolean(file)),
+    ];
+    batchCoverage.push({
+      batch: index + 1,
+      fileCount: batch.blocks.length,
+      hunkCount: batch.hunkCount,
+      graphResolvedFileCount: expectedGraphFiles.length - omittedFiles.length,
+      reviewedHunkCount: Math.max(0, batch.hunkCount - omittedHunks),
+      omittedFiles,
+      omittedHunks,
+      complete: omittedFiles.length === 0 && omittedHunks === 0,
+    });
+  }
+
+  const all = uniqueFindings(allFindings);
 
   const maxRank = PRIORITY_RANK[options.minPriority ?? 'P2'];
   const findings = all.filter(f => PRIORITY_RANK[f.priority] <= maxRank);
   const priorityCounts: Record<CiReviewPriority, number> = { P0: 0, P1: 0, P2: 0 };
   for (const finding of findings) priorityCounts[finding.priority] += 1;
+  const changedFiles = [...new Set(blocks.map(block => block.file).filter((file): file is string => Boolean(file)))];
+  const unparsedFileCount = blocks.filter(block => !block.file).length;
+  const graphEligibleFiles = [...new Set(blocks
+    .filter(block => !block.deleted)
+    .map(block => block.file)
+    .filter((file): file is string => Boolean(file)))];
+  const omittedFiles = [...new Set(batchCoverage.flatMap(batch => batch.omittedFiles))];
+  const omittedHunks = batchCoverage.reduce((sum, batch) => sum + batch.omittedHunks, 0);
+  const coverage: CiReviewCoverage = {
+    complete: batchCoverage.every(batch => batch.complete),
+    batchCount: batchCoverage.length,
+    reviewableFileCount: blocks.length,
+    unparsedFileCount,
+    graphEligibleFileCount: graphEligibleFiles.length,
+    graphResolvedFileCount: graphResolvedFiles.size,
+    reviewableHunkCount: blocks.reduce((sum, block) => sum + block.hunkCount, 0),
+    reviewedHunkCount: batchCoverage.reduce((sum, batch) => sum + batch.reviewedHunkCount, 0),
+    omittedFiles,
+    omittedHunks,
+    batches: batchCoverage,
+  };
+  const reviewStatus = !coverage.complete
+    ? 'incomplete-coverage'
+    : batchReviewStatuses.includes('blocked') || all.some(finding => finding.priority === 'P0')
+      ? 'blocked'
+      : all.some(finding => finding.priority === 'P1')
+        ? 'needs-attention'
+        : 'ready-for-review';
 
   return {
     baseRef: options.baseRef,
     headRef,
-    changedFiles: Array.isArray(response.changedFiles) ? response.changedFiles.map(String) : [],
+    changedFiles,
     ignoredFiles,
-    reviewStatus: typeof response.reviewStatus === 'string' ? response.reviewStatus : undefined,
-    diffStats: typeof response.diffStats === 'object' && response.diffStats !== null
-      ? response.diffStats as Record<string, unknown>
-      : undefined,
+    reviewStatus,
+    diffStats: fullDiffStats(diff, blocks),
+    coverage,
     findings,
     priorityCounts,
     droppedBelowMinPriority: all.length - findings.length,
@@ -297,6 +506,12 @@ function toMarkdown(result: CiReviewResult): string {
   lines.push(`### CodeGraph review — ${total === 0 ? 'no findings' : `${total} finding(s)`}`);
   lines.push('');
   lines.push(`\`${result.baseRef}...${result.headRef}\` · ${result.changedFiles.length} changed file(s) · deterministic graph facts, no LLM`);
+  if (result.coverage) {
+    lines.push(`Coverage: ${result.coverage.reviewedHunkCount}/${result.coverage.reviewableHunkCount} hunks, ${result.coverage.graphResolvedFileCount}/${result.coverage.graphEligibleFileCount} graph-resolved files, ${result.coverage.batchCount} batch(es).`);
+    if (!result.coverage.complete) {
+      lines.push('> ⚠️ Review coverage is incomplete; do not treat this report as full-PR evidence.');
+    }
+  }
   if (total > 0) {
     lines.push('');
     lines.push('| Priority | Rule | Location | Finding |');
@@ -323,6 +538,9 @@ function escapeMarkdownCell(value: string): string {
 function toText(result: CiReviewResult): string {
   const lines: string[] = [];
   lines.push(`codegraph review ${result.baseRef}...${result.headRef}: ${result.findings.length} finding(s) across ${result.changedFiles.length} changed file(s)`);
+  if (result.coverage) {
+    lines.push(`coverage: ${result.coverage.reviewedHunkCount}/${result.coverage.reviewableHunkCount} hunks, ${result.coverage.graphResolvedFileCount}/${result.coverage.graphEligibleFileCount} graph-resolved files, ${result.coverage.batchCount} batch(es), complete=${result.coverage.complete}`);
+  }
   for (const finding of result.findings) {
     const location = finding.file ? ` [${finding.file}${finding.line ? `:${finding.line}` : ''}]` : '';
     lines.push(`${finding.priority} ${finding.ruleId}${location}: ${finding.title}`);
