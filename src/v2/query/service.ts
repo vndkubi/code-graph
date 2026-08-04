@@ -5018,7 +5018,7 @@ export class V2QueryService {
       .filter(([, value]) => value.status === 'partial')
       .map(([key]) => key);
     const strictRubric = args.strictRubric !== false && args.strict_rubric !== false;
-    const answerable = compileEvidenceAnswerable(source.tool, sourcePacket, evidence, missing, strictRubric ? partial : []);
+    const answerable = compileEvidenceAnswerable(source.tool, sourcePacket, evidence, missing, strictRubric ? partial : [], taskType);
     const recommendedEscalation = !answerable && allowTargetedShell
       ? targetedShellEscalationForCompile(task, missing.length > 0 ? missing : partial, sourcePacket)
       : undefined;
@@ -8048,8 +8048,10 @@ function compileEvidenceAnswerable(
   evidence: Array<Record<string, unknown>>,
   missing: string[],
   strictPartial: string[] = [],
+  taskType: CompileEvidenceTaskType = 'unknown',
 ): boolean {
   if (missing.length > 0 || strictPartial.length > 0 || evidence.length === 0) return false;
+  if (taskType === 'unknown') return false;
   if (sourceTool === 'get_research_pack') {
     const routing = isPlainObject(packet.routing) ? packet.routing : {};
     const completeness = isPlainObject(packet.completeness) ? packet.completeness : {};

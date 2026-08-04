@@ -50,7 +50,7 @@ describe('MCP full tool mode', () => {
   });
 
   it('keeps named MCP profiles on the facade surface to avoid duplicate low-level choices', () => {
-    const facadeTools = ['codegraph_context', 'codegraph_slice', 'codegraph_status'];
+    const facadeTools = ['codegraph_context', 'codegraph_slice', 'codegraph_checkpoint', 'codegraph_status'];
     expect([...mcpToolNamesForProfile('client')!]).toEqual(facadeTools);
     expect([...mcpToolNamesForProfile('minimal')!]).toEqual(facadeTools);
     expect([...mcpToolNamesForProfile('research')!]).toEqual(facadeTools);
@@ -105,6 +105,9 @@ describe('MCP full tool mode', () => {
       toolName: 'compile_evidence',
       args: { task: 'Analyze PBI 123 acceptance criteria and related code' },
     });
+
+    expect(inferCodeGraphContextMode('Assess where to add a persistent phase checkpoint while preserving exact evidence.', {})).toBe('change');
+    expect(inferCodeGraphContextMode('Collect evidence with rubric coverage', {})).toBe('evidence');
 
     expect(routeCodeGraphContext({
       task: 'Explain the repository architecture',
@@ -221,6 +224,11 @@ describe('MCP full tool mode', () => {
       baseRef: 'origin/main',
       headRef: 'feature/orders',
     });
+    expect(parseToolArgs('codegraph_checkpoint', { action: 'list' })).toMatchObject({
+      action: 'list',
+      limit: 20,
+      apply: false,
+    });
   });
 
   it('compact descriptions preserve schema but reduce always-on text', () => {
@@ -286,10 +294,10 @@ describe('MCP full tool mode', () => {
 
   it('advertises a slim gate schema on client profiles and the full schema on full', () => {
     const client = buildV2ToolDefinitionsForProfile('client');
-    expect(client.map(tool => tool.name)).toEqual(['codegraph_context', 'codegraph_slice', 'codegraph_status']);
+    expect(client.map(tool => tool.name)).toEqual(['codegraph_context', 'codegraph_slice', 'codegraph_checkpoint', 'codegraph_status']);
     const gate = client.find(tool => tool.name === 'codegraph_context')!;
     const gateProperties = (gate.inputSchema as { properties: Record<string, unknown> }).properties;
-    expect(Object.keys(gateProperties)).toEqual(['task', 'target', 'diff', 'prUrl', 'baseRef', 'headRef', 'sessionId']);
+    expect(Object.keys(gateProperties)).toEqual(['task', 'target', 'diff', 'prUrl', 'baseRef', 'headRef', 'sessionId', 'scopePlan', 'resumeTaskId']);
     expect(gateProperties).not.toHaveProperty('mode');
     expect((gate.inputSchema as { required: string[] }).required).toEqual(['task']);
 

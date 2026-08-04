@@ -16,7 +16,7 @@ same stdio connection:
 
 | Surface | Representative tools | Role |
 | --- | --- | --- |
-| **CodeGraph gate** (default `client` profile) | `codegraph_context`, `codegraph_slice`, `codegraph_status` | PRIMARY entry point. `codegraph_context` classifies the task, routes to the right pack, and folds TokenOpt-style evidence into one bounded packet. |
+| **CodeGraph gate** (default `client` profile) | `codegraph_context`, `codegraph_slice`, `codegraph_checkpoint`, `codegraph_status` | PRIMARY entry point. `codegraph_context` classifies the task, requests an explicit Luna scope plan for ambiguous work, and returns one bounded evidence packet. Checkpoints are repo-local and versioned. |
 | **ContextGate/TokenOpt gate** (`full` profile or `TOKENOPT_MCP_MODE`) | `contextgate_get_context`, `tokenopt_compile_evidence`, `tokenopt_search`, `tokenopt_read_file` | Direct evidence-router surface for benchmark/power-user flows. Hidden by default so exactly one tool claims the first call. |
 
 The gate enriches its own packets by calling the CodeGraph query engine

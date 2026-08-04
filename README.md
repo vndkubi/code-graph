@@ -27,7 +27,7 @@ The default surface is deliberately **single-gate**: one entry point instead of 
 
 | Surface | Tools | Role |
 | --- | --- | --- |
-| **CodeGraph gate** (default `client` profile) | `codegraph_context`, `codegraph_slice`, `codegraph_status` | `codegraph_context` is THE entry point — it classifies the task and routes to the right pack (research/flow/change/review/evidence) internally, TokenOpt evidence flow included |
+| **CodeGraph gate** (default `client` profile) | `codegraph_context`, `codegraph_slice`, `codegraph_checkpoint`, `codegraph_status` | `codegraph_context` is THE entry point — it classifies the task, requests a Luna scope plan when ambiguous, and routes to the right bounded pack. `codegraph_checkpoint` persists explicit multi-phase task state. |
 | **Direct packs + TokenOpt gate** (`full` profile) | `get_research_pack`, `get_change_pack`, `review_patch`, `contextgate_get_context`, `tokenopt_*`, … | Benchmark/power-user flows |
 
 The flow for broad tasks:
@@ -38,7 +38,7 @@ The flow for broad tasks:
 
 For exact file/symbol tasks where the owner is already known, skip the gate and read directly.
 
-**Tool exposure** is controlled by `--mcp-profile` (default `client` → the 3 gate tools; `full` → every tool on both surfaces). The embedded TokenOpt gate tools are hidden outside `full`; `TOKENOPT_MCP_MODE=lite|full|broker` restores them on any profile, `off` hides them even on `full`.
+**Tool exposure** is controlled by `--mcp-profile` (default `client` → the 4 facade tools; `full` → every tool on both surfaces). The embedded TokenOpt gate tools are hidden outside `full`; `TOKENOPT_MCP_MODE=lite|full|broker` restores them on any profile, `off` hides them even on `full`. Set `CODEGRAPH_RELEVANCE_GATE=shadow` to measure would-block scope decisions before enforcing them.
 
 **CLI:** the TokenOpt gate surface (init, exec, report, doctor) lives under `codegraph gate <…>` (e.g. `codegraph gate doctor`). The legacy `tokenopt` binary alias maps to the same commands.
 

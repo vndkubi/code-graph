@@ -8,6 +8,7 @@ export interface WorkspacePaths {
   sourceCacheDir: string;
   artifactDir: string;
   setupStatePath: string;
+  taskStatePath: string;
   logDir: string;
   queryLogPath: string;
 }
@@ -23,6 +24,7 @@ export function getWorkspacePaths(root: string, graphDirName = '.codegraph'): Wo
     sourceCacheDir: path.join(graphDir, 'source-cache'),
     artifactDir: path.join(graphDir, 'artifacts'),
     setupStatePath: path.join(graphDir, 'setup-state.json'),
+    taskStatePath: path.join(graphDir, 'task-state.sqlite'),
     logDir,
     queryLogPath: path.join(logDir, 'query.jsonl'),
   };

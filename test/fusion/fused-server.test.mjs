@@ -23,9 +23,9 @@ async function listTools(extraArgs = [], extraEnv = {}) {
   }
 }
 
-test("client profile is the single-gate surface: exactly the 3 CodeGraph tools", async () => {
+test("client profile is the single-gate surface: exactly the 4 CodeGraph facade tools", async () => {
   const names = await listTools([], { TOKENOPT_MCP_MODE: "" });
-  assert.deepEqual(names, ["codegraph_context", "codegraph_slice", "codegraph_status"]);
+  assert.deepEqual(names, ["codegraph_context", "codegraph_slice", "codegraph_checkpoint", "codegraph_status"]);
 });
 
 test("TOKENOPT_MCP_MODE restores the embedded gate tools on any profile", async () => {

@@ -7,7 +7,7 @@ import { V2Indexer, type IndexProgressEvent } from '../index/indexer.js';
 import { resolveCurrentGraphSnapshot } from '../graph/export.js';
 import { estimateTextTokens } from '../token-estimator.js';
 
-export type CodexBenchmarkMode = 'baseline' | 'terse-no-mcp' | 'natural-tool-use' | 'mcp-first' | 'mcp-only' | 'compiled-packet' | 'compiled-packet+gate' | 'oracle-packet';
+export type CodexBenchmarkMode = 'baseline' | 'terse-no-mcp' | 'natural-tool-use' | 'mcp-first' | 'mcp-only' | 'mcp-scope' | 'mcp-phase-resume' | 'compiled-packet' | 'compiled-packet+gate' | 'oracle-packet';
 
 export interface CodexE2eTask {
   id: string;
@@ -195,6 +195,7 @@ const DEFAULT_CODEGRAPH_TOOLS = new Set([
   'codegraph_status',
   'codegraph_context',
   'codegraph_slice',
+  'codegraph_checkpoint',
   'search_symbol',
   'search_files',
   'find_references',
@@ -1232,6 +1233,18 @@ export function promptForMode(task: CodexE2eTask, mode: CodexBenchmarkMode): str
         POST_SLICE_STOP_RULE,
         prompt,
       ].join('\n\n');
+    case 'mcp-scope':
+      return [
+        'Use CodeGraph MCP server codegraph_bench first. Call codegraph_context with the task verbatim. If it returns answerable=false with recommendedNextAction=refine_scope_with_luna, fill scopePlan with one exact intent, target, candidate files, and requirements, then call codegraph_context once more. Do not broaden beyond the returned candidates or use shell/search/read fallback.',
+        POST_SLICE_STOP_RULE,
+        prompt,
+      ].join('\n\n');
+    case 'mcp-phase-resume':
+      return [
+        'Use CodeGraph MCP server codegraph_bench only. Start with codegraph_context, save a discovery or implementation checkpoint with codegraph_checkpoint, and resume only by the explicit taskId using a fresh codegraph_context call. Validate stale claims before answering; do not assume context from an earlier phase remains available.',
+        POST_SLICE_STOP_RULE,
+        prompt,
+      ].join('\n\n');
     case 'compiled-packet':
       return [
         'Use CodeGraph MCP server codegraph_bench only for context acquisition. Start with compile_evidence using the full task, inferred task_type, budget_tokens=5000, and required answer fields as quality_rubric. If compile_evidence returns answerable=true, answer immediately from its evidence ids. If it is not answerable, use only allowedFollowups from the packet. Do not use shell/search/read fallback unless compile_evidence explicitly returns a shell allowedFollowup.',
@@ -1260,6 +1273,8 @@ function modeUsesMcp(mode: CodexBenchmarkMode): boolean {
   return mode === 'natural-tool-use'
     || mode === 'mcp-first'
     || mode === 'mcp-only'
+    || mode === 'mcp-scope'
+    || mode === 'mcp-phase-resume'
     || mode === 'compiled-packet'
     || mode === 'compiled-packet+gate'
     || mode === 'oracle-packet';

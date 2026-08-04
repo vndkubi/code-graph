@@ -37,6 +37,7 @@ import { buildAdoptionReport, formatAdoptionReportText } from './v2/query/adopti
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 import { buildLocalArtifactIndex } from './v2/mcp/local-artifact.js';
 import { inspectWorkspaceReadiness } from './v2/workspace-health.js';
+import { CheckpointStateStore } from './v2/checkpoint.js';
 
 /*
  * Deliberately NOT imported at module scope: `./v2/mcp/proxy.js` (pulls the MCP
@@ -119,6 +120,9 @@ async function main(): Promise<void> {
       return;
     case 'adoption-report':
       runAdoptionReportCommand(parsed);
+      return;
+    case 'checkpoint':
+      runCheckpointCommand(subcommand, parsed);
       return;
     case 'benchmark':
       await runBenchmarkCommand(subcommand, parsed);
@@ -2454,6 +2458,32 @@ async function runRouteInspectCommand(parsed: ParsedArgs): Promise<void> {
   }), null, 2));
 }
 
+function runCheckpointCommand(subcommand: string | undefined, parsed: ParsedArgs): void {
+  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const store = new CheckpointStateStore(root);
+  try {
+    if (subcommand === 'list') {
+      console.log(JSON.stringify({ checkpoints: store.list(getNumberFlag(parsed, 'limit') ?? 20) }, null, 2));
+      return;
+    }
+    if (subcommand === 'show') {
+      const taskId = getFlag(parsed, 'task-id') ?? getFlag(parsed, 'task');
+      if (!taskId) throw new Error('Usage: codegraph checkpoint show --task-id <uuid>');
+      console.log(JSON.stringify(store.load(taskId, getNumberFlag(parsed, 'version')), null, 2));
+      return;
+    }
+    if (subcommand === 'prune') {
+      const before = getFlag(parsed, 'before');
+      if (!before || !Number.isFinite(Date.parse(before))) throw new Error('Usage: codegraph checkpoint prune --before <ISO timestamp> [--apply]');
+      console.log(JSON.stringify(store.pruneCompleted(before, parsed.flags.get('apply') === true), null, 2));
+      return;
+    }
+    throw new Error('Usage: codegraph checkpoint list|show|prune');
+  } finally {
+    store.close();
+  }
+}
+
 function parseArgs(argv: string[]): ParsedArgs {
   const command: string[] = [];
   const flags = new Map<string, string | boolean>();
@@ -2512,13 +2542,15 @@ function splitCodexModes(value: string | undefined): CodexBenchmarkMode[] | unde
     'natural-tool-use',
     'mcp-first',
     'mcp-only',
+    'mcp-scope',
+    'mcp-phase-resume',
     'compiled-packet',
     'compiled-packet+gate',
     'oracle-packet',
   ]);
   for (const part of parts) {
     if (!allowed.has(part as CodexBenchmarkMode)) {
-      throw new Error(`Unknown Codex benchmark mode: ${part}. Use baseline,terse-no-mcp,natural-tool-use,mcp-first,mcp-only,compiled-packet,compiled-packet+gate,oracle-packet.`);
+      throw new Error(`Unknown Codex benchmark mode: ${part}. Use baseline,terse-no-mcp,natural-tool-use,mcp-first,mcp-only,mcp-scope,mcp-phase-resume,compiled-packet,compiled-packet+gate,oracle-packet.`);
     }
   }
   return parts as CodexBenchmarkMode[];
@@ -2583,6 +2615,7 @@ Usage:
                                          Generate ARCHITECTURE.md/CLAUDE.md/.github/copilot-instructions.md from index facts (marker-based regeneration)
   codegraph adoption-report --root <workspace> [--since <ISO>] [--until <ISO>] [--format json|text]
                                          Aggregate the MCP call ledger (.codegraph/logs/query.jsonl) into adoption numbers
+  codegraph checkpoint list|show|prune --root <workspace>  Inspect or safely prune repo-local task checkpoints
   codegraph route-inspect --task <text>  Explain codegraph_context routing and stop/follow-up gate policy
   codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|copilot-e2e|codex-e2e|claude-e2e|competitive-compare
                                              Generate synthetic repos, measure indexing, run evals, or prove context/review savings
@@ -2655,9 +2688,10 @@ Options:
   --prewarm                             Index missing snapshots inside MCP startup/runtime. Off by default; prefer explicit index/setup.
   --mcp-profile <client|minimal|research|change|review|full>
                                              Tool surface for MCP. Default/client exposes facade tools; full exposes every tool.
+  CODEGRAPH_RELEVANCE_GATE=off|shadow|enforce  Scope relevance gate mode (default enforce; shadow records would-block results)
   --models <a,b,c>                       Copilot E2E model list for benchmark copilot-e2e
   --modes <codegraph,baseline,organic>   Copilot E2E comparison modes (organic = MCP available, neutral prompt; adoption measurement)
-  --modes <baseline,terse-no-mcp,natural-tool-use,mcp-first,mcp-only,compiled-packet,compiled-packet+gate,oracle-packet>
+  --modes <baseline,terse-no-mcp,natural-tool-use,mcp-first,mcp-only,mcp-scope,mcp-phase-resume,compiled-packet,compiled-packet+gate,oracle-packet>
                                              Codex E2E comparison modes
   --task-ids <a,b,c>                     Copilot/Codex/Claude E2E task ids
   --run-dir <path>                       Output directory for E2E benchmark artifacts

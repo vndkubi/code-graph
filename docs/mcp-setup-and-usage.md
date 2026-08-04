@@ -77,12 +77,12 @@ If `codegraph` is on `PATH`:
 
 A tool the model cannot see is a tool it will not call. Every major client now
 hides MCP tools once the combined surface gets large, and a GitHub or Atlassian
-server alone can carry dozens of tools. CodeGraph's three tools lose that
+server alone can carry dozens of tools. CodeGraph's four facade tools lose that
 competition by default — not on merit, but on visibility. Each client needs one
 setting:
 
 **Claude Code** defers MCP tools behind a tool-search step by default (requires
-v2.1.121+ for `alwaysLoad`). Opt the three-tool surface back into the initial
+v2.1.121+ for `alwaysLoad`). Opt the four-tool surface back into the initial
 tool list:
 
 ```json
@@ -100,7 +100,7 @@ tool list:
 
 `ENABLE_TOOL_SEARCH=auto` is the broader alternative: it loads schemas upfront
 while they fit inside ~10% of the context window and defers only the overflow.
-Keep `--mcp-profile client` — `full` puts 28 tools in the initial list and gives
+Keep `--mcp-profile client` — `full` puts 29 CodeGraph tools in the initial list and gives
 back the context `alwaysLoad` just bought.
 
 **VS Code Copilot** caps a request at 128 tools and groups the excess into
@@ -139,13 +139,13 @@ pick tools more reliably when exactly one claims the first call
 
 | Control | Values | Effect |
 | --- | --- | --- |
-| `--mcp-profile` | `client` (default), `minimal`, `research`, `change`, `review`, `full` | Width of the CodeGraph surface. `client` exposes `codegraph_context` / `codegraph_slice` / `codegraph_status`; `full` exposes every direct pack and follow-up tool. |
+| `--mcp-profile` | `client` (default), `minimal`, `research`, `change`, `review`, `full` | Width of the CodeGraph surface. `client` exposes `codegraph_context` / `codegraph_slice` / `codegraph_checkpoint` / `codegraph_status`; `full` exposes every direct pack and follow-up tool. |
 | `TOKENOPT_MCP_MODE` | unset (default), `lite`, `full`, `broker`, `off` | Embedded TokenOpt/ContextGate gate tools. Unset → hidden on every profile except `full`; `lite`/`full`/`broker` force that gate set on any profile; `off` hides it even on `full`. |
 
 Observed surfaces:
 
-- **`client` profile** (default) → **3 tools**: `codegraph_context`,
-  `codegraph_slice`, `codegraph_status`. The TokenOpt evidence flow still runs —
+- **`client` profile** (default) → **4 tools**: `codegraph_context`,
+  `codegraph_slice`, `codegraph_checkpoint`, `codegraph_status`. The TokenOpt evidence flow still runs —
   `codegraph_context` routes into the same packs internally.
 - **`full` profile** → the full CodeGraph pack/follow-up surface + the full
   TokenOpt gate surface (`contextgate_get_context`, `tokenopt_*`).
@@ -173,16 +173,19 @@ One entry point, by design:
 1. Any repo question, or before any edit → `codegraph_context` with the user's
    task verbatim (it classifies the task and routes to the right pack —
    research, flow, change, review, evidence — internally).
-2. For review input, include `prUrl` or `baseRef` + `headRef` when possible. A
+2. If the packet returns `answerable=false` with `recommendedNextAction=refine_scope_with_luna`, fill `scopePlan` with the exact target and requirements, then retry `codegraph_context` once.
+3. For review input, include `prUrl` or `baseRef` + `headRef` when possible. A
    GitHub PR URL or “from <base> to <head>” phrase in the task is also parsed;
    MCP resolves an immutable worktree, indexes the head, and batches the review
    before returning the packet.
-3. `answerable=true` / `sufficientForAnswer=true` → answer from the packet; do
+4. `answerable=true` / `sufficientForAnswer=true` → answer from the packet; do
    not re-verify the same ground with grep/read/shell.
-3. Packet names an exact missing file/line/symbol → `codegraph_slice` (batch
+5. Packet names an exact missing file/line/symbol → `codegraph_slice` (batch
    multiple ranges via `slices[]`).
-4. Pass the same `sessionId` on every call of a conversation so
+6. Pass the same `sessionId` on every call of a conversation so
    already-delivered evidence is not re-sent.
+7. Save phase state with `codegraph_checkpoint` and resume only with its explicit
+   `taskId`; stale claims must be refreshed before relying on them.
 
 **Exact known file/symbol:** skip the gate and read directly — a narrow read is
 the cheapest path.
