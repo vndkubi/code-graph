@@ -46,12 +46,17 @@ export const V2ToolSchemas = {
   }),
   codegraph_context: z.object({
     task: z.string(),
-    mode: z.enum(['auto', 'research', 'flow', 'change', 'review', 'evidence']).default('auto'),
+    mode: z.enum(['auto', 'research', 'flow', 'change', 'review', 'evidence'])
+      .default('auto')
+      .describe('Omit this unless the user explicitly requests a routing mode; auto infers from the full task.'),
     responseMode: z.enum(['agent', 'answer']).optional(),
     target: z.string().optional(),
     diff: z.string().optional(),
     files: z.array(z.string()).optional(),
     symbols: z.array(z.string()).optional(),
+    prUrl: z.string().optional().describe('Optional GitHub PR URL. The server resolves immutable base/head SHAs and reviews the PR in an isolated worktree.'),
+    baseRef: z.string().optional().describe('Optional review base branch/ref, paired with headRef.'),
+    headRef: z.string().optional().describe('Optional review head branch/ref, paired with baseRef; defaults to HEAD.'),
     budgetTokens: z.number().min(1000).max(30000).default(6000),
     riskMode: z.enum(['auto', 'calculation_sensitive']).optional(),
     ...PackProfileOption,
@@ -348,8 +353,9 @@ export const V2_TOOL_PROFILES: Record<V2ToolProfile, readonly V2ToolName[]> = {
 export interface V2ToolDefinitionOptions {
   compactDescriptions?: boolean;
   /**
-   * Advertise a trimmed codegraph_context schema (client profiles): 5 params
-   * instead of 17. Fewer knobs = fewer tokens in every tools/list and less
+   * Advertise a trimmed codegraph_context schema (client profiles): review
+   * routing plus the small set of params needed for ordinary tasks. Fewer
+   * knobs = fewer tokens in every tools/list and less
    * decision friction for the model. The server keeps parsing the full zod
    * schema, so power params still work if a client sends them anyway.
    */
@@ -365,9 +371,11 @@ const SLIM_CODEGRAPH_CONTEXT_SCHEMA: Record<string, unknown> = {
   type: 'object',
   properties: {
     task: { type: 'string', description: "The user's task, verbatim. Full sentences route better than keywords." },
-    mode: { type: 'string', enum: ['auto', 'research', 'flow', 'change', 'review', 'evidence'], description: 'Optional override; auto infers from the task.' },
     target: { type: 'string', description: 'Optional focus: a symbol, endpoint path, or file.' },
     diff: { type: 'string', description: 'Unified diff for review tasks.' },
+    prUrl: { type: 'string', description: 'GitHub PR URL; CodeGraph resolves immutable SHAs, creates an isolated worktree, indexes it, and reviews the full PR.' },
+    baseRef: { type: 'string', description: 'Review base branch/ref, paired with headRef (for example origin/main).' },
+    headRef: { type: 'string', description: 'Review head branch/ref, paired with baseRef (defaults to HEAD).' },
     sessionId: { type: 'string', description: 'Any constant string per conversation. Enables evidence reuse so repeated calls skip source you already received.' },
   },
   required: ['task'],
@@ -439,7 +447,7 @@ function descriptionFor(name: V2ToolName, options: V2ToolDefinitionOptions = {})
     case 'codegraph_status':
       return 'Diagnostic only. Returns workspace SQLite readiness, artifact readiness, and optional DB diagnostics. Do not use for normal code investigation.';
     case 'codegraph_context':
-      return 'Call this FIRST for almost any repository question or before an edit: investigate code, understand how X works, explore architecture, trace endpoint/request flows, debug bugs, plan changes, assess impact, or review risk. One call on the pre-indexed code graph returns ranked files, call/dependency edges, and line-numbered source evidence for the whole task — replacing a grep/read/grep exploration loop (benchmarked: ~20% fewer tokens, ~5x fewer tool round-trips than raw file reads). Pass the user\'s task verbatim and reuse one sessionId per conversation. If the response says answerable=true, answer from it and stop searching.';
+      return 'Call this FIRST for almost any repository question or before an edit: investigate code, understand how X works, explore architecture, trace endpoint/request flows, debug bugs, plan changes, assess impact, or review risk. For PR review, pass prUrl or baseRef/headRef (or include the URL/range in task); CodeGraph resolves the immutable range and batches the review. One call on the pre-indexed code graph returns ranked files, call/dependency edges, and line-numbered source evidence for the whole task — replacing a grep/read/grep exploration loop (benchmarked: ~20% fewer tokens, ~5x fewer tool round-trips than raw file reads). Pass the user\'s task verbatim and reuse one sessionId per conversation. If the response says answerable=true, answer from it and stop searching.';
     case 'codegraph_slice':
       return 'Follow-up source reader: when codegraph_context names an exact file, line range, or symbol still missing, fetch just that bounded slice (batch several via slices[]). Not a first tool for broad repo questions — the packet usually already contains the source as evidenceSlices.';
     case 'get_flow_pack':
@@ -500,7 +508,7 @@ function compactDescriptionFor(name: V2ToolName): string {
     case 'codegraph_status':
       return 'Diagnostic only: runtime/index readiness and optional SQLite diagnostics.';
     case 'codegraph_context':
-      return 'Call this FIRST for any repo question or before any edit. One call on the pre-indexed code graph returns ranked files, call/dependency edges, and line-numbered source for the whole task — replaces a grep/read/grep loop (benchmarked: ~20% fewer tokens, ~5x fewer round-trips than raw file reads). Pass the task verbatim; reuse one sessionId per conversation. If the response says answerable=true, answer from it and stop searching.';
+      return 'Call this FIRST for any repo question or before any edit. For PR review, pass prUrl or baseRef/headRef (or include the URL/range in task); CodeGraph resolves the immutable range and batches the review. One call on the pre-indexed code graph returns ranked files, call/dependency edges, and line-numbered source for the whole task — replaces a grep/read/grep loop (benchmarked: ~20% fewer tokens, ~5x fewer round-trips than raw file reads). Pass the task verbatim; reuse one sessionId per conversation. If the response says answerable=true, answer from it and stop searching.';
     case 'codegraph_slice':
       return 'Follow-up source reader: when codegraph_context names an exact file/line/symbol still missing, fetch just that bounded slice (batch several via slices[]). Not a first tool — the packet usually already contains the source as evidenceSlices.';
     case 'get_flow_pack':
@@ -562,6 +570,9 @@ function envFlag(value: string | undefined, fallback = false): boolean {
 }
 
 function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
+  const described = (value: Record<string, unknown>): Record<string, unknown> => schema.description
+    ? { ...value, description: schema.description }
+    : value;
   if (schema instanceof z.ZodObject) {
     const shape = schema.shape as Record<string, z.ZodType>;
     const properties: Record<string, unknown> = {};
@@ -570,14 +581,14 @@ function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
       properties[key] = zodToJsonSchema(value);
       if (!(value instanceof z.ZodOptional) && !(value instanceof z.ZodDefault)) required.push(key);
     }
-    return { type: 'object', properties, required };
+    return described({ type: 'object', properties, required });
   }
-  if (schema instanceof z.ZodString) return { type: 'string' };
-  if (schema instanceof z.ZodNumber) return { type: 'number' };
-  if (schema instanceof z.ZodBoolean) return { type: 'boolean' };
-  if (schema instanceof z.ZodEnum) return { type: 'string', enum: schema.options };
-  if (schema instanceof z.ZodArray) return { type: 'array', items: zodToJsonSchema(schema.element) };
-  if (schema instanceof z.ZodDefault) return zodToJsonSchema(schema._def.innerType);
-  if (schema instanceof z.ZodOptional) return zodToJsonSchema(schema.unwrap());
-  return { type: 'string' };
+  if (schema instanceof z.ZodString) return described({ type: 'string' });
+  if (schema instanceof z.ZodNumber) return described({ type: 'number' });
+  if (schema instanceof z.ZodBoolean) return described({ type: 'boolean' });
+  if (schema instanceof z.ZodEnum) return described({ type: 'string', enum: schema.options });
+  if (schema instanceof z.ZodArray) return described({ type: 'array', items: zodToJsonSchema(schema.element) });
+  if (schema instanceof z.ZodDefault) return described(zodToJsonSchema(schema._def.innerType));
+  if (schema instanceof z.ZodOptional) return described(zodToJsonSchema(schema.unwrap()));
+  return described({ type: 'string' });
 }

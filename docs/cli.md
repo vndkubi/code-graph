@@ -51,7 +51,7 @@ See [MCP Setup And Usage](mcp-setup-and-usage.md) for profiles, modes, and the
 ```text
 codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|
                     quality-trend|evidence-audit|recall|affected-tests|
-                    copilot-e2e|codex-e2e
+                    copilot-e2e|codex-e2e|claude-e2e
 ```
 
 - `recall [--root <repo>] [--tasks <suite.json>] [--max-files N] [--keep-ratio R]`
@@ -61,6 +61,15 @@ codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|
   (needed evidence never delivered) so packets can be right-sized.
 - `quality-trend [--out <report.md>]` — appends a dated correctness/token-saving
   row so ranking/resolver regressions surface over time.
+- `codex-e2e` and `claude-e2e` — run the same quality suite in baseline and
+  MCP-first modes with provider-specific token accounting. Claude fresh usage
+  counts cache creation but excludes cache reads; use a cold run plus a repeated
+  warm run when evaluating frequent-use workflows. For controlled headless
+  startup experiments, use `--claude-mcp-load eager|lazy` and
+  `--claude-startup-profile standard|lean`. The lean profile restricts built-in
+  tools, disables slash commands/session persistence/prompt suggestions, and
+  disables auto-memory plus nonessential background traffic. Keep the standard
+  profile when project skills or auto-memory are part of the workflow under test.
 
 ## `gate` subcommands
 

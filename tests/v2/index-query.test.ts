@@ -645,6 +645,11 @@ public class NotebookController {
         return id;
     }
 
+    @GetMapping(value = {"/recalling"})
+    public String recalling() {
+        return "recalling";
+    }
+
     @PostMapping(CREATE)
     public String createNotebook() {
         return "created";
@@ -689,6 +694,11 @@ public class PartialController {
     expect(endpoints.endpoints).toContainEqual(expect.objectContaining({
       method: 'GET',
       path: '/api/notebooks/{id}',
+      pathResolution: 'exact',
+    }));
+    expect(endpoints.endpoints).toContainEqual(expect.objectContaining({
+      method: 'GET',
+      path: '/api/notebooks/recalling',
       pathResolution: 'exact',
     }));
 
@@ -1763,6 +1773,7 @@ it('explains route gate policy for client facade calls', () => {
       },
     }) as {
       answerable: boolean;
+      answerGuidance: string[];
       coverageCertificate: { missing: string[]; partial: string[] };
       packetSummary: { topFiles: string[]; topSymbols: string[]; tests: number };
       evidence: Array<{ file?: string; symbol?: string; claim?: string }>;
@@ -1777,6 +1788,7 @@ it('explains route gate policy for client facade calls', () => {
     }, JSON.stringify(compiled));
 
     expect(compiled.answerable).toBe(true);
+    expect(compiled.answerGuidance.join(' ')).toContain('allowedFollowups');
     expect(compiled.coverageCertificate.missing).toHaveLength(0);
     expect(compiled.coverageCertificate.partial).toHaveLength(0);
     expect(compiled.packetSummary.tests).toBeGreaterThan(0);

@@ -47,6 +47,10 @@ export interface FileSearchScore {
   matchedTokens: string[];
   reason: string;
   factors: string[];
+  /** True when a triggered query concept (auth/tx/cache/...) matched this file. */
+  conceptMatch: boolean;
+  /** Concept ids satisfied by this file (for calibration coverage). */
+  matchedConcepts: string[];
 }
 
 export interface SearchScore {
@@ -56,6 +60,10 @@ export interface SearchScore {
   exactPhrase: boolean;
   intentMatch: boolean;
   factors: string[];
+  /** True when a triggered query concept (auth/tx/cache/...) matched this symbol. */
+  conceptMatch: boolean;
+  /** Concept ids satisfied by this symbol (for calibration coverage). */
+  matchedConcepts: string[];
 }
 
 export interface SearchIntent {

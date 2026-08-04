@@ -1,0 +1,19 @@
+{
+  "servers": {
+    "codegraph": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${workspaceFolder}/dist/cli.js",
+        "mcp",
+        "--root",
+        "${workspaceFolder}",
+        "--workspace-key",
+        "${workspaceFolder}",
+        "--no-prewarm",
+        "--mcp-profile",
+        "client"
+      ]
+    }
+  }
+}

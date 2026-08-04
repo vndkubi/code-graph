@@ -162,7 +162,11 @@ function findMatchingGitHubRemote(root: string, metadata: GitHubPullRequestMetad
   const expected = `${metadata.owner}/${metadata.repo}`.toLowerCase();
   const remotes = git(root, ['remote']).split(/\r?\n/).map(value => value.trim()).filter(Boolean);
   for (const remote of remotes) {
-    const remoteUrl = git(root, ['remote', 'get-url', remote]);
+    // Read the configured URL before any global `url.*.insteadOf` rewrite.
+    // Fetch still uses the rewrite (useful for offline/local test mirrors),
+    // while repository matching must compare the declared GitHub identity.
+    const remoteUrl = git(root, ['config', '--get', `remote.${remote}.url`])
+      || git(root, ['remote', 'get-url', remote]);
     if (githubRepositoryFromRemote(remoteUrl) === expected) return remote;
   }
   throw new Error(`No git remote in ${root} matches GitHub repository ${metadata.owner}/${metadata.repo}.`);

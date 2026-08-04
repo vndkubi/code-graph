@@ -12,6 +12,7 @@ import {
   wordsShareStem,
 } from './text-util.js';
 import { parseJson, uniqueStrings } from './util.js';
+import { scoreConceptMatch, CONCEPT_FILE_BOOST, CONCEPT_TOTAL_CAP, type ConceptRule } from './concepts.js';
 import type {
   SymbolRow,
   FileRow,
@@ -159,6 +160,7 @@ export function scoreSymbolSearch(
   tokens: string[],
   intent: SearchIntent,
   callInDegree?: number,
+  concepts: readonly ConceptRule[] = [],
 ): SearchScore {
   const queryLower = query.toLowerCase();
   const simpleLower = row.simple_name.toLowerCase();
@@ -296,6 +298,31 @@ export function scoreSymbolSearch(
     }
   }
 
+  // Concept boost: when the query names a cross-cutting concern (auth, tx, cache,
+  // scheduling, validation, messaging) the canonical code for it often shares no
+  // literal token with the query (AuthorizationService for "authentication").
+  // Lift it on structural/name evidence so it beats an incidental token collision
+  // (User* entities pulled in by the bare seed "user"). Additive on token score
+  // when both fire (strong), or a standalone score for concept-only matches.
+  const conceptResult = scoreConceptMatch(
+    { name: row.simple_name, frameworkRole: row.framework_role, annotations },
+    concepts,
+  );
+  if (conceptResult.score > 0) {
+    score += conceptResult.score;
+    factors.push(...conceptResult.factors);
+    if (matchedTokens.length === 0 && !exactPhrase) {
+      // Concept-only definition: give it the same definition-over-member priority
+      // a name match earns (the name-matched branch above already applied it).
+      const kindBoost = symbolKindRank(row.kind);
+      if (kindBoost !== 0) {
+        score += kindBoost;
+        factors.push(`concept match: symbol kind ${row.kind} contributed ${kindBoost} points`);
+      }
+      reason = `concept match: ${conceptResult.matchedConcepts.join(', ')}`;
+    }
+  }
+
   return {
     score,
     matchedTokens,
@@ -303,10 +330,46 @@ export function scoreSymbolSearch(
     exactPhrase,
     intentMatch: intentScore.score > 0,
     factors,
+    conceptMatch: conceptResult.matched,
+    matchedConcepts: conceptResult.matchedConcepts,
   };
 }
 
-export function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined, query: string, tokens: string[], bm25Boost?: number): FileSearchScore {
+/**
+ * File-level concept score: a file is evidence for a concept when it hosts a
+ * symbol that IS the concept (by name/annotation/role). Flat per-concept boost,
+ * capped — weaker than a symbol name match but enough to lift the file above an
+ * incidental token collision.
+ */
+function fileConceptScore(symbols: Array<Record<string, unknown>>, concepts: readonly ConceptRule[]): {
+  score: number;
+  matched: boolean;
+  matchedConcepts: string[];
+  factors: string[];
+} {
+  if (concepts.length === 0 || symbols.length === 0) {
+    return { score: 0, matched: false, matchedConcepts: [], factors: [] };
+  }
+  const matched = new Set<string>();
+  for (const symbol of symbols) {
+    const result = scoreConceptMatch({
+      name: String(symbol.name ?? symbol.simple_name ?? ''),
+      frameworkRole: String(symbol.frameworkRole ?? symbol.framework_role ?? ''),
+      annotations: Array.isArray(symbol.annotations) ? (symbol.annotations as unknown[]).map(String) : [],
+    }, concepts);
+    for (const id of result.matchedConcepts) matched.add(id);
+  }
+  if (matched.size === 0) return { score: 0, matched: false, matchedConcepts: [], factors: [] };
+  const score = Math.min(matched.size * CONCEPT_FILE_BOOST, CONCEPT_TOTAL_CAP);
+  return {
+    score,
+    matched: true,
+    matchedConcepts: [...matched],
+    factors: [`file hosts symbol(s) for concept(s) ${[...matched].join(', ')} (+${score})`],
+  };
+}
+
+export function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined, query: string, tokens: string[], bm25Boost?: number, concepts: readonly ConceptRule[] = []): FileSearchScore {
   const pathLower = row.path.toLowerCase();
   const basename = pathLower.substring(pathLower.lastIndexOf('/') + 1);
   const basenameWithoutExt = basename.replace(/\.[^.]+$/, '');
@@ -481,11 +544,23 @@ export function scoreFileSearch(row: FileRow, evidence: FileEvidence | undefined
   score += fileRoleBoost;
   factors.push(`file role ${row.file_role} contributed ${fileRoleBoost} points`);
 
+  // Concept boost (auth/tx/cache/scheduling/validation/messaging): lift a file
+  // that hosts the concept's canonical code even when its name/path shares no
+  // literal token with the query.
+  const conceptResult = fileConceptScore(symbols, concepts);
+  if (conceptResult.score > 0) {
+    score += conceptResult.score;
+    factors.push(...conceptResult.factors);
+    if (matchedTokens.length === 0) reason = `concept match: ${conceptResult.matchedConcepts.join(', ')}`;
+  }
+
   return {
     score,
     matchedTokens,
     reason,
     factors,
+    conceptMatch: conceptResult.matched,
+    matchedConcepts: conceptResult.matchedConcepts,
   };
 }
 

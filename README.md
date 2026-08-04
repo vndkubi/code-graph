@@ -33,7 +33,8 @@ The default surface is deliberately **single-gate**: one entry point instead of 
 The flow for broad tasks:
 
 1. Call `codegraph_context` with the user's task verbatim (same `sessionId` on every call of a conversation).
-2. If `answerable=true`, answer from the packet. If the packet names an exact missing file/line/symbol, fetch just that with `codegraph_slice`.
+2. For PR review, pass `prUrl` or `baseRef` + `headRef` when available; a GitHub PR URL or `from <base> to <head>` phrase in the task is parsed into an immutable, batched review.
+3. If `answerable=true`, answer from the packet. If the packet names an exact missing file/line/symbol, fetch just that with `codegraph_slice`.
 
 For exact file/symbol tasks where the owner is already known, skip the gate and read directly.
 
@@ -118,7 +119,7 @@ codegraph affected-tests --root <workspace> --changed <file[,file...]> [--max-de
 codegraph status --root <workspace>    Human-readable status report with optional machine-readable --json
 codegraph logs --root <workspace> --tail <number> [--summary|--all|--since|--until|--tool|--event|--invalid]
                                       Print recent workspace query events or a compact aggregate summary
-codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e
+codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e|claude-e2e
                                       Generate repos, measure indexing, or prove retrieval savings
                                       (quality-trend [--out <report.md>] appends a dated correctness/
                                       token-saving row so ranking/resolver regressions surface over time;
@@ -141,6 +142,11 @@ You can define required context by:
 - `task.expectedFiles` / `task.expectedMethods`: expected evidence from task-level prompts.
 
 If both file and method contracts are missing (at both root and task level), a warning is emitted (`missing_compatibility_contract`) instead of a hard block.
+
+Claude cold-start experiments can compare `--claude-mcp-load eager|lazy` and
+`--claude-startup-profile standard|lean`. `lean` is intended for repeatable
+headless benchmarks; it deliberately removes unrelated startup surfaces and
+auto-memory, so do not use it as a substitute for realistic interactive runs.
 
 ```json
 {

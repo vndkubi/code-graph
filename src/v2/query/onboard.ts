@@ -469,6 +469,7 @@ function composeMcpRoutingLines(): string[] {
     'When the codegraph MCP tools are available in this session:',
     '',
     '- Any repo question, or before any edit → call `codegraph_context` with the task verbatim.',
+    '- Ticket/PR/doc task (Jira, Confluence, GitHub) → fetch the artifact with that tool first, then pass its text to `codegraph_context` as the task; do not go from the ticket straight to grep.',
     '- The response says `answerable=true` → answer from that packet; do not re-grep/re-read the same ground.',
     '- Need more source at an exact file/line the packet named → `codegraph_slice`.',
     '- Pass the same `sessionId` string on every call in a conversation (dedupes evidence, saves tokens).',

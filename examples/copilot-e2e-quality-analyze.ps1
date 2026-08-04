@@ -86,18 +86,20 @@ function Percent-Saving([double]$Baseline, [double]$CodeGraph) {
 
 function New-RunAggregate([object[]]$Rows) {
   $passCount = @($Rows | Where-Object { $_.quality -eq 'pass' }).Count
+  $tokenRows = @($Rows | Where-Object { $_.hasTokenUsage })
   return [pscustomobject]@{
     runs = $Rows.Count
+    tokenUsageRuns = $tokenRows.Count
     passRate = if ($Rows.Count -gt 0) { ($passCount / $Rows.Count) * 100 } else { 0 }
     qualityScore = Average-Property $Rows 'qualityScore'
     latencyMs = Average-Property $Rows 'latencyMs'
-    inputTokens = Average-Property $Rows 'inputTokens'
-    cachedInputTokens = Average-Property $Rows 'cachedInputTokens'
-    outputTokens = Average-Property $Rows 'outputTokens'
-    reasoningTokens = Average-Property $Rows 'reasoningTokens'
-    totalTokens = Average-Property $Rows 'totalTokens'
-    nonCachedTokens = Average-Property $Rows 'nonCachedTokens'
-    toolDefinitionsTokens = Average-Property $Rows 'toolDefinitionsTokens'
+    inputTokens = Average-Property $tokenRows 'inputTokens'
+    cachedInputTokens = Average-Property $tokenRows 'cachedInputTokens'
+    outputTokens = Average-Property $tokenRows 'outputTokens'
+    reasoningTokens = Average-Property $tokenRows 'reasoningTokens'
+    totalTokens = Average-Property $tokenRows 'totalTokens'
+    nonCachedTokens = Average-Property $tokenRows 'nonCachedTokens'
+    toolDefinitionsTokens = Average-Property $tokenRows 'toolDefinitionsTokens'
   }
 }
 
@@ -119,13 +121,14 @@ function Get-Decision(
 }
 
 function New-SummaryRow([string]$ScopeType, [string]$Scope, [object[]]$Pairs) {
-  $baselineGross = Sum-Property $Pairs 'baselineTotalTokens'
-  $codegraphGross = Sum-Property $Pairs 'codegraphTotalTokens'
-  $baselineNonCached = Sum-Property $Pairs 'baselineNonCachedTokens'
-  $codegraphNonCached = Sum-Property $Pairs 'codegraphNonCachedTokens'
+  $tokenPairs = @($Pairs | Where-Object { $_.baselineTokenUsageRuns -gt 0 -and $_.codegraphTokenUsageRuns -gt 0 })
+  $baselineGross = Sum-Property $tokenPairs 'baselineTotalTokens'
+  $codegraphGross = Sum-Property $tokenPairs 'codegraphTotalTokens'
+  $baselineNonCached = Sum-Property $tokenPairs 'baselineNonCachedTokens'
+  $codegraphNonCached = Sum-Property $tokenPairs 'codegraphNonCachedTokens'
   $grossSaving = Percent-Saving $baselineGross $codegraphGross
   $nonCachedSaving = Percent-Saving $baselineNonCached $codegraphNonCached
-  $medianGross = Median @($Pairs | ForEach-Object { [double]$_.grossSavingPct })
+  $medianGross = Median @($tokenPairs | ForEach-Object { [double]$_.grossSavingPct })
   $baselineQuality = Average-Property $Pairs 'baselineQualityScore'
   $codegraphQuality = Average-Property $Pairs 'codegraphQualityScore'
   $qualityDelta = Average-Property $Pairs 'qualityDeltaPts'
@@ -134,17 +137,18 @@ function New-SummaryRow([string]$ScopeType, [string]$Scope, [object[]]$Pairs) {
     scopeType = $ScopeType
     scope = $Scope
     pairs = $Pairs.Count
+    tokenPairs = $tokenPairs.Count
     baselineQuality = [math]::Round($baselineQuality, 2)
     codegraphQuality = [math]::Round($codegraphQuality, 2)
     qualityDeltaPts = [math]::Round($qualityDelta, 2)
     grossSavingPct = if ($null -ne $grossSaving) { [math]::Round($grossSaving, 2) } else { $null }
     medianGrossSavingPct = [math]::Round($medianGross, 2)
     nonCachedSavingPct = if ($null -ne $nonCachedSaving) { [math]::Round($nonCachedSaving, 2) } else { $null }
-    grossTokenWins = @($Pairs | Where-Object { $_.grossSavingPct -gt 0 }).Count
-    nonCachedTokenWins = @($Pairs | Where-Object { $_.nonCachedSavingPct -gt 0 }).Count
+    grossTokenWins = @($tokenPairs | Where-Object { $_.grossSavingPct -gt 0 }).Count
+    nonCachedTokenWins = @($tokenPairs | Where-Object { $_.nonCachedSavingPct -gt 0 }).Count
     avgLatencyDeltaSec = [math]::Round((Average-Property $Pairs 'latencyDeltaSec'), 2)
     avgToolDefinitionDelta = [math]::Round((Average-Property $Pairs 'toolDefinitionDelta'), 2)
-    decision = Get-Decision $Pairs.Count $baselineQuality $codegraphQuality $qualityDelta ([double]$grossSaving) $medianGross ([double]$nonCachedSaving)
+    decision = Get-Decision $tokenPairs.Count $baselineQuality $codegraphQuality $qualityDelta ([double]$grossSaving) $medianGross ([double]$nonCachedSaving)
   }
 }
 
@@ -180,13 +184,16 @@ foreach ($reportFile in $reportFiles) {
     $taskId = [string](Get-ObjectProperty $run 'id' '')
     if (-not $taskId) { continue }
     $meta = if ($taskMetaById.ContainsKey($taskId)) { $taskMetaById[$taskId] } else { $null }
+    $tokenSource = [string](Get-ObjectProperty $run 'tokenSource' '')
+    $hasTokenUsage = $tokenSource -eq 'copilot-session-shutdown'
     $inputTokens = Get-NumberProperty $run 'inputTokens' 0
     $cachedInputTokens = Get-NumberProperty $run 'cachedInputTokens' 0
     $outputTokens = Get-NumberProperty $run 'outputTokens' 0
-    $totalTokens = Get-NumberProperty $run 'totalTokens' ($inputTokens + $outputTokens)
+    $reasoningTokens = Get-NumberProperty $run 'reasoningTokens' 0
+    $totalTokens = Get-NumberProperty $run 'totalTokens' ($inputTokens + $outputTokens + $reasoningTokens)
     $nonCachedTokens = Get-ObjectProperty $run 'nonCachedTokens' $null
     if ($null -eq $nonCachedTokens -or $nonCachedTokens -eq '') {
-      $nonCachedTokens = $inputTokens - $cachedInputTokens + $outputTokens
+      $nonCachedTokens = $inputTokens - $cachedInputTokens + $outputTokens + $reasoningTokens
     }
     $qualityScore = Get-ObjectProperty $run 'qualityScore' $null
     if ($null -eq $qualityScore -or $qualityScore -eq '') {
@@ -215,11 +222,13 @@ foreach ($reportFile in $reportFiles) {
       model = [string](Get-ObjectProperty $run 'model' '')
       quality = [string](Get-ObjectProperty $run 'quality' '')
       qualityScore = [double]$qualityScore
+      hasTokenUsage = $hasTokenUsage
+      tokenSource = $tokenSource
       latencyMs = Get-NumberProperty $run 'latencyMs' 0
       inputTokens = $inputTokens
       cachedInputTokens = $cachedInputTokens
       outputTokens = $outputTokens
-      reasoningTokens = Get-NumberProperty $run 'reasoningTokens' 0
+      reasoningTokens = $reasoningTokens
       totalTokens = $totalTokens
       nonCachedTokens = [double]$nonCachedTokens
       toolDefinitionsTokens = Get-NumberProperty $run 'toolDefinitionsTokens' 0
@@ -251,6 +260,8 @@ foreach ($group in ($rows | Group-Object sourceReport, model, id)) {
     model = $first.model
     baselineRuns = $baseline.runs
     codegraphRuns = $codegraph.runs
+    baselineTokenUsageRuns = $baseline.tokenUsageRuns
+    codegraphTokenUsageRuns = $codegraph.tokenUsageRuns
     baselineQualityScore = [math]::Round($baseline.qualityScore, 2)
     codegraphQualityScore = [math]::Round($codegraph.qualityScore, 2)
     qualityDeltaPts = [math]::Round(($codegraph.qualityScore - $baseline.qualityScore), 2)
