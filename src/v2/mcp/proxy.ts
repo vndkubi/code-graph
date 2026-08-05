@@ -1294,7 +1294,9 @@ export function applyContextScopeGate(args: Record<string, unknown>, rawResult: 
 }
 
 function relevanceGateMode(): 'off' | 'shadow' | 'enforce' {
-  const value = (process.env.CODEGRAPH_RELEVANCE_GATE ?? 'enforce').trim().toLowerCase();
+  // Release benchmarks are not green yet; keep production behavior in shadow
+  // until the current repository/task matrix proves no quality regression.
+  const value = (process.env.CODEGRAPH_RELEVANCE_GATE ?? 'shadow').trim().toLowerCase();
   if (value === 'off' || value === 'shadow') return value;
   return 'enforce';
 }

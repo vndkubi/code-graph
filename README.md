@@ -38,7 +38,7 @@ The flow for broad tasks:
 
 For exact file/symbol tasks where the owner is already known, skip the gate and read directly.
 
-**Tool exposure** is controlled by `--mcp-profile` (default `client` → the 4 facade tools; `full` → every tool on both surfaces). The embedded TokenOpt gate tools are hidden outside `full`; `TOKENOPT_MCP_MODE=lite|full|broker` restores them on any profile, `off` hides them even on `full`. Set `CODEGRAPH_RELEVANCE_GATE=shadow` to measure would-block scope decisions before enforcing them.
+**Tool exposure** is controlled by `--mcp-profile` (default `client` → the 4 facade tools; `full` → every tool on both surfaces). The embedded TokenOpt gate tools are hidden outside `full`; `TOKENOPT_MCP_MODE=lite|full|broker` restores them on any profile, `off` hides them even on `full`. `CODEGRAPH_RELEVANCE_GATE` defaults to `shadow`; set `enforce` only after the release benchmark gates pass, or `off` for an explicit opt-out.
 
 **CLI:** the TokenOpt gate surface (init, exec, report, doctor) lives under `codegraph gate <…>` (e.g. `codegraph gate doctor`). The legacy `tokenopt` binary alias maps to the same commands.
 

@@ -2677,7 +2677,7 @@ Options:
   --prewarm                             Index missing snapshots inside MCP startup/runtime. Off by default; prefer explicit index/setup.
   --mcp-profile <client|minimal|research|change|review|full>
                                              Tool surface for MCP. Default/client exposes facade tools; full exposes every tool.
-  CODEGRAPH_RELEVANCE_GATE=off|shadow|enforce  Scope relevance gate mode (default enforce; shadow records would-block results)
+  CODEGRAPH_RELEVANCE_GATE=off|shadow|enforce  Scope relevance gate mode (default shadow; enforce only after release gates pass)
   --models <a,b,c>                       Copilot E2E model list for benchmark copilot-e2e
   --modes <codegraph,baseline,organic>   Copilot E2E comparison modes (organic = MCP available, neutral prompt; adoption measurement)
   --modes <baseline,terse-no-mcp,natural-tool-use,mcp-first,mcp-only,mcp-scope,mcp-phase-resume,compiled-packet,compiled-packet+gate,oracle-packet>
