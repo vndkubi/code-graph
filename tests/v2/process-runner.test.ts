@@ -39,4 +39,16 @@ describe('async ProcessRunner', () => {
     expect(error).toBeInstanceOf(ProcessRunnerError);
     expect(error.message).toContain('maxBuffer');
   });
+
+  it('streams stdout through a bounded consumer without retaining the full output', async () => {
+    const chunks: string[] = [];
+    const result = await runProcess(node, ['-e', "process.stdout.write('a'.repeat(10000))"], {
+      maxBuffer: 128,
+      captureStdout: false,
+      onStdoutChunk: chunk => chunks.push(chunk),
+    });
+    expect(result.stdout).toBe('');
+    expect(chunks.join('')).toHaveLength(10000);
+    expect(result.exitCode).toBe(0);
+  });
 });

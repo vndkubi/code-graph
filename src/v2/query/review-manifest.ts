@@ -74,6 +74,28 @@ export function createReviewManifest(
   };
 }
 
+/** Add newly streamed file locators while preserving already-reviewed state. */
+export function addReviewManifestBlocks(
+  manifest: ReviewManifest,
+  blocks: ReviewManifestBlock[],
+): ReviewManifest {
+  if (blocks.length === 0) return manifest;
+  const additions = createReviewManifest(manifest.baseSha, manifest.headSha, blocks, manifest.reviewId).files;
+  const existing = new Map(manifest.files.map(file => [file.path, file]));
+  for (const file of additions) {
+    const current = existing.get(file.path);
+    if (!current) {
+      existing.set(file.path, file);
+      continue;
+    }
+    existing.set(file.path, {
+      ...current,
+      hunkRefs: [...new Set([...current.hunkRefs, ...file.hunkRefs])],
+    });
+  }
+  return { ...manifest, files: [...existing.values()] };
+}
+
 /**
  * Apply one completed (or failed) batch without mutating the prior snapshot.
  * Callers can persist each returned snapshot or emit it to a progress UI.

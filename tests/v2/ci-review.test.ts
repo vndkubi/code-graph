@@ -333,7 +333,7 @@ describe('reviewForCi (temp git repo)', () => {
     expect(calls.map(call => [...String(call.diff).matchAll(/^diff --git /gm)].length)).toEqual([2, 2, 1]);
     expect(result.changedFiles).toHaveLength(5);
     expect(result.findings.filter(finding => finding.id === 'review-missing-tests')).toHaveLength(1);
-    expect(manifestSnapshots).toHaveLength(4); // initial state plus one snapshot per batch
+    expect(manifestSnapshots).toHaveLength(7); // initial, pending, and completed snapshot per batch
     expect(result.manifest?.files.every(file => file.reviewState === 'reviewed')).toBe(true);
     expect(result.coverage).toMatchObject({
       complete: true,

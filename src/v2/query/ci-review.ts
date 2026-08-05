@@ -5,11 +5,16 @@
  * every finding is a graph/diff fact with a stable rule id, so the same diff
  * always produces the same report.
  */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import readline from 'node:readline';
 import { isIgnorableChangedPath } from './ci-test-selection.js';
 import { GitClient } from '../infrastructure/git-client.js';
 import type { V2QueryService } from './service.js';
 import {
   applyReviewManifestBatch,
+  addReviewManifestBlocks,
   createReviewManifest,
   reviewManifestCoverage,
   type ReviewFileStatus,
@@ -120,6 +125,106 @@ async function gitCommit(root: string, ref: string): Promise<string> {
   return gitClient.commit(root, ref);
 }
 
+/**
+ * Spool git's diff to a short-lived local file while consuming stdout in
+ * chunks. Review batches read that file line-by-line, so a very large diff is
+ * never duplicated as one giant in-memory string.
+ */
+async function streamGitDiffToTempFile(root: string, baseRef: string, headRef: string): Promise<{ directory: string; file: string }> {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codegraph-review-diff-'));
+  const file = path.join(directory, 'diff.patch');
+  const output = fs.createWriteStream(file, { encoding: 'utf8' });
+  const writeChunk = (chunk: string): Promise<void> => new Promise((resolve, reject) => {
+    const onError = (error: Error): void => { output.off('error', onError); reject(error); };
+    output.once('error', onError);
+    if (output.write(chunk, 'utf8', () => {
+      output.off('error', onError);
+      resolve();
+    })) return;
+    output.once('drain', () => {
+      output.off('error', onError);
+      resolve();
+    });
+  });
+  try {
+    await gitClient.runRaw(root, ['diff', '--no-renames', '--unified=3', `${baseRef}...${headRef}`], {
+      captureStdout: false,
+      onStdoutChunk: writeChunk,
+    });
+    await new Promise<void>((resolve, reject) => {
+      output.once('error', reject);
+      output.end(resolve);
+    });
+    return { directory, file };
+  } catch (error) {
+    output.destroy();
+    await fs.promises.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function forEachDiffBlock(file: string, onBlock: (block: ReviewDiffBlock) => Promise<void>): Promise<void> {
+  const input = fs.createReadStream(file, { encoding: 'utf8' });
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  let current: string[] = [];
+  try {
+    for await (const line of lines) {
+      if (line.startsWith('diff --git ') && current.length > 0) {
+        await onBlock(parseReviewDiffBlock(current.join('\n') + '\n'));
+        current = [];
+      }
+      current.push(line);
+    }
+    if (current.length > 0) await onBlock(parseReviewDiffBlock(current.join('\n') + '\n'));
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+}
+
+function parseReviewDiffBlock(block: string): ReviewDiffBlock {
+  return {
+    text: block,
+    file: /^diff --git a\/(.+?) b\/(.+)$/m.exec(block)?.[2]?.trim(),
+    hunkCount: (block.match(/^@@ /gm) ?? []).length,
+    deleted: /^\+\+\+ \/dev\/null$/m.test(block),
+    added: /^--- \/dev\/null$/m.test(block),
+  };
+}
+
+function addDiffStats(stats: ReviewDiffStatsAccumulator, block: ReviewDiffBlock): void {
+  stats.diffChars += block.text.length;
+  stats.hunkCount += block.hunkCount;
+  stats.files.add(block.file);
+  let inHunk = false;
+  for (const line of block.text.split(/\r?\n/)) {
+    if (line.startsWith('@@ ')) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (line.startsWith('+')) stats.addedLineCount += 1;
+    if (line.startsWith('-')) stats.removedLineCount += 1;
+  }
+}
+
+function finishDiffStats(stats: ReviewDiffStatsAccumulator): Record<string, unknown> {
+  const changedLineCount = stats.addedLineCount + stats.removedLineCount;
+  return {
+    fileCount: [...stats.files].filter(Boolean).length,
+    hunkCount: stats.hunkCount,
+    addedLineCount: stats.addedLineCount,
+    removedLineCount: stats.removedLineCount,
+    changedLineCount,
+    diffChars: stats.diffChars,
+    scale: changedLineCount >= 100_000 ? 'huge'
+      : changedLineCount >= 20_000 ? 'very-large'
+        : changedLineCount >= 2_000 ? 'large'
+          : changedLineCount >= 500 ? 'medium'
+            : 'small',
+  };
+}
+
 // Longest-prefix-first so 'review-duplicated-code-existing' wins over
 // 'review-duplicated-code'. Anything unknown keeps its full id as the rule.
 const RULE_ID_PREFIXES = [
@@ -210,17 +315,12 @@ interface ReviewDiffBatch {
   hunkCount: number;
 }
 
-function parseReviewDiffBlocks(diff: string): ReviewDiffBlock[] {
-  return diff
-    .split(/^(?=diff --git )/m)
-    .filter(block => block.trim() !== '')
-    .map(block => ({
-      text: block,
-      file: /^diff --git a\/(.+?) b\/(.+)$/m.exec(block)?.[2]?.trim(),
-      hunkCount: (block.match(/^@@ /gm) ?? []).length,
-      deleted: /^\+\+\+ \/dev\/null$/m.test(block),
-      added: /^--- \/dev\/null$/m.test(block),
-    }));
+interface ReviewDiffStatsAccumulator {
+  diffChars: number;
+  addedLineCount: number;
+  removedLineCount: number;
+  hunkCount: number;
+  files: Set<string | undefined>;
 }
 
 function manifestBlocks(blocks: ReviewDiffBlock[]): ReviewManifestBlock[] {
@@ -234,67 +334,6 @@ function manifestBlocks(blocks: ReviewDiffBlock[]): ReviewManifestBlock[] {
 function clampBatchSize(value: number | undefined, fallback: number, max: number): number {
   if (!Number.isFinite(value)) return fallback;
   return Math.max(1, Math.min(max, Math.floor(value!)));
-}
-
-/**
- * Partition by complete file blocks so every changed file is assigned exactly
- * once. Hunk count is a second guard: a 50-file batch with many methods should
- * not silently overflow review_patch's evidence window.
- */
-function buildReviewDiffBatches(
-  diff: string,
-  fileLimit: number,
-  hunkLimit: number,
-): ReviewDiffBatch[] {
-  const result: ReviewDiffBatch[] = [];
-  let blocks: ReviewDiffBlock[] = [];
-  let hunkCount = 0;
-  const flush = (): void => {
-    if (blocks.length === 0) return;
-    result.push({ diff: blocks.map(block => block.text).join(''), blocks, hunkCount });
-    blocks = [];
-    hunkCount = 0;
-  };
-  for (const block of parseReviewDiffBlocks(diff)) {
-    if (blocks.length > 0 && (blocks.length >= fileLimit || hunkCount + block.hunkCount > hunkLimit)) flush();
-    blocks.push(block);
-    hunkCount += block.hunkCount;
-  }
-  flush();
-  return result;
-}
-
-function fullDiffStats(diff: string, blocks: ReviewDiffBlock[]): Record<string, unknown> {
-  let addedLineCount = 0;
-  let removedLineCount = 0;
-  let inHunk = false;
-  for (const line of diff.split(/\r?\n/)) {
-    if (line.startsWith('diff --git ')) {
-      inHunk = false;
-      continue;
-    }
-    if (line.startsWith('@@ ')) {
-      inHunk = true;
-      continue;
-    }
-    if (!inHunk) continue;
-    if (line.startsWith('+')) addedLineCount += 1;
-    if (line.startsWith('-')) removedLineCount += 1;
-  }
-  const changedLineCount = addedLineCount + removedLineCount;
-  return {
-    fileCount: new Set(blocks.map(block => block.file).filter(Boolean)).size,
-    hunkCount: blocks.reduce((sum, block) => sum + block.hunkCount, 0),
-    addedLineCount,
-    removedLineCount,
-    changedLineCount,
-    diffChars: diff.length,
-    scale: changedLineCount >= 100_000 ? 'huge'
-      : changedLineCount >= 20_000 ? 'very-large'
-        : changedLineCount >= 2_000 ? 'large'
-          : changedLineCount >= 500 ? 'medium'
-            : 'small',
-  };
 }
 
 function findingsFromReviewResponse(response: Record<string, unknown>): CiReviewFinding[] {
@@ -347,31 +386,31 @@ export async function reviewForCi(
   const headRef = options.headRef ?? 'HEAD';
   const baseSha = await gitCommit(root, options.baseRef);
   const headSha = await gitCommit(root, headRef);
-  const rawDiff = await gitUnifiedDiff(root, options.baseRef, headRef);
-  if (rawDiff.trim() === '') {
-    const manifest = createReviewManifest(baseSha, headSha, [], options.reviewId);
-    await options.onManifestUpdate?.(manifest);
-    return emptyResult(options.baseRef, headRef, 'no-changes', [], manifest);
-  }
-  const { diff, ignoredFiles } = filterIgnorableDiff(rawDiff);
-  if (diff.trim() === '') {
-    const manifest = createReviewManifest(baseSha, headSha, [], options.reviewId);
-    await options.onManifestUpdate?.(manifest);
-    return emptyResult(options.baseRef, headRef, 'no-reviewable-changes', ignoredFiles, manifest);
-  }
   const requestedLimit = clampBatchSize(options.limit, 50, 200);
   const batchSize = clampBatchSize(options.batchSize, Math.min(requestedLimit, 50), 50);
   const maxHunksPerBatch = clampBatchSize(options.maxHunksPerBatch, 200, 200);
-  const blocks = parseReviewDiffBlocks(diff);
-  const batches = buildReviewDiffBatches(diff, batchSize, maxHunksPerBatch);
-  let manifest = createReviewManifest(baseSha, headSha, manifestBlocks(blocks), options.reviewId);
+  let manifest = createReviewManifest(baseSha, headSha, [], options.reviewId);
   await options.onManifestUpdate?.(manifest);
+  const blocks: ReviewDiffBlock[] = [];
+  const ignoredFiles: string[] = [];
+  const stats: ReviewDiffStatsAccumulator = {
+    diffChars: 0,
+    addedLineCount: 0,
+    removedLineCount: 0,
+    hunkCount: 0,
+    files: new Set(),
+  };
   const allFindings: CiReviewFinding[] = [];
   const batchCoverage: CiReviewBatchCoverage[] = [];
   const batchReviewStatuses: string[] = [];
   const batchFailures: CiReviewBatchFailure[] = [];
+  let pendingBlocks: ReviewDiffBlock[] = [];
+  let pendingHunks = 0;
 
-  for (const [index, batch] of batches.entries()) {
+  const processBatch = async (batch: ReviewDiffBatch): Promise<void> => {
+    const index = batchCoverage.length;
+    manifest = addReviewManifestBlocks(manifest, manifestBlocks(batch.blocks));
+    await options.onManifestUpdate?.(manifest);
     const batchLimit = Math.min(200, Math.max(requestedLimit, batch.blocks.length, batch.hunkCount));
     const expectedGraphFiles = batch.blocks
       .filter(block => !block.deleted)
@@ -442,6 +481,48 @@ export async function reviewForCi(
       });
       await options.onManifestUpdate?.(manifest);
     }
+  };
+
+  const flushBatch = async (): Promise<void> => {
+    if (pendingBlocks.length === 0) return;
+    const batch: ReviewDiffBatch = {
+      diff: pendingBlocks.map(block => block.text).join(''),
+      blocks: pendingBlocks,
+      hunkCount: pendingHunks,
+    };
+    pendingBlocks = [];
+    pendingHunks = 0;
+    await processBatch(batch);
+  };
+
+  const streamed = await streamGitDiffToTempFile(root, options.baseRef, headRef);
+  try {
+    await forEachDiffBlock(streamed.file, async block => {
+      if (block.file && isIgnorableChangedPath(block.file)) {
+        ignoredFiles.push(block.file);
+        return;
+      }
+      addDiffStats(stats, block);
+      blocks.push(block);
+      if (pendingBlocks.length > 0 && (pendingBlocks.length >= batchSize || pendingHunks + block.hunkCount > maxHunksPerBatch)) {
+        await flushBatch();
+      }
+      pendingBlocks.push(block);
+      pendingHunks += block.hunkCount;
+    });
+    await flushBatch();
+  } finally {
+    await fs.promises.rm(streamed.directory, { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  if (blocks.length === 0) {
+    return emptyResult(
+      options.baseRef,
+      headRef,
+      ignoredFiles.length > 0 ? 'no-reviewable-changes' : 'no-changes',
+      [...new Set(ignoredFiles)],
+      manifest,
+    );
   }
 
   const all = uniqueFindings(allFindings);
@@ -482,7 +563,7 @@ export async function reviewForCi(
     changedFiles,
     ignoredFiles,
     reviewStatus,
-    diffStats: fullDiffStats(diff, blocks),
+    diffStats: finishDiffStats(stats),
     coverage,
     manifest,
     ...(batchFailures.length > 0 ? { batchFailures } : {}),

@@ -1,4 +1,4 @@
-import { runCheckedProcess, type ProcessResult } from './process-runner.js';
+import { runCheckedProcess, type ProcessResult, type ProcessRunnerOptions } from './process-runner.js';
 
 const DEFAULT_GIT_TIMEOUT_MS = 120_000;
 const DEFAULT_GIT_MAX_BUFFER = 16 * 1024 * 1024;
@@ -15,11 +15,12 @@ export class GitClient {
     return result.stdout.trim();
   }
 
-  async runRaw(root: string, args: string[]): Promise<ProcessResult> {
+  async runRaw(root: string, args: string[], options: Omit<ProcessRunnerOptions, 'cwd'> = {}): Promise<ProcessResult> {
     return runCheckedProcess('git', args, {
       cwd: root,
       timeoutMs: this.timeoutMs,
       maxBuffer: this.maxBuffer,
+      ...options,
     });
   }
 

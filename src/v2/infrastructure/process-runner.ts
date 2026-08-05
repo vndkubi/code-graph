@@ -6,6 +6,12 @@ export interface ProcessRunnerOptions {
   timeoutMs?: number;
   maxBuffer?: number;
   signal?: AbortSignal;
+  /** Optional bounded stream consumer. The process pauses while each chunk is handled. */
+  onStdoutChunk?: (chunk: string) => void | Promise<void>;
+  onStderrChunk?: (chunk: string) => void | Promise<void>;
+  /** Disable accumulation when a caller consumes output through a chunk handler. */
+  captureStdout?: boolean;
+  captureStderr?: boolean;
 }
 
 export interface ProcessResult {
@@ -74,8 +80,8 @@ export function runProcess(
     };
     const append = (kind: 'stdout' | 'stderr', chunk: Buffer | string): void => {
       const text = chunk.toString();
-      if (kind === 'stdout') stdout += text;
-      else stderr += text;
+      if (kind === 'stdout' && options.captureStdout !== false) stdout += text;
+      if (kind === 'stderr' && options.captureStderr !== false) stderr += text;
       const size = Buffer.byteLength(stdout) + Buffer.byteLength(stderr);
       if (size > maxBuffer) {
         child.kill();
@@ -90,6 +96,26 @@ export function runProcess(
           aborted,
         }));
       }
+    };
+    let stdoutWork = Promise.resolve();
+    let stderrWork = Promise.resolve();
+    const consume = (kind: 'stdout' | 'stderr', chunk: Buffer | string): void => {
+      const text = chunk.toString();
+      append(kind, text);
+      const callback = kind === 'stdout' ? options.onStdoutChunk : options.onStderrChunk;
+      if (!callback) return;
+      const stream = kind === 'stdout' ? child.stdout : child.stderr;
+      stream.pause();
+      const previous = kind === 'stdout' ? stdoutWork : stderrWork;
+      const next = previous
+        .then(() => callback(text))
+        .finally(() => stream.resume());
+      if (kind === 'stdout') stdoutWork = next;
+      else stderrWork = next;
+      next.catch(error => {
+        child.kill();
+        fail(error);
+      });
     };
     const abort = (): void => {
       if (settled) return;
@@ -109,14 +135,17 @@ export function runProcess(
       child.kill();
     }, timeoutMs);
 
-    child.stdout.on('data', chunk => append('stdout', chunk));
-    child.stderr.on('data', chunk => append('stderr', chunk));
+    child.stdout.on('data', chunk => consume('stdout', chunk));
+    child.stderr.on('data', chunk => consume('stderr', chunk));
     child.once('error', error => fail(error));
     child.once('close', (exitCode, signal) => {
       if (settled) return;
-      settled = true;
-      cleanup();
-      resolve({ command, args, stdout, stderr, exitCode, signal, timedOut, aborted });
+      Promise.all([stdoutWork, stderrWork]).then(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve({ command, args, stdout, stderr, exitCode, signal, timedOut, aborted });
+      }).catch(fail);
     });
 
     // An already-aborted signal can race with spawn's close event; the close
