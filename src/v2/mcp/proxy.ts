@@ -306,7 +306,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
           durationMs: Date.now() - startedAt,
           responseChars: serialized.length,
           args: summarizeArgs(args),
-          result: summarizeResult(result),
+          result: summarizeResult(result, args),
           checkpoint: true,
         });
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
@@ -321,7 +321,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
           durationMs: Date.now() - startedAt,
           responseChars: serialized.length,
           args: summarizeArgs(args),
-          result: summarizeResult(result),
+          result: summarizeResult(result, args),
         });
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
@@ -353,7 +353,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
             durationMs,
             responseChars: serialized.length,
             args: summarizeArgs(args),
-            result: summarizeResult(reviewPacket),
+            result: summarizeResult(reviewPacket, args),
             reviewInput: reviewPacket.reviewInput,
           });
           const enriched = addResponseMeta(reviewPacket, request.params.name, durationMs, serialized.length);
@@ -388,7 +388,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
         durationMs,
         responseChars: serialized.length,
         args: summarizeArgs(args),
-        result: summarizeResult(result),
+        result: summarizeResult(result, args),
       });
       const enriched = addResponseMeta(result, request.params.name, durationMs, serialized.length);
       return {
@@ -414,7 +414,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
             durationMs: Date.now() - startedAt,
             responseChars: serialized.length,
             args: summarizeArgs(args),
-            result: summarizeResult(fallback),
+            result: summarizeResult(fallback, args),
             fallbackReason: summarizeErrorPayload(payload),
           });
           return {
@@ -909,8 +909,16 @@ function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
   return summary;
 }
 
-function summarizeResult(result: unknown): Record<string, unknown> {
+function summarizeResult(result: unknown, args: Record<string, unknown> = {}): Record<string, unknown> {
   if (!isRecord(result)) return {};
+  const relevanceGate = isRecord(result.relevanceGate) ? result.relevanceGate : undefined;
+  const missingRequirements = relevanceGate && Array.isArray(relevanceGate.missingRequirements)
+    ? relevanceGate.missingRequirements.length
+    : undefined;
+  const requirements = isRecord(args.scopePlan) && Array.isArray(args.scopePlan.requirements)
+    ? args.scopePlan.requirements.length
+    : undefined;
+  const claimValidation = Array.isArray(result.claimValidation) ? result.claimValidation : [];
   return copyDefined({
     ok: booleanOrUndefined(result.ok),
     state: stringOrUndefined(result.state),
@@ -924,15 +932,23 @@ function summarizeResult(result: unknown): Record<string, unknown> {
     indexFreshness: summarizeIndexFreshness(result.indexFreshness),
     freshness: summarizeIndexFreshness(result.freshness),
     debugTiming: summarizeDebugTiming(result.debugTiming),
-    relevanceGate: isRecord(result.relevanceGate)
+    relevanceGate: relevanceGate
       ? copyDefined({
-        status: stringOrUndefined(result.relevanceGate.status),
-        targetMatched: booleanOrUndefined(result.relevanceGate.targetMatched),
-        missingRequirements: Array.isArray(result.relevanceGate.missingRequirements)
-          ? result.relevanceGate.missingRequirements.slice(0, 20)
+        status: stringOrUndefined(relevanceGate.status),
+        targetMatched: booleanOrUndefined(relevanceGate.targetMatched),
+        missingRequirements: Array.isArray(relevanceGate.missingRequirements)
+          ? relevanceGate.missingRequirements.slice(0, 20)
           : undefined,
       })
       : undefined,
+    refinementCount: isRecord(args.scopePlan) ? numberOrUndefined(args.scopePlan.attempt) ?? 1 : undefined,
+    targetCoverage: relevanceGate ? booleanOrUndefined(relevanceGate.targetMatched) : undefined,
+    requirementCoverage: relevanceGate ? copyDefined({ total: requirements, missing: missingRequirements }) : undefined,
+    falseAnswerablePrevented: relevanceGate
+      ? relevanceGate.status === 'blocked' || relevanceGate.wouldBlock === true
+      : undefined,
+    checkpointVersion: numberOrUndefined(result.version) ?? numberOrUndefined(args.version),
+    staleClaimCount: claimValidation.filter(item => isRecord(item) && ['stale', 'missing', 'ambiguous'].includes(String(item.status))).length || undefined,
     recommendedNextAction: stringOrUndefined(result.recommendedNextAction),
   });
 }
