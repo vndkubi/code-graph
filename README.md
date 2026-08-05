@@ -101,6 +101,12 @@ Run on this repository after the right-sizing + ranking pass (relevance-cliff tr
 
 Token counts use the shared `cl100k_base/js-tiktoken` text estimator. Actual model billing can differ because tools, files, cached input, and model runtime accounting are provider-specific.
 
+For the production decision, collect the host-driven A–D matrix and run
+`codegraph benchmark release-gate --report <matrix.json>`. The evaluator fails
+closed and recommends `shadow` until recall, stale-claim, token, latency,
+schema, and index/query regression thresholds all pass; synthetic 10,000-file
+indexing demonstrates scale only, not semantic quality.
+
 ## CLI Reference
 
 ```text
@@ -119,7 +125,7 @@ codegraph affected-tests --root <workspace> --changed <file[,file...]> [--max-de
 codegraph status --root <workspace>    Human-readable status report with optional machine-readable --json
 codegraph logs --root <workspace> --tail <number> [--summary|--all|--since|--until|--tool|--event|--invalid]
                                       Print recent workspace query events or a compact aggregate summary
-codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e|claude-e2e
+codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|release-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e|claude-e2e
                                       Generate repos, measure indexing, or prove retrieval savings
                                       (quality-trend [--out <report.md>] appends a dated correctness/
                                       token-saving row so ranking/resolver regressions surface over time;
