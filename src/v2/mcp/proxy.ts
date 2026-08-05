@@ -5,13 +5,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { V2Indexer } from '../index/indexer.js';
 import { watchWorkspace, type WorkspaceWatchHandle } from '../index/watcher.js';
-import { sha256Text } from '../hash.js';
 import { getWorkspacePaths } from '../paths.js';
-import { reviewForCi } from '../query/ci-review.js';
-import {
-  prepareManagedReviewWorktree,
-  preparePullRequestReviewWorkspace,
-} from '../query/pr-review.js';
+import { ReviewPullRequestUseCase } from '../application/review-use-case.js';
+import type { CiReviewResult } from '../query/ci-review.js';
 import { hasExplicitReviewPayload, resolveReviewInput, type ReviewInput } from '../query/review-input.js';
 import { V2QueryService } from '../query/service.js';
 import { openCodeGraphDb, type CodeGraphDb } from '../storage/database.js';
@@ -489,47 +485,15 @@ export async function executeMcpReviewIfRequested(
     );
   }
 
-  let reviewRoot: string;
-  let baseRef: string;
-  let headRef: string;
-  let workspaceKey: string | undefined;
   try {
-    if (input.kind === 'pull_request') {
-      const prepared = await preparePullRequestReviewWorkspace(options.root, input.prUrl);
-      reviewRoot = prepared.root;
-      baseRef = prepared.baseSha;
-      headRef = prepared.headSha;
-      workspaceKey = prepared.workspaceKey;
-    } else {
-      baseRef = input.baseRef;
-      headRef = input.headRef;
-      const worktreeId = `mcp-range-${sha256Text(`${baseRef}...${headRef}`).slice(0, 16)}`;
-      reviewRoot = await prepareManagedReviewWorktree(
-        path.resolve(options.root),
-        path.join(path.resolve(options.root), '.codegraph', 'review-worktrees', worktreeId),
-        headRef,
-      );
-      workspaceKey = `mcp-review:${sha256Text(`${path.resolve(options.root)}:${baseRef}...${headRef}`).slice(0, 24)}`;
-    }
-
-    const opened = await openCodeGraphDb(reviewRoot);
-    try {
-      const indexer = new V2Indexer(opened.db);
-      const indexed = await indexer.indexWorkspace({
-        root: reviewRoot,
-        workspaceKey,
-        ...providerOptions,
-      });
-      const queries = new V2QueryService(opened.db);
-      const review = await reviewForCi(queries, indexed.workspaceId, reviewRoot, {
-        baseRef,
-        headRef,
-        focus: 'general',
-      });
-      return mcpReviewPacket(review, input, task, reviewRoot);
-    } finally {
-      await opened.db.close();
-    }
+    const execution = await new ReviewPullRequestUseCase().execute({
+      sourceRoot: options.root,
+      input,
+      isolateRangeWorkspace: true,
+      focus: 'general',
+      ...providerOptions,
+    });
+    return mcpReviewPacket(execution.review, input, task, execution.reviewRoot);
   } catch (error) {
     return missingMcpReviewInputPacket(
       task,
@@ -541,7 +505,7 @@ export async function executeMcpReviewIfRequested(
 }
 
 function mcpReviewPacket(
-  review: Awaited<ReturnType<typeof reviewForCi>>,
+  review: CiReviewResult,
   input: ReviewInput,
   task: string,
   reviewRoot: string,

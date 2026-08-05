@@ -14,15 +14,11 @@ import { formatCiSelection, selectTestsForCi, type CiSelectionFormat } from './v
 import {
   ciReviewExitCode,
   formatCiReview,
-  reviewForCi,
   type CiReviewFailOn,
   type CiReviewFormat,
   type CiReviewPriority,
 } from './v2/query/ci-review.js';
-import {
-  assertReviewWorkspaceAtHead,
-  preparePullRequestReviewWorkspace,
-} from './v2/query/pr-review.js';
+import { ReviewPullRequestUseCase } from './v2/application/review-use-case.js';
 import {
   applyGeneratedBlock,
   buildComponentStats,
@@ -659,72 +655,64 @@ function runAdoptionReportCommand(parsed: ParsedArgs): void {
 async function runReviewCommand(parsed: ParsedArgs): Promise<void> {
   const sourceRoot = path.resolve(getFlag(parsed, 'root') ?? process.cwd());
   const prUrl = getFlag(parsed, 'pr') ?? getFlag(parsed, 'pr-url');
-  let reviewRoot = sourceRoot;
-  let baseRef = getFlag(parsed, 'base');
-  let headRef = getFlag(parsed, 'head') ?? 'HEAD';
-  let workspaceKey = getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY;
-  let preparedPr: Awaited<ReturnType<typeof preparePullRequestReviewWorkspace>> | undefined;
+  const baseRef = getFlag(parsed, 'base');
+  const headRef = getFlag(parsed, 'head') ?? 'HEAD';
+  const workspaceKey = getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY;
+  let reviewInput: { kind: 'pull_request'; prUrl: string } | { kind: 'range'; baseRef: string; headRef: string };
   if (prUrl) {
     if (baseRef || getFlag(parsed, 'head')) {
       throw new Error('Use either --pr <GitHub PR URL> or --base/--head, not both.');
     }
-    preparedPr = await preparePullRequestReviewWorkspace(sourceRoot, prUrl);
-    reviewRoot = preparedPr.root;
-    baseRef = preparedPr.baseSha;
-    headRef = preparedPr.headSha;
-    workspaceKey = preparedPr.workspaceKey;
+    reviewInput = { kind: 'pull_request', prUrl };
   } else {
     if (!baseRef) {
       throw new Error('review requires --pr <GitHub PR URL> or --base <git ref> (e.g. --base origin/main).');
     }
-    await assertReviewWorkspaceAtHead(reviewRoot, headRef);
+    reviewInput = { kind: 'range', baseRef, headRef };
   }
   const format = normalizeCiReviewFormat(getFlag(parsed, 'format'));
   const failOn = normalizeCiReviewFailOn(getFlag(parsed, 'fail-on'));
   const minPriority = normalizeCiReviewPriority(getFlag(parsed, 'min-priority'), 'P2');
-  const { db } = await openCodeGraphDb(reviewRoot);
-  try {
-    const index = await new V2Indexer(db).indexWorkspace({ root: reviewRoot, workspaceKey });
-    const service = new V2QueryService(db);
-    const result = await reviewForCi(service, index.workspaceId, reviewRoot, {
-      baseRef,
-      headRef,
-      focus: getFlag(parsed, 'focus'),
-      limit: getNumberFlag(parsed, 'limit'),
-      batchSize: getNumberFlag(parsed, 'batch-size'),
-      maxHunksPerBatch: getNumberFlag(parsed, 'max-hunks-per-batch'),
-      minPriority,
-    });
-    const output = formatCiReview(result, format, cliPackageVersion());
-    const outPath = getFlag(parsed, 'out');
-    if (outPath) {
-      fs.writeFileSync(path.resolve(sourceRoot, outPath), `${output}\n`);
-    } else {
-      console.log(output);
-    }
-    console.error(JSON.stringify({
-      baseRef: result.baseRef,
-      headRef: result.headRef,
-      changedFiles: result.changedFiles.length,
-      reviewStatus: result.reviewStatus,
-      findings: result.findings.length,
-      priorityCounts: result.priorityCounts,
-      coverage: result.coverage,
-      batchFailures: result.batchFailures,
-      droppedBelowMinPriority: result.droppedBelowMinPriority,
-      ...(preparedPr ? {
-        prUrl: preparedPr.url,
-        baseSha: preparedPr.baseSha,
-        headSha: preparedPr.headSha,
-        reviewRoot: preparedPr.root,
-      } : {}),
-      ...(outPath ? { wrote: outPath, format } : {}),
-    }, null, 2));
-    const exitCode = ciReviewExitCode(result, failOn);
-    if (exitCode !== 0) process.exitCode = exitCode;
-  } finally {
-    await db.close();
+  const execution = await new ReviewPullRequestUseCase().execute({
+    sourceRoot,
+    input: reviewInput,
+    workspaceKey,
+    isolateRangeWorkspace: false,
+    requireCurrentHead: true,
+    focus: getFlag(parsed, 'focus'),
+    limit: getNumberFlag(parsed, 'limit'),
+    batchSize: getNumberFlag(parsed, 'batch-size'),
+    maxHunksPerBatch: getNumberFlag(parsed, 'max-hunks-per-batch'),
+    minPriority,
+  });
+  const result = execution.review;
+  const output = formatCiReview(result, format, cliPackageVersion());
+  const outPath = getFlag(parsed, 'out');
+  if (outPath) {
+    fs.writeFileSync(path.resolve(sourceRoot, outPath), `${output}\n`);
+  } else {
+    console.log(output);
   }
+  console.error(JSON.stringify({
+    baseRef: result.baseRef,
+    headRef: result.headRef,
+    changedFiles: result.changedFiles.length,
+    reviewStatus: result.reviewStatus,
+    findings: result.findings.length,
+    priorityCounts: result.priorityCounts,
+    coverage: result.coverage,
+    batchFailures: result.batchFailures,
+    droppedBelowMinPriority: result.droppedBelowMinPriority,
+    ...(execution.preparedPullRequest ? {
+      prUrl: execution.preparedPullRequest.url,
+      baseSha: execution.preparedPullRequest.baseSha,
+      headSha: execution.preparedPullRequest.headSha,
+      reviewRoot: execution.preparedPullRequest.root,
+    } : {}),
+    ...(outPath ? { wrote: outPath, format } : {}),
+  }, null, 2));
+  const exitCode = ciReviewExitCode(result, failOn);
+  if (exitCode !== 0) process.exitCode = exitCode;
 }
 
 function normalizeCiReviewFormat(value: string | undefined): CiReviewFormat {

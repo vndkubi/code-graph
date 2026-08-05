@@ -57,11 +57,16 @@ src/
     mcp/proxy.ts         The single fused MCP server (both surfaces)
     query/handler-registry.ts  Snapshot-scoped tool handler dispatch
     query/service.ts     V2QueryService — all graph, pack, search, review tools
+    application/review-use-case.ts  Shared immutable CLI/MCP review pipeline
     storage/             SQLite backend + schema
     infrastructure/process-runner.ts  Async bounded child-process boundary
     index/indexer.ts     Manifest scan, tree-sitter parse, snapshot writes
     benchmark/           Deterministic proof/eval/e2e harnesses
   tokenopt/              Vendored TokenOpt source (compiles to dist/tokenopt/*)
+
+Review adapters (CLI and MCP) resolve transport input, then call
+`ReviewPullRequestUseCase`; immutable source preparation, indexing, batching,
+coverage and finding aggregation stay in that shared application pipeline.
     mcp.ts               TOKENOPT_TOOL_DEFINITIONS + dispatchTokenoptTool
     cli.ts               TokenOpt CLI surface, reached via `codegraph gate <…>`
     codegraph-bridge.ts  parseCodeGraphResult (reused by the in-process provider)
