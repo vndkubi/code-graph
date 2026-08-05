@@ -60,6 +60,9 @@ src/
     application/review-use-case.ts  Shared immutable CLI/MCP review pipeline
     storage/             SQLite backend + schema
     infrastructure/process-runner.ts  Async bounded child-process boundary
+    infrastructure/git-client.ts  Bounded async Git adapter
+    infrastructure/github-pull-request-client.ts  Immutable GitHub PR metadata adapter
+    infrastructure/review-workspace-provider.ts  Detached worktree/head safety adapter
     index/indexer.ts     Manifest scan, tree-sitter parse, snapshot writes
     benchmark/           Deterministic proof/eval/e2e harnesses
   tokenopt/              Vendored TokenOpt source (compiles to dist/tokenopt/*)
