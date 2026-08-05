@@ -11,6 +11,7 @@ import type { V2QueryService } from './service.js';
 import {
   applyReviewManifestBatch,
   createReviewManifest,
+  reviewManifestCoverage,
   type ReviewFileStatus,
   type ReviewManifest,
   type ReviewManifestBlock,
@@ -367,7 +368,6 @@ export async function reviewForCi(
   await options.onManifestUpdate?.(manifest);
   const allFindings: CiReviewFinding[] = [];
   const batchCoverage: CiReviewBatchCoverage[] = [];
-  const graphResolvedFiles = new Set<string>();
   const batchReviewStatuses: string[] = [];
   const batchFailures: CiReviewBatchFailure[] = [];
 
@@ -396,7 +396,6 @@ export async function reviewForCi(
       if (typeof response.reviewStatus === 'string') batchReviewStatuses.push(response.reviewStatus);
 
       const responseChangedFiles = Array.isArray(response.changedFiles) ? response.changedFiles.map(String) : [];
-      for (const file of responseChangedFiles) graphResolvedFiles.add(file);
       const metrics = typeof response.metrics === 'object' && response.metrics !== null
         ? response.metrics as Record<string, unknown>
         : {};
@@ -453,21 +452,18 @@ export async function reviewForCi(
   for (const finding of findings) priorityCounts[finding.priority] += 1;
   const changedFiles = [...new Set(blocks.map(block => block.file).filter((file): file is string => Boolean(file)))];
   const unparsedFileCount = blocks.filter(block => !block.file).length;
-  const graphEligibleFiles = [...new Set(blocks
-    .filter(block => !block.deleted)
-    .map(block => block.file)
-    .filter((file): file is string => Boolean(file)))];
-  const omittedFiles = [...new Set(batchCoverage.flatMap(batch => batch.omittedFiles))];
-  const omittedHunks = batchCoverage.reduce((sum, batch) => sum + batch.omittedHunks, 0);
+  const manifestCoverage = reviewManifestCoverage(manifest);
+  const omittedFiles = [...new Set(manifestCoverage.omittedFiles)];
+  const omittedHunks = manifestCoverage.omittedHunks;
   const coverage: CiReviewCoverage = {
-    complete: batchCoverage.every(batch => batch.complete),
+    complete: manifestCoverage.complete,
     batchCount: batchCoverage.length,
     reviewableFileCount: blocks.length,
     unparsedFileCount,
-    graphEligibleFileCount: graphEligibleFiles.length,
-    graphResolvedFileCount: graphResolvedFiles.size,
-    reviewableHunkCount: blocks.reduce((sum, block) => sum + block.hunkCount, 0),
-    reviewedHunkCount: batchCoverage.reduce((sum, batch) => sum + batch.reviewedHunkCount, 0),
+    graphEligibleFileCount: manifestCoverage.graphEligibleFileCount,
+    graphResolvedFileCount: manifestCoverage.graphResolvedFileCount,
+    reviewableHunkCount: manifestCoverage.reviewableHunkCount,
+    reviewedHunkCount: manifestCoverage.reviewedHunkCount,
     omittedFiles,
     omittedHunks,
     batches: batchCoverage,

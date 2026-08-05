@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   applyReviewManifestBatch,
   createReviewManifest,
+  reviewManifestCoverage,
 } from '../../src/v2/query/review-manifest.js';
 
 describe('review manifest state machine', () => {
@@ -70,5 +71,29 @@ describe('review manifest state machine', () => {
 
     expect(failed.files[0]).toMatchObject({ graphResolution: 'failed', reviewState: 'failed' });
     expect(initial.files[0]).toMatchObject({ graphResolution: 'pending', reviewState: 'pending' });
+  });
+
+  it('derives aggregate completeness and hunk counts from manifest state', () => {
+    const initial = createReviewManifest('base', 'head', [
+      { path: 'src/a.ts', status: 'modified', hunkCount: 2 },
+      { path: 'src/deleted.ts', status: 'deleted', hunkCount: 1 },
+    ]);
+    const reviewed = applyReviewManifestBatch(initial, {
+      blocks: [
+        { path: 'src/a.ts', status: 'modified', hunkCount: 2 },
+        { path: 'src/deleted.ts', status: 'deleted', hunkCount: 1 },
+      ],
+      resolvedFiles: ['src/a.ts'],
+      complete: true,
+    });
+    expect(reviewManifestCoverage(reviewed)).toEqual({
+      complete: true,
+      graphEligibleFileCount: 1,
+      graphResolvedFileCount: 1,
+      reviewableHunkCount: 3,
+      reviewedHunkCount: 3,
+      omittedFiles: [],
+      omittedHunks: 0,
+    });
   });
 });

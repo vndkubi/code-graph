@@ -37,6 +37,16 @@ export interface ReviewManifestBatchUpdate {
   failed?: boolean;
 }
 
+export interface ReviewManifestCoverage {
+  complete: boolean;
+  graphEligibleFileCount: number;
+  graphResolvedFileCount: number;
+  reviewableHunkCount: number;
+  reviewedHunkCount: number;
+  omittedFiles: string[];
+  omittedHunks: number;
+}
+
 /**
  * Build the first-class review state machine before any batch is sent to the
  * review engine. The manifest contains locators and state only; it never
@@ -94,6 +104,27 @@ export function applyReviewManifestBatch(
     return { ...file, graphResolution, reviewState, hunkRefs: [...file.hunkRefs] };
   });
   return { ...manifest, files };
+}
+
+/** Aggregate correctness coverage from the manifest state, not raw response fields. */
+export function reviewManifestCoverage(manifest: ReviewManifest): ReviewManifestCoverage {
+  const graphEligible = manifest.files.filter(file => file.status !== 'deleted');
+  const resolved = graphEligible.filter(file => file.graphResolution === 'resolved');
+  const reviewed = manifest.files.filter(file => file.reviewState === 'reviewed');
+  const omittedFiles = manifest.files
+    .filter(file => file.reviewState !== 'reviewed')
+    .map(file => file.path);
+  const reviewableHunkCount = manifest.files.reduce((sum, file) => sum + file.hunkRefs.length, 0);
+  const reviewedHunkCount = reviewed.reduce((sum, file) => sum + file.hunkRefs.length, 0);
+  return {
+    complete: manifest.files.every(file => file.reviewState === 'reviewed'),
+    graphEligibleFileCount: graphEligible.length,
+    graphResolvedFileCount: resolved.length,
+    reviewableHunkCount,
+    reviewedHunkCount,
+    omittedFiles,
+    omittedHunks: Math.max(0, reviewableHunkCount - reviewedHunkCount),
+  };
 }
 
 function mergeManifestBlocks(blocks: ReviewManifestBlock[]): Array<ReviewManifestBlock & { path: string }> {
