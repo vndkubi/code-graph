@@ -710,6 +710,7 @@ async function runReviewCommand(parsed: ParsedArgs): Promise<void> {
       findings: result.findings.length,
       priorityCounts: result.priorityCounts,
       coverage: result.coverage,
+      batchFailures: result.batchFailures,
       droppedBelowMinPriority: result.droppedBelowMinPriority,
       ...(preparedPr ? {
         prUrl: preparedPr.url,
@@ -2776,5 +2777,9 @@ function shorten(value: string, maxLength: number): string {
 
 main().catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
+  // Review input/worktree/index failures are distinct from a completed review
+  // that found a threshold violation (1) or incomplete coverage (2). Keep the
+  // classification stable for CI consumers while preserving exit 1 for other
+  // CLI commands and unexpected command errors.
+  process.exitCode = process.argv[2] === 'review' ? 3 : 1;
 });

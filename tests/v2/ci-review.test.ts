@@ -123,6 +123,27 @@ describe('ciReviewExitCode', () => {
     onlyP2.findings = onlyP2.findings.filter(f => f.priority === 'P2');
     expect(ciReviewExitCode(onlyP2, 'P1')).toBe(0);
   });
+
+  it('fails closed with code 2 when review coverage is incomplete', () => {
+    const incomplete = sampleResult({
+      findings: [],
+      reviewStatus: 'incomplete-coverage',
+      coverage: { complete: false } as CiReviewResult['coverage'],
+    });
+
+    expect(ciReviewExitCode(incomplete, 'none')).toBe(2);
+    expect(ciReviewExitCode(incomplete, 'P2')).toBe(2);
+  });
+
+  it('allows an explicit API caller to opt out of the incomplete-coverage gate', () => {
+    const incomplete = sampleResult({
+      findings: [],
+      reviewStatus: 'incomplete-coverage',
+      coverage: { complete: false } as CiReviewResult['coverage'],
+    });
+
+    expect(ciReviewExitCode(incomplete, 'none', false)).toBe(0);
+  });
 });
 
 describe('formatCiReview sarif', () => {
@@ -140,11 +161,10 @@ describe('formatCiReview sarif', () => {
     expect(run.results[0].partialFingerprints.codegraphFindingId).toBe('review-stale-caller-com.example.Foo#bar');
   });
 
-  it('anchors file-less findings to the first changed file at line 1', () => {
+  it('does not anchor file-less findings to an unrelated changed file', () => {
     const sarif = JSON.parse(formatCiReview(sampleResult(), 'sarif')) as Record<string, any>;
     const fanout = sarif.runs[0].results[1];
-    expect(fanout.locations[0].physicalLocation.artifactLocation.uri).toBe('src/app.ts');
-    expect(fanout.locations[0].physicalLocation.region.startLine).toBe(1);
+    expect(fanout.locations).toEqual([]);
   });
 });
 
@@ -177,6 +197,13 @@ describe('filterIgnorableDiff', () => {
     const { diff, ignoredFiles } = filterIgnorableDiff(docsBlock);
     expect(diff.trim()).toBe('');
     expect(ignoredFiles).toEqual(['README.md']);
+  });
+
+  it('keeps malformed diff blocks so they cannot be silently omitted', () => {
+    const malformed = 'diff --git malformed-header\n@@ -1 +1 @@\n-old\n+new\n';
+    const result = filterIgnorableDiff(malformed);
+    expect(result.ignoredFiles).toEqual([]);
+    expect(result.diff).toContain('malformed-header');
   });
 });
 
@@ -309,6 +336,44 @@ describe('reviewForCi (temp git repo)', () => {
       omittedFiles: [],
       omittedHunks: 0,
     });
+  });
+
+  it('returns incomplete coverage when a batch fails instead of dropping the rest silently', async () => {
+    if (!hasGit()) return;
+    const { repo, workspaceId } = await setupRepo();
+    writeFile(repo, 'src/lib.ts', 'export function libValue(): number { return 42; }\n');
+    writeFile(repo, 'src/consumer.ts', "import { libValue } from './lib.js';\nexport function doubled(): number { return libValue() * 3; }\n");
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'change two files');
+
+    let callCount = 0;
+    const service = {
+      async query(envelope: { args: Record<string, unknown> }): Promise<unknown> {
+        callCount += 1;
+        if (callCount === 2) throw new Error('simulated review batch failure');
+        const batchDiff = String(envelope.args.diff ?? '');
+        const files = [...batchDiff.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)].map(match => match[2]);
+        const hunkCount = (batchDiff.match(/^@@ /gm) ?? []).length;
+        return {
+          changedFiles: files,
+          lineFocus: Array.from({ length: hunkCount }, () => ({})),
+          reviewFindings: [],
+          metrics: { omittedHunks: 0 },
+        };
+      },
+    };
+
+    const result = await reviewForCi(service as Pick<V2QueryService, 'query'>, 'workspace', repo, {
+      baseRef: 'HEAD~1',
+      batchSize: 1,
+    });
+
+    expect(result.coverage?.complete).toBe(false);
+    expect(result.reviewStatus).toBe('incomplete-coverage');
+    expect(result.batchFailures).toEqual([{ batch: 2, message: 'simulated review batch failure' }]);
+    expect(result.coverage?.batches[1]).toMatchObject({ complete: false, omittedHunks: 1 });
+    expect(ciReviewExitCode(result, 'none')).toBe(2);
+    expect(formatCiReview(result, 'text')).toContain('batch failures: #2 simulated review batch failure');
   });
 
   it('keeps internal graph coverage independent from the public response cap', async () => {

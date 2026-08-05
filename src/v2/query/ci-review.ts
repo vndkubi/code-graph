@@ -51,6 +51,11 @@ export interface CiReviewCoverage {
   batches: CiReviewBatchCoverage[];
 }
 
+export interface CiReviewBatchFailure {
+  batch: number;
+  message: string;
+}
+
 export interface CiReviewFinding {
   /** Instance id from the engine (may embed file/symbol). */
   id: string;
@@ -77,6 +82,8 @@ export interface CiReviewResult {
   reviewStatus?: string;
   diffStats?: Record<string, unknown>;
   coverage?: CiReviewCoverage;
+  /** Review-engine failures are reported separately from code findings. */
+  batchFailures?: CiReviewBatchFailure[];
   findings: CiReviewFinding[];
   priorityCounts: Record<CiReviewPriority, number>;
   droppedBelowMinPriority: number;
@@ -324,49 +331,68 @@ export async function reviewForCi(
   const batchCoverage: CiReviewBatchCoverage[] = [];
   const graphResolvedFiles = new Set<string>();
   const batchReviewStatuses: string[] = [];
+  const batchFailures: CiReviewBatchFailure[] = [];
 
   for (const [index, batch] of batches.entries()) {
     const batchLimit = Math.min(200, Math.max(requestedLimit, batch.blocks.length, batch.hunkCount));
-    const response = await service.query({
-      workspaceId,
-      toolName: 'review_patch',
-      args: {
-        diff: batch.diff,
-        focus: options.focus ?? 'general',
-        limit: batchLimit,
-        outputMode: 'full',
-      },
-    }) as Record<string, unknown>;
-    allFindings.push(...findingsFromReviewResponse(response));
-    if (typeof response.reviewStatus === 'string') batchReviewStatuses.push(response.reviewStatus);
-
-    const responseChangedFiles = Array.isArray(response.changedFiles) ? response.changedFiles.map(String) : [];
-    for (const file of responseChangedFiles) graphResolvedFiles.add(file);
-    const metrics = typeof response.metrics === 'object' && response.metrics !== null
-      ? response.metrics as Record<string, unknown>
-      : {};
-    const omittedHunks = Math.max(0, Number(metrics.omittedHunks ?? Math.max(0, batch.hunkCount - (Array.isArray(response.lineFocus) ? response.lineFocus.length : 0))));
     const expectedGraphFiles = batch.blocks
       .filter(block => !block.deleted)
       .map(block => block.file)
       .filter((file): file is string => Boolean(file));
-    const responseFileSet = new Set(responseChangedFiles);
-    const omittedFiles = [
-      ...expectedGraphFiles.filter(file => !responseFileSet.has(file)),
-      ...batch.blocks
-        .map((block, blockIndex) => block.file ? undefined : `<unparsed-diff-block:${index + 1}.${blockIndex + 1}>`)
-        .filter((file): file is string => Boolean(file)),
-    ];
-    batchCoverage.push({
-      batch: index + 1,
-      fileCount: batch.blocks.length,
-      hunkCount: batch.hunkCount,
-      graphResolvedFileCount: expectedGraphFiles.length - omittedFiles.length,
-      reviewedHunkCount: Math.max(0, batch.hunkCount - omittedHunks),
-      omittedFiles,
-      omittedHunks,
-      complete: omittedFiles.length === 0 && omittedHunks === 0,
-    });
+    const unparsedFiles = batch.blocks
+      .map((block, blockIndex) => block.file ? undefined : `<unparsed-diff-block:${index + 1}.${blockIndex + 1}>`)
+      .filter((file): file is string => Boolean(file));
+
+    try {
+      const response = await service.query({
+        workspaceId,
+        toolName: 'review_patch',
+        args: {
+          diff: batch.diff,
+          focus: options.focus ?? 'general',
+          limit: batchLimit,
+          outputMode: 'full',
+        },
+      }) as Record<string, unknown>;
+      allFindings.push(...findingsFromReviewResponse(response));
+      if (typeof response.reviewStatus === 'string') batchReviewStatuses.push(response.reviewStatus);
+
+      const responseChangedFiles = Array.isArray(response.changedFiles) ? response.changedFiles.map(String) : [];
+      for (const file of responseChangedFiles) graphResolvedFiles.add(file);
+      const metrics = typeof response.metrics === 'object' && response.metrics !== null
+        ? response.metrics as Record<string, unknown>
+        : {};
+      const omittedHunks = Math.max(0, Number(metrics.omittedHunks ?? Math.max(0, batch.hunkCount - (Array.isArray(response.lineFocus) ? response.lineFocus.length : 0))));
+      const responseFileSet = new Set(responseChangedFiles);
+      const omittedFiles = [
+        ...expectedGraphFiles.filter(file => !responseFileSet.has(file)),
+        ...unparsedFiles,
+      ];
+      const omittedGraphFiles = omittedFiles.filter(file => !file.startsWith('<unparsed-'));
+      batchCoverage.push({
+        batch: index + 1,
+        fileCount: batch.blocks.length,
+        hunkCount: batch.hunkCount,
+        graphResolvedFileCount: Math.max(0, expectedGraphFiles.length - omittedGraphFiles.length),
+        reviewedHunkCount: Math.max(0, batch.hunkCount - omittedHunks),
+        omittedFiles,
+        omittedHunks,
+        complete: omittedFiles.length === 0 && omittedHunks === 0,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      batchFailures.push({ batch: index + 1, message: message.slice(0, 500) });
+      batchCoverage.push({
+        batch: index + 1,
+        fileCount: batch.blocks.length,
+        hunkCount: batch.hunkCount,
+        graphResolvedFileCount: 0,
+        reviewedHunkCount: 0,
+        omittedFiles: [...expectedGraphFiles, ...unparsedFiles],
+        omittedHunks: batch.hunkCount,
+        complete: false,
+      });
+    }
   }
 
   const all = uniqueFindings(allFindings);
@@ -412,14 +438,28 @@ export async function reviewForCi(
     reviewStatus,
     diffStats: fullDiffStats(diff, blocks),
     coverage,
+    ...(batchFailures.length > 0 ? { batchFailures } : {}),
     findings,
     priorityCounts,
     droppedBelowMinPriority: all.length - findings.length,
   };
 }
 
-/** Exit code for a CI gate: fail when any finding is at or above `failOn`. */
-export function ciReviewExitCode(result: CiReviewResult, failOn: CiReviewFailOn): number {
+/**
+ * Exit code for a CI gate.
+ *
+ * Coverage is a correctness precondition, not a finding threshold. A review
+ * that did not inspect every reviewable hunk must never pass as a clean review
+ * merely because it produced no findings (or because `failOn` is `none`).
+ * Code 2 is reserved for this incomplete-evidence state; callers that have a
+ * separate policy can explicitly opt out via the third argument.
+ */
+export function ciReviewExitCode(
+  result: CiReviewResult,
+  failOn: CiReviewFailOn,
+  failOnIncompleteCoverage = true,
+): number {
+  if (failOnIncompleteCoverage && result.coverage?.complete === false) return 2;
   if (failOn === 'none') return 0;
   const threshold = PRIORITY_RANK[failOn];
   return result.findings.some(f => PRIORITY_RANK[f.priority] <= threshold) ? 1 : 0;
@@ -453,9 +493,8 @@ function toSarif(result: CiReviewResult, toolVersion: string): Record<string, un
       properties: finding.category ? { category: finding.category } : {},
     });
   }
-  const fallbackFile = result.changedFiles[0];
   const results = result.findings.map(finding => {
-    const file = finding.file ?? fallbackFile;
+    const file = finding.file;
     const message = [
       finding.title,
       finding.why,
@@ -466,8 +505,10 @@ function toSarif(result: CiReviewResult, toolVersion: string): Record<string, un
       ruleId: finding.ruleId,
       level: SARIF_LEVEL[finding.priority],
       message: { text: message },
-      // GitHub code scanning requires a physical location; findings without a
-      // file anchor fall back to the first changed file at line 1.
+      // Do not attach a finding with no source location to an unrelated
+      // changed file. SARIF permits a result without locations, and the
+      // fingerprint/message still make the finding actionable without a
+      // misleading code-navigation target.
       locations: file
         ? [{
           physicalLocation: {
@@ -512,6 +553,9 @@ function toMarkdown(result: CiReviewResult): string {
       lines.push('> ⚠️ Review coverage is incomplete; do not treat this report as full-PR evidence.');
     }
   }
+  if (result.batchFailures && result.batchFailures.length > 0) {
+    lines.push(`Batch failures: ${result.batchFailures.map(failure => `#${failure.batch} ${escapeMarkdownCell(failure.message)}`).join('; ')}`);
+  }
   if (total > 0) {
     lines.push('');
     lines.push('| Priority | Rule | Location | Finding |');
@@ -540,6 +584,9 @@ function toText(result: CiReviewResult): string {
   lines.push(`codegraph review ${result.baseRef}...${result.headRef}: ${result.findings.length} finding(s) across ${result.changedFiles.length} changed file(s)`);
   if (result.coverage) {
     lines.push(`coverage: ${result.coverage.reviewedHunkCount}/${result.coverage.reviewableHunkCount} hunks, ${result.coverage.graphResolvedFileCount}/${result.coverage.graphEligibleFileCount} graph-resolved files, ${result.coverage.batchCount} batch(es), complete=${result.coverage.complete}`);
+  }
+  if (result.batchFailures && result.batchFailures.length > 0) {
+    lines.push(`batch failures: ${result.batchFailures.map(failure => `#${failure.batch} ${failure.message}`).join('; ')}`);
   }
   for (const finding of result.findings) {
     const location = finding.file ? ` [${finding.file}${finding.line ? `:${finding.line}` : ''}]` : '';

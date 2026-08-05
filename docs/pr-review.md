@@ -45,3 +45,10 @@ codegraph review --root D:\src\my-repo --base origin/main --head HEAD
 This mode fails closed unless the checkout's current commit exactly equals
 `--head` and tracked files are clean. That invariant prevents a graph built
 from one source state from being combined with a diff from another.
+
+The command also fails closed when review coverage is incomplete: exit code `2`
+means the report is not full-PR evidence, even with `--fail-on none`. Exit code
+`1` means a finding reached the configured priority threshold; exit code `0`
+means the review completed without a threshold violation. Exit code `3` is
+reserved for review input, worktree, git, or index failures before a valid
+review result can be produced.
