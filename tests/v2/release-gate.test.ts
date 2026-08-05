@@ -1,7 +1,11 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   evaluateReleaseGate,
   formatReleaseGateMarkdown,
+  loadReleaseGateInput,
   type ReleaseGateInput,
 } from '../../src/v2/benchmark/release-gate.js';
 
@@ -65,5 +69,16 @@ describe('release benchmark gate', () => {
     const result = evaluateReleaseGate(input);
     expect(result.passed).toBe(false);
     expect(result.checks.find(check => check.id === 'tokens-D-vs-B')).toMatchObject({ passed: false, actual: 'missing' });
+  });
+
+  it('loads a complete matrix from the report path used by the CLI', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-release-gate-'));
+    const reportPath = path.join(root, 'matrix.json');
+    fs.writeFileSync(reportPath, JSON.stringify(report()), 'utf8');
+    try {
+      expect(loadReleaseGateInput(reportPath).arms.D.freshModelInputTokens).toBe(600);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
