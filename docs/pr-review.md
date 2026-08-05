@@ -23,7 +23,9 @@ and does not include it in reports or errors. The current `--pr` adapter
 supports `https://github.com/<owner>/<repo>/pull/<number>` URLs. The local clone
 must contain a remote whose GitHub owner/repository matches the URL.
 
-Large diffs are split into bounded calls to `review_patch`. The final report
+Large diffs are streamed from Git into a short-lived local spool and split into
+bounded calls to `review_patch`; the full unified diff is not retained as one
+in-memory string. The final report
 contains a `coverage` ledger with assigned batches, graph-resolved files,
 reviewed hunks, and any omission. Do not treat a report with
 `coverage.complete=false` as full-PR evidence.

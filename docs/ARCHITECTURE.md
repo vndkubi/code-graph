@@ -60,7 +60,7 @@ src/
     query/review-manifest.ts  Source-free per-file/hunk review state machine
     application/review-use-case.ts  Shared immutable CLI/MCP review pipeline
     storage/             SQLite backend + schema
-    infrastructure/process-runner.ts  Async bounded child-process boundary
+    infrastructure/process-runner.ts  Async bounded child-process boundary with chunk streaming
     infrastructure/git-client.ts  Bounded async Git adapter
     infrastructure/github-pull-request-client.ts  Immutable GitHub PR metadata adapter
     infrastructure/review-workspace-provider.ts  Detached worktree/head safety adapter
