@@ -28,6 +28,13 @@ contains a `coverage` ledger with assigned batches, graph-resolved files,
 reviewed hunks, and any omission. Do not treat a report with
 `coverage.complete=false` as full-PR evidence.
 
+The JSON result also contains a source-free `manifest` with the immutable
+`baseSha`/`headSha`, each changed file's status, hunk locators, graph
+resolution, and review state (`pending`, `reviewed`, `omitted`, or `failed`).
+The application can receive an immutable manifest snapshot after initialization
+and after every batch through `onManifestUpdate`; this makes progress and
+partial failure explicit without persisting source text.
+
 Useful controls:
 
 ```text

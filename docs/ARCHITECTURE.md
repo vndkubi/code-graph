@@ -57,6 +57,7 @@ src/
     mcp/proxy.ts         The single fused MCP server (both surfaces)
     query/handler-registry.ts  Snapshot-scoped tool handler dispatch
     query/service.ts     V2QueryService — all graph, pack, search, review tools
+    query/review-manifest.ts  Source-free per-file/hunk review state machine
     application/review-use-case.ts  Shared immutable CLI/MCP review pipeline
     storage/             SQLite backend + schema
     infrastructure/process-runner.ts  Async bounded child-process boundary

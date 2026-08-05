@@ -236,6 +236,11 @@ describe('reviewForCi (temp git repo)', () => {
 
     const result = await reviewForCi(service, workspaceId, repo, { baseRef: 'HEAD~1' });
     expect(result.changedFiles).toContain('src/lib.ts');
+    expect(result.manifest).toMatchObject({
+      baseSha: expect.stringMatching(/^[0-9a-f]{40}$/),
+      headSha: expect.stringMatching(/^[0-9a-f]{40}$/),
+      files: [{ path: 'src/lib.ts', status: 'modified', graphResolution: 'resolved', reviewState: 'reviewed' }],
+    });
     expect(Array.isArray(result.findings)).toBe(true);
     for (const finding of result.findings) {
       expect(finding.ruleId).toBeTruthy();
@@ -294,6 +299,7 @@ describe('reviewForCi (temp git repo)', () => {
     runGit(repo, 'commit', '-m', 'change all files');
 
     const calls: Array<Record<string, unknown>> = [];
+    const manifestSnapshots: Array<{ files: Array<{ path: string; reviewState: string }> }> = [];
     const service = {
       async query(envelope: { args: Record<string, unknown> }): Promise<unknown> {
         calls.push(envelope.args);
@@ -318,12 +324,17 @@ describe('reviewForCi (temp git repo)', () => {
       baseRef: 'HEAD~1',
       batchSize: 2,
       limit: 2,
+      onManifestUpdate: manifest => manifestSnapshots.push({
+        files: manifest.files.map(file => ({ path: file.path, reviewState: file.reviewState })),
+      }),
     });
 
     expect(calls).toHaveLength(3);
     expect(calls.map(call => [...String(call.diff).matchAll(/^diff --git /gm)].length)).toEqual([2, 2, 1]);
     expect(result.changedFiles).toHaveLength(5);
     expect(result.findings.filter(finding => finding.id === 'review-missing-tests')).toHaveLength(1);
+    expect(manifestSnapshots).toHaveLength(4); // initial state plus one snapshot per batch
+    expect(result.manifest?.files.every(file => file.reviewState === 'reviewed')).toBe(true);
     expect(result.coverage).toMatchObject({
       complete: true,
       batchCount: 3,
@@ -371,6 +382,9 @@ describe('reviewForCi (temp git repo)', () => {
     expect(result.coverage?.complete).toBe(false);
     expect(result.reviewStatus).toBe('incomplete-coverage');
     expect(result.batchFailures).toEqual([{ batch: 2, message: 'simulated review batch failure' }]);
+    expect(result.manifest?.files.filter(file => file.reviewState === 'reviewed')).toHaveLength(1);
+    expect(result.manifest?.files.filter(file => file.reviewState === 'failed')).toHaveLength(1);
+    expect(result.manifest?.files.find(file => file.reviewState === 'failed')).toMatchObject({ graphResolution: 'failed' });
     expect(result.coverage?.batches[1]).toMatchObject({ complete: false, omittedHunks: 1 });
     expect(ciReviewExitCode(result, 'none')).toBe(2);
     expect(formatCiReview(result, 'text')).toContain('batch failures: #2 simulated review batch failure');

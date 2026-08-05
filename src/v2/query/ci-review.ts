@@ -6,8 +6,15 @@
  * always produces the same report.
  */
 import { isIgnorableChangedPath } from './ci-test-selection.js';
-import { runCheckedProcess } from '../infrastructure/process-runner.js';
+import { GitClient } from '../infrastructure/git-client.js';
 import type { V2QueryService } from './service.js';
+import {
+  applyReviewManifestBatch,
+  createReviewManifest,
+  type ReviewFileStatus,
+  type ReviewManifest,
+  type ReviewManifestBlock,
+} from './review-manifest.js';
 
 export type CiReviewFormat = 'json' | 'sarif' | 'markdown' | 'text';
 export type CiReviewPriority = 'P0' | 'P1' | 'P2';
@@ -24,6 +31,10 @@ export interface CiReviewOptions {
   limit?: number;
   /** Drop findings below this priority (P0 strictest). Default: keep all. */
   minPriority?: CiReviewPriority;
+  /** Stable caller-provided identity for persisted/replayed review state. */
+  reviewId?: string;
+  /** Receive immutable manifest snapshots after initialization and each batch. */
+  onManifestUpdate?: (manifest: ReviewManifest) => void | Promise<void>;
 }
 
 export interface CiReviewBatchCoverage {
@@ -82,6 +93,8 @@ export interface CiReviewResult {
   reviewStatus?: string;
   diffStats?: Record<string, unknown>;
   coverage?: CiReviewCoverage;
+  /** First-class file/hunk state; no source text is stored here. */
+  manifest?: ReviewManifest;
   /** Review-engine failures are reported separately from code findings. */
   batchFailures?: CiReviewBatchFailure[];
   findings: CiReviewFinding[];
@@ -90,6 +103,7 @@ export interface CiReviewResult {
 }
 
 const GIT_DIFF_TIMEOUT_MS = 30_000;
+const gitClient = new GitClient(GIT_DIFF_TIMEOUT_MS, 64 * 1024 * 1024);
 
 /**
  * Unified diff for merge-base(base, head)..head — `base...head`, the same
@@ -97,12 +111,12 @@ const GIT_DIFF_TIMEOUT_MS = 30_000;
  * an unknown diff would be a guess.
  */
 export async function gitUnifiedDiff(root: string, baseRef: string, headRef = 'HEAD'): Promise<string> {
-  const result = await runCheckedProcess('git', ['diff', '--no-renames', '--unified=3', `${baseRef}...${headRef}`], {
-    cwd: root,
-    timeoutMs: GIT_DIFF_TIMEOUT_MS,
-    maxBuffer: 64 * 1024 * 1024,
-  });
-  return result.stdout;
+  return gitClient.runRaw(root, ['diff', '--no-renames', '--unified=3', `${baseRef}...${headRef}`])
+    .then(result => result.stdout);
+}
+
+async function gitCommit(root: string, ref: string): Promise<string> {
+  return gitClient.commit(root, ref);
 }
 
 // Longest-prefix-first so 'review-duplicated-code-existing' wins over
@@ -137,13 +151,20 @@ function normalizePriority(value: unknown): CiReviewPriority {
   return value === 'P0' || value === 'P1' || value === 'P2' ? value : 'P2';
 }
 
-function emptyResult(baseRef: string, headRef: string, reviewStatus: string, ignoredFiles: string[] = []): CiReviewResult {
+function emptyResult(
+  baseRef: string,
+  headRef: string,
+  reviewStatus: string,
+  ignoredFiles: string[] = [],
+  manifest?: ReviewManifest,
+): CiReviewResult {
   return {
     baseRef,
     headRef,
     changedFiles: [],
     ignoredFiles,
     reviewStatus,
+    ...(manifest ? { manifest } : {}),
     findings: [],
     priorityCounts: { P0: 0, P1: 0, P2: 0 },
     droppedBelowMinPriority: 0,
@@ -179,6 +200,7 @@ interface ReviewDiffBlock {
   file?: string;
   hunkCount: number;
   deleted: boolean;
+  added: boolean;
 }
 
 interface ReviewDiffBatch {
@@ -196,7 +218,16 @@ function parseReviewDiffBlocks(diff: string): ReviewDiffBlock[] {
       file: /^diff --git a\/(.+?) b\/(.+)$/m.exec(block)?.[2]?.trim(),
       hunkCount: (block.match(/^@@ /gm) ?? []).length,
       deleted: /^\+\+\+ \/dev\/null$/m.test(block),
+      added: /^--- \/dev\/null$/m.test(block),
     }));
+}
+
+function manifestBlocks(blocks: ReviewDiffBlock[]): ReviewManifestBlock[] {
+  return blocks.map(block => ({
+    path: block.file,
+    status: block.deleted ? 'deleted' as ReviewFileStatus : block.added ? 'added' as ReviewFileStatus : 'modified' as ReviewFileStatus,
+    hunkCount: block.hunkCount,
+  }));
 }
 
 function clampBatchSize(value: number | undefined, fallback: number, max: number): number {
@@ -313,19 +344,27 @@ export async function reviewForCi(
   options: CiReviewOptions,
 ): Promise<CiReviewResult> {
   const headRef = options.headRef ?? 'HEAD';
+  const baseSha = await gitCommit(root, options.baseRef);
+  const headSha = await gitCommit(root, headRef);
   const rawDiff = await gitUnifiedDiff(root, options.baseRef, headRef);
   if (rawDiff.trim() === '') {
-    return emptyResult(options.baseRef, headRef, 'no-changes');
+    const manifest = createReviewManifest(baseSha, headSha, [], options.reviewId);
+    await options.onManifestUpdate?.(manifest);
+    return emptyResult(options.baseRef, headRef, 'no-changes', [], manifest);
   }
   const { diff, ignoredFiles } = filterIgnorableDiff(rawDiff);
   if (diff.trim() === '') {
-    return emptyResult(options.baseRef, headRef, 'no-reviewable-changes', ignoredFiles);
+    const manifest = createReviewManifest(baseSha, headSha, [], options.reviewId);
+    await options.onManifestUpdate?.(manifest);
+    return emptyResult(options.baseRef, headRef, 'no-reviewable-changes', ignoredFiles, manifest);
   }
   const requestedLimit = clampBatchSize(options.limit, 50, 200);
   const batchSize = clampBatchSize(options.batchSize, Math.min(requestedLimit, 50), 50);
   const maxHunksPerBatch = clampBatchSize(options.maxHunksPerBatch, 200, 200);
   const blocks = parseReviewDiffBlocks(diff);
   const batches = buildReviewDiffBatches(diff, batchSize, maxHunksPerBatch);
+  let manifest = createReviewManifest(baseSha, headSha, manifestBlocks(blocks), options.reviewId);
+  await options.onManifestUpdate?.(manifest);
   const allFindings: CiReviewFinding[] = [];
   const batchCoverage: CiReviewBatchCoverage[] = [];
   const graphResolvedFiles = new Set<string>();
@@ -378,6 +417,12 @@ export async function reviewForCi(
         omittedHunks,
         complete: omittedFiles.length === 0 && omittedHunks === 0,
       });
+      manifest = applyReviewManifestBatch(manifest, {
+        blocks: manifestBlocks(batch.blocks),
+        resolvedFiles: responseChangedFiles,
+        complete: omittedFiles.length === 0 && omittedHunks === 0,
+      });
+      await options.onManifestUpdate?.(manifest);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       batchFailures.push({ batch: index + 1, message: message.slice(0, 500) });
@@ -391,6 +436,12 @@ export async function reviewForCi(
         omittedHunks: batch.hunkCount,
         complete: false,
       });
+      manifest = applyReviewManifestBatch(manifest, {
+        blocks: manifestBlocks(batch.blocks),
+        complete: false,
+        failed: true,
+      });
+      await options.onManifestUpdate?.(manifest);
     }
   }
 
@@ -437,6 +488,7 @@ export async function reviewForCi(
     reviewStatus,
     diffStats: fullDiffStats(diff, blocks),
     coverage,
+    manifest,
     ...(batchFailures.length > 0 ? { batchFailures } : {}),
     findings,
     priorityCounts,

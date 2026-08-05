@@ -5,6 +5,7 @@ import {
   type CiReviewOptions,
   type CiReviewResult,
 } from '../query/ci-review.js';
+import type { ReviewManifest } from '../query/review-manifest.js';
 import {
   assertReviewWorkspaceAtHead,
   prepareManagedReviewWorktree,
@@ -31,6 +32,7 @@ export interface ReviewPullRequestRequest {
   maxHunksPerBatch?: number;
   limit?: number;
   minPriority?: CiReviewOptions['minPriority'];
+  onManifestUpdate?: (manifest: ReviewManifest) => void | Promise<void>;
 }
 
 export interface ReviewPullRequestExecution {
@@ -86,6 +88,7 @@ export class ReviewPullRequestUseCase {
           maxHunksPerBatch: request.maxHunksPerBatch,
           limit: request.limit,
           minPriority: request.minPriority,
+          onManifestUpdate: request.onManifestUpdate,
         },
       );
       return {
