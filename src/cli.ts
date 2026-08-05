@@ -677,7 +677,7 @@ async function runReviewCommand(parsed: ParsedArgs): Promise<void> {
     if (!baseRef) {
       throw new Error('review requires --pr <GitHub PR URL> or --base <git ref> (e.g. --base origin/main).');
     }
-    assertReviewWorkspaceAtHead(reviewRoot, headRef);
+    await assertReviewWorkspaceAtHead(reviewRoot, headRef);
   }
   const format = normalizeCiReviewFormat(getFlag(parsed, 'format'));
   const failOn = normalizeCiReviewFailOn(getFlag(parsed, 'fail-on'));

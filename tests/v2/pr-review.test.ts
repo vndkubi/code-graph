@@ -88,21 +88,21 @@ describe('GitHub PR input', () => {
 });
 
 describe('review head-state safety', () => {
-  it('creates an isolated detached worktree at the requested immutable head', () => {
+  it('creates an isolated detached worktree at the requested immutable head', async () => {
     const { root, baseSha, headSha } = createRepo();
     git(root, 'checkout', '--detach', baseSha);
     const worktreeRoot = path.join(root, '.codegraph', 'pr-worktrees', 'review');
-    expect(prepareManagedReviewWorktree(root, worktreeRoot, headSha)).toBe(path.resolve(worktreeRoot));
+    await expect(prepareManagedReviewWorktree(root, worktreeRoot, headSha)).resolves.toBe(path.resolve(worktreeRoot));
     expect(git(worktreeRoot, 'rev-parse', 'HEAD')).toBe(headSha);
     expect(git(root, 'rev-parse', 'HEAD')).toBe(baseSha);
-    expect(assertReviewWorkspaceAtHead(worktreeRoot, headSha)).toBe(headSha);
+    await expect(assertReviewWorkspaceAtHead(worktreeRoot, headSha)).resolves.toBe(headSha);
   });
 
-  it('fails closed on a mismatched head or tracked worktree edits', () => {
+  it('fails closed on a mismatched head or tracked worktree edits', async () => {
     const { root, baseSha, headSha } = createRepo();
-    expect(() => assertReviewWorkspaceAtHead(root, baseSha)).toThrow(/does not match requested head/);
-    expect(assertReviewWorkspaceAtHead(root, headSha)).toBe(headSha);
+    await expect(assertReviewWorkspaceAtHead(root, baseSha)).rejects.toThrow(/does not match requested head/);
+    await expect(assertReviewWorkspaceAtHead(root, headSha)).resolves.toBe(headSha);
     fs.writeFileSync(path.join(root, 'app.ts'), 'export const value = 3;\n');
-    expect(() => assertReviewWorkspaceAtHead(root, headSha)).toThrow(/tracked modifications/);
+    await expect(assertReviewWorkspaceAtHead(root, headSha)).rejects.toThrow(/tracked modifications/);
   });
 });

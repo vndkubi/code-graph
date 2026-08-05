@@ -5,8 +5,8 @@
  * every finding is a graph/diff fact with a stable rule id, so the same diff
  * always produces the same report.
  */
-import { execFileSync } from 'node:child_process';
 import { isIgnorableChangedPath } from './ci-test-selection.js';
+import { runCheckedProcess } from '../infrastructure/process-runner.js';
 import type { V2QueryService } from './service.js';
 
 export type CiReviewFormat = 'json' | 'sarif' | 'markdown' | 'text';
@@ -96,14 +96,13 @@ const GIT_DIFF_TIMEOUT_MS = 30_000;
  * range a GitHub PR shows. Throws when git cannot answer: a review built from
  * an unknown diff would be a guess.
  */
-export function gitUnifiedDiff(root: string, baseRef: string, headRef = 'HEAD'): string {
-  return execFileSync('git', ['diff', '--no-renames', '--unified=3', `${baseRef}...${headRef}`], {
+export async function gitUnifiedDiff(root: string, baseRef: string, headRef = 'HEAD'): Promise<string> {
+  const result = await runCheckedProcess('git', ['diff', '--no-renames', '--unified=3', `${baseRef}...${headRef}`], {
     cwd: root,
-    encoding: 'utf-8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: GIT_DIFF_TIMEOUT_MS,
+    timeoutMs: GIT_DIFF_TIMEOUT_MS,
     maxBuffer: 64 * 1024 * 1024,
   });
+  return result.stdout;
 }
 
 // Longest-prefix-first so 'review-duplicated-code-existing' wins over
@@ -314,7 +313,7 @@ export async function reviewForCi(
   options: CiReviewOptions,
 ): Promise<CiReviewResult> {
   const headRef = options.headRef ?? 'HEAD';
-  const rawDiff = gitUnifiedDiff(root, options.baseRef, headRef);
+  const rawDiff = await gitUnifiedDiff(root, options.baseRef, headRef);
   if (rawDiff.trim() === '') {
     return emptyResult(options.baseRef, headRef, 'no-changes');
   }

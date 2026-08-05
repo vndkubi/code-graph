@@ -504,7 +504,7 @@ export async function executeMcpReviewIfRequested(
       baseRef = input.baseRef;
       headRef = input.headRef;
       const worktreeId = `mcp-range-${sha256Text(`${baseRef}...${headRef}`).slice(0, 16)}`;
-      reviewRoot = prepareManagedReviewWorktree(
+      reviewRoot = await prepareManagedReviewWorktree(
         path.resolve(options.root),
         path.join(path.resolve(options.root), '.codegraph', 'review-worktrees', worktreeId),
         headRef,

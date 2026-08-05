@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { runCheckedProcess } from '../infrastructure/process-runner.js';
 
 const GIT_TIMEOUT_MS = 120_000;
 const GIT_MAX_BUFFER = 16 * 1024 * 1024;
@@ -41,18 +41,17 @@ interface GitHubPullResponse {
   };
 }
 
-function git(root: string, args: string[]): string {
-  return execFileSync('git', args, {
+async function git(root: string, args: string[]): Promise<string> {
+  const result = await runCheckedProcess('git', args, {
     cwd: root,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: GIT_TIMEOUT_MS,
+    timeoutMs: GIT_TIMEOUT_MS,
     maxBuffer: GIT_MAX_BUFFER,
-  }).trim();
+  });
+  return result.stdout.trim();
 }
 
-function gitCommit(root: string, ref: string): string {
-  return git(root, ['rev-parse', '--verify', `${ref}^{commit}`]).toLowerCase();
+async function gitCommit(root: string, ref: string): Promise<string> {
+  return (await git(root, ['rev-parse', '--verify', `${ref}^{commit}`])).toLowerCase();
 }
 
 function normalizedPath(value: string): string {
@@ -158,44 +157,44 @@ export async function resolveGitHubPullRequest(
   };
 }
 
-function findMatchingGitHubRemote(root: string, metadata: GitHubPullRequestMetadata): string {
+async function findMatchingGitHubRemote(root: string, metadata: GitHubPullRequestMetadata): Promise<string> {
   const expected = `${metadata.owner}/${metadata.repo}`.toLowerCase();
-  const remotes = git(root, ['remote']).split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+  const remotes = (await git(root, ['remote'])).split(/\r?\n/).map(value => value.trim()).filter(Boolean);
   for (const remote of remotes) {
     // Read the configured URL before any global `url.*.insteadOf` rewrite.
     // Fetch still uses the rewrite (useful for offline/local test mirrors),
     // while repository matching must compare the declared GitHub identity.
-    const remoteUrl = git(root, ['config', '--get', `remote.${remote}.url`])
-      || git(root, ['remote', 'get-url', remote]);
+    const remoteUrl = await git(root, ['config', '--get', `remote.${remote}.url`])
+      .catch(() => git(root, ['remote', 'get-url', remote]));
     if (githubRepositoryFromRemote(remoteUrl) === expected) return remote;
   }
   throw new Error(`No git remote in ${root} matches GitHub repository ${metadata.owner}/${metadata.repo}.`);
 }
 
-function ensureCommitAvailable(root: string, remote: string, sha: string): void {
+async function ensureCommitAvailable(root: string, remote: string, sha: string): Promise<void> {
   try {
-    gitCommit(root, sha);
+    await gitCommit(root, sha);
   } catch {
-    git(root, ['fetch', '--no-tags', remote, sha]);
-    gitCommit(root, sha);
+    await git(root, ['fetch', '--no-tags', remote, sha]);
+    await gitCommit(root, sha);
   }
 }
 
-function registeredWorktreePaths(root: string): Set<string> {
+async function registeredWorktreePaths(root: string): Promise<Set<string>> {
   const paths = new Set<string>();
-  for (const line of git(root, ['worktree', 'list', '--porcelain']).split(/\r?\n/)) {
+  for (const line of (await git(root, ['worktree', 'list', '--porcelain'])).split(/\r?\n/)) {
     if (line.startsWith('worktree ')) paths.add(normalizedPath(line.slice('worktree '.length)));
   }
   return paths;
 }
 
-export function assertReviewWorkspaceAtHead(root: string, headRef: string): string {
-  const expected = gitCommit(root, headRef);
-  const actual = gitCommit(root, 'HEAD');
+export async function assertReviewWorkspaceAtHead(root: string, headRef: string): Promise<string> {
+  const expected = await gitCommit(root, headRef);
+  const actual = await gitCommit(root, 'HEAD');
   if (actual !== expected) {
     throw new Error(`Review workspace HEAD ${actual} does not match requested head ${expected}. Check out the head commit or use --pr for an isolated worktree.`);
   }
-  const trackedChanges = git(root, ['status', '--porcelain=v1', '--untracked-files=no']);
+  const trackedChanges = await git(root, ['status', '--porcelain=v1', '--untracked-files=no']);
   if (trackedChanges !== '') {
     throw new Error('Review workspace has tracked modifications. Commit/stash them or use --pr so graph facts and the git diff describe the same head state.');
   }
@@ -207,27 +206,27 @@ export function assertReviewWorkspaceAtHead(root: string, headRef: string): stri
  * checkout. Existing managed worktrees are reused only when tracked files are
  * clean; unexpected user edits fail closed instead of being reset.
  */
-export function prepareManagedReviewWorktree(sourceRoot: string, worktreeRoot: string, headSha: string): string {
+export async function prepareManagedReviewWorktree(sourceRoot: string, worktreeRoot: string, headSha: string): Promise<string> {
   const resolvedSource = path.resolve(sourceRoot);
   const resolvedWorktree = path.resolve(worktreeRoot);
-  const registered = registeredWorktreePaths(resolvedSource).has(normalizedPath(resolvedWorktree));
+  const registered = (await registeredWorktreePaths(resolvedSource)).has(normalizedPath(resolvedWorktree));
   if (registered) {
     if (!fs.existsSync(resolvedWorktree)) {
       throw new Error(`Managed review worktree is registered but missing on disk: ${resolvedWorktree}`);
     }
-    const trackedChanges = git(resolvedWorktree, ['status', '--porcelain=v1', '--untracked-files=no']);
+    const trackedChanges = await git(resolvedWorktree, ['status', '--porcelain=v1', '--untracked-files=no']);
     if (trackedChanges !== '') {
       throw new Error(`Managed review worktree contains tracked modifications and was not reset: ${resolvedWorktree}`);
     }
-    git(resolvedWorktree, ['checkout', '--detach', headSha]);
+    await git(resolvedWorktree, ['checkout', '--detach', headSha]);
   } else {
     if (fs.existsSync(resolvedWorktree) && fs.readdirSync(resolvedWorktree).length > 0) {
       throw new Error(`Refusing to replace an unregistered non-empty review directory: ${resolvedWorktree}`);
     }
     fs.mkdirSync(path.dirname(resolvedWorktree), { recursive: true });
-    git(resolvedSource, ['worktree', 'add', '--detach', resolvedWorktree, headSha]);
+    await git(resolvedSource, ['worktree', 'add', '--detach', resolvedWorktree, headSha]);
   }
-  assertReviewWorkspaceAtHead(resolvedWorktree, headSha);
+  await assertReviewWorkspaceAtHead(resolvedWorktree, headSha);
   return resolvedWorktree;
 }
 
@@ -238,26 +237,26 @@ export async function preparePullRequestReviewWorkspace(
 ): Promise<PreparedPullRequestWorkspace> {
   const resolvedSource = path.resolve(sourceRoot);
   const metadata = await resolveGitHubPullRequest(prUrl, options);
-  const remote = findMatchingGitHubRemote(resolvedSource, metadata);
+  const remote = await findMatchingGitHubRemote(resolvedSource, metadata);
   const namespace = `refs/codegraph/pull/${metadata.number}`;
-  git(resolvedSource, ['fetch', '--no-tags', '--force', remote,
+  await git(resolvedSource, ['fetch', '--no-tags', '--force', remote,
     `+refs/heads/${metadata.baseRef}:${namespace}/base-tip`,
     `+refs/pull/${metadata.number}/head:${namespace}/head-tip`,
   ]);
-  ensureCommitAvailable(resolvedSource, remote, metadata.baseSha);
-  ensureCommitAvailable(resolvedSource, remote, metadata.headSha);
-  const fetchedHead = gitCommit(resolvedSource, `${namespace}/head-tip`);
+  await ensureCommitAvailable(resolvedSource, remote, metadata.baseSha);
+  await ensureCommitAvailable(resolvedSource, remote, metadata.headSha);
+  const fetchedHead = await gitCommit(resolvedSource, `${namespace}/head-tip`);
   if (fetchedHead !== metadata.headSha) {
     throw new Error(`Pull request head changed during preparation (API ${metadata.headSha}, fetched ${fetchedHead}). Retry the review.`);
   }
-  git(resolvedSource, ['update-ref', `${namespace}/base`, metadata.baseSha]);
-  git(resolvedSource, ['update-ref', `${namespace}/head`, metadata.headSha]);
+  await git(resolvedSource, ['update-ref', `${namespace}/base`, metadata.baseSha]);
+  await git(resolvedSource, ['update-ref', `${namespace}/head`, metadata.headSha]);
 
   const worktreeId = `github-${metadata.owner}-${metadata.repo}-pr-${metadata.number}`
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, '-');
   const worktreeRoot = path.join(resolvedSource, '.codegraph', 'pr-worktrees', worktreeId);
-  const root = prepareManagedReviewWorktree(resolvedSource, worktreeRoot, metadata.headSha);
+  const root = await prepareManagedReviewWorktree(resolvedSource, worktreeRoot, metadata.headSha);
   return {
     ...metadata,
     root,
