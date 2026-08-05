@@ -85,7 +85,7 @@ Add `.codegraph/` to `.gitignore`; it is local generated state.
 
 ## Current Local Benchmark
 
-Run on this repository after the right-sizing + ranking pass (relevance-cliff trimming with an outlier guard and a `minKeep` floor, keepRatio=0.5 default; stem-aware file ranking; `__tests__/` role classification). These are self-repo deterministic proof harnesses, not external multi-repo claims:
+Run on this repository after the right-sizing + ranking pass (relevance-cliff trimming with an outlier guard and a `minKeep` floor, keepRatio=0.5 default; stem-aware file ranking; `__tests__/` role classification). These are self-repo deterministic proof harnesses, not external multi-repo claims or a production savings guarantee. Token and round-trip cost varies by repository/task; release decisions require the current benchmark gates to pass:
 
 | Benchmark | Result |
 | --- | ---: |
