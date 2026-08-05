@@ -55,6 +55,7 @@ src/
   cli.ts                 Unified CLI entrypoint (codegraph + `gate` delegation)
   v2/
     mcp/proxy.ts         The single fused MCP server (both surfaces)
+    query/handler-registry.ts  Snapshot-scoped tool handler dispatch
     query/service.ts     V2QueryService — all graph, pack, search, review tools
     storage/             SQLite backend + schema
     index/indexer.ts     Manifest scan, tree-sitter parse, snapshot writes
@@ -142,8 +143,9 @@ Core tables:
    `dispatchTokenoptTool` **before** the CodeGraph profile gate; the gate's
    in-process `codeGraphProvider` calls `V2QueryService` to fold in `code_graph`
    evidence.
-3. Otherwise the request goes to `V2QueryService`, which runs bounded SQL and
-   reads bounded source slices.
+3. Otherwise the request goes to `V2QueryService`, whose
+   `QueryHandlerRegistry` dispatches the tool against one resolved snapshot;
+   handlers run bounded SQL and read bounded source slices.
 4. The server optionally checks freshness and refreshes inline when configured.
 5. Telemetry and compact result summaries are logged to
    `.codegraph/logs/query.jsonl` for tool calls that pass through MCP.

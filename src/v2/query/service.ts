@@ -141,6 +141,7 @@ import {
 import { scanManifest } from '../index/manifest.js';
 import { getGitDirtyFiles, getGitFreshnessInfo } from '../git.js';
 import { architectureContextForFiles, dependencyTraceDiagnostics } from '../graph/overlay.js';
+import { QueryHandlerRegistry } from './handler-registry.js';
 
 export interface QueryEnvelope {
   workspaceId: string;
@@ -150,6 +151,7 @@ export interface QueryEnvelope {
 
 export class V2QueryService {
   private readonly indexer: V2Indexer;
+  private readonly handlers: QueryHandlerRegistry;
   private readonly inFlightBatchSliceKeys = new Map<string, number>();
   private readonly inFlightRefreshes = new Map<string, Promise<string>>();
   private readonly freshnessCache = new Map<string, { expiresAt: number; value: Record<string, unknown> | undefined }>();
@@ -166,6 +168,36 @@ export class V2QueryService {
 
   constructor(private readonly db: CodeGraphDb) {
     this.indexer = new V2Indexer(db);
+    this.handlers = new QueryHandlerRegistry([
+      ['search_symbol', (snapshotId, args) => this.searchSymbol(snapshotId, args)],
+      ['search_files', (snapshotId, args) => this.searchFiles(snapshotId, args)],
+      ['find_references', (snapshotId, args) => this.findReferences(snapshotId, args)],
+      ['get_file_summary', (snapshotId, args) => this.getFileSummary(snapshotId, args)],
+      ['get_file_slice', (snapshotId, args) => this.getFileSlice(snapshotId, args)],
+      ['get_dependencies', (snapshotId, args) => this.getDependencies(snapshotId, args)],
+      ['get_dependents', (snapshotId, args) => this.getDependents(snapshotId, args)],
+      ['get_callers', (snapshotId, args) => this.getCallers(snapshotId, args)],
+      ['get_callees', (snapshotId, args) => this.getCallees(snapshotId, args)],
+      ['find_endpoints', (snapshotId, args) => this.findEndpoints(snapshotId, args)],
+      ['get_impact_radius', (snapshotId, args) => this.getImpactRadius(snapshotId, args)],
+      ['trace_dependencies', (snapshotId, args) => this.traceDependencies(snapshotId, args)],
+      ['explain_endpoint', (snapshotId, args) => this.explainEndpoint(snapshotId, args)],
+      ['impact_of_symbol', (snapshotId, args) => this.impactOfSymbol(snapshotId, args)],
+      ['simulate_patch_impact', (snapshotId, args) => this.simulatePatchImpact(snapshotId, args)],
+      ['review_patch', (snapshotId, args) => this.reviewPatch(snapshotId, args)],
+      ['find_tests_for', (snapshotId, args) => this.findTestsFor(snapshotId, args)],
+      ['get_flow_pack', (snapshotId, args) => this.getResearchPack(snapshotId, {
+        ...args,
+        taskType: args.taskType ?? 'architecture',
+      })],
+      ['get_research_pack', (snapshotId, args) => this.getResearchPack(snapshotId, args)],
+      ['get_context_packet', (snapshotId, args) => this.getContextPacket(snapshotId, args)],
+      ['get_change_pack', (snapshotId, args) => this.getChangePack(snapshotId, args)],
+      ['compile_evidence', (snapshotId, args) => this.compileEvidence(snapshotId, args)],
+      ['generate_repo_atlas', (snapshotId, args) => this.generateRepoAtlas(snapshotId, args)],
+      ['search_code', (snapshotId, args) => this.searchCode(snapshotId, args)],
+      ['get_index_stats', (snapshotId, args) => this.getIndexStats(snapshotId, args)],
+    ]);
   }
 
   /** Stable key for an evidence slice / source body. */
@@ -279,63 +311,7 @@ export class V2QueryService {
         indexFreshness: agentFacingFreshness(freshness),
       };
     };
-    switch (envelope.toolName) {
-      case 'search_symbol':
-        return withFreshness(await this.searchSymbol(snapshotId, envelope.args));
-      case 'search_files':
-        return withFreshness(await this.searchFiles(snapshotId, envelope.args));
-      case 'find_references':
-        return withFreshness(await this.findReferences(snapshotId, envelope.args));
-      case 'get_file_summary':
-        return withFreshness(await this.getFileSummary(snapshotId, envelope.args));
-      case 'get_file_slice':
-        return withFreshness(await this.getFileSlice(snapshotId, envelope.args));
-      case 'get_dependencies':
-        return withFreshness(await this.getDependencies(snapshotId, envelope.args));
-      case 'get_dependents':
-        return withFreshness(await this.getDependents(snapshotId, envelope.args));
-      case 'get_callers':
-        return withFreshness(await this.getCallers(snapshotId, envelope.args));
-      case 'get_callees':
-        return withFreshness(await this.getCallees(snapshotId, envelope.args));
-      case 'find_endpoints':
-        return withFreshness(await this.findEndpoints(snapshotId, envelope.args));
-      case 'get_impact_radius':
-        return withFreshness(await this.getImpactRadius(snapshotId, envelope.args));
-      case 'trace_dependencies':
-        return withFreshness(await this.traceDependencies(snapshotId, envelope.args));
-      case 'explain_endpoint':
-        return withFreshness(await this.explainEndpoint(snapshotId, envelope.args));
-      case 'impact_of_symbol':
-        return withFreshness(await this.impactOfSymbol(snapshotId, envelope.args));
-      case 'simulate_patch_impact':
-        return withFreshness(await this.simulatePatchImpact(snapshotId, envelope.args));
-      case 'review_patch':
-        return withFreshness(await this.reviewPatch(snapshotId, envelope.args));
-      case 'find_tests_for':
-        return withFreshness(await this.findTestsFor(snapshotId, envelope.args));
-      case 'get_flow_pack':
-        return withFreshness(await this.getResearchPack(snapshotId, {
-          ...envelope.args,
-          taskType: envelope.args.taskType ?? 'architecture',
-        }));
-      case 'get_research_pack':
-        return withFreshness(await this.getResearchPack(snapshotId, envelope.args));
-      case 'get_context_packet':
-        return withFreshness(await this.getContextPacket(snapshotId, envelope.args));
-      case 'get_change_pack':
-        return withFreshness(await this.getChangePack(snapshotId, envelope.args));
-      case 'compile_evidence':
-        return withFreshness(await this.compileEvidence(snapshotId, envelope.args));
-      case 'generate_repo_atlas':
-        return withFreshness(await this.generateRepoAtlas(snapshotId, envelope.args));
-      case 'search_code':
-        return withFreshness(await this.searchCode(snapshotId, envelope.args));
-      case 'get_index_stats':
-        return withFreshness(await this.getIndexStats(snapshotId, envelope.args));
-      default:
-        throw new Error(`Unknown v2 tool: ${envelope.toolName}`);
-    }
+    return withFreshness(await this.handlers.execute(envelope.toolName, snapshotId, envelope.args));
   }
 
   async ensureIndexed(root: string): ReturnType<V2Indexer['indexWorkspace']> {
