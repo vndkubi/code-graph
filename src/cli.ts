@@ -174,6 +174,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     { runRecallBench },
     { runTrustSignalProof },
     { runAffectedTestsEval },
+    { evaluateReleaseGate, formatReleaseGateMarkdown, loadReleaseGateInput },
   ] = await Promise.all([
     import('./v2/benchmark/synthetic-java.js'),
     import('./v2/benchmark/run.js'),
@@ -190,6 +191,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     import('./v2/benchmark/recall-bench.js'),
     import('./v2/benchmark/trust-signal-proof.js'),
     import('./v2/benchmark/affected-tests-eval.js'),
+    import('./v2/benchmark/release-gate.js'),
   ]);
   switch (subcommand) {
     case 'generate': {
@@ -259,6 +261,13 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     case 'route-gate':
       console.log(JSON.stringify(runRouteGateBenchmark(getFlag(parsed, 'suite') ?? getFlag(parsed, 'tasks')), null, 2));
       return;
+    case 'release-gate': {
+      const result = evaluateReleaseGate(loadReleaseGateInput(requiredFlag(parsed, 'report')));
+      if (getFlag(parsed, 'format') === 'markdown') console.log(formatReleaseGateMarkdown(result));
+      else console.log(JSON.stringify(result, null, 2));
+      if (!result.passed) process.exitCode = 1;
+      return;
+    }
     case 'quality-trend': {
       const root = getFlag(parsed, 'root') ?? process.cwd();
       const { db } = await openCodeGraphDb(root);
@@ -416,7 +425,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e|claude-e2e|trust-signal-proof|competitive-compare');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|release-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e|claude-e2e|trust-signal-proof|competitive-compare');
   }
 }
 
@@ -2606,7 +2615,7 @@ Usage:
                                          Aggregate the MCP call ledger (.codegraph/logs/query.jsonl) into adoption numbers
   codegraph checkpoint list|show|prune --root <workspace>  Inspect or safely prune repo-local task checkpoints
   codegraph route-inspect --task <text>  Explain codegraph_context routing and stop/follow-up gate policy
-  codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|copilot-e2e|codex-e2e|claude-e2e|competitive-compare
+  codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|release-gate|copilot-e2e|codex-e2e|claude-e2e|competitive-compare
                                              Generate synthetic repos, measure indexing, run evals, or prove context/review savings
 
 Options:
@@ -2614,6 +2623,7 @@ Options:
   --tasks <path>                         Golden eval task JSON file
   --tasks auto                           Derive proof/review tasks from indexed-looking source files
   --suite <path>                         Route-gate or E2E suite JSON file
+  --report <path>                        A-D release benchmark matrix JSON for benchmark release-gate
   --task <text|id>                       Route-inspect task text or benchmark task id
   --task-count <number>                  Number of auto-derived proof/review tasks
   --no-index                             Reuse the current proof/review/graph snapshot instead of refreshing first
