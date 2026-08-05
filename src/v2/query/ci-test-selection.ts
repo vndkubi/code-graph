@@ -16,8 +16,8 @@
  * tests WITHOUT triggering run-all — skipping the suite for a README edit is
  * exactly the payoff CI selection exists for.
  */
-import { execFileSync } from 'node:child_process';
 import type { CodeGraphDb } from '../storage/database.js';
+import { runCheckedProcess } from '../infrastructure/process-runner.js';
 import {
   findAffectedTests,
   type AffectedTestsOptions,
@@ -53,15 +53,13 @@ const GIT_DIFF_TIMEOUT_MS = 30_000;
  * built from an unknown diff would be a guess, and CI must fall back to the
  * full suite via its own error handling, not silently run zero tests.
  */
-export function gitChangedFiles(root: string, baseRef: string, headRef = 'HEAD'): ChangedFileStatus[] {
-  const output = execFileSync('git', ['diff', '--name-status', '--no-renames', `${baseRef}...${headRef}`], {
+export async function gitChangedFiles(root: string, baseRef: string, headRef = 'HEAD'): Promise<ChangedFileStatus[]> {
+  const result = await runCheckedProcess('git', ['diff', '--name-status', '--no-renames', `${baseRef}...${headRef}`], {
     cwd: root,
-    encoding: 'utf-8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: GIT_DIFF_TIMEOUT_MS,
+    timeoutMs: GIT_DIFF_TIMEOUT_MS,
     maxBuffer: 32 * 1024 * 1024,
   });
-  return output
+  return result.stdout
     .split(/\r?\n/)
     .map(line => line.trim())
     .filter(Boolean)
@@ -129,7 +127,7 @@ export async function selectTestsForCi(
   options: CiSelectionOptions,
 ): Promise<CiSelectionResult> {
   const headRef = options.headRef ?? 'HEAD';
-  const changedInput = gitChangedFiles(root, options.baseRef, headRef);
+  const changedInput = await gitChangedFiles(root, options.baseRef, headRef);
   return classifyAndSelect(db, snapshotId, changedInput, options, headRef);
 }
 

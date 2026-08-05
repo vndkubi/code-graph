@@ -142,6 +142,14 @@ import { scanManifest } from '../index/manifest.js';
 import { getGitDirtyFiles, getGitFreshnessInfo } from '../git.js';
 import { architectureContextForFiles, dependencyTraceDiagnostics } from '../graph/overlay.js';
 import { QueryHandlerRegistry } from './handler-registry.js';
+import {
+  buildReviewCoverage,
+  normalizeReviewOutputMode,
+  reviewAnswerable,
+  reviewBudgetFor,
+  type ReviewBudget,
+  type ReviewOutputMode,
+} from './review-policy.js';
 
 export interface QueryEnvelope {
   workspaceId: string;
@@ -2561,23 +2569,13 @@ export class V2QueryService {
       .map(hunk => compactReviewObject(hunk, budget.maxEvidencePerFinding, 2) as Record<string, unknown>);
     const changedFileSet = new Set(changedFiles);
     const omittedGraphFiles = allDiffFiles.filter(file => !changedFileSet.has(file));
-    const reviewCoverage = {
-      // A vacuous 0/0 comparison is not review coverage. An empty patch input
-      // must remain blocked so the MCP facade cannot present a successful-looking
-      // packet whose every metric is zero.
-      complete: changedFiles.length > 0
-        && omittedGraphFiles.length === 0
-        && lineFocus.length === allHunks.length,
+    const reviewCoverage = buildReviewCoverage({
+      changedFiles,
       diffFileCount: allDiffFiles.length,
-      graphResolvedFileCount: changedFiles.length,
-      omittedGraphFileCount: omittedGraphFiles.length,
-      omittedGraphFiles: omittedGraphFiles.slice(0, 20),
-      omittedGraphFilesTruncated: omittedGraphFiles.length > 20,
       diffHunkCount: allHunks.length,
       reportedHunkCount: lineFocus.length,
-      omittedHunkCount: Math.max(0, allHunks.length - lineFocus.length),
-      batchingRequired: omittedGraphFiles.length > 0 || lineFocus.length < allHunks.length,
-    };
+      omittedGraphFiles,
+    });
     const reviewTargets = await this.patchReviewTargets(
       snapshotId,
       hunks,
@@ -2609,7 +2607,7 @@ export class V2QueryService {
       }
       : undefined;
     const requiredToolCalls = reviewToolCalls(changedFiles, lineFocus, findings, budget.maxRequiredToolCalls);
-    const answerable = changedFiles.length > 0 && reviewCoverage.complete;
+    const answerable = reviewAnswerable(changedFiles, reviewCoverage);
     const allowedFollowups = answerable
       ? []
       : changedFiles.length === 0
@@ -9138,7 +9136,6 @@ function isTestPatchFile(file: string): boolean {
 }
 
 type ReviewFocus = 'general' | 'bug-risk' | 'api-contract' | 'tests' | 'security';
-type ReviewOutputMode = 'compact' | 'balanced' | 'full';
 
 interface PatchLineChange {
   line: number;
@@ -9233,43 +9230,9 @@ interface PatchLineMapping {
   fileSliceLines?: string;
 }
 
-interface ReviewBudget {
-  outputMode: ReviewOutputMode;
-  maxFindings: number;
-  maxLineFocus: number;
-  maxReviewTargets: number;
-  maxRiskFlags: number;
-  maxTests: number;
-  maxEvidencePerFinding: number;
-  maxRequiredToolCalls: number;
-}
-
 function normalizeReviewFocus(value: string): ReviewFocus {
   if (value === 'bug-risk' || value === 'api-contract' || value === 'tests' || value === 'security') return value;
   return 'general';
-}
-
-function normalizeReviewOutputMode(value: string): ReviewOutputMode {
-  if (value === 'balanced' || value === 'full') return value;
-  return 'compact';
-}
-
-function reviewBudgetFor(outputMode: ReviewOutputMode, args: Record<string, unknown>, limit: number): ReviewBudget {
-  const defaults = outputMode === 'full'
-    ? { maxFindings: limit, maxLineFocus: limit, maxReviewTargets: Math.min(limit, 20), maxRiskFlags: limit, maxTests: Math.min(limit, 50), maxEvidencePerFinding: 12, maxRequiredToolCalls: 8 }
-    : outputMode === 'balanced'
-      ? { maxFindings: 10, maxLineFocus: 20, maxReviewTargets: 10, maxRiskFlags: 12, maxTests: 8, maxEvidencePerFinding: 5, maxRequiredToolCalls: 4 }
-      : { maxFindings: 6, maxLineFocus: 10, maxReviewTargets: 6, maxRiskFlags: 8, maxTests: 5, maxEvidencePerFinding: 3, maxRequiredToolCalls: 3 };
-  return {
-    outputMode,
-    maxFindings: clampInt(Number(args.maxFindings ?? defaults.maxFindings), 1, limit),
-    maxLineFocus: clampInt(Number(args.maxLineFocus ?? defaults.maxLineFocus), 1, limit),
-    maxReviewTargets: clampInt(defaults.maxReviewTargets, 1, limit),
-    maxRiskFlags: clampInt(defaults.maxRiskFlags, 1, limit),
-    maxTests: clampInt(defaults.maxTests, 0, limit),
-    maxEvidencePerFinding: clampInt(Number(args.maxEvidencePerFinding ?? defaults.maxEvidencePerFinding), 1, 20),
-    maxRequiredToolCalls: clampInt(Number(args.maxRequiredToolCalls ?? defaults.maxRequiredToolCalls), 1, 20),
-  };
 }
 
 function parsePatchHunks(diff: string): PatchHunk[] {
