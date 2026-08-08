@@ -50,7 +50,7 @@ describe('MCP full tool mode', () => {
   });
 
   it('keeps named MCP profiles on the facade surface to avoid duplicate low-level choices', () => {
-    const facadeTools = ['codegraph_context', 'codegraph_slice', 'codegraph_status'];
+    const facadeTools = ['codegraph_context', 'codegraph_slice', 'codegraph_checkpoint', 'codegraph_status'];
     expect([...mcpToolNamesForProfile('client')!]).toEqual(facadeTools);
     expect([...mcpToolNamesForProfile('minimal')!]).toEqual(facadeTools);
     expect([...mcpToolNamesForProfile('research')!]).toEqual(facadeTools);
@@ -106,6 +106,9 @@ describe('MCP full tool mode', () => {
       args: { task: 'Analyze PBI 123 acceptance criteria and related code' },
     });
 
+    expect(inferCodeGraphContextMode('Assess where to add a persistent phase checkpoint while preserving exact evidence.', {})).toBe('change');
+    expect(inferCodeGraphContextMode('Collect evidence with rubric coverage', {})).toBe('evidence');
+
     expect(routeCodeGraphContext({
       task: 'Explain the repository architecture',
     })).toMatchObject({
@@ -130,6 +133,10 @@ describe('MCP full tool mode', () => {
     expect(inferCodeGraphContextMode('Trace PATCH /checkout flow', {})).toBe('flow');
     expect(inferCodeGraphContextMode('Investigate this bug: GET /api/refunds returns duplicate refunds after timeout. Trace the request flow and propose the safest fix.', {})).toBe('change');
     expect(inferCodeGraphContextMode('Debug duplicate refund timeout', {})).toBe('change');
+    expect(inferCodeGraphContextMode(
+      'Investigate the impact of changing the Java field Note.deletedAt or its soft-delete semantics.',
+      {},
+    )).toBe('change');
     expect(inferCodeGraphContextMode('Collect evidence with rubric coverage', {})).toBe('evidence');
     expect(inferCodeGraphContextMode('Analyze PBI acceptance criteria against code', {})).toBe('evidence');
     expect(inferCodeGraphContextMode('Understand the architecture', {})).toBe('research');
@@ -207,6 +214,21 @@ describe('MCP full tool mode', () => {
     expect(parseToolArgs('codegraph_status', {})).toMatchObject({
       includeDiagnostics: false,
     });
+    expect(parseToolArgs('codegraph_context', {
+      task: 'Review this PR',
+      prUrl: 'https://github.com/acme/orders/pull/123',
+      baseRef: 'origin/main',
+      headRef: 'feature/orders',
+    })).toMatchObject({
+      prUrl: 'https://github.com/acme/orders/pull/123',
+      baseRef: 'origin/main',
+      headRef: 'feature/orders',
+    });
+    expect(parseToolArgs('codegraph_checkpoint', { action: 'list' })).toMatchObject({
+      action: 'list',
+      limit: 20,
+      apply: false,
+    });
   });
 
   it('compact descriptions preserve schema but reduce always-on text', () => {
@@ -272,10 +294,11 @@ describe('MCP full tool mode', () => {
 
   it('advertises a slim gate schema on client profiles and the full schema on full', () => {
     const client = buildV2ToolDefinitionsForProfile('client');
-    expect(client.map(tool => tool.name)).toEqual(['codegraph_context', 'codegraph_slice', 'codegraph_status']);
+    expect(client.map(tool => tool.name)).toEqual(['codegraph_context', 'codegraph_slice', 'codegraph_checkpoint', 'codegraph_status']);
     const gate = client.find(tool => tool.name === 'codegraph_context')!;
     const gateProperties = (gate.inputSchema as { properties: Record<string, unknown> }).properties;
-    expect(Object.keys(gateProperties)).toEqual(['task', 'mode', 'target', 'diff', 'sessionId']);
+    expect(Object.keys(gateProperties)).toEqual(['task', 'target', 'diff', 'prUrl', 'baseRef', 'headRef', 'sessionId', 'scopePlan', 'resumeTaskId']);
+    expect(gateProperties).not.toHaveProperty('mode');
     expect((gate.inputSchema as { required: string[] }).required).toEqual(['task']);
 
     const full = buildV2ToolDefinitionsForProfile('full');
@@ -287,5 +310,47 @@ describe('MCP full tool mode', () => {
       budgetTokens: 8000,
       includeSnippets: true,
     });
+  });
+
+  it('routes natural-language Java field changes through the change pack', () => {
+    expect(routeCodeGraphContext({
+      task: 'Investigate the impact of changing the Java field Note.deletedAt or its soft-delete semantics.',
+      target: 'Note.deletedAt',
+    })).toMatchObject({
+      toolName: 'get_change_pack',
+      args: {
+        target: 'Note.deletedAt',
+        changeType: 'investigate',
+        symbols: ['Note.deletedAt'],
+      },
+    });
+
+    expect(routeCodeGraphContext({
+      task: 'Investigate the impact of changing the Java field Note.deletedAt or its soft-delete semantics.',
+    })).toMatchObject({
+      toolName: 'get_change_pack',
+      args: {
+        changeType: 'investigate',
+        symbols: ['Note.deletedAt'],
+      },
+    });
+  });
+
+  it('tells agents to leave routing on auto unless the user explicitly overrides it', () => {
+    const clientGate = buildV2ToolDefinitionsForProfile('client')
+      .find(tool => tool.name === 'codegraph_context')!;
+    const clientProperties = (clientGate.inputSchema as {
+      properties: Record<string, { description?: string }>;
+    }).properties;
+    expect(clientProperties).not.toHaveProperty('mode');
+
+    const fullGate = buildV2ToolDefinitionsForProfile('full')
+      .find(tool => tool.name === 'codegraph_context')!;
+    const fullProperties = (fullGate.inputSchema as {
+      properties: Record<string, { description?: string }>;
+    }).properties;
+    expect(fullProperties.mode.description).toMatch(/omit.*unless the user explicitly/i);
+
+    expect(MCP_SERVER_INSTRUCTIONS).toMatch(/omit mode.*unless the user explicitly/i);
   });
 });

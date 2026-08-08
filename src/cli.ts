@@ -7,31 +7,18 @@ import { fileURLToPath } from 'node:url';
 import { openCodeGraphDb } from './v2/storage/database.js';
 import { V2Indexer, type IndexProgressEvent } from './v2/index/indexer.js';
 import { V2QueryService } from './v2/query/service.js';
-import { inspectCodeGraphRoute, runMcpProxy } from './v2/mcp/proxy.js';
 import { getWorkspacePaths } from './v2/paths.js';
-import { generateSyntheticJavaRepo } from './v2/benchmark/synthetic-java.js';
-import { runIndexBenchmark } from './v2/benchmark/run.js';
-import { loadGoldenEvalTasks, runGoldenEval } from './v2/benchmark/golden-eval.js';
-import { deriveContextProofTasks, loadContextProofTasks, runContextProofEval } from './v2/benchmark/context-proof.js';
-import { runLocalFallbackBenchmark } from './v2/benchmark/local-fallback.js';
-import { deriveReviewProofTasks, loadReviewProofTasks, runReviewProofEval } from './v2/benchmark/review-proof.js';
-import { runCodexE2eBenchmark, type CodexBenchmarkMode } from './v2/benchmark/codex-e2e.js';
-import { compareCodexE2eReports, formatCompetitiveComparisonMarkdown } from './v2/benchmark/competitive-compare.js';
-import { runRouteGateBenchmark } from './v2/benchmark/route-gate.js';
-import { runQualityTrend, appendQualityTrend } from './v2/benchmark/quality-trend.js';
-import { runEvidenceAudit } from './v2/benchmark/evidence-audit.js';
-import { runRecallBench } from './v2/benchmark/recall-bench.js';
-import { runTrustSignalProof } from './v2/benchmark/trust-signal-proof.js';
+import type { CodexBenchmarkMode } from './v2/benchmark/codex-e2e.js';
 import { findAffectedTests } from './v2/query/affected-tests.js';
 import { formatCiSelection, selectTestsForCi, type CiSelectionFormat } from './v2/query/ci-test-selection.js';
 import {
   ciReviewExitCode,
   formatCiReview,
-  reviewForCi,
   type CiReviewFailOn,
   type CiReviewFormat,
   type CiReviewPriority,
 } from './v2/query/ci-review.js';
+import { ReviewPullRequestUseCase } from './v2/application/review-use-case.js';
 import {
   applyGeneratedBlock,
   buildComponentStats,
@@ -43,11 +30,19 @@ import {
   normalizeOnboardProfile,
 } from './v2/query/onboard.js';
 import { buildAdoptionReport, formatAdoptionReportText } from './v2/query/adoption-report.js';
-import { runAffectedTestsEval } from './v2/benchmark/affected-tests-eval.js';
 import { buildGraphExport, renderGraphHtml, resolveCurrentGraphSnapshot } from './v2/graph/export.js';
 import { buildLocalArtifactIndex } from './v2/mcp/local-artifact.js';
 import { inspectWorkspaceReadiness } from './v2/workspace-health.js';
-import { main as tokenoptMain } from './tokenopt/cli.js';
+import { CheckpointStateStore } from './v2/checkpoint.js';
+
+/*
+ * Deliberately NOT imported at module scope: `./v2/mcp/proxy.js` (pulls the MCP
+ * SDK, ~1.75 s to evaluate) and `./tokenopt/cli.js` (pulls the TokenOpt MCP
+ * surface, ~0.8 s on top of it). Static imports are evaluated on every process
+ * start, so `codegraph index`, `review`, `onboard` and even `--help` were each
+ * paying ~2.5 s for code they never call — measured 4.5 s for `--help` against
+ * 88 ms for bare node. They are loaded inside the one command that needs them.
+ */
 
 interface ParsedArgs {
   command: string[];
@@ -59,7 +54,8 @@ async function main(): Promise<void> {
   const [command, subcommand] = parsed.command;
 
   switch (command) {
-    case 'mcp':
+    case 'mcp': {
+      const { runMcpProxy } = await import('./v2/mcp/proxy.js');
       await runMcpProxy({
         root: getFlag(parsed, 'root') ?? process.cwd(),
         prewarm: parsed.flags.get('no-prewarm') === true
@@ -81,6 +77,7 @@ async function main(): Promise<void> {
         mcpProfile: getFlag(parsed, 'mcp-profile') ?? process.env.CODEGRAPH_MCP_PROFILE,
       });
       return;
+    }
     case 'setup':
       await runSetupCommand(parsed);
       return;
@@ -106,7 +103,7 @@ async function main(): Promise<void> {
       await runLogsCommand(parsed);
       return;
     case 'route-inspect':
-      runRouteInspectCommand(parsed);
+      await runRouteInspectCommand(parsed);
       return;
     case 'affected-tests':
       await runAffectedTestsCommand(parsed);
@@ -119,6 +116,9 @@ async function main(): Promise<void> {
       return;
     case 'adoption-report':
       runAdoptionReportCommand(parsed);
+      return;
+    case 'checkpoint':
+      runCheckpointCommand(subcommand, parsed);
       return;
     case 'benchmark':
       await runBenchmarkCommand(subcommand, parsed);
@@ -137,18 +137,62 @@ async function main(): Promise<void> {
 
 /**
  * `codegraph gate <...>` delegates to the TokenOpt/ContextGate CLI surface
- * (install/hook/exec/instructions/report/doctor). The MCP gate tools are served
- * by the fused `codegraph mcp` server, so `gate mcp` is intentionally rejected.
+ * (init/exec/report/doctor). The MCP gate tools are served by the fused
+ * `codegraph mcp` server, so `gate mcp` is intentionally rejected.
+ *
+ * The reject happens BEFORE the dynamic import on purpose: the rejected path
+ * must not pay TokenOpt's module-evaluation cost just to print an error.
  */
 async function runGateCommand(args: string[]): Promise<void> {
   if (args[0] === 'mcp') {
     throw new Error('Use `codegraph mcp` — the fused server already exposes the TokenOpt/ContextGate gate tools. There is no separate gate MCP server.');
   }
+  const { main: tokenoptMain } = await import('./tokenopt/cli.js');
   const code = await tokenoptMain(args);
   if (code !== 0) process.exitCode = code;
 }
 
 async function runBenchmarkCommand(subcommand: string | undefined, parsed: ParsedArgs): Promise<void> {
+  // Loaded here, not at module scope. `route-gate.js` statically imports the MCP
+  // proxy (and through it the MCP SDK + TokenOpt), so leaving these at the top
+  // of the file cost ~2.8 s on EVERY codegraph command — it also silently
+  // defeated making the proxy import lazy above. Benchmarks are minutes long;
+  // one eager load of the whole benchmark set here is free by comparison.
+  const [
+    { generateSyntheticJavaRepo },
+    { runIndexBenchmark },
+    { loadGoldenEvalTasks, runGoldenEval },
+    { deriveContextProofTasks, loadContextProofTasks, runContextProofEval },
+    { runLocalFallbackBenchmark },
+    { deriveReviewProofTasks, loadReviewProofTasks, runReviewProofEval },
+    { runCodexE2eBenchmark },
+    { runClaudeE2eBenchmark },
+    { compareCodexE2eReports, formatCompetitiveComparisonMarkdown },
+    { runRouteGateBenchmark },
+    { runQualityTrend, appendQualityTrend },
+    { runEvidenceAudit },
+    { runRecallBench },
+    { runTrustSignalProof },
+    { runAffectedTestsEval },
+    { evaluateReleaseGate, formatReleaseGateMarkdown, loadReleaseGateInput },
+  ] = await Promise.all([
+    import('./v2/benchmark/synthetic-java.js'),
+    import('./v2/benchmark/run.js'),
+    import('./v2/benchmark/golden-eval.js'),
+    import('./v2/benchmark/context-proof.js'),
+    import('./v2/benchmark/local-fallback.js'),
+    import('./v2/benchmark/review-proof.js'),
+    import('./v2/benchmark/codex-e2e.js'),
+    import('./v2/benchmark/claude-e2e.js'),
+    import('./v2/benchmark/competitive-compare.js'),
+    import('./v2/benchmark/route-gate.js'),
+    import('./v2/benchmark/quality-trend.js'),
+    import('./v2/benchmark/evidence-audit.js'),
+    import('./v2/benchmark/recall-bench.js'),
+    import('./v2/benchmark/trust-signal-proof.js'),
+    import('./v2/benchmark/affected-tests-eval.js'),
+    import('./v2/benchmark/release-gate.js'),
+  ]);
   switch (subcommand) {
     case 'generate': {
       const root = getFlag(parsed, 'root') ?? './synthetic-java';
@@ -217,6 +261,13 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
     case 'route-gate':
       console.log(JSON.stringify(runRouteGateBenchmark(getFlag(parsed, 'suite') ?? getFlag(parsed, 'tasks')), null, 2));
       return;
+    case 'release-gate': {
+      const result = evaluateReleaseGate(loadReleaseGateInput(requiredFlag(parsed, 'report')));
+      if (getFlag(parsed, 'format') === 'markdown') console.log(formatReleaseGateMarkdown(result));
+      else console.log(JSON.stringify(result, null, 2));
+      if (!result.passed) process.exitCode = 1;
+      return;
+    }
     case 'quality-trend': {
       const root = getFlag(parsed, 'root') ?? process.cwd();
       const { db } = await openCodeGraphDb(root);
@@ -326,6 +377,29 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
         dryRun: parsed.flags.get('dry-run') === true,
       }), null, 2));
       return;
+    case 'claude-e2e':
+      console.log(JSON.stringify(await runClaudeE2eBenchmark({
+        suitePath: getFlag(parsed, 'suite') ?? getFlag(parsed, 'tasks'),
+        root: getFlag(parsed, 'root'),
+        workspaceKey: getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY,
+        runDir: getFlag(parsed, 'run-dir'),
+        models: splitCsv(getFlag(parsed, 'models')),
+        modes: splitCodexModes(getFlag(parsed, 'modes')),
+        taskIds: splitCsv(getFlag(parsed, 'task-ids') ?? getFlag(parsed, 'task')),
+        parseWorkers: getNumberFlag(parsed, 'parse-workers'),
+        claudeCommand: getFlag(parsed, 'claude-command'),
+        effort: claudeEffort(getFlag(parsed, 'claude-effort')),
+        mcpLoadMode: claudeMcpLoadMode(getFlag(parsed, 'claude-mcp-load')),
+        startupProfile: claudeStartupProfile(getFlag(parsed, 'claude-startup-profile')),
+        mcpServerName: getFlag(parsed, 'mcp-server-name'),
+        mcpCommand: getFlag(parsed, 'mcp-command'),
+        mcpCommandArgs: splitCsv(getFlag(parsed, 'mcp-command-args')),
+        timeoutSeconds: getNumberFlag(parsed, 'claude-timeout-seconds'),
+        skipIndex: parsed.flags.get('no-index') === true,
+        skipPreflight: parsed.flags.get('skip-preflight') === true,
+        dryRun: parsed.flags.get('dry-run') === true,
+      }), null, 2));
+      return;
     case 'trust-signal-proof': {
       const result = await runTrustSignalProof({
         repeats: getNumberFlag(parsed, 'repeats'),
@@ -351,7 +425,7 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
       }
       return;
     default:
-      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e|trust-signal-proof|competitive-compare');
+      throw new Error('Usage: codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|release-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e|claude-e2e|trust-signal-proof|competitive-compare');
   }
 }
 
@@ -582,52 +656,72 @@ function runAdoptionReportCommand(parsed: ParsedArgs): void {
 }
 
 /**
- * `codegraph review --base <ref>`: deterministic PR review over a git range.
+ * `codegraph review --base <ref>` or `codegraph review --pr <url>`:
+ * deterministic PR review over an immutable git range.
  * stdout carries the rendered report (json/sarif/markdown/text); the audit
  * summary goes to stderr so pipes stay clean, mirroring affected-tests.
  */
 async function runReviewCommand(parsed: ParsedArgs): Promise<void> {
-  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const sourceRoot = path.resolve(getFlag(parsed, 'root') ?? process.cwd());
+  const prUrl = getFlag(parsed, 'pr') ?? getFlag(parsed, 'pr-url');
   const baseRef = getFlag(parsed, 'base');
-  if (!baseRef) {
-    throw new Error('review requires --base <git ref> (e.g. --base origin/main).');
+  const headRef = getFlag(parsed, 'head') ?? 'HEAD';
+  const workspaceKey = getFlag(parsed, 'workspace-key') ?? process.env.CODEGRAPH_WORKSPACE_KEY;
+  let reviewInput: { kind: 'pull_request'; prUrl: string } | { kind: 'range'; baseRef: string; headRef: string };
+  if (prUrl) {
+    if (baseRef || getFlag(parsed, 'head')) {
+      throw new Error('Use either --pr <GitHub PR URL> or --base/--head, not both.');
+    }
+    reviewInput = { kind: 'pull_request', prUrl };
+  } else {
+    if (!baseRef) {
+      throw new Error('review requires --pr <GitHub PR URL> or --base <git ref> (e.g. --base origin/main).');
+    }
+    reviewInput = { kind: 'range', baseRef, headRef };
   }
   const format = normalizeCiReviewFormat(getFlag(parsed, 'format'));
   const failOn = normalizeCiReviewFailOn(getFlag(parsed, 'fail-on'));
   const minPriority = normalizeCiReviewPriority(getFlag(parsed, 'min-priority'), 'P2');
-  const { db } = await openCodeGraphDb(root);
-  try {
-    const index = await new V2Indexer(db).indexWorkspace({ root });
-    const service = new V2QueryService(db);
-    const result = await reviewForCi(service, index.workspaceId, root, {
-      baseRef,
-      headRef: getFlag(parsed, 'head'),
-      focus: getFlag(parsed, 'focus'),
-      limit: getNumberFlag(parsed, 'limit'),
-      minPriority,
-    });
-    const output = formatCiReview(result, format, cliPackageVersion());
-    const outPath = getFlag(parsed, 'out');
-    if (outPath) {
-      fs.writeFileSync(path.resolve(root, outPath), `${output}\n`);
-    } else {
-      console.log(output);
-    }
-    console.error(JSON.stringify({
-      baseRef: result.baseRef,
-      headRef: result.headRef,
-      changedFiles: result.changedFiles.length,
-      reviewStatus: result.reviewStatus,
-      findings: result.findings.length,
-      priorityCounts: result.priorityCounts,
-      droppedBelowMinPriority: result.droppedBelowMinPriority,
-      ...(outPath ? { wrote: outPath, format } : {}),
-    }, null, 2));
-    const exitCode = ciReviewExitCode(result, failOn);
-    if (exitCode !== 0) process.exitCode = exitCode;
-  } finally {
-    await db.close();
+  const execution = await new ReviewPullRequestUseCase().execute({
+    sourceRoot,
+    input: reviewInput,
+    workspaceKey,
+    isolateRangeWorkspace: false,
+    requireCurrentHead: true,
+    focus: getFlag(parsed, 'focus'),
+    limit: getNumberFlag(parsed, 'limit'),
+    batchSize: getNumberFlag(parsed, 'batch-size'),
+    maxHunksPerBatch: getNumberFlag(parsed, 'max-hunks-per-batch'),
+    minPriority,
+  });
+  const result = execution.review;
+  const output = formatCiReview(result, format, cliPackageVersion());
+  const outPath = getFlag(parsed, 'out');
+  if (outPath) {
+    fs.writeFileSync(path.resolve(sourceRoot, outPath), `${output}\n`);
+  } else {
+    console.log(output);
   }
+  console.error(JSON.stringify({
+    baseRef: result.baseRef,
+    headRef: result.headRef,
+    changedFiles: result.changedFiles.length,
+    reviewStatus: result.reviewStatus,
+    findings: result.findings.length,
+    priorityCounts: result.priorityCounts,
+    coverage: result.coverage,
+    batchFailures: result.batchFailures,
+    droppedBelowMinPriority: result.droppedBelowMinPriority,
+    ...(execution.preparedPullRequest ? {
+      prUrl: execution.preparedPullRequest.url,
+      baseSha: execution.preparedPullRequest.baseSha,
+      headSha: execution.preparedPullRequest.headSha,
+      reviewRoot: execution.preparedPullRequest.root,
+    } : {}),
+    ...(outPath ? { wrote: outPath, format } : {}),
+  }, null, 2));
+  const exitCode = ciReviewExitCode(result, failOn);
+  if (exitCode !== 0) process.exitCode = exitCode;
 }
 
 function normalizeCiReviewFormat(value: string | undefined): CiReviewFormat {
@@ -2346,9 +2440,10 @@ function matchesLogEvent(entryEvent: string | undefined, eventFilter: string | u
   return entryEvent === eventFilter || entryEvent.startsWith(`${eventFilter}.`);
 }
 
-function runRouteInspectCommand(parsed: ParsedArgs): void {
+async function runRouteInspectCommand(parsed: ParsedArgs): Promise<void> {
   const task = getFlag(parsed, 'task') ?? getFlag(parsed, 'target');
   if (!task) throw new Error('Usage: codegraph route-inspect --task "<task text>"');
+  const { inspectCodeGraphRoute } = await import('./v2/mcp/proxy.js');
   console.log(JSON.stringify(inspectCodeGraphRoute({
     task,
     target: getFlag(parsed, 'target'),
@@ -2359,6 +2454,32 @@ function runRouteInspectCommand(parsed: ParsedArgs): void {
     budgetTokens: getNumberFlag(parsed, 'budget-tokens'),
     profile: getFlag(parsed, 'profile'),
   }), null, 2));
+}
+
+function runCheckpointCommand(subcommand: string | undefined, parsed: ParsedArgs): void {
+  const root = getFlag(parsed, 'root') ?? process.cwd();
+  const store = new CheckpointStateStore(root);
+  try {
+    if (subcommand === 'list') {
+      console.log(JSON.stringify({ checkpoints: store.list(getNumberFlag(parsed, 'limit') ?? 20) }, null, 2));
+      return;
+    }
+    if (subcommand === 'show') {
+      const taskId = getFlag(parsed, 'task-id') ?? getFlag(parsed, 'task');
+      if (!taskId) throw new Error('Usage: codegraph checkpoint show --task-id <uuid>');
+      console.log(JSON.stringify(store.load(taskId, getNumberFlag(parsed, 'version')), null, 2));
+      return;
+    }
+    if (subcommand === 'prune') {
+      const before = getFlag(parsed, 'before');
+      if (!before || !Number.isFinite(Date.parse(before))) throw new Error('Usage: codegraph checkpoint prune --before <ISO timestamp> [--apply]');
+      console.log(JSON.stringify(store.pruneCompleted(before, parsed.flags.get('apply') === true), null, 2));
+      return;
+    }
+    throw new Error('Usage: codegraph checkpoint list|show|prune');
+  } finally {
+    store.close();
+  }
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -2419,16 +2540,36 @@ function splitCodexModes(value: string | undefined): CodexBenchmarkMode[] | unde
     'natural-tool-use',
     'mcp-first',
     'mcp-only',
+    'mcp-scope',
+    'mcp-phase-resume',
     'compiled-packet',
     'compiled-packet+gate',
     'oracle-packet',
   ]);
   for (const part of parts) {
     if (!allowed.has(part as CodexBenchmarkMode)) {
-      throw new Error(`Unknown Codex benchmark mode: ${part}. Use baseline,terse-no-mcp,natural-tool-use,mcp-first,mcp-only,compiled-packet,compiled-packet+gate,oracle-packet.`);
+      throw new Error(`Unknown Codex benchmark mode: ${part}. Use baseline,terse-no-mcp,natural-tool-use,mcp-first,mcp-only,mcp-scope,mcp-phase-resume,compiled-packet,compiled-packet+gate,oracle-packet.`);
     }
   }
   return parts as CodexBenchmarkMode[];
+}
+
+function claudeEffort(value: string | undefined): 'low' | 'medium' | 'high' | 'max' | undefined {
+  if (!value) return undefined;
+  if (value === 'low' || value === 'medium' || value === 'high' || value === 'max') return value;
+  throw new Error(`Unknown Claude effort: ${value}. Use low, medium, high, or max.`);
+}
+
+function claudeMcpLoadMode(value: string | undefined): 'eager' | 'lazy' | undefined {
+  if (!value) return undefined;
+  if (value === 'eager' || value === 'lazy') return value;
+  throw new Error(`Unknown Claude MCP load mode: ${value}. Use eager or lazy.`);
+}
+
+function claudeStartupProfile(value: string | undefined): 'standard' | 'lean' | undefined {
+  if (!value) return undefined;
+  if (value === 'standard' || value === 'lean') return value;
+  throw new Error(`Unknown Claude startup profile: ${value}. Use standard or lean.`);
 }
 
 function indexProvidersFlag(args: ParsedArgs): string | undefined {
@@ -2466,14 +2607,15 @@ Usage:
                                          Print recent workspace query events or an aggregate summary
   codegraph affected-tests --root <workspace> --base <ref> [--format json|list|maven|gradle]
                                          Select the tests a git range can affect (ALL = safety fallback)
-  codegraph review --root <workspace> --base <ref> [--format json|sarif|markdown|text] [--min-priority P0|P1|P2] [--fail-on P0|P1|P2|none] [--out <path>]
-                                         Deterministic PR review: graph-fact findings for CI (SARIF/comment)
+  codegraph review --root <workspace> (--pr <GitHub PR URL> | --base <ref> [--head <ref>]) [--format json|sarif|markdown|text] [--min-priority P0|P1|P2] [--fail-on P0|P1|P2|none] [--out <path>]
+                                         Deterministic, batched PR review over an immutable head worktree
   codegraph onboard --root <workspace> [--profile architecture|claude|copilot|both] [--dry-run]
                                          Generate ARCHITECTURE.md/CLAUDE.md/.github/copilot-instructions.md from index facts (marker-based regeneration)
   codegraph adoption-report --root <workspace> [--since <ISO>] [--until <ISO>] [--format json|text]
                                          Aggregate the MCP call ledger (.codegraph/logs/query.jsonl) into adoption numbers
+  codegraph checkpoint list|show|prune --root <workspace>  Inspect or safely prune repo-local task checkpoints
   codegraph route-inspect --task <text>  Explain codegraph_context routing and stop/follow-up gate policy
-  codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|copilot-e2e|codex-e2e|competitive-compare
+  codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|release-gate|copilot-e2e|codex-e2e|claude-e2e|competitive-compare
                                              Generate synthetic repos, measure indexing, run evals, or prove context/review savings
 
 Options:
@@ -2481,6 +2623,7 @@ Options:
   --tasks <path>                         Golden eval task JSON file
   --tasks auto                           Derive proof/review tasks from indexed-looking source files
   --suite <path>                         Route-gate or E2E suite JSON file
+  --report <path>                        A-D release benchmark matrix JSON for benchmark release-gate
   --task <text|id>                       Route-inspect task text or benchmark task id
   --task-count <number>                  Number of auto-derived proof/review tasks
   --no-index                             Reuse the current proof/review/graph snapshot instead of refreshing first
@@ -2504,6 +2647,9 @@ Options:
   --no-incremental                       Force changed-file index runs through full snapshot rebuild
   --incremental-file-limit <number>      Max changed/deleted files for incremental index path
   --workspace-key <key>                  Stable workspace identity key, useful when Docker always mounts roots at /workspace
+  --pr <GitHub PR URL>                   Resolve immutable base/head SHAs and use a managed isolated worktree
+  --batch-size <number>                  Maximum changed files per review batch (default 50, max 50)
+  --max-hunks-per-batch <number>         Maximum diff hunks targeted per review batch (default 200)
   --quiet                                Suppress index progress logs on stderr
   --auto-refresh                         Refresh stale snapshots automatically before MCP tool calls
   --refresh-on-start                     Queue a workspace refresh when MCP starts, without blocking startup
@@ -2541,26 +2687,33 @@ Options:
   --prewarm                             Index missing snapshots inside MCP startup/runtime. Off by default; prefer explicit index/setup.
   --mcp-profile <client|minimal|research|change|review|full>
                                              Tool surface for MCP. Default/client exposes facade tools; full exposes every tool.
+  CODEGRAPH_RELEVANCE_GATE=off|shadow|enforce  Scope relevance gate mode (default shadow; enforce only after release gates pass)
   --models <a,b,c>                       Copilot E2E model list for benchmark copilot-e2e
   --modes <codegraph,baseline,organic>   Copilot E2E comparison modes (organic = MCP available, neutral prompt; adoption measurement)
-  --modes <baseline,terse-no-mcp,natural-tool-use,mcp-first,mcp-only,compiled-packet,compiled-packet+gate,oracle-packet>
+  --modes <baseline,terse-no-mcp,natural-tool-use,mcp-first,mcp-only,mcp-scope,mcp-phase-resume,compiled-packet,compiled-packet+gate,oracle-packet>
                                              Codex E2E comparison modes
-  --task-ids <a,b,c>                     Copilot/Codex E2E task ids
+  --task-ids <a,b,c>                     Copilot/Codex/Claude E2E task ids
   --run-dir <path>                       Output directory for E2E benchmark artifacts
   --codex-command <path>                 Codex CLI executable for benchmark codex-e2e
   --codex-command-args <a,b>             Args before "exec", e.g. "-y,@openai/codex" for npx.cmd
+  --claude-command <path>                Claude CLI executable for benchmark claude-e2e
+  --claude-effort <low|medium|high|max>  Claude reasoning effort (default low)
+  --claude-mcp-load <eager|lazy>         Eagerly inject MCP schemas or defer them to ToolSearch
+  --claude-startup-profile <standard|lean>
+                                             Lean disables unrelated built-ins, skills, persistence, and prompt suggestions
   --use-user-config                      Keep Codex user config enabled for wrapper/proxy provider tests
-  --mcp-server-name <name>               MCP server name exposed to Codex E2E prompts (default codegraph_bench)
-  --mcp-command <path>                   MCP server command for benchmark codex-e2e competitor arms
-  --mcp-command-args <a,b>               MCP server args for benchmark codex-e2e competitor arms
+  --mcp-server-name <name>               MCP server name exposed to agent E2E prompts (default codegraph_bench)
+  --mcp-command <path>                   MCP server command for Codex/Claude benchmark arms
+  --mcp-command-args <a,b>               MCP server args for Codex/Claude benchmark arms
   --ours <report.json>                   This project report for benchmark competitive-compare
   --theirs <report.json>                 Competitor report for benchmark competitive-compare
   --ours-label <name>                    Label for this project in competitive comparison output
   --theirs-label <name>                  Label for competitor in competitive comparison output
   --format <json|markdown>               Output format for benchmark competitive-compare
   --codex-timeout-seconds <number>       Timeout per Codex task run
-  --dry-run                              Print benchmark plan without running Copilot/Codex
-  --skip-preflight                       Skip Codex E2E SQLite preflight for external MCP server arms
+  --claude-timeout-seconds <number>      Timeout per Claude task run
+  --dry-run                              Print benchmark plan without running Copilot/Codex/Claude
+  --skip-preflight                       Skip Codex/Claude E2E SQLite preflight for external MCP server arms
 `);
 }
 
@@ -2622,5 +2775,9 @@ function shorten(value: string, maxLength: number): string {
 
 main().catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
+  // Review input/worktree/index failures are distinct from a completed review
+  // that found a threshold violation (1) or incomplete coverage (2). Keep the
+  // classification stable for CI consumers while preserving exit 1 for other
+  // CLI commands and unexpected command errors.
+  process.exitCode = process.argv[2] === 'review' ? 3 : 1;
 });

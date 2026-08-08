@@ -212,7 +212,11 @@ export function verifyBudgetForEndpoints(
  * already has its own verification contract (missingFacts/allowedFollowups/
  * stopRule) and a second, competing trust signal would only add confusion.
  */
-export function trustPostureFor(sufficientForAnswer: boolean, verifyBudgetLength: number): TrustPosture | undefined {
+export function trustPostureFor(
+  sufficientForAnswer: boolean,
+  verifyBudgetLength: number,
+  retrievalWeak = false,
+): TrustPosture | undefined {
   if (!sufficientForAnswer) return undefined;
-  return verifyBudgetLength > 0 ? 'spot_check_recommended' : 'act_directly';
+  return verifyBudgetLength > 0 || retrievalWeak ? 'spot_check_recommended' : 'act_directly';
 }

@@ -1278,7 +1278,7 @@ export class TreeSitterAnalyzer implements CodeAnalyzer {
           const val = child.childForFieldName('value');
           const resolved = val ? this.evaluateJavaStringExpression(val, this.javaStringConstants) : undefined;
           if (resolved !== undefined) return resolved;
-          if (val?.type === 'array_initializer') {
+          if (val?.type === 'array_initializer' || val?.type === 'element_value_array_initializer') {
             for (const item of val.namedChildren) {
               const arrayValue = this.evaluateJavaStringExpression(item, this.javaStringConstants);
               if (arrayValue !== undefined) return arrayValue;

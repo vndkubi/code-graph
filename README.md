@@ -27,17 +27,18 @@ The default surface is deliberately **single-gate**: one entry point instead of 
 
 | Surface | Tools | Role |
 | --- | --- | --- |
-| **CodeGraph gate** (default `client` profile) | `codegraph_context`, `codegraph_slice`, `codegraph_status` | `codegraph_context` is THE entry point — it classifies the task and routes to the right pack (research/flow/change/review/evidence) internally, TokenOpt evidence flow included |
+| **CodeGraph gate** (default `client` profile) | `codegraph_context`, `codegraph_slice`, `codegraph_checkpoint`, `codegraph_status` | `codegraph_context` is THE entry point — it classifies the task, requests a Luna scope plan when ambiguous, and routes to the right bounded pack. `codegraph_checkpoint` persists explicit multi-phase task state. |
 | **Direct packs + TokenOpt gate** (`full` profile) | `get_research_pack`, `get_change_pack`, `review_patch`, `contextgate_get_context`, `tokenopt_*`, … | Benchmark/power-user flows |
 
 The flow for broad tasks:
 
 1. Call `codegraph_context` with the user's task verbatim (same `sessionId` on every call of a conversation).
-2. If `answerable=true`, answer from the packet. If the packet names an exact missing file/line/symbol, fetch just that with `codegraph_slice`.
+2. For PR review, pass `prUrl` or `baseRef` + `headRef` when available; a GitHub PR URL or `from <base> to <head>` phrase in the task is parsed into an immutable, batched review.
+3. If `answerable=true`, answer from the packet. If the packet names an exact missing file/line/symbol, fetch just that with `codegraph_slice`.
 
 For exact file/symbol tasks where the owner is already known, skip the gate and read directly.
 
-**Tool exposure** is controlled by `--mcp-profile` (default `client` → the 3 gate tools; `full` → every tool on both surfaces). The embedded TokenOpt gate tools are hidden outside `full`; `TOKENOPT_MCP_MODE=lite|full|broker` restores them on any profile, `off` hides them even on `full`.
+**Tool exposure** is controlled by `--mcp-profile` (default `client` → the 4 facade tools; `full` → every tool on both surfaces). The embedded TokenOpt gate tools are hidden outside `full`; `TOKENOPT_MCP_MODE=lite|full|broker` restores them on any profile, `off` hides them even on `full`. `CODEGRAPH_RELEVANCE_GATE` defaults to `shadow`; set `enforce` only after the release benchmark gates pass, or `off` for an explicit opt-out.
 
 **CLI:** the TokenOpt gate surface (init, exec, report, doctor) lives under `codegraph gate <…>` (e.g. `codegraph gate doctor`). The legacy `tokenopt` binary alias maps to the same commands.
 
@@ -84,7 +85,7 @@ Add `.codegraph/` to `.gitignore`; it is local generated state.
 
 ## Current Local Benchmark
 
-Run on this repository after the right-sizing + ranking pass (relevance-cliff trimming with an outlier guard and a `minKeep` floor, keepRatio=0.5 default; stem-aware file ranking; `__tests__/` role classification). These are self-repo deterministic proof harnesses, not external multi-repo claims:
+Run on this repository after the right-sizing + ranking pass (relevance-cliff trimming with an outlier guard and a `minKeep` floor, keepRatio=0.5 default; stem-aware file ranking; `__tests__/` role classification). These are self-repo deterministic proof harnesses, not external multi-repo claims or a production savings guarantee. Token and round-trip cost varies by repository/task; release decisions require the current benchmark gates to pass:
 
 | Benchmark | Result |
 | --- | ---: |
@@ -99,6 +100,12 @@ Run on this repository after the right-sizing + ranking pass (relevance-cliff tr
 | Test-impact selection (`benchmark affected-tests`) | Every directly-coupled test recovered (recall 1.0, worst 1.0) while cutting the suite ~76–79% on average (internal 41 tests → ~8.7 selected; external 86 → ~21.4). Reverse local-import reachability; `affected-tests --changed <files>` for a real diff. |
 
 Token counts use the shared `cl100k_base/js-tiktoken` text estimator. Actual model billing can differ because tools, files, cached input, and model runtime accounting are provider-specific.
+
+For the production decision, collect the host-driven A–D matrix and run
+`codegraph benchmark release-gate --report <matrix.json>`. The evaluator fails
+closed and recommends `shadow` until recall, stale-claim, token, latency,
+schema, and index/query regression thresholds all pass; synthetic 10,000-file
+indexing demonstrates scale only, not semantic quality.
 
 ## CLI Reference
 
@@ -118,7 +125,7 @@ codegraph affected-tests --root <workspace> --changed <file[,file...]> [--max-de
 codegraph status --root <workspace>    Human-readable status report with optional machine-readable --json
 codegraph logs --root <workspace> --tail <number> [--summary|--all|--since|--until|--tool|--event|--invalid]
                                       Print recent workspace query events or a compact aggregate summary
-codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e
+codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|release-gate|quality-trend|evidence-audit|recall|affected-tests|copilot-e2e|codex-e2e|claude-e2e
                                       Generate repos, measure indexing, or prove retrieval savings
                                       (quality-trend [--out <report.md>] appends a dated correctness/
                                       token-saving row so ranking/resolver regressions surface over time;
@@ -141,6 +148,11 @@ You can define required context by:
 - `task.expectedFiles` / `task.expectedMethods`: expected evidence from task-level prompts.
 
 If both file and method contracts are missing (at both root and task level), a warning is emitted (`missing_compatibility_contract`) instead of a hard block.
+
+Claude cold-start experiments can compare `--claude-mcp-load eager|lazy` and
+`--claude-startup-profile standard|lean`. `lean` is intended for repeatable
+headless benchmarks; it deliberately removes unrelated startup surfaces and
+auto-memory, so do not use it as a substitute for realistic interactive runs.
 
 ```json
 {

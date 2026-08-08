@@ -136,10 +136,12 @@ function normalizeStatusPath(value: string): string {
 }
 
 function filteredGitStatus(root: string, preserveUndefined = false): string | undefined {
-  const status = git(root, ['status', '--porcelain=v1', '--untracked-files=normal']);
+  // gitRaw, not git: see gitRaw's note on the fixed-column porcelain format.
+  const status = gitRaw(root, ['status', '--porcelain=v1', '--untracked-files=normal']);
   if (status === undefined) return preserveUndefined ? undefined : '';
   const filtered = status
     .split(/\r?\n/)
+    .map(line => line.trimEnd())
     .filter(line => {
       if (line.length < 4) return Boolean(line.trim());
       return !isCodeGraphArtifactPath(normalizeStatusPath(line.slice(3)));
@@ -153,13 +155,26 @@ function isCodeGraphArtifactPath(file: string): boolean {
 }
 
 function git(cwd: string, args: string[]): string | undefined {
+  return gitRaw(cwd, args)?.trim();
+}
+
+/**
+ * Untrimmed git output. `--porcelain=v1` encodes status in fixed columns
+ * `XY<space>path`, and X is blank for worktree-only changes (` M file`). A
+ * full .trim() therefore ate the leading space of the FIRST status line only,
+ * shifting its path by one character ("backend/..." -> "ackend/..."). That
+ * corrupted path then reached the agent in the stale banner and defeated any
+ * consumer matching dirty paths against indexed paths. Column-based parsers
+ * must read raw output and trim per line instead.
+ */
+function gitRaw(cwd: string, args: string[]): string | undefined {
   try {
     return execFileSync('git', args, {
       cwd,
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: GIT_COMMAND_TIMEOUT_MS,
-    }).trim();
+    });
   } catch {
     return undefined;
   }

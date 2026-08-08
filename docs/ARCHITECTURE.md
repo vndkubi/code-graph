@@ -16,7 +16,7 @@ same stdio connection:
 
 | Surface | Representative tools | Role |
 | --- | --- | --- |
-| **CodeGraph gate** (default `client` profile) | `codegraph_context`, `codegraph_slice`, `codegraph_status` | PRIMARY entry point. `codegraph_context` classifies the task, routes to the right pack, and folds TokenOpt-style evidence into one bounded packet. |
+| **CodeGraph gate** (default `client` profile) | `codegraph_context`, `codegraph_slice`, `codegraph_checkpoint`, `codegraph_status` | PRIMARY entry point. `codegraph_context` classifies the task, requests an explicit Luna scope plan for ambiguous work, and returns one bounded evidence packet. Checkpoints are repo-local and versioned. |
 | **ContextGate/TokenOpt gate** (`full` profile or `TOKENOPT_MCP_MODE`) | `contextgate_get_context`, `tokenopt_compile_evidence`, `tokenopt_search`, `tokenopt_read_file` | Direct evidence-router surface for benchmark/power-user flows. Hidden by default so exactly one tool claims the first call. |
 
 The gate enriches its own packets by calling the CodeGraph query engine
@@ -55,11 +55,22 @@ src/
   cli.ts                 Unified CLI entrypoint (codegraph + `gate` delegation)
   v2/
     mcp/proxy.ts         The single fused MCP server (both surfaces)
+    query/handler-registry.ts  Snapshot-scoped tool handler dispatch
     query/service.ts     V2QueryService — all graph, pack, search, review tools
+    query/review-manifest.ts  Source-free per-file/hunk review state machine
+    application/review-use-case.ts  Shared immutable CLI/MCP review pipeline
     storage/             SQLite backend + schema
+    infrastructure/process-runner.ts  Async bounded child-process boundary with chunk streaming
+    infrastructure/git-client.ts  Bounded async Git adapter
+    infrastructure/github-pull-request-client.ts  Immutable GitHub PR metadata adapter
+    infrastructure/review-workspace-provider.ts  Detached worktree/head safety adapter
     index/indexer.ts     Manifest scan, tree-sitter parse, snapshot writes
     benchmark/           Deterministic proof/eval/e2e harnesses
   tokenopt/              Vendored TokenOpt source (compiles to dist/tokenopt/*)
+
+Review adapters (CLI and MCP) resolve transport input, then call
+`ReviewPullRequestUseCase`; immutable source preparation, indexing, batching,
+coverage and finding aggregation stay in that shared application pipeline.
     mcp.ts               TOKENOPT_TOOL_DEFINITIONS + dispatchTokenoptTool
     cli.ts               TokenOpt CLI surface, reached via `codegraph gate <…>`
     codegraph-bridge.ts  parseCodeGraphResult (reused by the in-process provider)
@@ -142,8 +153,9 @@ Core tables:
    `dispatchTokenoptTool` **before** the CodeGraph profile gate; the gate's
    in-process `codeGraphProvider` calls `V2QueryService` to fold in `code_graph`
    evidence.
-3. Otherwise the request goes to `V2QueryService`, which runs bounded SQL and
-   reads bounded source slices.
+3. Otherwise the request goes to `V2QueryService`, whose
+   `QueryHandlerRegistry` dispatches the tool against one resolved snapshot;
+   handlers run bounded SQL and read bounded source slices.
 4. The server optionally checks freshness and refreshes inline when configured.
 5. Telemetry and compact result summaries are logged to
    `.codegraph/logs/query.jsonl` for tool calls that pass through MCP.

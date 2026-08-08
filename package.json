@@ -8,6 +8,7 @@
     "dist/",
     "docs/ARCHITECTURE.md",
     "docs/MIGRATION.md",
+    "docs/pr-review.md",
     "docs/mcp-setup-and-usage.md",
     "docs/cli.md",
     "examples/",
@@ -22,7 +23,8 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc",
-    "ci": "npm run lint && npm run build && npm test && npm run quality-gate",
+    "ci": "npm run lint && npm run build && npm test && npm run architecture-gate && npm run quality-gate",
+    "architecture-gate": "node scripts/architecture-gate.mjs",
     "prepack": "npm run build",
     "prepare": "npm run build",
     "start": "node dist/cli.js",
@@ -32,7 +34,7 @@
     "test": "vitest run --maxWorkers=1 && npm run test:tokenopt",
     "test:tokenopt": "npm run build && node --test \"test/tokenopt/**/*.test.mjs\" \"test/fusion/**/*.test.mjs\"",
     "test:local": "node .githooks/run-verification.js",
-    "verify": "npm run lint && npm run build && npm test && npm run quality-gate",
+    "verify": "npm run lint && npm run build && npm test && npm run architecture-gate && npm run quality-gate",
     "verify:local": "node .githooks/run-verification.js",
     "test:watch": "vitest",
     "lint": "tsc --noEmit"

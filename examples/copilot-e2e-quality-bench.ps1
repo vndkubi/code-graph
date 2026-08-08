@@ -276,13 +276,21 @@ function Get-CopilotShutdownUsage([string]$SessionId) {
   if (-not $shutdown) {
     return [pscustomobject]@{ found = $false; reason = 'missing-session-shutdown' }
   }
-  $metric = $shutdown.data.modelMetrics.PSObject.Properties | Select-Object -First 1
+  $modelMetrics = $shutdown.data.modelMetrics
+  if ($null -eq $modelMetrics) {
+    return [pscustomobject]@{ found = $false; reason = 'missing-model-usage' }
+  }
+  $metric = $modelMetrics.PSObject.Properties | Select-Object -First 1
+  if ($null -eq $metric -or $null -eq $metric.Value -or $null -eq $metric.Value.usage) {
+    return [pscustomobject]@{ found = $false; reason = 'missing-model-usage' }
+  }
   $usage = $metric.Value.usage
   $premiumRequests = if ($null -ne $shutdown.data.totalPremiumRequests) { [double]$shutdown.data.totalPremiumRequests } else { 0 }
   $inputTokens = if ($null -ne $usage.inputTokens) { [int]$usage.inputTokens } else { 0 }
   $cachedInputTokens = if ($null -ne $usage.cacheReadTokens) { [int]$usage.cacheReadTokens } else { 0 }
   $outputTokens = if ($null -ne $usage.outputTokens) { [int]$usage.outputTokens } else { 0 }
   $reasoningTokens = if ($null -ne $usage.reasoningTokens) { [int]$usage.reasoningTokens } else { 0 }
+  $freshTokens = $inputTokens - $cachedInputTokens + $outputTokens + $reasoningTokens
   return [pscustomobject]@{
     found = $true
     modelKey = $metric.Name
@@ -291,7 +299,8 @@ function Get-CopilotShutdownUsage([string]$SessionId) {
     cachedInputTokens = $cachedInputTokens
     outputTokens = $outputTokens
     reasoningTokens = $reasoningTokens
-    totalTokens = $inputTokens + $outputTokens
+    totalTokens = $inputTokens + $outputTokens + $reasoningTokens
+    freshTokens = $freshTokens
     totalApiDurationMs = if ($null -ne $shutdown.data.totalApiDurationMs) { [int]$shutdown.data.totalApiDurationMs } else { 0 }
     currentTokens = if ($null -ne $shutdown.data.currentTokens) { [int]$shutdown.data.currentTokens } else { 0 }
     systemTokens = if ($null -ne $shutdown.data.systemTokens) { [int]$shutdown.data.systemTokens } else { 0 }
@@ -835,7 +844,7 @@ foreach ($model in $modelsToRun) {
           outputTokens = if ($usage.found) { $usage.outputTokens } else { $null }
           reasoningTokens = if ($usage.found) { $usage.reasoningTokens } else { $null }
           totalTokens = if ($usage.found) { $usage.totalTokens } else { $null }
-          nonCachedTokens = if ($usage.found) { ($usage.inputTokens - $usage.cachedInputTokens + $usage.outputTokens) } else { $null }
+          nonCachedTokens = if ($usage.found) { $usage.freshTokens } else { $null }
           systemTokens = if ($usage.found) { $usage.systemTokens } else { $null }
           conversationTokens = if ($usage.found) { $usage.conversationTokens } else { $null }
           toolDefinitionsTokens = if ($usage.found) { $usage.toolDefinitionsTokens } else { $null }

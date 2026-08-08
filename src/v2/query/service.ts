@@ -130,9 +130,26 @@ import {
   isDockerConfigLike,
   rightSizeCandidates,
 } from './ranking.js';
+import {
+  detectConcepts,
+  conceptLikeTerms,
+  conceptAnnotationTerms,
+  conceptRoles,
+  scoreConceptMatch,
+  type ConceptRule,
+} from './concepts.js';
 import { scanManifest } from '../index/manifest.js';
 import { getGitDirtyFiles, getGitFreshnessInfo } from '../git.js';
 import { architectureContextForFiles, dependencyTraceDiagnostics } from '../graph/overlay.js';
+import { QueryHandlerRegistry } from './handler-registry.js';
+import {
+  buildReviewCoverage,
+  normalizeReviewOutputMode,
+  reviewAnswerable,
+  reviewBudgetFor,
+  type ReviewBudget,
+  type ReviewOutputMode,
+} from './review-policy.js';
 
 export interface QueryEnvelope {
   workspaceId: string;
@@ -142,6 +159,7 @@ export interface QueryEnvelope {
 
 export class V2QueryService {
   private readonly indexer: V2Indexer;
+  private readonly handlers: QueryHandlerRegistry;
   private readonly inFlightBatchSliceKeys = new Map<string, number>();
   private readonly inFlightRefreshes = new Map<string, Promise<string>>();
   private readonly freshnessCache = new Map<string, { expiresAt: number; value: Record<string, unknown> | undefined }>();
@@ -158,6 +176,36 @@ export class V2QueryService {
 
   constructor(private readonly db: CodeGraphDb) {
     this.indexer = new V2Indexer(db);
+    this.handlers = new QueryHandlerRegistry([
+      ['search_symbol', (snapshotId, args) => this.searchSymbol(snapshotId, args)],
+      ['search_files', (snapshotId, args) => this.searchFiles(snapshotId, args)],
+      ['find_references', (snapshotId, args) => this.findReferences(snapshotId, args)],
+      ['get_file_summary', (snapshotId, args) => this.getFileSummary(snapshotId, args)],
+      ['get_file_slice', (snapshotId, args) => this.getFileSlice(snapshotId, args)],
+      ['get_dependencies', (snapshotId, args) => this.getDependencies(snapshotId, args)],
+      ['get_dependents', (snapshotId, args) => this.getDependents(snapshotId, args)],
+      ['get_callers', (snapshotId, args) => this.getCallers(snapshotId, args)],
+      ['get_callees', (snapshotId, args) => this.getCallees(snapshotId, args)],
+      ['find_endpoints', (snapshotId, args) => this.findEndpoints(snapshotId, args)],
+      ['get_impact_radius', (snapshotId, args) => this.getImpactRadius(snapshotId, args)],
+      ['trace_dependencies', (snapshotId, args) => this.traceDependencies(snapshotId, args)],
+      ['explain_endpoint', (snapshotId, args) => this.explainEndpoint(snapshotId, args)],
+      ['impact_of_symbol', (snapshotId, args) => this.impactOfSymbol(snapshotId, args)],
+      ['simulate_patch_impact', (snapshotId, args) => this.simulatePatchImpact(snapshotId, args)],
+      ['review_patch', (snapshotId, args) => this.reviewPatch(snapshotId, args)],
+      ['find_tests_for', (snapshotId, args) => this.findTestsFor(snapshotId, args)],
+      ['get_flow_pack', (snapshotId, args) => this.getResearchPack(snapshotId, {
+        ...args,
+        taskType: args.taskType ?? 'architecture',
+      })],
+      ['get_research_pack', (snapshotId, args) => this.getResearchPack(snapshotId, args)],
+      ['get_context_packet', (snapshotId, args) => this.getContextPacket(snapshotId, args)],
+      ['get_change_pack', (snapshotId, args) => this.getChangePack(snapshotId, args)],
+      ['compile_evidence', (snapshotId, args) => this.compileEvidence(snapshotId, args)],
+      ['generate_repo_atlas', (snapshotId, args) => this.generateRepoAtlas(snapshotId, args)],
+      ['search_code', (snapshotId, args) => this.searchCode(snapshotId, args)],
+      ['get_index_stats', (snapshotId, args) => this.getIndexStats(snapshotId, args)],
+    ]);
   }
 
   /** Stable key for an evidence slice / source body. */
@@ -268,66 +316,10 @@ export class V2QueryService {
       if (!freshness || !freshness.isStale || !isPlainObject(result)) return result;
       return {
         ...result,
-        indexFreshness: freshness,
+        indexFreshness: agentFacingFreshness(freshness),
       };
     };
-    switch (envelope.toolName) {
-      case 'search_symbol':
-        return withFreshness(await this.searchSymbol(snapshotId, envelope.args));
-      case 'search_files':
-        return withFreshness(await this.searchFiles(snapshotId, envelope.args));
-      case 'find_references':
-        return withFreshness(await this.findReferences(snapshotId, envelope.args));
-      case 'get_file_summary':
-        return withFreshness(await this.getFileSummary(snapshotId, envelope.args));
-      case 'get_file_slice':
-        return withFreshness(await this.getFileSlice(snapshotId, envelope.args));
-      case 'get_dependencies':
-        return withFreshness(await this.getDependencies(snapshotId, envelope.args));
-      case 'get_dependents':
-        return withFreshness(await this.getDependents(snapshotId, envelope.args));
-      case 'get_callers':
-        return withFreshness(await this.getCallers(snapshotId, envelope.args));
-      case 'get_callees':
-        return withFreshness(await this.getCallees(snapshotId, envelope.args));
-      case 'find_endpoints':
-        return withFreshness(await this.findEndpoints(snapshotId, envelope.args));
-      case 'get_impact_radius':
-        return withFreshness(await this.getImpactRadius(snapshotId, envelope.args));
-      case 'trace_dependencies':
-        return withFreshness(await this.traceDependencies(snapshotId, envelope.args));
-      case 'explain_endpoint':
-        return withFreshness(await this.explainEndpoint(snapshotId, envelope.args));
-      case 'impact_of_symbol':
-        return withFreshness(await this.impactOfSymbol(snapshotId, envelope.args));
-      case 'simulate_patch_impact':
-        return withFreshness(await this.simulatePatchImpact(snapshotId, envelope.args));
-      case 'review_patch':
-        return withFreshness(await this.reviewPatch(snapshotId, envelope.args));
-      case 'find_tests_for':
-        return withFreshness(await this.findTestsFor(snapshotId, envelope.args));
-      case 'get_flow_pack':
-        return withFreshness(await this.getResearchPack(snapshotId, {
-          ...envelope.args,
-          taskType: envelope.args.taskType ?? 'architecture',
-        }));
-      case 'get_research_pack':
-        return withFreshness(await this.getResearchPack(snapshotId, envelope.args));
-      case 'get_context_packet':
-        return withFreshness(await this.getContextPacket(snapshotId, envelope.args));
-      case 'get_change_pack':
-        return withFreshness(await this.getChangePack(snapshotId, envelope.args));
-      case 'compile_evidence':
-        return withFreshness(await this.compileEvidence(snapshotId, envelope.args));
-      case 'generate_repo_atlas':
-        return withFreshness(await this.generateRepoAtlas(snapshotId, envelope.args));
-      case 'search_code':
-        return withFreshness(await this.searchCode(snapshotId, envelope.args));
-      case 'get_index_stats':
-        return withFreshness(await this.getIndexStats(snapshotId, envelope.args));
-      default:
-        throw new Error(`Unknown v2 tool: ${envelope.toolName}`);
-    }
+    return withFreshness(await this.handlers.execute(envelope.toolName, snapshotId, envelope.args));
   }
 
   async ensureIndexed(root: string): ReturnType<V2Indexer['indexWorkspace']> {
@@ -526,6 +518,7 @@ export class V2QueryService {
     const compactQuery = compactSearchText(query);
     const kindFilter = kindFilterFor(kind);
     const intent = detectSearchIntent(query);
+    const concepts = detectConcepts(query);
     const filters = searchFiltersFor(args, query);
     const snippets = await this.snippetOptions(snapshotId, args);
     const baseClauses = [
@@ -640,12 +633,13 @@ export class V2QueryService {
         LENGTH(simple_name)
       LIMIT ?
     `).all(...baseParams, ...matchParams, query, candidateLimit) as SymbolRow[];
-    const rows = mergeSymbolRows(exactRows, broadRows);
+    const conceptRows = await this.conceptSymbolCandidateRows(baseWhere, baseParams, concepts, Math.min(candidateLimit, 120));
+    const rows = mergeSymbolRows(exactRows, broadRows, conceptRows);
 
     const inDegree = await this.symbolCallInDegree(snapshotId, rows.map(row => row.fq_name));
     const ranked = rows
-      .map(row => ({ row, score: scoreSymbolSearch(row, query, compactQuery, tokens, intent, inDegree.get(row.fq_name)) }))
-      .filter(candidate => candidate.score.matchedTokens.length > 0 || candidate.score.exactPhrase || candidate.score.intentMatch)
+      .map(row => ({ row, score: scoreSymbolSearch(row, query, compactQuery, tokens, intent, inDegree.get(row.fq_name), concepts) }))
+      .filter(candidate => candidate.score.matchedTokens.length > 0 || candidate.score.exactPhrase || candidate.score.intentMatch || candidate.score.conceptMatch)
       .sort((a, b) => {
         if (b.score.score !== a.score.score) return b.score.score - a.score.score;
         const roleDelta = roleRank(b.row.file_role) - roleRank(a.row.file_role);
@@ -690,6 +684,7 @@ export class V2QueryService {
     const explainRank = Boolean(args.explainRank ?? false);
     const tokens = tokenizeSearchQuery(query);
     const rankingTokens = fileSearchRankingTokens(query, tokens);
+    const concepts = detectConcepts(query);
     const filters = fileFiltersFor(args, query);
     const snippets = await this.snippetOptions(snapshotId, args);
     const baseClauses = ['f.snapshot_id = ?', ...filters.sql.map(sql => sql.replace(/\bfile_role\b/g, 'f.file_role'))];
@@ -738,7 +733,7 @@ export class V2QueryService {
     const candidateLimit = broadConfigSearch
       ? Math.min(Math.max((cursorOffset + limit) * 100, 1000), 5000)
       : Math.min(Math.max((cursorOffset + limit) * 40, 500), 2000);
-    const candidateTerms = fileSearchCandidateTerms(query, rankingTokens);
+    const candidateTerms = uniqueStrings([...fileSearchCandidateTerms(query, rankingTokens), ...conceptLikeTerms(concepts)]);
     const explicitRows = await this.explicitFileSearchRows(snapshotId, baseWhere, baseParams, query, Math.min(candidateLimit, limit * 2));
     // Research/explanation queries (how does X work, trace from A to B, explain Y)
     // mention class names as CONTEXT, not as the sole target. Using explicit-only
@@ -760,8 +755,8 @@ export class V2QueryService {
     const evidence = await this.fileEvidence(snapshotId, rows.map(row => row.path));
     const bm25 = await this.fileBm25Scores(snapshotId, rankingTokens, rows.map(row => row.path));
     const ranked = rows
-      .map(row => ({ row, score: scoreFileSearch(row, evidence.get(row.path), query, rankingTokens, bm25.get(row.path)) }))
-      .filter(candidate => candidate.score.matchedTokens.length > 0 || candidate.score.score > roleRank(candidate.row.file_role) / 10)
+      .map(row => ({ row, score: scoreFileSearch(row, evidence.get(row.path), query, rankingTokens, bm25.get(row.path), concepts) }))
+      .filter(candidate => candidate.score.matchedTokens.length > 0 || candidate.score.conceptMatch || candidate.score.score > roleRank(candidate.row.file_role) / 10)
       .sort((a, b) => {
         if (b.score.score !== a.score.score) return b.score.score - a.score.score;
         const roleDelta = roleRank(b.row.file_role) - roleRank(a.row.file_role);
@@ -1000,6 +995,63 @@ export class V2QueryService {
       LIMIT ?
     `).all(...baseParams, phrasePattern, phrasePattern, phrasePattern, phrasePattern, limit) as SymbolRow[];
     return mergeSymbolRows(exactBySimpleName, exactByFqName, phraseRows).slice(0, limit);
+  }
+
+  /**
+   * Fetch symbols that match a detected CONCEPT (auth/tx/cache/...) by name,
+   * annotation, or framework role — even when they share no literal token with
+   * the query. Concept boosting in ranking.ts can only re-rank rows that were
+   * retrieved, and a concept's canonical code (AuthorizationService for
+   * "authentication") is exactly the row token-FTS never fetches. This closes
+   * that gap so the boost has something to lift. Bounded by `limit` and the
+   * distinctive (len >= 4) likeTerms so it never floods the candidate pool.
+   */
+  private async conceptSymbolCandidateRows(
+    baseWhere: string,
+    baseParams: unknown[],
+    concepts: readonly ConceptRule[],
+    limit: number,
+  ): Promise<SymbolRow[]> {
+    if (concepts.length === 0) return [];
+    const likeTerms = conceptLikeTerms(concepts);
+    const annotationTerms = conceptAnnotationTerms(concepts);
+    const roles = conceptRoles(concepts);
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    for (const term of likeTerms) {
+      const pattern = `%${escapeLike(term)}%`;
+      clauses.push(`simple_name LIKE ? ESCAPE '\\'`);
+      params.push(pattern);
+    }
+    for (const term of annotationTerms) {
+      clauses.push(`annotations_json LIKE ? ESCAPE '\\'`);
+      params.push(`%${escapeLike(term)}%`);
+    }
+    if (roles.length > 0) {
+      clauses.push(`framework_role IN (${roles.map(() => '?').join(', ')})`);
+      params.push(...roles);
+    }
+    if (clauses.length === 0) return [];
+    return await this.db.prepare(`
+      SELECT fq_name, simple_name, kind, file, line, end_line, signature, visibility, parent,
+             package_name, return_type, parameter_types_json, annotations_json,
+             framework_role, framework_meta_json, file_role
+      FROM symbols
+      WHERE ${baseWhere}
+        AND (${clauses.join(' OR ')})
+      ORDER BY
+        CASE file_role
+          WHEN 'main_source' THEN 0
+          WHEN 'resource_config' THEN 1
+          WHEN 'build_config' THEN 2
+          WHEN 'test_source' THEN 3
+          WHEN 'mock_source' THEN 4
+          WHEN 'generated' THEN 5
+          ELSE 6
+        END,
+        LENGTH(simple_name)
+      LIMIT ?
+    `).all(...baseParams, ...params, limit) as SymbolRow[];
   }
 
   private async symbolSearchCandidateRowsFromFts(
@@ -2000,7 +2052,11 @@ export class V2QueryService {
     };
   }
 
-  private async simulatePatchImpact(snapshotId: string, args: Record<string, unknown>) {
+  private async simulatePatchImpact(
+    snapshotId: string,
+    args: Record<string, unknown>,
+    executionOptions: { bypassResponseCap?: boolean } = {},
+  ) {
     const timing = createDebugTiming(args);
     const limit = clampInt(Number(args.limit ?? 50), 1, 200);
     const outputMode = normalizePatchImpactOutputMode(args.outputMode);
@@ -2198,6 +2254,15 @@ export class V2QueryService {
         'Dependency impact follows indexed file dependency edges; call impact follows indexed call edges and may include lower-confidence name-only matches.',
       ],
     };
+    // review_patch composes this result into its own compact response. Applying
+    // the public simulate_patch_impact response cap here would discard changed
+    // files before review can compute callers/tests/coverage. Keep the cap for
+    // direct tool calls, but never let a serialization budget alter internal
+    // review semantics.
+    if (executionOptions.bypassResponseCap) {
+      timing.checkpoint('internal_full_result');
+      return withDebugTiming(fullResult, timing);
+    }
     const requestedResult = outputMode === 'full'
       ? fullResult
       : compactPatchImpactResult(fullResult, compactLimitForResponseCap(maxResponseTokens), {
@@ -2421,13 +2486,16 @@ export class V2QueryService {
     const budget = reviewBudgetFor(outputMode, args, limit);
     const diff = stringOrUndefined(args.diff) ?? '';
     const allHunks = parsePatchHunks(diff);
+    const allDiffFiles = uniqueFilesInOrder(parsePatchFilePaths(diff));
     const diffStats = patchDiffStats(allHunks, diff);
+    const impactLimit = Math.min(200, Math.max(limit, allDiffFiles.length));
     const impact = await this.simulatePatchImpact(snapshotId, {
       ...args,
-      limit,
+      limit: impactLimit,
+      outputMode: 'full',
       callSeedLimit: 0,
       skipLikelyTests: args.includeLikelyTests !== true,
-    }) as Record<string, unknown>;
+    }, { bypassResponseCap: true }) as Record<string, unknown>;
     const hunks = rankPatchHunks(allHunks).slice(0, Math.max(budget.maxLineFocus, budget.maxFindings));
     const lineMapping = await this.patchLineMappings(snapshotId, hunks);
     const changedFiles = stringArray(impact.changedFiles);
@@ -2499,6 +2567,15 @@ export class V2QueryService {
       .slice(0, budget.maxLineFocus)
       .map(hunk => compactPatchHunk(hunk, lineMapping.get(hunk)))
       .map(hunk => compactReviewObject(hunk, budget.maxEvidencePerFinding, 2) as Record<string, unknown>);
+    const changedFileSet = new Set(changedFiles);
+    const omittedGraphFiles = allDiffFiles.filter(file => !changedFileSet.has(file));
+    const reviewCoverage = buildReviewCoverage({
+      changedFiles,
+      diffFileCount: allDiffFiles.length,
+      diffHunkCount: allHunks.length,
+      reportedHunkCount: lineFocus.length,
+      omittedGraphFiles,
+    });
     const reviewTargets = await this.patchReviewTargets(
       snapshotId,
       hunks,
@@ -2530,6 +2607,19 @@ export class V2QueryService {
       }
       : undefined;
     const requiredToolCalls = reviewToolCalls(changedFiles, lineFocus, findings, budget.maxRequiredToolCalls);
+    const answerable = reviewAnswerable(changedFiles, reviewCoverage);
+    const allowedFollowups = answerable
+      ? []
+      : changedFiles.length === 0
+        ? [{
+          tool: 'codegraph_context',
+          args: {
+            task: String(args.task ?? 'Review this patch'),
+            diff,
+          },
+          when: 'Resolve a non-empty PR diff or explicit changed files before producing review findings.',
+        }]
+        : requiredToolCalls;
     const reviewProfile: PackProfile = outputMode === 'full' ? 'full' : 'compact';
     const evidenceHandles = evidenceHandlesForObjects([
       ...lineFocus,
@@ -2544,6 +2634,7 @@ export class V2QueryService {
       fieldImpact: packedFieldImpact,
       architectureContext: packedArchitectureContext,
       diffStats,
+      reviewCoverage,
       reviewFindings: findings,
       lineFocus,
       reviewTargets,
@@ -2554,6 +2645,7 @@ export class V2QueryService {
       testsLikelyRelevant: cappedTests,
       validation: packedValidation,
       requiredToolCalls,
+      allowedFollowups,
     };
     const fullPayloadForBudget = {
       impact,
@@ -2566,17 +2658,21 @@ export class V2QueryService {
       tests,
       validation,
       requiredToolCalls,
+      allowedFollowups,
     };
 
     return {
       outputMode,
       focus,
       reviewStatus: reviewStatusFor(findings, changedFiles),
+      answerable,
+      sufficientForAnswer: answerable,
       impactSummary: impact.summary,
       changedFiles,
       fieldImpact: packedFieldImpact,
       architectureContext: packedArchitectureContext,
       diffStats,
+      reviewCoverage,
       reviewPlan: reviewPlanForPatch(diffStats, findings, impact),
       seededRiskCategories: seededRiskCategoriesForReview(focus, findings, riskFlags, diffStats),
       mustCheckInvariants: mustCheckInvariantsForReview(focus, changedFiles, impact, findings),
@@ -2594,6 +2690,15 @@ export class V2QueryService {
       testsLikelyRelevant: cappedTests,
       validation: packedValidation,
       requiredToolCalls,
+      allowedFollowups,
+      nextAction: answerable
+        ? 'Answer from this complete review packet.'
+        : changedFiles.length === 0
+          ? 'Retry codegraph_context with a PR URL, baseRef/headRef, or explicit unified diff.'
+          : 'Use only the exact allowed follow-ups before claiming complete review coverage.',
+      stopRule: answerable
+        ? 'answerable=true: answer from the packet.'
+        : 'answerable=false: resolve missing patch evidence before answering.',
       reviewerQuestions: reviewQuestionsForPatch(findings, impact),
       metrics: {
         changedFileCount: changedFiles.length,
@@ -2606,6 +2711,8 @@ export class V2QueryService {
         likelyTestCount: tests.length,
         omittedFindings: Math.max(0, allFindings.length - findings.length),
         omittedHunks: Math.max(0, allHunks.length - lineFocus.length),
+        graphResolvedChangedFileCount: changedFiles.length,
+        omittedGraphFiles: omittedGraphFiles.length,
         omittedRiskFlags: Math.max(0, riskFlags.length - cappedRiskFlags.length),
         omittedTests: Math.max(0, tests.length - cappedTests.length),
       },
@@ -2620,6 +2727,9 @@ export class V2QueryService {
       confidenceNotes: [
         'Review findings are deterministic risk hypotheses from the diff and graph impact, not proof of bugs.',
         'Default output is capped for large diffs; use outputMode=full only when expanded evidence is needed.',
+        reviewCoverage.complete
+          ? 'Every diff file was graph-resolved and every hunk is represented in lineFocus.'
+          : 'Review coverage is incomplete in this packet; follow reviewPlan batching guidance before claiming full-PR coverage.',
         'Use requiredToolCalls for exact source slices before writing final review comments.',
       ],
     };
@@ -3253,6 +3363,20 @@ export class V2QueryService {
     ]).slice(0, packProfileValue(profile, 4, 5, 6));
     const endpointSymbolCandidates = handlerSeedEndpoints.map(endpointHandlerSymbolCandidate);
     const hasEndpointSeed = endpointSymbolCandidates.length > 0;
+    // An endpoint seed normally means "the user named a route, resolve THAT
+    // flow", so symbol and file search are skipped as redundant. But a task can
+    // name a route AND a cross-cutting concept in one sentence ("how does auth
+    // work, from the HTTP endpoint down to the database"): the word "endpoint"
+    // seeds generic handlers, the endpoint-only path then skips the very search
+    // that knows what auth code looks like, and the pack answers with whatever
+    // the handlers happen to call. Measured on doughnut: that phrasing returned
+    // HttpClientAdapter/QueryBuilder (Wikidata plumbing) while the same question
+    // without "HTTP endpoint" returned CurrentUserFetcher* — and a direct
+    // search_symbol with the identical sentence returned the auth chain too.
+    // When a concept is named, keep the concept-aware search alongside the
+    // endpoint seed; concept-free endpoint questions keep the old fast path.
+    const targetConcepts = detectConcepts(target);
+    const endpointSeedSuppressesSearch = hasEndpointSeed && targetConcepts.length === 0;
     const endpointFileCandidates = handlerSeedEndpoints.map(endpoint => ({
       file: endpoint.file,
       lines: endpoint.lines,
@@ -3279,7 +3403,7 @@ export class V2QueryService {
     const explicitMemberTarget = explicitSymbolRefs(target).some(ref => Boolean(ref.member));
     const explicitFastPath = explicitFiles.length >= 3 || (explicitMemberTarget && explicitFiles.length > 0);
     const symbolRows: Array<Record<string, unknown>> = [];
-    if (!explicitFastPath && !hasEndpointSeed) {
+    if (!explicitFastPath && !endpointSeedSuppressesSearch) {
       for (const query of researchSymbolQueries(target, seedTerms)) {
         const result = await this.searchSymbol(snapshotId, {
           ...args,
@@ -3308,12 +3432,17 @@ export class V2QueryService {
     const scopedSymbolCandidates = explicitFiles.length > 0
       ? symbolCandidates.filter(symbol => explicitFileSet.has(symbol.file) || endpointSymbolKeys.has(`${symbol.symbol}\0${symbol.file}`))
       : symbolCandidates;
-    const relevantSymbols = (scopedSymbolCandidates.length > 0
+    const relevantSymbolPool = scopedSymbolCandidates.length > 0
       ? scopedSymbolCandidates
       : explicitFastPath
         ? []
-        : symbolCandidates).slice(0, packProfileValue(profile, 4, 5, 6));
-    const fileResults = explicitFastPath || hasEndpointSeed
+        : symbolCandidates;
+    const relevantSymbols = reserveConceptSlots(
+      relevantSymbolPool,
+      targetConcepts,
+      packProfileValue(profile, 4, 5, 6),
+    );
+    const fileResults = explicitFastPath || endpointSeedSuppressesSearch
       ? { files: [] as Array<Record<string, unknown>>, totalFound: explicitFiles.length }
       : await this.searchFiles(snapshotId, {
         ...args,
@@ -3338,7 +3467,7 @@ export class V2QueryService {
         whyRelevant: symbol.whyRelevant,
         confidence: symbol.confidence,
         matchedTokens: symbol.matchedTokens,
-        topSymbols: [symbol],
+        topSymbols: [symbol as unknown as Record<string, unknown>],
         endpoints: [],
       })),
       ...(explicitFiles.length >= 3 ? [] : (rightSize ? rightSizeCandidates(fileResults.files, { keepRatio, minKeep: 3 }) : fileResults.files).map(row => compactFileCandidate(row))),
@@ -3454,10 +3583,18 @@ export class V2QueryService {
       ...candidateFiles,
       ...calleeFileCandidates,
     ]);
-    const flowRelevantSymbols = uniqueSymbolCandidates([
-      ...relevantSymbols,
-      ...calleeDefinitions,
-    ]);
+    // Evidence slices are drawn from this list in order under a token budget
+    // that realistically covers ~3 symbols, so a concept match sitting at
+    // position 5 gets a name in definitionCandidates but no source. The agent
+    // reads slices, not names — surface the concept inside the slice window.
+    const flowRelevantSymbols = promoteConceptMatchesToFront(
+      uniqueSymbolCandidates([
+        ...relevantSymbols,
+        ...calleeDefinitions,
+      ]),
+      targetConcepts,
+      2,
+    );
     const topFiles = uniqueFilesInOrder([
       // 1. Primary ranked core (blended lexical + structural). Recall-neutral; the top
       //    of this list must not be reordered (an experiment that pushed downstream
@@ -3511,6 +3648,12 @@ export class V2QueryService {
       flowSteps,
     });
     const sufficientForAnswer = missingFacts.length === 0;
+    const retrievalQuality = computeRetrievalQuality({
+      target,
+      topDefinitions: flowRelevantSymbols.slice(0, 3),
+      topFileCandidates: candidateFiles.slice(0, 3),
+      evidenceSlices,
+    });
     const returnedFlowSteps = flowSteps.slice(0, packProfileValue(profile, 5, 6, 8));
     // Scored from the FULL flowSteps (pre-display-cap), not returnedFlowSteps:
     // 'call' steps are appended last in researchFlowSteps, so a compact-profile
@@ -3531,10 +3674,13 @@ export class V2QueryService {
       ...verifyBudgetForEndpoints(handlerSeedEndpoints),
       ...verifyBudgetForCallEdges(callersRaw, calleesRaw),
     ].slice(0, 3);
-    const trustPosture = trustPostureFor(sufficientForAnswer, verifyBudget.length);
+    const trustPosture = trustPostureFor(sufficientForAnswer, verifyBudget.length, retrievalQuality.weak);
     const returnedDefinitions = flowRelevantSymbols.slice(0, packProfileValue(profile, 3, 5, 8));
-    const returnedCallers = callers.slice(0, packProfileValue(profile, 3, 5, 8)).map(compactCallEdge);
-    const returnedCallees = callees.slice(0, packProfileValue(profile, 6, 10, 14)).map(compactCallEdge);
+    const returnedCallers = coalesceCallEdges(callers.slice(0, packProfileValue(profile, 3, 5, 8)).map(compactCallEdge));
+    const returnedCallees = dropEdgesAlreadyListed(
+      coalesceCallEdges(callees.slice(0, packProfileValue(profile, 6, 10, 14)).map(compactCallEdge)),
+      returnedCallers,
+    );
     const returnedEndpoints = impactedEndpoints.slice(0, packProfileValue(profile, 3, 4, 4));
     // Return as many topFiles as we actually ranked (build cap), not a smaller subset.
     // The extra entries are cheap paths and only ADD coverage — a phrase-matching file
@@ -3582,7 +3728,7 @@ export class V2QueryService {
     const reusedEvidenceCount = evidenceDedup.reusedCount;
     const evidenceHandles = evidenceHandlesForObjects([
       ...evidenceSlices,
-      ...returnedDefinitions,
+      ...(returnedDefinitions as unknown as Array<Record<string, unknown>>),
       ...candidateFiles,
     ], profile);
     const disallowedFollowups = [
@@ -3640,6 +3786,13 @@ export class V2QueryService {
     const reuseGuidance = reusedEvidenceCount > 0
       ? [`${reusedEvidenceCount} evidence slice(s) were already delivered earlier this session (marked reusedFromEarlierCall) and their source was omitted to save tokens — reuse them from prior context instead of re-opening.`]
       : [];
+    // When retrieval is weak (concept unsatisfied, or only broad tokens matched)
+    // the pack still answers structurally, but the agent should sanity-check
+    // rather than assert blindly. Surface the reason + one cheap targeted
+    // followup instead of a broad re-search — the anti-double-spend nudge.
+    const retrievalGuidance = sufficientForAnswer && retrievalQuality.weak
+      ? [retrievalQuality.note, retrievalQuality.suggestedFollowup].filter((line): line is string => Boolean(line))
+      : [];
     const answerGuidance = (sufficientForAnswer
       ? (trustPosture === 'spot_check_recommended'
         ? [
@@ -3655,11 +3808,13 @@ export class V2QueryService {
       : [
         'This pack is incomplete; perform only the targeted follow-up named in missingFacts.',
         'Prefer one allowedFollowup for a listed missing file/range over broad rg/shell/read loops.',
-      ]).concat(reuseGuidance);
+      ]).concat(retrievalGuidance).concat(reuseGuidance);
     const nextAction = sufficientForAnswer
       ? 'Answer the user directly from flowSteps and evidenceSlices.'
       : `Resolve missing fact: ${missingFacts[0]}`;
-    const confidence = sufficientForAnswer ? 0.82 : relevantSymbols.length > 0 ? 0.62 : 0.35;
+    const confidence = sufficientForAnswer
+      ? retrievalQuality.confidence
+      : relevantSymbols.length > 0 ? 0.62 : 0.35;
     // The former middle note ("ambiguous Java call edges remain confidence-scored")
     // was a static, always-present disclaimer that verifyBudget/trustPosture below
     // now supersedes with a precise, per-edge signal that only costs tokens when
@@ -3667,10 +3822,30 @@ export class V2QueryService {
     // twice for the same fact; the vague blanket note is dropped in favor of the
     // targeted one, which pays for the verifyBudget/trustPosture addition instead
     // of stacking on top of it.
-    const confidenceNotes = [
-      'The pack intentionally includes capped source evidence so architecture answers do not need many follow-up slice calls.',
-      'Use granular tools only for explicit missing facts, not for broad rediscovery.',
-    ];
+    // Static prose, previously emitted on every packet. On an answerable pack it
+    // restates what stopRule, answerGuidance and trustPosture already say, and
+    // the same two sentences also live in the server instructions — three copies
+    // of one rule, billed per call. Keep it only where it still adds something:
+    // an incomplete pack, where "don't rediscover broadly" is the actual risk.
+    const confidenceNotes = sufficientForAnswer
+      ? []
+      : [
+        'The pack intentionally includes capped source evidence so architecture answers do not need many follow-up slice calls.',
+        'Use granular tools only for explicit missing facts, not for broad rediscovery.',
+      ];
+    // Only emitted when retrieval is weak — a strong pack's quality is already
+    // conveyed by confidence + trustPosture, so paying tokens for a redundant
+    // "tier: strong" block on every packet would defeat the point.
+    const retrievalQualityField = sufficientForAnswer && retrievalQuality.weak
+      ? {
+        retrievalQuality: {
+          tier: retrievalQuality.tier,
+          confidence: retrievalQuality.confidence,
+          ...(retrievalQuality.note ? { note: retrievalQuality.note } : {}),
+          ...(retrievalQuality.suggestedFollowup ? { suggestedFollowup: retrievalQuality.suggestedFollowup } : {}),
+        },
+      }
+      : {};
     const slimTaskOracle = slimTaskOracleForPack(taskOracle, profile);
     const agentPayloadForBudget = {
       ...returnedPayloadForBudget,
@@ -3684,20 +3859,14 @@ export class V2QueryService {
       const compactAnswerGuidance = sufficientForAnswer
         ? ['Answer directly from evidenceSlices and flowSteps; cite file/line ranges.']
         : ['Resolve only the listed missingFacts before answering.'];
-      const answerPayloadForBudget = {
-        flowSteps: returnedFlowSteps,
-        definitionCandidates: returnedDefinitions,
-        callers: returnedCallers,
-        callees: returnedCallees,
-        impactedEndpoints: returnedEndpoints,
-        notCalledCandidates,
-        topFiles: returnedTopFiles,
-        evidenceSlices: packedEvidenceSlices,
-        completeness,
-        missingFacts,
-        answerGuidance: compactAnswerGuidance,
-      };
-      return {
+      // Everything the caller actually receives except `budget` itself. The
+      // budget block used to be computed from an evidence-only subset, so it
+      // reported ~47% fewer tokens than the packet weighed on the wire
+      // (measured live: 2,890 reported vs 4,239 actual) and `tokenBudget`
+      // capped nothing. Measuring this object makes the number honest;
+      // `fullPayload` carries the same envelope so compressionRatio still
+      // compares like with like.
+      const answerPayload = {
         target,
         taskType: args.taskType ?? 'research',
         responseMode,
@@ -3712,7 +3881,6 @@ export class V2QueryService {
           intendedUse: 'answer-ready architecture/research context',
           expectedToolCalls: sufficientForAnswer ? 1 : 2,
           answerDirectly: sufficientForAnswer,
-          maxAdditionalCalls,
           followUpRule: sufficientForAnswer
             ? stopRule
             : 'Do not call rg or shell search; use only allowedFollowups for specific items listed in missingFacts.',
@@ -3730,15 +3898,19 @@ export class V2QueryService {
         answerGuidance: compactAnswerGuidance,
         nextAction,
         confidence,
-        confidenceNotes,
+        ...(confidenceNotes.length > 0 ? { confidenceNotes } : {}),
         verifyBudget,
         trustPosture,
+        ...retrievalQualityField,
+      };
+      return {
+        ...answerPayload,
         budget: {
           ...responseBudgetReport({
             profile,
             tokenBudget,
-            returnedPayload: answerPayloadForBudget,
-            fullPayload: agentPayloadForBudget,
+            returnedPayload: answerPayload,
+            fullPayload: { ...answerPayload, ...agentPayloadForBudget },
             handleCount: 0,
             policy: 'answer mode omits compressedEvidence, taskOracle, evidenceHandles, architectureContext, and seedTerms; set responseMode=agent when planner metadata is needed',
           }),
@@ -3758,7 +3930,6 @@ export class V2QueryService {
         intendedUse: 'answer-ready architecture/research context',
         expectedToolCalls: sufficientForAnswer ? 1 : 2,
         answerDirectly: sufficientForAnswer,
-        maxAdditionalCalls,
         followUpRule: sufficientForAnswer
           ? stopRule
           : 'Do not call rg or shell search; use only allowedFollowups for specific items listed in missingFacts.',
@@ -3786,9 +3957,10 @@ export class V2QueryService {
       answerGuidance,
       nextAction,
       confidence,
-      confidenceNotes,
+      ...(confidenceNotes.length > 0 ? { confidenceNotes } : {}),
       verifyBudget,
       trustPosture,
+      ...retrievalQualityField,
       budget: {
         ...responseBudgetReport({
           profile,
@@ -4820,7 +4992,7 @@ export class V2QueryService {
       .filter(([, value]) => value.status === 'partial')
       .map(([key]) => key);
     const strictRubric = args.strictRubric !== false && args.strict_rubric !== false;
-    const answerable = compileEvidenceAnswerable(source.tool, sourcePacket, evidence, missing, strictRubric ? partial : []);
+    const answerable = compileEvidenceAnswerable(source.tool, sourcePacket, evidence, missing, strictRubric ? partial : [], taskType);
     const recommendedEscalation = !answerable && allowTargetedShell
       ? targetedShellEscalationForCompile(task, missing.length > 0 ? missing : partial, sourcePacket)
       : undefined;
@@ -4862,6 +5034,7 @@ export class V2QueryService {
       },
       evidence,
       missing,
+      answerGuidance: stringArray(sourcePacket.answerGuidance),
       allowedFollowups,
       disallowedFollowups,
       recommendedNextAction,
@@ -7849,8 +8022,10 @@ function compileEvidenceAnswerable(
   evidence: Array<Record<string, unknown>>,
   missing: string[],
   strictPartial: string[] = [],
+  taskType: CompileEvidenceTaskType = 'unknown',
 ): boolean {
   if (missing.length > 0 || strictPartial.length > 0 || evidence.length === 0) return false;
+  if (taskType === 'unknown') return false;
   if (sourceTool === 'get_research_pack') {
     const routing = isPlainObject(packet.routing) ? packet.routing : {};
     const completeness = isPlainObject(packet.completeness) ? packet.completeness : {};
@@ -8253,6 +8428,92 @@ function researchSeedTerms(target: string): string[] {
   ].filter(Boolean)).slice(0, 18);
 }
 
+/**
+ * Guarantee the pack shows at least one symbol that actually implements the
+ * concept the question named.
+ *
+ * researchSymbolQueries runs the identifier-looking seed terms BEFORE the full
+ * sentence, so a query containing a capitalised generic word ("HTTP") floods
+ * symbolRows with that word's matches; the concept-aware full-sentence results
+ * land past the display cap and never ship. Measured on doughnut: the auth
+ * question returned five Http* symbols and zero auth symbols, while the same
+ * sentence sent straight to search_symbol returned the CurrentUserFetcher chain.
+ *
+ * Fills from the tail only — the top-ranked entry is never displaced, matching
+ * the "fill leftover slots, never re-order the top" rule that an earlier
+ * interleaving attempt violated (and regressed recall doing so).
+ */
+function reserveConceptSlots(
+  pool: ResearchSymbolCandidate[],
+  concepts: readonly ConceptRule[],
+  limit: number,
+): ResearchSymbolCandidate[] {
+  const head = pool.slice(0, limit);
+  if (concepts.length === 0 || head.length === 0) return head;
+  const isConceptMatch = (candidate: ResearchSymbolCandidate): boolean =>
+    scoreConceptMatch({ name: candidate.name, frameworkRole: candidate.frameworkRole }, concepts).matched;
+  // A quota, not a presence check. "At least one match" was satisfied on the
+  // doughnut auth query by `bearerTokenFromRequestOrThrow` (a real but
+  // incidental hit) while the other four slots stayed Wikidata HTTP plumbing —
+  // the guarantee held and the packet was still useless.
+  const quota = Math.max(1, Math.min(2, limit - 1));
+  const matchedInHead = head.filter(isConceptMatch).length;
+  if (matchedInHead >= quota) return head;
+  const headKeys = new Set(head.map(candidate => `${candidate.symbol}|${candidate.file}`));
+  const promoted = pool
+    .slice(limit)
+    .filter(candidate => isConceptMatch(candidate) && !headKeys.has(`${candidate.symbol}|${candidate.file}`))
+    .slice(0, quota - matchedInHead);
+  if (promoted.length === 0) return head;
+  // Drop the lowest-ranked NON-matching entries; every concept match already in
+  // the head keeps its place, and rank order is preserved among the survivors.
+  const kept: ResearchSymbolCandidate[] = [];
+  const droppable = head.length - (limit - promoted.length);
+  let dropped = 0;
+  for (let index = head.length - 1; index >= 0; index -= 1) {
+    const candidate = head[index]!;
+    if (dropped < droppable && !isConceptMatch(candidate)) {
+      dropped += 1;
+      continue;
+    }
+    kept.unshift(candidate);
+  }
+  return [...kept, ...promoted];
+}
+
+/**
+ * Move up to `quota` concept-matching symbols into the evidence window, keeping
+ * the top-ranked entry in place and preserving relative order everywhere else.
+ *
+ * Position 0 is never displaced: an earlier experiment that re-ordered the head
+ * of a ranked list regressed recall, so the hedge stays. Entries already inside
+ * the window count toward the quota, so a list that is already concept-covered
+ * is returned untouched.
+ */
+function promoteConceptMatchesToFront(
+  candidates: ResearchSymbolCandidate[],
+  concepts: readonly ConceptRule[],
+  quota: number,
+): ResearchSymbolCandidate[] {
+  if (concepts.length === 0 || candidates.length <= 1) return candidates;
+  const window = 1 + quota;
+  const isConceptMatch = (candidate: ResearchSymbolCandidate): boolean =>
+    scoreConceptMatch({ name: candidate.name, frameworkRole: candidate.frameworkRole }, concepts).matched;
+  const inWindow = candidates.slice(0, window).filter(isConceptMatch).length;
+  if (inWindow >= quota) return candidates;
+  const promoted: ResearchSymbolCandidate[] = [];
+  const rest: ResearchSymbolCandidate[] = [];
+  for (const [index, candidate] of candidates.entries()) {
+    if (index > 0 && index >= window && promoted.length < quota - inWindow && isConceptMatch(candidate)) {
+      promoted.push(candidate);
+      continue;
+    }
+    rest.push(candidate);
+  }
+  if (promoted.length === 0) return candidates;
+  return [rest[0]!, ...promoted, ...rest.slice(1)];
+}
+
 function researchSymbolQueries(target: string, seedTerms: string[]): string[] {
   const identifiers = seedTerms.filter(term => /[A-Z_.$:]/.test(term));
   const queryGroups = [
@@ -8306,6 +8567,29 @@ function signalReasonsOrUndefined(value: unknown): string[] | undefined {
   return parsed.length > 0 ? parsed : undefined;
 }
 
+/**
+ * The freshness view an answering agent can act on: is the index behind, and
+ * which files moved. Commit SHAs, dirty-tree hashes and scan timings are
+ * operator diagnostics — they cost ~370 chars on every packet emitted from a
+ * dirty tree (the normal development state) and no agent has ever branched on
+ * them. `codegraph status` and `codegraph doctor` still expose the full record.
+ */
+function agentFacingFreshness(freshness: Record<string, unknown>): Record<string, unknown> {
+  const slim: Record<string, unknown> = { isStale: freshness.isStale };
+  if (freshness.warning !== undefined) slim.warning = freshness.warning;
+  if (freshness.autoRefreshSkipped !== undefined) slim.autoRefreshSkipped = freshness.autoRefreshSkipped;
+  if (isPlainObject(freshness.dirtyFiles)) {
+    const dirty = freshness.dirtyFiles as Record<string, unknown>;
+    slim.dirtyFiles = {
+      addedCount: dirty.addedCount,
+      modifiedCount: dirty.modifiedCount,
+      deletedCount: dirty.deletedCount,
+      samples: dirty.samples,
+    };
+  }
+  return slim;
+}
+
 function compactCallEdge(edge: CallEdgeRow): Record<string, unknown> {
   return {
     caller: edge.caller,
@@ -8317,6 +8601,51 @@ function compactCallEdge(edge: CallEdgeRow): Record<string, unknown> {
     signalTier: edge.signal_tier,
     signalReasons: signalReasonsOrUndefined(edge.signal_reasons_json),
   };
+}
+
+/**
+ * Collapse rows that describe the SAME caller->callee relation in the same file
+ * and differ only by call site, keeping the extra sites as `alsoAtLines`.
+ *
+ * A packet routinely serialized `HttpClientAdapter.getResponseString ->
+ * HttpResponse.body` once per line, each row repeating a ~90-char file path for
+ * one integer of new information. `line` keeps its original meaning (first call
+ * site) so existing consumers are unaffected.
+ *
+ * Applied to the RETURNED arrays only — verifyBudget scores the raw pools
+ * before this, so no low-confidence edge can be hidden by the collapse.
+ */
+function coalesceCallEdges(edges: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const byRelation = new Map<string, Record<string, unknown>>();
+  const order: string[] = [];
+  for (const edge of edges) {
+    const key = `${String(edge.caller)}|${String(edge.callee)}|${String(edge.file)}`;
+    const existing = byRelation.get(key);
+    if (!existing) {
+      byRelation.set(key, { ...edge });
+      order.push(key);
+      continue;
+    }
+    const line = edge.line;
+    if (typeof line !== 'number' || line === existing.line) continue;
+    const also = Array.isArray(existing.alsoAtLines) ? existing.alsoAtLines as number[] : [];
+    if (!also.includes(line)) existing.alsoAtLines = [...also, line];
+  }
+  return order.map(key => byRelation.get(key)!);
+}
+
+/**
+ * Drop callee rows already serialized in `callers`. The two arrays are built
+ * from different graph directions but overlap whenever both endpoints of an
+ * edge rank into the packet, and an identical row twice tells the agent nothing
+ * the first one did not.
+ */
+function dropEdgesAlreadyListed(
+  edges: Array<Record<string, unknown>>,
+  alreadyListed: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const seen = new Set(alreadyListed.map(edge => `${String(edge.caller)}|${String(edge.callee)}|${String(edge.file)}`));
+  return edges.filter(edge => !seen.has(`${String(edge.caller)}|${String(edge.callee)}|${String(edge.file)}`));
 }
 
 function callEdgesAsResearchSymbols(edges: CallEdgeRow[]): ResearchSymbolCandidate[] {
@@ -8490,6 +8819,90 @@ function researchFlowSteps(input: {
     });
   }
   return steps.slice(0, 10);
+}
+
+export interface RetrievalQuality {
+  tier: 'strong' | 'weak';
+  confidence: number;
+  weak: boolean;
+  note?: string;
+  suggestedFollowup?: string;
+}
+
+/**
+ * Calibrated retrieval confidence — replaces the former hardcoded `confidence =
+ * 0.82` constant, which carried zero information about whether the packet
+ * actually matched the question. A pack is `sufficientForAnswer` whenever it
+ * found something (researchMissingFacts is purely structural), so on a keyword
+ * collision (query "authentication" resolving to Http.. / User.. classes by the
+ * incidental tokens "http"/"user") the old constant still told the agent to stop
+ * and answer, causing the worst token outcome: pay for the packet AND re-search
+ * (or answer wrong).
+ *
+ * This scores the ACTUAL top candidates two ways:
+ *  - Concept coverage: if the query names a cross-cutting concern (auth/tx/...)
+ *    but no top-ranked candidate is that concept, the retrieval is weak — the
+ *    #2 concept boost gets first crack at fixing the ranking; this flags the
+ *    residual cases it could not.
+ *  - Token specificity: with no concept in play, a pack whose top candidates
+ *    matched only broad/generic tokens (service/system/request/user) is weak.
+ *
+ * Weak packs keep answerable=true (something WAS found) but drop confidence and
+ * flip trustPosture to spot_check_recommended with a cheap, targeted followup —
+ * converting a silent-wrong into a flagged-uncertain, which is strictly cheaper.
+ */
+function computeRetrievalQuality(input: {
+  target: string;
+  topDefinitions: ResearchSymbolCandidate[];
+  topFileCandidates: ResearchFileCandidate[];
+  evidenceSlices: Array<Record<string, unknown>>;
+}): RetrievalQuality {
+  const concepts = detectConcepts(input.target);
+  const topConfidence = Math.max(input.topDefinitions[0]?.confidence ?? 0, input.topFileCandidates[0]?.confidence ?? 0);
+
+  // Judge concept coverage on what the agent ACTUALLY sees — the returned top
+  // definitions and the evidence-slice source — not on any candidate buried
+  // deep in the ranked pool. A concept file at rank 5 with no evidence slice
+  // does not make an answer that reads entirely off unrelated top results
+  // trustworthy (observed: "...HTTP endpoint..." ranks Http* into every slice
+  // while AuthorizationService lurks at topFiles[5]).
+  const conceptTargets = [
+    ...input.topDefinitions.map(symbol => ({ name: symbol.name, frameworkRole: symbol.frameworkRole })),
+    ...input.evidenceSlices.map(slice => ({
+      name: symbolSimpleName(stringOrUndefined(slice.symbol)) ?? path.basename(String(slice.file ?? ''), path.extname(String(slice.file ?? ''))),
+    })),
+  ];
+
+  let weak: boolean;
+  let note: string | undefined;
+  let suggestedFollowup: string | undefined;
+  if (concepts.length > 0) {
+    const conceptSatisfied = conceptTargets.some(target => scoreConceptMatch(target, concepts).matched);
+    weak = !conceptSatisfied;
+    if (weak) {
+      const conceptId = concepts[0].id;
+      note = `Query names the '${conceptId}' concept but no top result or evidence slice clearly implements it — results may be a keyword collision. Verify before asserting.`;
+      suggestedFollowup = `search_symbol for a '${conceptId}'-specific term (e.g. ${concepts[0].likeTerms.slice(0, 3).join(', ')}) if the answer is not among these files.`;
+    }
+  } else {
+    const specificMatch = [...input.topDefinitions.slice(0, 3), ...input.topFileCandidates.slice(0, 3)]
+      .some(candidate => (candidate.matchedTokens ?? []).some(token => !isBroadSearchTerm(token)));
+    weak = !specificMatch && topConfidence < 0.75;
+    if (weak) {
+      note = 'Top-ranked results matched only broad/generic tokens; retrieval may be imprecise. Verify before asserting.';
+    }
+  }
+
+  const confidence = weak ? 0.55 : Math.min(0.88, 0.72 + topConfidence * 0.18);
+  return { tier: weak ? 'weak' : 'strong', confidence, weak, note, suggestedFollowup };
+}
+
+/** Simple (last-segment) name of a possibly-qualified symbol string. */
+function symbolSimpleName(symbol: string | undefined): string | undefined {
+  if (!symbol) return undefined;
+  const noParams = symbol.replace(/\(.*$/, '');
+  const parts = noParams.split(/[.#]/).filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : undefined;
 }
 
 function researchMissingFacts(input: {
@@ -8723,7 +9136,6 @@ function isTestPatchFile(file: string): boolean {
 }
 
 type ReviewFocus = 'general' | 'bug-risk' | 'api-contract' | 'tests' | 'security';
-type ReviewOutputMode = 'compact' | 'balanced' | 'full';
 
 interface PatchLineChange {
   line: number;
@@ -8818,43 +9230,9 @@ interface PatchLineMapping {
   fileSliceLines?: string;
 }
 
-interface ReviewBudget {
-  outputMode: ReviewOutputMode;
-  maxFindings: number;
-  maxLineFocus: number;
-  maxReviewTargets: number;
-  maxRiskFlags: number;
-  maxTests: number;
-  maxEvidencePerFinding: number;
-  maxRequiredToolCalls: number;
-}
-
 function normalizeReviewFocus(value: string): ReviewFocus {
   if (value === 'bug-risk' || value === 'api-contract' || value === 'tests' || value === 'security') return value;
   return 'general';
-}
-
-function normalizeReviewOutputMode(value: string): ReviewOutputMode {
-  if (value === 'balanced' || value === 'full') return value;
-  return 'compact';
-}
-
-function reviewBudgetFor(outputMode: ReviewOutputMode, args: Record<string, unknown>, limit: number): ReviewBudget {
-  const defaults = outputMode === 'full'
-    ? { maxFindings: limit, maxLineFocus: limit, maxReviewTargets: Math.min(limit, 20), maxRiskFlags: limit, maxTests: Math.min(limit, 50), maxEvidencePerFinding: 12, maxRequiredToolCalls: 8 }
-    : outputMode === 'balanced'
-      ? { maxFindings: 10, maxLineFocus: 20, maxReviewTargets: 10, maxRiskFlags: 12, maxTests: 8, maxEvidencePerFinding: 5, maxRequiredToolCalls: 4 }
-      : { maxFindings: 6, maxLineFocus: 10, maxReviewTargets: 6, maxRiskFlags: 8, maxTests: 5, maxEvidencePerFinding: 3, maxRequiredToolCalls: 3 };
-  return {
-    outputMode,
-    maxFindings: clampInt(Number(args.maxFindings ?? defaults.maxFindings), 1, limit),
-    maxLineFocus: clampInt(Number(args.maxLineFocus ?? defaults.maxLineFocus), 1, limit),
-    maxReviewTargets: clampInt(defaults.maxReviewTargets, 1, limit),
-    maxRiskFlags: clampInt(defaults.maxRiskFlags, 1, limit),
-    maxTests: clampInt(defaults.maxTests, 0, limit),
-    maxEvidencePerFinding: clampInt(Number(args.maxEvidencePerFinding ?? defaults.maxEvidencePerFinding), 1, 20),
-    maxRequiredToolCalls: clampInt(Number(args.maxRequiredToolCalls ?? defaults.maxRequiredToolCalls), 1, 20),
-  };
 }
 
 function parsePatchHunks(diff: string): PatchHunk[] {
@@ -10262,12 +10640,23 @@ function fileSearchCandidateTerms(query: string, tokens: string[]): string[] {
     endpointNeedle,
     ...identifiers,
   ].filter(term => term.length >= 3));
-  if (explicitTerms.length > 0) return explicitTerms.slice(0, 10);
-
   const fallbackTerms = uniqueStrings(tokens
     .filter(term => term.length >= 3 && !isBroadSearchTerm(term)))
     .slice(0, 10);
-  return fallbackTerms.length > 0 ? fallbackTerms : tokens.slice(0, 6);
+  if (explicitTerms.length === 0) {
+    return fallbackTerms.length > 0 ? fallbackTerms : tokens.slice(0, 6);
+  }
+  // Blend rather than replace: `identifierSearchTerms` classifies any plain
+  // English compound joined by a hyphen/dot/underscore ("right-sizing") the
+  // same as a real dotted/hyphenated code identifier, and a bare capitalized
+  // word ("SQLite") the same as a class name. A natural multi-concept
+  // question ("...from manifest file scan to the final SQLite snapshot")
+  // then had its ENTIRE other vocabulary (manifest, snapshot, indexing,
+  // pipeline) discarded the moment one such term was found, collapsing a
+  // whole-sentence query down to a single OR-term. Explicit terms are still
+  // valuable, precise anchors -- keep them first -- but merge in the rest of
+  // the sentence's content words instead of returning explicit-only.
+  return uniqueStrings([...explicitTerms, ...fallbackTerms]).slice(0, 12);
 }
 
 function ftsPrefixQuery(terms: string[]): string | undefined {

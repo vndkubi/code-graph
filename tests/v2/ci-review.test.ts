@@ -123,6 +123,27 @@ describe('ciReviewExitCode', () => {
     onlyP2.findings = onlyP2.findings.filter(f => f.priority === 'P2');
     expect(ciReviewExitCode(onlyP2, 'P1')).toBe(0);
   });
+
+  it('fails closed with code 2 when review coverage is incomplete', () => {
+    const incomplete = sampleResult({
+      findings: [],
+      reviewStatus: 'incomplete-coverage',
+      coverage: { complete: false } as CiReviewResult['coverage'],
+    });
+
+    expect(ciReviewExitCode(incomplete, 'none')).toBe(2);
+    expect(ciReviewExitCode(incomplete, 'P2')).toBe(2);
+  });
+
+  it('allows an explicit API caller to opt out of the incomplete-coverage gate', () => {
+    const incomplete = sampleResult({
+      findings: [],
+      reviewStatus: 'incomplete-coverage',
+      coverage: { complete: false } as CiReviewResult['coverage'],
+    });
+
+    expect(ciReviewExitCode(incomplete, 'none', false)).toBe(0);
+  });
 });
 
 describe('formatCiReview sarif', () => {
@@ -140,11 +161,10 @@ describe('formatCiReview sarif', () => {
     expect(run.results[0].partialFingerprints.codegraphFindingId).toBe('review-stale-caller-com.example.Foo#bar');
   });
 
-  it('anchors file-less findings to the first changed file at line 1', () => {
+  it('does not anchor file-less findings to an unrelated changed file', () => {
     const sarif = JSON.parse(formatCiReview(sampleResult(), 'sarif')) as Record<string, any>;
     const fanout = sarif.runs[0].results[1];
-    expect(fanout.locations[0].physicalLocation.artifactLocation.uri).toBe('src/app.ts');
-    expect(fanout.locations[0].physicalLocation.region.startLine).toBe(1);
+    expect(fanout.locations).toEqual([]);
   });
 });
 
@@ -178,6 +198,13 @@ describe('filterIgnorableDiff', () => {
     expect(diff.trim()).toBe('');
     expect(ignoredFiles).toEqual(['README.md']);
   });
+
+  it('keeps malformed diff blocks so they cannot be silently omitted', () => {
+    const malformed = 'diff --git malformed-header\n@@ -1 +1 @@\n-old\n+new\n';
+    const result = filterIgnorableDiff(malformed);
+    expect(result.ignoredFiles).toEqual([]);
+    expect(result.diff).toContain('malformed-header');
+  });
 });
 
 describe('reviewForCi (temp git repo)', () => {
@@ -209,6 +236,11 @@ describe('reviewForCi (temp git repo)', () => {
 
     const result = await reviewForCi(service, workspaceId, repo, { baseRef: 'HEAD~1' });
     expect(result.changedFiles).toContain('src/lib.ts');
+    expect(result.manifest).toMatchObject({
+      baseSha: expect.stringMatching(/^[0-9a-f]{40}$/),
+      headSha: expect.stringMatching(/^[0-9a-f]{40}$/),
+      files: [{ path: 'src/lib.ts', status: 'modified', graphResolution: 'resolved', reviewState: 'reviewed' }],
+    });
     expect(Array.isArray(result.findings)).toBe(true);
     for (const finding of result.findings) {
       expect(finding.ruleId).toBeTruthy();
@@ -251,5 +283,149 @@ describe('reviewForCi (temp git repo)', () => {
     const strict = await reviewForCi(service, workspaceId, repo, { baseRef: 'HEAD~1', minPriority: 'P0' });
     expect(strict.findings.every(f => f.priority === 'P0')).toBe(true);
     expect(strict.droppedBelowMinPriority).toBe(all.findings.length - strict.findings.length);
+  });
+
+  it('batches every changed file and deduplicates cross-batch findings', async () => {
+    if (!hasGit()) return;
+    const repo = tempDir('codegraph-ci-review-batches-');
+    runGit(repo, 'init');
+    runGit(repo, 'config', 'user.email', 'codegraph@example.test');
+    runGit(repo, 'config', 'user.name', 'CodeGraph Test');
+    for (let index = 0; index < 5; index += 1) writeFile(repo, `src/file-${index}.ts`, `export const value${index} = 1;\n`);
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'base');
+    for (let index = 0; index < 5; index += 1) writeFile(repo, `src/file-${index}.ts`, `export const value${index} = 2;\n`);
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'change all files');
+
+    const calls: Array<Record<string, unknown>> = [];
+    const manifestSnapshots: Array<{ files: Array<{ path: string; reviewState: string }> }> = [];
+    const service = {
+      async query(envelope: { args: Record<string, unknown> }): Promise<unknown> {
+        calls.push(envelope.args);
+        const batchDiff = String(envelope.args.diff ?? '');
+        const files = [...batchDiff.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)].map(match => match[2]);
+        const hunkCount = (batchDiff.match(/^@@ /gm) ?? []).length;
+        return {
+          changedFiles: files,
+          lineFocus: Array.from({ length: hunkCount }, () => ({})),
+          reviewFindings: [{
+            id: 'review-missing-tests',
+            priority: 'P1',
+            title: 'No likely tests were found',
+            why: 'The same cross-batch fact should appear once.',
+            confidence: 0.72,
+          }],
+          metrics: { omittedHunks: 0 },
+        };
+      },
+    };
+    const result = await reviewForCi(service as Pick<V2QueryService, 'query'>, 'workspace', repo, {
+      baseRef: 'HEAD~1',
+      batchSize: 2,
+      limit: 2,
+      onManifestUpdate: manifest => manifestSnapshots.push({
+        files: manifest.files.map(file => ({ path: file.path, reviewState: file.reviewState })),
+      }),
+    });
+
+    expect(calls).toHaveLength(3);
+    expect(calls.map(call => [...String(call.diff).matchAll(/^diff --git /gm)].length)).toEqual([2, 2, 1]);
+    expect(result.changedFiles).toHaveLength(5);
+    expect(result.findings.filter(finding => finding.id === 'review-missing-tests')).toHaveLength(1);
+    expect(manifestSnapshots).toHaveLength(7); // initial, pending, and completed snapshot per batch
+    expect(result.manifest?.files.every(file => file.reviewState === 'reviewed')).toBe(true);
+    expect(result.coverage).toMatchObject({
+      complete: true,
+      batchCount: 3,
+      reviewableFileCount: 5,
+      unparsedFileCount: 0,
+      graphEligibleFileCount: 5,
+      graphResolvedFileCount: 5,
+      reviewableHunkCount: 5,
+      reviewedHunkCount: 5,
+      omittedFiles: [],
+      omittedHunks: 0,
+    });
+  });
+
+  it('returns incomplete coverage when a batch fails instead of dropping the rest silently', async () => {
+    if (!hasGit()) return;
+    const { repo, workspaceId } = await setupRepo();
+    writeFile(repo, 'src/lib.ts', 'export function libValue(): number { return 42; }\n');
+    writeFile(repo, 'src/consumer.ts', "import { libValue } from './lib.js';\nexport function doubled(): number { return libValue() * 3; }\n");
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'change two files');
+
+    let callCount = 0;
+    const service = {
+      async query(envelope: { args: Record<string, unknown> }): Promise<unknown> {
+        callCount += 1;
+        if (callCount === 2) throw new Error('simulated review batch failure');
+        const batchDiff = String(envelope.args.diff ?? '');
+        const files = [...batchDiff.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)].map(match => match[2]);
+        const hunkCount = (batchDiff.match(/^@@ /gm) ?? []).length;
+        return {
+          changedFiles: files,
+          lineFocus: Array.from({ length: hunkCount }, () => ({})),
+          reviewFindings: [],
+          metrics: { omittedHunks: 0 },
+        };
+      },
+    };
+
+    const result = await reviewForCi(service as Pick<V2QueryService, 'query'>, 'workspace', repo, {
+      baseRef: 'HEAD~1',
+      batchSize: 1,
+    });
+
+    expect(result.coverage?.complete).toBe(false);
+    expect(result.reviewStatus).toBe('incomplete-coverage');
+    expect(result.batchFailures).toEqual([{ batch: 2, message: 'simulated review batch failure' }]);
+    expect(result.manifest?.files.filter(file => file.reviewState === 'reviewed')).toHaveLength(1);
+    expect(result.manifest?.files.filter(file => file.reviewState === 'failed')).toHaveLength(1);
+    expect(result.manifest?.files.find(file => file.reviewState === 'failed')).toMatchObject({ graphResolution: 'failed' });
+    expect(result.coverage?.batches[1]).toMatchObject({ complete: false, omittedHunks: 1 });
+    expect(ciReviewExitCode(result, 'none')).toBe(2);
+    expect(formatCiReview(result, 'text')).toContain('batch failures: #2 simulated review batch failure');
+  });
+
+  it('keeps internal graph coverage independent from the public response cap', async () => {
+    if (!hasGit()) return;
+    const repo = tempDir('codegraph-ci-review-cap-');
+    runGit(repo, 'init');
+    runGit(repo, 'config', 'user.email', 'codegraph@example.test');
+    runGit(repo, 'config', 'user.name', 'CodeGraph Test');
+    for (let index = 0; index < 12; index += 1) {
+      writeFile(repo, `src/service-${index}.ts`, `export function service${index}(): number { return 1; }\n`);
+    }
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'base');
+    for (let index = 0; index < 12; index += 1) {
+      writeFile(repo, `src/service-${index}.ts`, `export function service${index}(): number { return 2; }\n`);
+    }
+    runGit(repo, 'add', '.');
+    runGit(repo, 'commit', '-m', 'change services');
+
+    const { db } = await openCodeGraphDb(tempDir('codegraph-home-'));
+    dbs.push(db);
+    const index = await new V2Indexer(db).indexWorkspace({ root: repo });
+    const diff = execFileSync('git', ['diff', '--no-renames', '--unified=3', 'HEAD~1...HEAD'], {
+      cwd: repo,
+      encoding: 'utf8',
+    });
+    const response = await new V2QueryService(db).query({
+      workspaceId: index.workspaceId,
+      toolName: 'review_patch',
+      args: { diff, outputMode: 'full', limit: 12, maxResponseTokens: 500 },
+    }) as {
+      changedFiles: string[];
+      reviewCoverage: { graphResolvedFileCount: number; omittedGraphFileCount: number };
+      metrics: { graphResolvedChangedFileCount: number; omittedGraphFiles: number };
+    };
+
+    expect(response.changedFiles).toHaveLength(12);
+    expect(response.reviewCoverage).toMatchObject({ graphResolvedFileCount: 12, omittedGraphFileCount: 0 });
+    expect(response.metrics).toMatchObject({ graphResolvedChangedFileCount: 12, omittedGraphFiles: 0 });
   });
 });

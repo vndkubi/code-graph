@@ -1,0 +1,159 @@
+{
+  "name": "doughnut-java-external-quality-suite",
+  "repoRoot": "<doughnut-project>",
+  "workspaceKey": "doughnut-java-external-proof",
+  "rootProfile": {
+    "name": "doughnut-spring-java",
+    "requiredFiles": [
+      "backend/src/main/java/com/odde/doughnut/controllers/RecallsController.java",
+      "backend/src/main/java/com/odde/doughnut/services/NoteService.java",
+      "backend/src/main/java/com/odde/doughnut/services/focusContext/FocusContextRetrievalService.java"
+    ],
+    "requiredMethods": [
+      "recalling",
+      "getDueMemoryTrackers",
+      "restore",
+      "sameTimestamp",
+      "retrieve"
+    ]
+  },
+  "tasks": [
+    {
+      "id": "recalls-recalling-api-flow",
+      "type": "api-flow",
+      "prompt": "Trace the Spring API GET /api/recalls/recalling end to end. Include authentication, timezone and dueindays handling, the service call, result DTO, and likely controller tests. Return compact JSON with keys task,keyFiles,methods,flow,dependencies,tests,risks,confidence.",
+      "expectedFiles": [
+        "RecallsController.java",
+        "RecallService.java",
+        "RecallsControllerTests.java"
+      ],
+      "expectedMethods": [
+        "recalling",
+        "getDueMemoryTrackers",
+        "parseTimezone"
+      ],
+      "expectedTerms": [
+        "dueInDays",
+        "assertLoggedIn",
+        "DueMemoryTrackers"
+      ],
+      "requiredAnswerFields": [
+        "task",
+        "keyFiles",
+        "methods",
+        "flow",
+        "tests"
+      ],
+      "requireJson": true
+    },
+    {
+      "id": "note-deleted-at-field-impact",
+      "type": "field-impact",
+      "prompt": "Investigate the impact of changing the Java field Note.deletedAt or its soft-delete semantics. Include where it is written, read, queried, how MemoryTracker deletion timestamps are coordinated, restore behavior, risks, and likely tests. Return compact JSON with keys task,field,keyFiles,definitions,usagesByMethod,flow,risks,tests,confidence.",
+      "expectedFiles": [
+        "Note.java",
+        "NoteService.java",
+        "NoteRepository.java",
+        "NoteServiceTest.java"
+      ],
+      "expectedMethods": [
+        "destroy",
+        "restore",
+        "sameTimestamp"
+      ],
+      "expectedTerms": [
+        "deletedAt",
+        "MemoryTracker",
+        "soft delete"
+      ],
+      "requiredAnswerFields": [
+        "field",
+        "definitions",
+        "usagesByMethod",
+        "risks",
+        "tests"
+      ],
+      "requireJson": true
+    },
+    {
+      "id": "review-note-restore-timestamp-guard",
+      "type": "code-review",
+      "prompt": "Review this Java patch for correctness and missing tests. Return compact JSON with keys status,topFindings,impactedFlow,tests,confidence. Cite repository-relative files.\n\ndiff --git a/backend/src/main/java/com/odde/doughnut/services/NoteService.java b/backend/src/main/java/com/odde/doughnut/services/NoteService.java\n--- a/backend/src/main/java/com/odde/doughnut/services/NoteService.java\n+++ b/backend/src/main/java/com/odde/doughnut/services/NoteService.java\n@@\n-        if (sameTimestamp(deletedAt, mt.getDeletedAt())) {\n+        if (mt.getDeletedAt() != null) {\n           mt.setDeletedAt(null);\n           entityPersister.merge(mt);\n         }",
+      "expectedFiles": [
+        "NoteService.java",
+        "NoteServiceTest.java"
+      ],
+      "expectedMethods": [
+        "restore",
+        "sameTimestamp"
+      ],
+      "expectedTerms": [
+        "deletedAt",
+        "MemoryTracker",
+        "missing test"
+      ],
+      "requiredAnswerFields": [
+        "status",
+        "topFindings",
+        "impactedFlow",
+        "tests"
+      ],
+      "requireJson": true
+    },
+    {
+      "id": "focus-context-bounded-retrieval",
+      "type": "investigation",
+      "prompt": "Explain how FocusContextRetrievalService.retrieve builds bounded related-note context. Include hydration, wiki links, inbound references, structural peers, depth and token budgets, deterministic sampling, and tests. Return compact JSON with keys task,keyFiles,methods,flow,budgets,tests,risks,confidence.",
+      "expectedFiles": [
+        "FocusContextRetrievalService.java",
+        "ApproximateUtf8TokenBudget.java",
+        "FocusContextRetrievalServiceTest.java"
+      ],
+      "expectedMethods": [
+        "retrieve",
+        "findStructuralPeerNotesSample",
+        "hydrateNonDeletedNotesWithNotebookAndFolderByIds"
+      ],
+      "expectedTerms": [
+        "maxDepth",
+        "sampleSeed",
+        "relatedTotalBudget"
+      ],
+      "requiredAnswerFields": [
+        "task",
+        "keyFiles",
+        "methods",
+        "flow",
+        "budgets",
+        "tests"
+      ],
+      "requireJson": true
+    },
+    {
+      "id": "notebook-index-content-test-selection",
+      "type": "test-selection",
+      "prompt": "Determine the minimum high-confidence Java tests for changing NotebookController.updateNotebookIndexContent, especially blank-content clearing and authorization. Explain the controller-to-entity/DTO flow and return compact JSON with keys task,keyFiles,methods,flow,tests,risks,confidence.",
+      "expectedFiles": [
+        "NotebookController.java",
+        "NotebookCrudControllerTest.java",
+        "NotebookRealm.java"
+      ],
+      "expectedMethods": [
+        "updateNotebookIndexContent"
+      ],
+      "expectedTerms": [
+        "indexContent",
+        "blank",
+        "authorization"
+      ],
+      "requiredAnswerFields": [
+        "task",
+        "keyFiles",
+        "methods",
+        "flow",
+        "tests"
+      ],
+      "requireJson": true
+    }
+  ]
+}

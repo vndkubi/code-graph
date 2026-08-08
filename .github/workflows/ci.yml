@@ -9,11 +9,15 @@ on:
 
 jobs:
   build-test:
-    name: Node ${{ matrix.node-version }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / Node ${{ matrix.node-version }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
         node-version:
           - 20
           - 22
@@ -34,6 +38,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Architecture gate
+        run: npm run architecture-gate
+
       - name: Build
         run: npm run build
 
@@ -45,7 +52,7 @@ jobs:
 
       - name: Super VIP quality gate
         run: |
-          mkdir -p .tmp/quality-gate
+          node -e "require('node:fs').mkdirSync('.tmp/quality-gate', { recursive: true })"
           node dist/cli.js upgrade-audit --root . --require-ready --require-fresh --min-grade A --min-score 96 --max-slow-ms 5000 --json > .tmp/quality-gate/upgrade-audit.json
 
       - name: Upload quality gate report

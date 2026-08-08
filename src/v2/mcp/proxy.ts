@@ -6,6 +6,9 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { V2Indexer } from '../index/indexer.js';
 import { watchWorkspace, type WorkspaceWatchHandle } from '../index/watcher.js';
 import { getWorkspacePaths } from '../paths.js';
+import { ReviewPullRequestUseCase } from '../application/review-use-case.js';
+import type { CiReviewResult } from '../query/ci-review.js';
+import { hasExplicitReviewPayload, resolveReviewInput, type ReviewInput } from '../query/review-input.js';
 import { V2QueryService } from '../query/service.js';
 import { openCodeGraphDb, type CodeGraphDb } from '../storage/database.js';
 import { inspectWorkspaceReadiness } from '../workspace-health.js';
@@ -21,6 +24,7 @@ import {
 } from '../../tokenopt/mcp.js';
 import { parseCodeGraphResult } from '../../tokenopt/codegraph-bridge.js';
 import { createGraphSymbolProvider, type GraphSymbolProvider } from '../../tokenopt/coding/graph-symbol-provider.js';
+import { CheckpointConflictError, CheckpointStateStore, type CheckpointPhase, type CheckpointState } from '../checkpoint.js';
 
 const TOKENOPT_TOOL_NAMES = new Set(TOKENOPT_TOOL_DEFINITIONS.map(tool => tool.name));
 
@@ -45,6 +49,13 @@ type McpRuntime = {
   indexer: V2Indexer;
   queries: V2QueryService;
   workspace: RegisteredWorkspace;
+  checkpoints: CheckpointStateStore;
+};
+
+type McpReviewPacket = Record<string, unknown> & {
+  answerable: boolean;
+  sufficientForAnswer: boolean;
+  reviewStatus: string;
 };
 
 interface CachedRuntimeFailure {
@@ -154,6 +165,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
       indexer,
       queries,
       workspace,
+      checkpoints: new CheckpointStateStore(options.root),
     };
   };
   const readyRuntime = async (): Promise<McpRuntime> => {
@@ -283,6 +295,22 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
         };
       }
       args = parseToolArgs(request.params.name, request.params.arguments);
+      if (request.params.name === 'codegraph_checkpoint') {
+        const current = await runtime();
+        const result = dispatchCheckpoint(current.checkpoints, args);
+        const serialized = JSON.stringify(result);
+        logQueryEvent(current.logPath, {
+          event: 'query',
+          toolName: request.params.name,
+          routedToolName: request.params.name,
+          durationMs: Date.now() - startedAt,
+          responseChars: serialized.length,
+          args: summarizeArgs(args),
+          result: summarizeResult(result, args),
+          checkpoint: true,
+        });
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+      }
       if (request.params.name === 'codegraph_status') {
         const result = await codegraphStatus(options.root, args, runtimeValue);
         const serialized = JSON.stringify(result);
@@ -293,7 +321,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
           durationMs: Date.now() - startedAt,
           responseChars: serialized.length,
           args: summarizeArgs(args),
-          result: summarizeResult(result),
+          result: summarizeResult(result, args),
         });
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
@@ -313,26 +341,54 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
         // forces it off globally as an opt-out for benchmark/perf scenarios.
         args.warnStale = options.warnStale !== false;
       }
+      if (request.params.name === 'codegraph_context') {
+        const reviewPacket = await executeMcpReviewIfRequested(options, args, providerOptions);
+        if (reviewPacket) {
+          const durationMs = Date.now() - startedAt;
+          const serialized = JSON.stringify(reviewPacket);
+          logQueryEvent(getWorkspacePaths(options.root).queryLogPath, {
+            event: 'query',
+            toolName: request.params.name,
+            routedToolName: 'review_for_ci',
+            durationMs,
+            responseChars: serialized.length,
+            args: summarizeArgs(args),
+            result: summarizeResult(reviewPacket, args),
+            reviewInput: reviewPacket.reviewInput,
+          });
+          const enriched = addResponseMeta(reviewPacket, request.params.name, durationMs, serialized.length);
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify(enriched, null, 2) }],
+          };
+        }
+      }
       const routed = routeMcpTool(request.params.name, args);
       const current = routed.requiresIndexedWorkspace === false
         ? await runtime()
         : await readyRuntime();
-      const result = await current.queries.query({
-        workspaceId: current.workspace.workspaceId,
-        toolName: routed.toolName,
-        args: routed.args,
-      });
+      const effectiveArgs = request.params.name === 'codegraph_context' && typeof args.resumeTaskId === 'string'
+        ? resumeContextArgs(current.checkpoints, args)
+        : args;
+      const routedWithResume = request.params.name === 'codegraph_context' ? routeMcpTool(request.params.name, effectiveArgs) : routed;
+      const rawResult = isRecord(effectiveArgs._resumeBlocked)
+        ? effectiveArgs._resumeBlocked
+        : await current.queries.query({
+          workspaceId: current.workspace.workspaceId,
+          toolName: routedWithResume.toolName,
+          args: routedWithResume.args,
+        });
+      const result = applyContextScopeGate(effectiveArgs, rawResult);
       const durationMs = Date.now() - startedAt;
       const serialized = JSON.stringify(result);
       logQueryEvent(current.logPath, {
         event: 'query',
         toolName: request.params.name,
-        routedToolName: routed.toolName,
+        routedToolName: routedWithResume.toolName,
         workspaceId: current.workspace.workspaceId,
         durationMs,
         responseChars: serialized.length,
         args: summarizeArgs(args),
-        result: summarizeResult(result),
+        result: summarizeResult(result, args),
       });
       const enriched = addResponseMeta(result, request.params.name, durationMs, serialized.length);
       return {
@@ -358,7 +414,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
             durationMs: Date.now() - startedAt,
             responseChars: serialized.length,
             args: summarizeArgs(args),
-            result: summarizeResult(fallback),
+            result: summarizeResult(fallback, args),
             fallbackReason: summarizeErrorPayload(payload),
           });
           return {
@@ -376,6 +432,7 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
   const transport = new StdioServerTransport();
   const cleanup = async () => {
     await watcher?.close().catch(() => undefined);
+    runtimeValue?.checkpoints.close();
     await runtimeValue?.db.close().catch(() => undefined);
   };
   process.once('SIGINT', () => { void cleanup().finally(() => process.exit(0)); });
@@ -400,6 +457,158 @@ export function routeMcpTool(name: string, args: Record<string, unknown>): {
   return routeCodeGraphContext(args);
 }
 
+/**
+ * Resolve review-only facade calls before the generic review_patch router. A
+ * PR URL or branch range is a source locator, not a diff; the CLI already has
+ * the safe immutable-worktree and batched-review pipeline, so MCP reuses it
+ * here instead of returning a misleading zero-file review packet.
+ */
+export async function executeMcpReviewIfRequested(
+  options: RunMcpProxyOptions,
+  args: Record<string, unknown>,
+  providerOptions: { indexProviders?: string[] | string; scipIndexPath?: string },
+): Promise<McpReviewPacket | undefined> {
+  const task = String(args.task ?? args.target ?? '').trim();
+  if (inferCodeGraphContextMode(task, args) !== 'review' || hasExplicitReviewPayload(args)) return undefined;
+
+  let input: ReviewInput | undefined;
+  try {
+    input = resolveReviewInput(task, args);
+  } catch (error) {
+    return missingMcpReviewInputPacket(task, undefined, error instanceof Error ? error.message : String(error));
+  }
+  if (!input) {
+    return missingMcpReviewInputPacket(
+      task,
+      undefined,
+      'A review needs a GitHub PR URL, baseRef/headRef, or an explicit unified diff/files payload.',
+    );
+  }
+
+  try {
+    const execution = await new ReviewPullRequestUseCase().execute({
+      sourceRoot: options.root,
+      input,
+      isolateRangeWorkspace: true,
+      focus: 'general',
+      ...providerOptions,
+    });
+    return mcpReviewPacket(execution.review, input, task, execution.reviewRoot);
+  } catch (error) {
+    return missingMcpReviewInputPacket(
+      task,
+      input,
+      error instanceof Error ? error.message : String(error),
+      'input-resolution-failed',
+    );
+  }
+}
+
+function mcpReviewPacket(
+  review: CiReviewResult,
+  input: ReviewInput,
+  task: string,
+  reviewRoot: string,
+): McpReviewPacket {
+  const changedFiles = Array.isArray(review.changedFiles) ? review.changedFiles.map(String) : [];
+  const reviewStatus = typeof review.reviewStatus === 'string' ? review.reviewStatus : 'unknown';
+  const originalCoverage = isRecord(review.coverage) ? review.coverage : undefined;
+  const coverage = originalCoverage ?? {
+    complete: reviewStatus === 'no-changes' || reviewStatus === 'no-reviewable-changes',
+    batchCount: 0,
+    reviewableFileCount: changedFiles.length,
+    graphResolvedFileCount: changedFiles.length,
+    reviewableHunkCount: 0,
+    reviewedHunkCount: 0,
+    omittedFiles: [],
+    omittedHunks: 0,
+  };
+  const answerable = coverage.complete === true && reviewStatus !== 'incomplete-coverage';
+  const followup = reviewFollowupArgs(task, input);
+  return {
+    ...review,
+    reviewRoot,
+    reviewInput: input,
+    reviewStatus,
+    reviewFindings: review.findings,
+    answerable,
+    sufficientForAnswer: answerable,
+    coverage,
+    allowedFollowups: answerable ? [] : [{ tool: 'codegraph_context', args: followup }],
+    disallowedFollowups: ['broad_shell_search', 'unbounded_file_reads', 'unbounded_mcp_exploration'],
+    nextAction: answerable
+      ? 'Answer from this complete review packet; do not re-run broad repository search.'
+      : 'Retry codegraph_context with the exact review source shown in allowedFollowups before answering.',
+    stopRule: answerable
+      ? 'answerable=true: answer from the packet.'
+      : 'answerable=false: use the exact codegraph_context follow-up; do not substitute broad shell search.',
+    reviewMetrics: {
+      changedFileCount: changedFiles.length,
+      reviewableFileCount: numberOrUndefined(coverage.reviewableFileCount) ?? changedFiles.length,
+      graphResolvedFileCount: numberOrUndefined(coverage.graphResolvedFileCount) ?? changedFiles.length,
+      reviewableHunkCount: numberOrUndefined(coverage.reviewableHunkCount) ?? 0,
+      reviewedHunkCount: numberOrUndefined(coverage.reviewedHunkCount) ?? 0,
+    },
+  };
+}
+
+function missingMcpReviewInputPacket(
+  task: string,
+  input: ReviewInput | undefined,
+  reason: string,
+  reviewStatus = 'input-unresolved',
+): McpReviewPacket {
+  const followup = reviewFollowupArgs(task, input);
+  return {
+    answerable: false,
+    sufficientForAnswer: false,
+    reviewStatus,
+    reviewInput: input ?? { kind: 'missing' },
+    changedFiles: [],
+    reviewFindings: [{
+      id: 'review-input-unresolved',
+      ruleId: 'review-input-unresolved',
+      priority: 'P1',
+      category: 'correctness',
+      title: 'Review source could not be resolved',
+      why: reason,
+      suggestedCheck: 'Provide a GitHub PR URL, baseRef/headRef, or a unified diff.',
+      confidence: 0.99,
+    }],
+    coverage: {
+      complete: false,
+      batchCount: 0,
+      reviewableFileCount: 0,
+      graphEligibleFileCount: 0,
+      graphResolvedFileCount: 0,
+      reviewableHunkCount: 0,
+      reviewedHunkCount: 0,
+      omittedFiles: [],
+      omittedHunks: 0,
+    },
+    missingFacts: [reason],
+    allowedFollowups: [{ tool: 'codegraph_context', args: followup }],
+    disallowedFollowups: ['broad_shell_search', 'unbounded_file_reads', 'unbounded_mcp_exploration'],
+    nextAction: 'Retry codegraph_context with prUrl or baseRef/headRef; the review cannot be answered from zero patch input.',
+    stopRule: 'answerable=false: resolve the review source before producing findings.',
+    reviewMetrics: {
+      changedFileCount: 0,
+      reviewableFileCount: 0,
+      graphResolvedFileCount: 0,
+      reviewableHunkCount: 0,
+      reviewedHunkCount: 0,
+    },
+  };
+}
+
+function reviewFollowupArgs(task: string, input: ReviewInput | undefined): Record<string, unknown> {
+  return copyDefined({
+    task,
+    ...(input?.kind === 'pull_request' ? { prUrl: input.prUrl } : {}),
+    ...(input?.kind === 'range' ? { baseRef: input.baseRef, headRef: input.headRef } : {}),
+  });
+}
+
 export function routeCodeGraphContext(args: Record<string, unknown>): {
   toolName: string;
   args: Record<string, unknown>;
@@ -407,6 +616,7 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
   const task = String(args.task ?? args.target ?? '').trim();
   const target = typeof args.target === 'string' && args.target.trim().length > 0 ? args.target.trim() : task;
   const mode = inferCodeGraphContextMode(task, args);
+  const fieldImpactSymbol = fieldImpactSymbolForTask(task, target);
   const tokenBudget = numberArg(args.budgetTokens, 6000);
   const common = copyDefined({
     profile: args.profile,
@@ -417,15 +627,23 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
     autoRefresh: args.autoRefresh,
     warnStale: args.warnStale,
     debugTiming: args.debugTiming,
+    sessionId: args.sessionId,
+    freshEvidence: args.freshEvidence,
+    scopePlan: args.scopePlan,
+    resumeTaskId: args.resumeTaskId,
   });
 
   if (mode === 'review') {
     return {
       toolName: 'review_patch',
       args: copyDefined({
+        task,
         diff: args.diff,
         files: args.files,
         symbols: args.symbols,
+        prUrl: args.prUrl,
+        baseRef: args.baseRef,
+        headRef: args.headRef,
         focus: 'general',
         outputMode: args.profile === 'full' ? 'full' : 'compact',
         includeLikelyTests: true,
@@ -451,9 +669,10 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
       args: copyDefined({
         task,
         target,
+        changeType: fieldImpactSymbol ? 'investigate' : undefined,
         diff: args.diff,
         files: args.files,
-        symbols: args.symbols,
+        symbols: args.symbols ?? (fieldImpactSymbol ? [fieldImpactSymbol] : undefined),
         tokenBudget,
         ...common,
       }),
@@ -546,13 +765,25 @@ export function inferCodeGraphContextMode(task: string, args: Record<string, unk
   if (explicit === 'research' || explicit === 'flow' || explicit === 'change' || explicit === 'review' || explicit === 'evidence') {
     return explicit;
   }
+  const plannedIntent = isRecord(args.scopePlan) && typeof args.scopePlan.intent === 'string'
+    ? args.scopePlan.intent
+    : undefined;
+  if (plannedIntent === 'research' || plannedIntent === 'flow' || plannedIntent === 'change' || plannedIntent === 'review' || plannedIntent === 'evidence') {
+    return plannedIntent;
+  }
   const text = `${task}\n${typeof args.diff === 'string' ? args.diff.slice(0, 2000) : ''}`.toLowerCase();
   if (typeof args.diff === 'string' && args.diff.trim().length > 0) return 'review';
   if (hasReviewIntent(text)) return 'review';
-  if (/\b(evidence|answerable|rubric|coverage|pbi|ticket|story|acceptance criteria)\b/.test(text)) return 'evidence';
   if (hasChangeIntent(text)) return 'change';
   if (hasExplicitFlowIntent(text)) return 'flow';
+  if (hasEvidenceIntent(text)) return 'evidence';
   return 'research';
+}
+
+function hasEvidenceIntent(text: string): boolean {
+  if (/\b(pbi|ticket|user story|acceptance criteria)\b/.test(text)) return true;
+  if (/\b(answerable|rubric|coverage)\b/.test(text)) return true;
+  return /\b(compile|collect|prove|audit|evaluate|assess)\b[^\n]{0,80}\b(evidence|answerability|rubric|coverage)\b/.test(text);
 }
 
 function hasReviewIntent(text: string): boolean {
@@ -566,7 +797,7 @@ function hasReviewIntent(text: string): boolean {
 }
 
 function hasChangeIntent(text: string): boolean {
-  return /\b(implement|fix|debug|refactor|change|modify|test|add|remove|update|bug|regression|failure|failing|root cause)\b/.test(text)
+  return /\b(implement|fix|debug|refactor|chang(?:e|es|ed|ing)|modif(?:y|ies|ied|ying|ication|ications)|test|add|remove|update|bug|regression|failure|failing|root cause)\b/.test(text)
     || /\binvestigate\b.*\b(bug|issue|error|failure|failing|regression|timeout|wrong|slow|root cause)\b/.test(text)
     || /\bwhy\b.*\b(fail|fails|failing|error|timeout|wrong|slow|happen|happens)\b/.test(text);
 }
@@ -615,6 +846,18 @@ function dependencyFailurePayload(error: unknown): Record<string, unknown> {
 
 function errorPayload(error: unknown): Record<string, unknown> {
   if (error instanceof McpStructuredError) return error.payload;
+  if (error instanceof CheckpointConflictError) {
+    return {
+      error: {
+        code: 'checkpoint_version_conflict',
+        message: error.message,
+        taskId: error.taskId,
+        expectedVersion: error.expectedVersion,
+        actualVersion: error.actualVersion,
+        next: 'Reload the explicit taskId and retry with expectedVersion equal to actualVersion.',
+      },
+    };
+  }
   const message = error instanceof Error ? error.message : String(error);
   if (/is not indexed yet/i.test(message)) {
     return {
@@ -657,7 +900,7 @@ function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
   const summary: Record<string, unknown> = {};
   // sessionId keeps the query log usable as an adoption ledger: it groups the
   // calls of one conversation (see `codegraph adoption-report`).
-  for (const key of ['target', 'symbol', 'source', 'module', 'file', 'query', 'task', 'taskType', 'tokenBudget', 'method', 'path', 'sessionId']) {
+  for (const key of ['target', 'symbol', 'source', 'module', 'file', 'query', 'task', 'taskType', 'tokenBudget', 'method', 'path', 'sessionId', 'taskId', 'action', 'version', 'expectedVersion', 'prUrl', 'baseRef', 'headRef']) {
     const value = args[key];
     if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
       summary[key] = typeof value === 'string' && value.length > 240 ? `${value.slice(0, 237)}...` : value;
@@ -666,8 +909,16 @@ function summarizeArgs(args: Record<string, unknown>): Record<string, unknown> {
   return summary;
 }
 
-function summarizeResult(result: unknown): Record<string, unknown> {
+function summarizeResult(result: unknown, args: Record<string, unknown> = {}): Record<string, unknown> {
   if (!isRecord(result)) return {};
+  const relevanceGate = isRecord(result.relevanceGate) ? result.relevanceGate : undefined;
+  const missingRequirements = relevanceGate && Array.isArray(relevanceGate.missingRequirements)
+    ? relevanceGate.missingRequirements.length
+    : undefined;
+  const requirements = isRecord(args.scopePlan) && Array.isArray(args.scopePlan.requirements)
+    ? args.scopePlan.requirements.length
+    : undefined;
+  const claimValidation = Array.isArray(result.claimValidation) ? result.claimValidation : [];
   return copyDefined({
     ok: booleanOrUndefined(result.ok),
     state: stringOrUndefined(result.state),
@@ -681,6 +932,24 @@ function summarizeResult(result: unknown): Record<string, unknown> {
     indexFreshness: summarizeIndexFreshness(result.indexFreshness),
     freshness: summarizeIndexFreshness(result.freshness),
     debugTiming: summarizeDebugTiming(result.debugTiming),
+    relevanceGate: relevanceGate
+      ? copyDefined({
+        status: stringOrUndefined(relevanceGate.status),
+        targetMatched: booleanOrUndefined(relevanceGate.targetMatched),
+        missingRequirements: Array.isArray(relevanceGate.missingRequirements)
+          ? relevanceGate.missingRequirements.slice(0, 20)
+          : undefined,
+      })
+      : undefined,
+    refinementCount: isRecord(args.scopePlan) ? numberOrUndefined(args.scopePlan.attempt) ?? 1 : undefined,
+    targetCoverage: relevanceGate ? booleanOrUndefined(relevanceGate.targetMatched) : undefined,
+    requirementCoverage: relevanceGate ? copyDefined({ total: requirements, missing: missingRequirements }) : undefined,
+    falseAnswerablePrevented: relevanceGate
+      ? relevanceGate.status === 'blocked' || relevanceGate.wouldBlock === true
+      : undefined,
+    checkpointVersion: numberOrUndefined(result.version) ?? numberOrUndefined(args.version),
+    staleClaimCount: claimValidation.filter(item => isRecord(item) && ['stale', 'missing', 'ambiguous'].includes(String(item.status))).length || undefined,
+    recommendedNextAction: stringOrUndefined(result.recommendedNextAction),
   });
 }
 
@@ -747,21 +1016,69 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function withFreshnessBanner(text: string, result: unknown): string {
+/**
+ * Stale-index banner, scoped to files this packet actually stands on.
+ *
+ * `isStale` is snapshot-wide: ANY uncommitted file marks it true, so during
+ * normal development (a dirty tree is the normal state) the banner fired on
+ * every packet, and it named unrelated files. Worse, it said "Read these files
+ * directly if precision matters" — a broad-read instruction contradicting the
+ * same packet's `answerable=true` stop rule, teaching exactly the double-spend
+ * the tool exists to prevent.
+ *
+ * Now it fires only when a dirty path intersects the packet's own evidence, and
+ * points at the bounded follow-up (codegraph_slice) instead of a file read.
+ */
+export function withFreshnessBanner(text: string, result: unknown): string {
   if (!isRecord(result)) return text;
   const freshness = result.indexFreshness;
   if (!isRecord(freshness) || freshness.isStale !== true) return text;
+  const dirty = dirtyPathsFromFreshness(freshness);
+  if (dirty.length === 0) return text;
+  const relied = packetFilePaths(result);
+  if (relied.size === 0) return text;
+  const overlap = dirty.filter(entry => pathTouchesPacket(entry, relied)).slice(0, 5);
+  if (overlap.length === 0) return text;
+  return `⚠️ Uncommitted edits since indexing touch this packet's evidence: ${overlap.join(', ')}. `
+    + `Everything else here is current. Re-fetch only those ranges with codegraph_slice if exact line numbers matter.\n\n${text}`;
+}
+
+function dirtyPathsFromFreshness(freshness: Record<string, unknown>): string[] {
   const dirtyFiles = freshness.dirtyFiles;
   const samples = isRecord(dirtyFiles) && isRecord(dirtyFiles.samples) ? dirtyFiles.samples : undefined;
-  const names = samples
-    ? [
-      ...(Array.isArray(samples.modified) ? samples.modified : []),
-      ...(Array.isArray(samples.added) ? samples.added : []),
-      ...(Array.isArray(samples.deleted) ? samples.deleted : []),
-    ].slice(0, 10)
-    : [];
-  const list = names.length ? `: ${names.join(', ')}` : '';
-  return `⚠️ Index may be stale${list}. Read these files directly if precision matters.\n\n${text}`;
+  if (!samples) return [];
+  return [
+    ...(Array.isArray(samples.modified) ? samples.modified : []),
+    ...(Array.isArray(samples.added) ? samples.added : []),
+    ...(Array.isArray(samples.deleted) ? samples.deleted : []),
+  ].filter((entry): entry is string => typeof entry === 'string' && entry.length > 0);
+}
+
+/** git status reports untracked directories as `docs/scan/` — match by prefix. */
+function pathTouchesPacket(dirtyPath: string, relied: Set<string>): boolean {
+  const normalized = dirtyPath.replace(/\\/g, '/');
+  if (relied.has(normalized)) return true;
+  if (!normalized.endsWith('/')) return false;
+  for (const file of relied) {
+    if (file.startsWith(normalized)) return true;
+  }
+  return false;
+}
+
+/** Every file path the packet presents as evidence, across pack shapes. */
+function packetFilePaths(result: Record<string, unknown>): Set<string> {
+  const paths = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value === 'string' && value.length > 0) paths.add(value.replace(/\\/g, '/'));
+  };
+  for (const value of Object.values(result)) {
+    if (!Array.isArray(value)) continue;
+    for (const entry of value) {
+      if (typeof entry === 'string') add(entry);
+      else if (isRecord(entry)) add(entry.file);
+    }
+  }
+  return paths;
 }
 
 function booleanOrUndefined(value: unknown): boolean | undefined {
@@ -837,17 +1154,22 @@ function addResponseMeta(
 
 export const MCP_SERVER_INSTRUCTIONS = `# CodeGraph — pre-indexed repository context
 
-The workspace is pre-indexed into a code graph (symbols, calls, dependencies, endpoints). One codegraph_context call returns a bounded evidence packet — ranked files, call/dependency edges, line-numbered source — for a whole task, replacing a grep->read->grep loop (benchmarked: ~20% fewer tokens, ~5x fewer tool round-trips than raw file reads).
+The workspace is pre-indexed into a code graph. codegraph_context returns bounded ranked files, graph edges, and line-numbered evidence for the task.
 
-Session reuse first: pass the same sessionId string on EVERY call in a conversation. Already-delivered slices then return reusedFromEarlierCall=true with no text body — you already have that source; do NOT re-open it with other tools. Re-fetch one slice via codegraph_slice (or freshEvidence=true) only if it truly left your context.
+Session reuse first: pass the same sessionId on EVERY call. Reuse delivered evidence; fetch one missing range with codegraph_slice.
 
 Routing:
 - Any repository question, or before any edit -> codegraph_context with the user's task verbatim.
-- answerable=true or sufficientForAnswer=true -> answer from the packet; no grep/read/shell re-verification of the same ground.
+- PR review -> pass prUrl or baseRef/headRef; a URL/range in task is also parsed and reviewed in an immutable, batched range.
+- Omit mode unless the user explicitly requests one; automatic routing uses the full task.
+- answerable=true -> answer from the packet; do not re-search the same ground.
+- answerable=false review input -> retry codegraph_context with the exact allowedFollowups; do not answer from zero metrics.
 - Packet names an exact missing file/line/symbol -> codegraph_slice (batch via slices[]).
+- Ambiguous work -> use the returned scopeRequest, fill scopePlan, then retry codegraph_context once.
+- Multi-phase work -> save/load codegraph_checkpoint by explicit taskId; load may require fresh evidence after source drift.
 - codegraph_status is diagnostic only.
 
-Trust the packet: evidenceSlices are already-read source; when facts are missing the packet lists its own followups — use those, not broad search. Index missing/stale errors name the exact fix command (codegraph index); run it once, retry. Do not set autoRefresh=true unless the user asks for a fresh index.`;
+Trust the packet and its followups; avoid broad search. Index errors name the exact codegraph index/setup retry. Do not set autoRefresh=true unless requested.`;
 
 /**
  * Appended to the base instructions only when the TokenOpt/pack tool surface is
@@ -859,4 +1181,222 @@ export const FULL_PROFILE_INSTRUCTIONS_SUFFIX = `Full profile addendum: direct p
 
 function isAnswerPackTool(name: string): boolean {
   return name === 'get_flow_pack' || name === 'get_research_pack';
+}
+
+function dispatchCheckpoint(store: CheckpointStateStore, args: Record<string, unknown>): Record<string, unknown> {
+  const action = String(args.action ?? '');
+  if (action === 'list') return { action, checkpoints: store.list(numberOrUndefined(args.limit) ?? 20) };
+  const taskId = typeof args.taskId === 'string' ? args.taskId : undefined;
+  if (action === 'load') {
+    if (!taskId) throw new Error('codegraph_checkpoint load requires taskId.');
+    return { action, ...store.load(taskId, numberOrUndefined(args.version)) };
+  }
+  if (action === 'save') {
+    const task = typeof args.task === 'string'
+      ? args.task
+      : taskId
+        ? store.load(taskId).task
+        : undefined;
+    if (!task || typeof args.phase !== 'string' || !isRecord(args.state)) {
+      throw new Error('codegraph_checkpoint save requires task, phase, and state.');
+    }
+    return { action, ...store.save({
+      taskId,
+      expectedVersion: numberOrUndefined(args.expectedVersion),
+      task,
+      phase: args.phase as CheckpointPhase,
+      state: args.state as CheckpointState,
+    }) };
+  }
+  if (action === 'complete') {
+    if (!taskId || typeof args.expectedVersion !== 'number' || !isRecord(args.state)) {
+      throw new Error('codegraph_checkpoint complete requires taskId, expectedVersion, and state.');
+    }
+    return { action, ...store.complete(taskId, args.expectedVersion, args.state as CheckpointState) };
+  }
+  throw new Error(`Unknown checkpoint action: ${action}.`);
+}
+
+function resumeContextArgs(store: CheckpointStateStore, args: Record<string, unknown>): Record<string, unknown> {
+  const taskId = String(args.resumeTaskId ?? '').trim();
+  if (!taskId) return args;
+  const loaded = store.load(taskId);
+  if (!loaded.resumeReady) {
+    return {
+      ...args,
+      _resumeBlocked: {
+        task: loaded.task,
+        answerable: false,
+        sufficientForAnswer: false,
+        resumeReady: false,
+        checkpoint: loaded,
+        recommendedNextAction: 'refresh_checkpoint_evidence',
+        allowedFollowups: loaded.nextActions,
+        disallowedFollowups: ['broad_shell_search', 'unbounded_file_reads', 'unbounded_mcp_exploration'],
+      },
+    };
+  }
+  const scopePlan = isRecord(loaded.state.scopePlan) ? loaded.state.scopePlan : undefined;
+  return copyDefined({
+    ...args,
+    task: args.task ?? loaded.task,
+    target: args.target ?? (typeof scopePlan?.target === 'string' ? scopePlan.target : undefined),
+    scopePlan,
+    freshEvidence: true,
+    resumeTaskId: taskId,
+  });
+}
+
+export function applyContextScopeGate(args: Record<string, unknown>, rawResult: unknown): unknown {
+  if (!isRecord(rawResult)) return rawResult;
+  if (isRecord(args._resumeBlocked)) return rawResult;
+  const task = String(args.task ?? '').trim();
+  const scopePlan = isRecord(args.scopePlan) ? args.scopePlan : undefined;
+  const gateMode = relevanceGateMode();
+  if (!scopePlan && shouldRequireScopePlan(task, args)) {
+    const discovery = buildScopeDiscoveryPacket(task, rawResult);
+    return gateMode === 'shadow'
+      ? { ...rawResult, relevanceGate: { status: 'shadow', wouldBlock: true, reason: 'ambiguous_task_requires_scopePlan' }, scopeDiscovery: discovery }
+      : gateMode === 'off' ? rawResult : discovery;
+  }
+
+  const answerable = rawResult.answerable === true || rawResult.sufficientForAnswer === true;
+  const taskType = String(rawResult.taskType ?? '');
+  if (taskType === 'unknown') {
+    const blocked = {
+      ...rawResult,
+      answerable: false,
+      sufficientForAnswer: false,
+      recommendedNextAction: 'refine_scope_with_luna',
+      relevanceGate: { status: 'blocked', reason: 'unknown_task_type_requires_scopePlan' },
+    };
+    return gateMode === 'shadow' ? { ...rawResult, relevanceGate: { status: 'shadow', wouldBlock: true, reason: 'unknown_task_type_requires_scopePlan' } } : gateMode === 'off' ? rawResult : blocked;
+  }
+  if (!scopePlan || !answerable) return rawResult;
+  const relevance = evaluateScopeRelevance(scopePlan, rawResult);
+  if (relevance.targetMatched && relevance.missingRequirements.length === 0) {
+    return { ...rawResult, relevanceGate: { status: 'passed', ...relevance } };
+  }
+  const blocked = {
+    ...rawResult,
+    answerable: false,
+    sufficientForAnswer: false,
+    missing: uniqueStrings([...(Array.isArray(rawResult.missing) ? rawResult.missing.map(String) : []), ...relevance.missingRequirements]),
+    recommendedNextAction: Number(scopePlan.attempt ?? 1) >= 2 ? 'ask_for_exact_target' : 'refine_scope_with_luna',
+    relevanceGate: { status: 'blocked', ...relevance },
+    allowedFollowups: Number(scopePlan.attempt ?? 1) >= 2
+      ? []
+      : [{ tool: 'codegraph_context', args: { task, scopePlan: { ...scopePlan, attempt: 2 } }, reason: 'Target or requirement evidence is not source-relevant yet.' }],
+  };
+  return gateMode === 'shadow'
+    ? { ...rawResult, relevanceGate: { status: 'shadow', wouldBlock: true, ...relevance } }
+    : gateMode === 'off' ? rawResult : blocked;
+}
+
+function relevanceGateMode(): 'off' | 'shadow' | 'enforce' {
+  // Release benchmarks are not green yet; keep production behavior in shadow
+  // until the current repository/task matrix proves no quality regression.
+  const value = (process.env.CODEGRAPH_RELEVANCE_GATE ?? 'shadow').trim().toLowerCase();
+  if (value === 'off' || value === 'shadow') return value;
+  return 'enforce';
+}
+
+export function shouldRequireScopePlan(task: string, args: Record<string, unknown>): boolean {
+  if (!task || args.target || args.files || args.symbols || args.diff) return false;
+  if (/\b(checkpoint|persistent phase|context reset|resume task|long context|exact evidence)\b/i.test(task)) return true;
+  const words = task.toLowerCase().replace(/[^a-z0-9_$./-]+/g, ' ').trim().split(/\s+/).filter(Boolean);
+  return words.length <= 2;
+}
+
+function buildScopeDiscoveryPacket(task: string, rawResult: Record<string, unknown>): Record<string, unknown> {
+  const candidates = candidateRecords(rawResult.candidateFiles).concat(candidateRecords(rawResult.topFiles)).slice(0, 20);
+  const symbols = candidateRecords(rawResult.relevantSymbols).concat(candidateRecords(rawResult.symbols)).slice(0, 20);
+  return {
+    task,
+    answerable: false,
+    sufficientForAnswer: false,
+    confidence: 0.25,
+    recommendedNextAction: 'refine_scope_with_luna',
+    refinementAttempt: 1,
+    scopeCandidates: {
+      files: candidates.map(item => pickCandidate(item)),
+      symbols: symbols.map(item => pickCandidate(item)),
+      sourceTool: rawResult.sourceTool ?? rawResult.tool,
+    },
+    scopeRequest: {
+      required: ['intent', 'target', 'requirements'],
+      candidateFileLimit: 20,
+      requirementLimit: 12,
+      allowedKinds: ['source', 'definition', 'reference', 'dependency', 'endpoint', 'config', 'test', 'validation'],
+      nextCall: 'Call codegraph_context again with scopePlan filled by Luna.',
+    },
+    missing: ['scopePlan.target', 'scopePlan.requirements'],
+    allowedFollowups: [{ tool: 'codegraph_context', args: { task }, reason: 'Refine scope with Luna before retrieving answer-ready evidence.' }],
+    disallowedFollowups: ['broad_shell_search', 'unbounded_file_reads', 'unbounded_mcp_exploration'],
+  };
+}
+
+function evaluateScopeRelevance(scopePlan: Record<string, unknown>, result: Record<string, unknown>): { targetMatched: boolean; missingRequirements: string[]; evidenceIds: Record<string, string[]> } {
+  const target = String(scopePlan.target ?? '').toLowerCase();
+  const targetTokens = target.split(/[^a-z0-9_$./-]+/).filter(token => token.length >= 3);
+  const searchable = JSON.stringify(result).toLowerCase();
+  const targetMatched = targetTokens.length === 0 || targetTokens.some(token => searchable.includes(token));
+  const requirements = Array.isArray(scopePlan.requirements) ? scopePlan.requirements.filter(isRecord) : [];
+  const evidence = collectEvidenceRecords(result);
+  const evidenceIds: Record<string, string[]> = {};
+  const missingRequirements: string[] = [];
+  for (const requirement of requirements) {
+    const id = String(requirement.id ?? 'requirement');
+    const kinds = Array.isArray(requirement.kinds) ? requirement.kinds.map(String) : [];
+    const matches = evidence.filter(item => kinds.some(kind => evidenceKindMatches(kind, item)));
+    evidenceIds[id] = matches.map(item => String(item.id ?? item.file ?? id)).slice(0, 8);
+    if (matches.length === 0) missingRequirements.push(id);
+  }
+  return { targetMatched, missingRequirements, evidenceIds };
+}
+
+function collectEvidenceRecords(result: Record<string, unknown>): Array<Record<string, unknown>> {
+  const keys = ['evidenceSlices', 'definitionCandidates', 'symbols', 'relevantSymbols', 'references', 'dependencies', 'callEdges', 'flowSteps', 'endpoints', 'testsLikelyRelevant', 'validation', 'files', 'candidateFiles', 'editRanges', 'reviewFindings'];
+  return keys.flatMap(key => arrayRecords(result[key]).map(item => ({ ...item, __source: key })));
+}
+
+function evidenceKindMatches(kind: string, item: Record<string, unknown>): boolean {
+  const source = String(item.__source ?? '').toLowerCase();
+  const itemKind = String(item.kind ?? item.type ?? '').toLowerCase();
+  if (kind === 'source') return source === 'evidenceslices' || itemKind.includes('source') || item.text !== undefined;
+  if (kind === 'definition') return source.includes('definition') || itemKind.includes('definition') || itemKind === 'symbol';
+  if (kind === 'reference') return source.includes('reference') || itemKind.includes('reference') || itemKind.includes('call');
+  if (kind === 'dependency') return source.includes('depend') || source.includes('call') || itemKind.includes('depend') || itemKind.includes('call');
+  if (kind === 'endpoint') return source.includes('endpoint') || itemKind.includes('endpoint') || source.includes('flow');
+  if (kind === 'test') return source.includes('test') || itemKind.includes('test') || /test|spec/i.test(String(item.file ?? ''));
+  if (kind === 'validation') return source.includes('validation') || itemKind.includes('validation') || item.command !== undefined;
+  if (kind === 'config') return source.includes('config') || itemKind.includes('config') || /config|yaml|yml|properties|json/i.test(String(item.file ?? ''));
+  return false;
+}
+
+function pickCandidate(item: Record<string, unknown>): Record<string, unknown> {
+  return copyDefined({ file: item.file, symbol: item.symbol, name: item.name, score: item.score, reasons: item.reasons });
+}
+
+function arrayRecords(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value) ? value.filter(isRecord) : [];
+}
+
+function candidateRecords(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap(item => typeof item === 'string' ? [{ file: item }] : isRecord(item) ? [item] : []);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function fieldImpactSymbolForTask(task: string, target: string): string | undefined {
+  const text = task.toLowerCase();
+  if (!/\b(field|property|member)\b/.test(text)) return undefined;
+  if (!/\b(impact|usage|usages|read|write|chang(?:e|es|ed|ing)|modif(?:y|ies|ied|ying|ication|ications))\b/.test(text)) return undefined;
+  const identifier = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/;
+  const explicit = target.trim();
+  if (identifier.test(explicit)) return explicit;
+  return task.match(/\b[A-Z][A-Za-z0-9_$]*\.[A-Za-z_$][A-Za-z0-9_$]*\b/)?.[0];
 }
