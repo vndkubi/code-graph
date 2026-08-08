@@ -1,1 +1,4 @@
-(refactor_mcp.js, refactor_plan.md, src/tokenopt/mcp.ts are source code files, no build artifacts, dependencies, or temp files in the changes)
+```
+# Backup files
+*.backup
+```

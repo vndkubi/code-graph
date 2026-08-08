@@ -7,12 +7,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { callCodeGraphBridge, type CodeGraphEvidence } from "./codegraph-bridge.js";
 import { resolveCodeGraphCli } from "./codegraph-discovery.js";
-import { assembleSpringContext } from "./assemblers/spring-context-assembler.js";
 import { compileCodingCoverageEvidence } from "./coding/coverage-contract.js";
 import { parseFailurePacket } from "./coding/failure-packet.js";
 import type { GraphSymbolProvider } from "./coding/graph-symbol-provider.js";
 import { buildSymbolPacket, collectCodingFiles, findCodingSymbols } from "./coding/symbol-index.js";
-import { findTestNeighbors } from "./coding/test-neighbors.js";
 import { loadConfig } from "./config.js";
 import {
   createEvidenceCacheLookup,
@@ -23,13 +21,9 @@ import {
 } from "./evidence-cache.js";
 import { readActiveEvidenceTaskState, readEvidenceTaskState, writeEvidenceTaskState } from "./evidence-state.js";
 import { executeWrappedShellCommand } from "./exec.js";
-import { filterJakartaAnnotations } from "./filters/jakarta-annotation-filter.js";
 import { compressText } from "./log-compressor.js";
 import { appendEvent, writeArtifact } from "./observability.js";
 import { evaluatePolicy } from "./policy-core.js";
-import { linkBusinessContracts } from "./processors/business-contract-linker.js";
-import { analyzeImpact } from "./processors/impact-analysis.js";
-import { prepareJavaDiff } from "./processors/java-diff-processor.js";
 import { routeTask } from "./router.js";
 import { evaluateShadowGate, logShadowGateDecision } from "./shadow-gate.js";
 import { estimateTokens, estimateTokensSaved } from "./token-estimator.js";
@@ -47,8 +41,6 @@ import type {
   OutputPolicy,
   PolicyDecision,
   RouteDecision,
-  SymbolPacket,
-  TestNeighborPacket,
   TokenOptConfig,
   TokenOptEvent,
   TracebugEvidenceLine,
@@ -296,27 +288,6 @@ export const TOKENOPT_TOOL_DEFINITIONS = [
         }
       },
       {
-        name: "tokenopt_run_command",
-        title: "Run Command Through TokenOpt",
-        description: "Run command with policy and compact output.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            command: { type: "string", description: "Shell command." },
-            cwd: { type: "string", description: "Working directory." }
-          },
-          required: ["command"],
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt run command",
-          readOnlyHint: false,
-          destructiveHint: true,
-          idempotentHint: false,
-          openWorldHint: true
-        }
-      },
-      {
         name: "tokenopt_search",
         title: "Search Repository Through TokenOpt",
         description: "FOLLOWUP ONLY after contextgate_get_context or tokenopt_compile_evidence names a missing exact pattern, file, symbol, test, route, or evidence slot. Searches repository text with compact bounded output. Do NOT use as the first tool for broad investigation, architecture, PBI planning, or review; call the evidence gate first so search stays narrow.",
@@ -355,272 +326,6 @@ export const TOKENOPT_TOOL_DEFINITIONS = [
         },
         annotations: {
           title: "TokenOpt read file",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_project_facts",
-        title: "Extract Project Build Facts",
-        description: "Return compact build and inventory facts.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            cwd: { type: "string", description: "Working directory." }
-          },
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt project facts",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_prepare_java_diff",
-        title: "Prepare Java Diff",
-        description: "Compress and classify Java diff hunks for review/refactor evidence.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            diff: { type: "string", description: "Unified diff text. If omitted, reads git diff." },
-            cwd: { type: "string", description: "Working directory." },
-            staged: { type: "boolean", description: "Read git diff --cached when diff is omitted." }
-          },
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt prepare Java diff",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_jakarta_annotation_filter",
-        title: "Filter Jakarta/Lombok Annotations",
-        description: "Collapse low-signal Lombok annotations while preserving Jakarta/JPA annotations.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            code: { type: "string", description: "Java source text." },
-            path: { type: "string", description: "Repo-relative Java file to filter." },
-            cwd: { type: "string", description: "Working directory." }
-          },
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt Jakarta annotation filter",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_assemble_spring_context",
-        title: "Assemble Spring Context",
-        description: "Compress actuator/beans JSON into entrypoint, security, service, data, messaging, and transaction slices.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            json: { type: "string", description: "Spring actuator/beans JSON text." },
-            path: { type: "string", description: "Repo-relative JSON file to assemble." },
-            cwd: { type: "string", description: "Working directory." }
-          },
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt Spring context assembler",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_business_contract",
-        title: "Link Business Contracts",
-        description: "Find API, schema, messaging, security, docs, and test contracts relevant to a diff or task.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            task: { type: "string", description: "User task or review question." },
-            diff: { type: "string", description: "Unified diff text." },
-            changed_files: { type: "array", items: { type: "string" }, description: "Changed repo-relative files." },
-            cwd: { type: "string", description: "Working directory." }
-          },
-          required: ["task"],
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt business contract linker",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_impact_analysis",
-        title: "Analyze Impact",
-        description: "Find definitions, usages, hot paths, public contracts, and likely tests for a target symbol or changed files.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            target: { type: "string", description: "Symbol, class, method, route, or behavior to analyze." },
-            diff: { type: "string", description: "Unified diff text." },
-            changed_files: { type: "array", items: { type: "string" }, description: "Changed repo-relative files." },
-            cwd: { type: "string", description: "Working directory." }
-          },
-          required: ["target"],
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt impact analysis",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_symbols_find",
-        title: "Find Coding Symbols",
-        description: "Regex-lite symbol discovery for coding tasks. Returns compact candidates with file, line, signature, and confidence.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Class, function, file, or task target." },
-            language: {
-              type: "string",
-              enum: ["typescript", "javascript", "java", "python", "unknown"],
-              description: "Optional language filter."
-            },
-            kind: {
-              type: "string",
-              enum: ["class", "interface", "function", "method", "const", "type", "unknown"],
-              description: "Optional symbol kind filter."
-            },
-            limit: { type: "number", description: "Maximum candidates, capped at 50." },
-            cwd: { type: "string", description: "Working directory." }
-          },
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt symbols find",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_symbol_packet",
-        title: "Build Symbol Packet",
-        description: "Return signature, bounded definition slice, imports, dependencies, callers, callees, and nearby tests for a symbol.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            symbol_id: { type: "string", description: "Symbol id returned by tokenopt_symbols_find." },
-            query: { type: "string", description: "Fallback class/function/file query." },
-            cwd: { type: "string", description: "Working directory." }
-          },
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt symbol packet",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_test_neighbors",
-        title: "Find Test Neighbors",
-        description: "Find nearby tests, naming patterns, framework hints, and mocking style for a source file or symbol.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            target: { type: "string", description: "Source file, class, function, or module." },
-            symbol_name: { type: "string", description: "Optional symbol name." },
-            limit: { type: "number", description: "Maximum test candidates, capped at 50." },
-            cwd: { type: "string", description: "Working directory." }
-          },
-          required: ["target"],
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt test neighbors",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_failure_packet",
-        title: "Parse Failure Packet",
-        description: "Parse compiler/test/runtime output into compact failure locations and suggested file slices.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            output: { type: "string", description: "Compiler, test, or stack-trace output." },
-            cwd: { type: "string", description: "Working directory. Accepted for consistency; not required." }
-          },
-          required: ["output"],
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt failure packet",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_tracebug_packet",
-        title: "Build Tracebug Packet",
-        description: "Assemble exact line-level bug evidence from a concrete failure artifact, symbol, file, or behavior.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Tracebug query, failing behavior, file/symbol target, endpoint, or repro description." },
-            output: { type: "string", description: "Optional stack trace, compiler/test output, or logs." },
-            cwd: { type: "string", description: "Working directory." },
-            max_candidates: { type: "number", description: "Maximum candidate evidence lines, capped at 12." },
-            include_tests: { type: "boolean", description: "Include nearby tests when available." },
-            include_callers: { type: "boolean", description: "Include caller/reference cues when available." }
-          },
-          required: ["query"],
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt tracebug packet",
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false
-        }
-      },
-      {
-        name: "tokenopt_session_stats",
-        title: "Session Token Savings",
-        description: "Return cumulative token savings for this MCP session. Call at end of task to see how many tokens contextgate replaced vs raw exploration.",
-        inputSchema: {
-          type: "object",
-          properties: {},
-          additionalProperties: false
-        },
-        annotations: {
-          title: "TokenOpt session stats",
           readOnlyHint: true,
           destructiveHint: false,
           idempotentHint: true,
@@ -696,36 +401,10 @@ export async function dispatchTokenoptTool(
         return await contextGateGetContextTool(args, mcpMode, ctx);
       case "tokenopt_compile_evidence":
         return await compileEvidenceTool(args, mcpMode, ctx);
-      case "tokenopt_run_command":
-        return await runCommandTool(args);
       case "tokenopt_search":
         return await searchTool(args);
       case "tokenopt_read_file":
         return readFileTool(args);
-      case "tokenopt_project_facts":
-        return projectFactsTool(args);
-      case "tokenopt_prepare_java_diff":
-        return prepareJavaDiffTool(args);
-      case "tokenopt_jakarta_annotation_filter":
-        return jakartaAnnotationFilterTool(args);
-      case "tokenopt_assemble_spring_context":
-        return assembleSpringContextTool(args);
-      case "tokenopt_business_contract":
-        return businessContractTool(args);
-      case "tokenopt_impact_analysis":
-        return impactAnalysisTool(args);
-      case "tokenopt_symbols_find":
-        return await symbolsFindTool(args, ctx);
-      case "tokenopt_symbol_packet":
-        return await symbolPacketTool(args, ctx);
-      case "tokenopt_test_neighbors":
-        return await testNeighborsTool(args, ctx);
-      case "tokenopt_failure_packet":
-        return failurePacketTool(args);
-      case "tokenopt_tracebug_packet":
-        return await tracebugPacketTool(args, ctx);
-      case "tokenopt_session_stats":
-        return sessionStatsTool();
       default:
         return textResult(`Unknown TokenOpt tool: ${name}`, true);
     }
@@ -1686,8 +1365,6 @@ function writeContextGateBrokerState(
     disallowed_followups: [
       "tokenopt_search",
       "tokenopt_read_file",
-      "tokenopt_project_facts",
-      "tokenopt_run_command",
       "shell_rg",
       "shell_grep",
       "shell_git_grep",
@@ -2126,8 +1803,6 @@ async function compileEvidenceTool(args: Record<string, unknown>, mcpMode: McpMo
       ? [
           "tokenopt_search",
           "tokenopt_read_file",
-          "tokenopt_project_facts",
-          "tokenopt_run_command",
           "shell_rg",
           "shell_grep",
           "shell_git_grep",
@@ -2301,30 +1976,20 @@ function compileSecurityAuditPacket(input: EarlyEvidencePacketInput) {
 }
 
 function compileDirectNarrowTracebugPacket(input: EarlyEvidencePacketInput, mcpMode: McpMode) {
-  const fullMode = mcpMode === "full";
-  const allowedFollowups: EvidenceFollowup[] = fullMode
-    ? [
-        {
-          tool: "tokenopt_tracebug_packet",
-          reason: "Assemble one tracebug packet from the concrete bug artifact before any broad exploration.",
-          args: { query: input.task },
-          max_output_tokens: 1400
-        }
-      ]
-    : [
-        {
-          tool: "tokenopt_search",
-          reason: "Search only for the exact failing test, stack frame, file, symbol, guard, condition, endpoint, or behavior named by the task.",
-          args: { pattern: "<exact-tracebug-anchor>", path: "<narrow-path>" },
-          max_output_tokens: 600
-        },
-        {
-          tool: "tokenopt_read_file",
-          reason: "Read only the bounded slice around the exact tracebug anchor.",
-          args: { path: "<matched-file>", startLine: 1, maxLines: 120 },
-          max_output_tokens: 900
-        }
-      ];
+  const allowedFollowups: EvidenceFollowup[] = [
+    {
+      tool: "tokenopt_search",
+      reason: "Search only for the exact failing test, stack frame, file, symbol, guard, condition, endpoint, or behavior named by the task.",
+      args: { pattern: "<exact-tracebug-anchor>", path: "<narrow-path>" },
+      max_output_tokens: 600
+    },
+    {
+      tool: "tokenopt_read_file",
+      reason: "Read only the bounded slice around the exact tracebug anchor.",
+      args: { path: "<matched-file>", startLine: 1, maxLines: 120 },
+      max_output_tokens: 900
+    }
+  ];
   return writeEarlyEvidencePacket({
     ...input,
     answerable: false,
@@ -2337,10 +2002,7 @@ function compileDirectNarrowTracebugPacket(input: EarlyEvidencePacketInput, mcpM
       repo_inventory_needed: "missing"
     },
     missing: [
-      "Tracebug requires exact file/line proof plus one corroborating caller, callee, nearby test, config, or failure cue.",
-      fullMode
-        ? "Use tokenopt_tracebug_packet once, then answer only if the trace proof contract passes."
-        : "Use native narrow search/read directly; do not compile broad ContextGate evidence first."
+      "Tracebug requires exact file/line proof plus one corroborating caller, callee, nearby test, config, or failure cue."
     ],
     evidence: [
       {
@@ -2355,9 +2017,9 @@ function compileDirectNarrowTracebugPacket(input: EarlyEvidencePacketInput, mcpM
         tokens_est: 90
       }
     ],
-    allowedFollowups: allowedFollowups.slice(0, 1),
+    allowedFollowups: allowedFollowups.slice(0, 2),
     recommendedNextAction: "expand_exact",
-    maxAdditionalCalls: 1,
+    maxAdditionalCalls: 2,
     disallowedFollowups: [
       "repo_wide_rg_files",
       "broad_compile_evidence",
@@ -2476,8 +2138,6 @@ function writeEarlyEvidencePacket(input: EarlyEvidencePacketInput & {
       ? [
           "tokenopt_search",
           "tokenopt_read_file",
-          "tokenopt_project_facts",
-          "tokenopt_run_command",
           "shell_rg",
           "shell_grep",
           "shell_git_grep",
