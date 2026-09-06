@@ -1,10 +1,1 @@
-node_modules/
-dist/
-.codegraph/
-.claude/
-*.mjs
-!test/**/*.mjs
-scripts/*
-!scripts/adoption-score.mjs
-.tmp-debug-home/
-.tmp/
+(refactor_mcp.js, refactor_plan.md, src/tokenopt/mcp.ts are source code files, no build artifacts, dependencies, or temp files in the changes)
