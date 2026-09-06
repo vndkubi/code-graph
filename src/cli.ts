@@ -23,6 +23,7 @@ import {
   applyGeneratedBlock,
   buildComponentStats,
   buildDirectoryStats,
+  composeAgentsMarkdown,
   composeArchitectureMarkdown,
   composeClaudeMarkdown,
   composeCopilotMarkdown,
@@ -371,6 +372,8 @@ async function runBenchmarkCommand(subcommand: string | undefined, parsed: Parse
         mcpServerName: getFlag(parsed, 'mcp-server-name'),
         mcpCommand: getFlag(parsed, 'mcp-command'),
         mcpCommandArgs: splitCsv(getFlag(parsed, 'mcp-command-args')),
+        mcpProfile: getFlag(parsed, 'mcp-profile') as 'client' | 'minimal' | 'research' | 'change' | 'review' | 'full' | undefined,
+        relevanceGate: getFlag(parsed, 'relevance-gate') as 'off' | 'shadow' | 'enforce' | undefined,
         timeoutSeconds: getNumberFlag(parsed, 'codex-timeout-seconds'),
         skipIndex: parsed.flags.get('no-index') === true,
         skipPreflight: parsed.flags.get('skip-preflight') === true,
@@ -602,14 +605,17 @@ async function runOnboardCommand(parsed: ParsedArgs): Promise<void> {
       toolVersion: cliPackageVersion(),
     };
     const targets: Array<{ file: string; body: string }> = [];
-    if (profile === 'architecture' || profile === 'both') {
+    if (profile === 'architecture' || profile === 'both' || profile === 'all') {
       targets.push({ file: 'ARCHITECTURE.md', body: composeArchitectureMarkdown(inputs) });
     }
-    if (profile === 'claude' || profile === 'both') {
+    if (profile === 'claude' || profile === 'both' || profile === 'all') {
       targets.push({ file: 'CLAUDE.md', body: composeClaudeMarkdown(inputs) });
     }
-    if (profile === 'copilot' || profile === 'both') {
+    if (profile === 'copilot' || profile === 'both' || profile === 'all') {
       targets.push({ file: path.join('.github', 'copilot-instructions.md'), body: composeCopilotMarkdown(inputs) });
+    }
+    if (profile === 'codex' || profile === 'agents' || profile === 'both' || profile === 'all') {
+      targets.push({ file: 'AGENTS.md', body: composeAgentsMarkdown(inputs) });
     }
     const written: Array<Record<string, unknown>> = [];
     for (const target of targets) {
@@ -2609,8 +2615,8 @@ Usage:
                                          Select the tests a git range can affect (ALL = safety fallback)
   codegraph review --root <workspace> (--pr <GitHub PR URL> | --base <ref> [--head <ref>]) [--format json|sarif|markdown|text] [--min-priority P0|P1|P2] [--fail-on P0|P1|P2|none] [--out <path>]
                                          Deterministic, batched PR review over an immutable head worktree
-  codegraph onboard --root <workspace> [--profile architecture|claude|copilot|both] [--dry-run]
-                                         Generate ARCHITECTURE.md/CLAUDE.md/.github/copilot-instructions.md from index facts (marker-based regeneration)
+  codegraph onboard --root <workspace> [--profile architecture|claude|copilot|codex|agents|both|all] [--dry-run]
+                                         Generate ARCHITECTURE.md/CLAUDE.md/.github/copilot-instructions.md/AGENTS.md from index facts (marker-based regeneration)
   codegraph adoption-report --root <workspace> [--since <ISO>] [--until <ISO>] [--format json|text]
                                          Aggregate the MCP call ledger (.codegraph/logs/query.jsonl) into adoption numbers
   codegraph checkpoint list|show|prune --root <workspace>  Inspect or safely prune repo-local task checkpoints
@@ -2688,6 +2694,7 @@ Options:
   --mcp-profile <client|minimal|research|change|review|full>
                                              Tool surface for MCP. Default/client exposes facade tools; full exposes every tool.
   CODEGRAPH_RELEVANCE_GATE=off|shadow|enforce  Scope relevance gate mode (default shadow; enforce only after release gates pass)
+  --relevance-gate <off|shadow|enforce>       Override relevance gate mode for Codex/Claude E2E MCP child runs
   --models <a,b,c>                       Copilot E2E model list for benchmark copilot-e2e
   --modes <codegraph,baseline,organic>   Copilot E2E comparison modes (organic = MCP available, neutral prompt; adoption measurement)
   --modes <baseline,terse-no-mcp,natural-tool-use,mcp-first,mcp-only,mcp-scope,mcp-phase-resume,compiled-packet,compiled-packet+gate,oracle-packet>

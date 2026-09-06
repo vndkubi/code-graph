@@ -357,8 +357,11 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
             reviewInput: reviewPacket.reviewInput,
           });
           const enriched = addResponseMeta(reviewPacket, request.params.name, durationMs, serialized.length);
+          const compactText = process.env.CODEGRAPH_PRETTY_JSON === 'true'
+            ? JSON.stringify(enriched, null, 2)
+            : JSON.stringify(enriched);
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify(enriched, null, 2) }],
+            content: [{ type: 'text' as const, text: compactText }],
           };
         }
       }
@@ -377,7 +380,20 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
           toolName: routedWithResume.toolName,
           args: routedWithResume.args,
         });
-      const result = applyContextScopeGate(effectiveArgs, rawResult);
+      let result = applyContextScopeGate(effectiveArgs, rawResult);
+      if (isRecord(effectiveArgs._loadedCheckpoint) && isRecord(result)) {
+        const loaded = effectiveArgs._loadedCheckpoint as Record<string, unknown>;
+        result = {
+          ...result,
+          checkpoint: {
+            taskId: loaded.taskId,
+            version: loaded.version,
+            phase: loaded.phase,
+            resumeReady: loaded.resumeReady,
+            claimValidation: loaded.claimValidation,
+          },
+        };
+      }
       const durationMs = Date.now() - startedAt;
       const serialized = JSON.stringify(result);
       logQueryEvent(current.logPath, {
@@ -391,8 +407,11 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
         result: summarizeResult(result, args),
       });
       const enriched = addResponseMeta(result, request.params.name, durationMs, serialized.length);
+      const compactText = process.env.CODEGRAPH_PRETTY_JSON === 'true'
+        ? JSON.stringify(enriched, null, 2)
+        : JSON.stringify(enriched);
       return {
-        content: [{ type: 'text' as const, text: withFreshnessBanner(JSON.stringify(enriched, null, 2), result) }],
+        content: [{ type: 'text' as const, text: withFreshnessBanner(compactText, result) }],
       };
     } catch (error) {
       const payload = errorPayload(error);
@@ -417,8 +436,11 @@ export async function runMcpProxy(options: RunMcpProxyOptions): Promise<void> {
             result: summarizeResult(fallback, args),
             fallbackReason: summarizeErrorPayload(payload),
           });
+          const compactText = process.env.CODEGRAPH_PRETTY_JSON === 'true'
+            ? JSON.stringify(fallback, null, 2)
+            : JSON.stringify(fallback);
           return {
-            content: [{ type: 'text' as const, text: JSON.stringify(fallback, null, 2) }],
+            content: [{ type: 'text' as const, text: compactText }],
           };
         }
       }
@@ -614,10 +636,23 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
   args: Record<string, unknown>;
 } {
   const task = String(args.task ?? args.target ?? '').trim();
-  const target = typeof args.target === 'string' && args.target.trim().length > 0 ? args.target.trim() : task;
+  const plannedTarget = isRecord(args.scopePlan) && typeof args.scopePlan.target === 'string'
+    ? args.scopePlan.target.trim()
+    : '';
+  // A Luna refinement is an explicit localization contract. Preserve it when
+  // routing instead of falling back to the entire task prose; otherwise a
+  // precise target such as `build_signal` is diluted by every other noun in
+  // the request and the packet can be incorrectly marked answer-ready.
+  const target = typeof args.target === 'string' && args.target.trim().length > 0
+    ? args.target.trim()
+    : plannedTarget || task;
   const mode = inferCodeGraphContextMode(task, args);
   const fieldImpactSymbol = fieldImpactSymbolForTask(task, target);
   const tokenBudget = numberArg(args.budgetTokens, 6000);
+  const plannedFiles = isRecord(args.scopePlan) && Array.isArray(args.scopePlan.candidateFiles)
+    ? args.scopePlan.candidateFiles.map(String)
+    : undefined;
+  const effectiveFiles = (Array.isArray(args.files) ? args.files : undefined) ?? plannedFiles;
   const common = copyDefined({
     profile: args.profile,
     includeSnippets: args.includeSnippets,
@@ -628,6 +663,7 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
     warnStale: args.warnStale,
     debugTiming: args.debugTiming,
     sessionId: args.sessionId,
+    actorId: args.actorId ?? args.subagentId,
     freshEvidence: args.freshEvidence,
     scopePlan: args.scopePlan,
     resumeTaskId: args.resumeTaskId,
@@ -639,7 +675,7 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
       args: copyDefined({
         task,
         diff: args.diff,
-        files: args.files,
+        files: effectiveFiles,
         symbols: args.symbols,
         prUrl: args.prUrl,
         baseRef: args.baseRef,
@@ -671,7 +707,7 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
         target,
         changeType: fieldImpactSymbol ? 'investigate' : undefined,
         diff: args.diff,
-        files: args.files,
+        files: effectiveFiles,
         symbols: args.symbols ?? (fieldImpactSymbol ? [fieldImpactSymbol] : undefined),
         tokenBudget,
         ...common,
@@ -685,7 +721,7 @@ export function routeCodeGraphContext(args: Record<string, unknown>): {
         task,
         target,
         diff: args.diff,
-        files: args.files,
+        files: effectiveFiles,
         symbols: args.symbols,
         budgetTokens: tokenBudget,
         ...common,
@@ -1221,7 +1257,7 @@ function resumeContextArgs(store: CheckpointStateStore, args: Record<string, unk
   const taskId = String(args.resumeTaskId ?? '').trim();
   if (!taskId) return args;
   const loaded = store.load(taskId);
-  if (!loaded.resumeReady) {
+  if (!loaded.resumeReady && args.freshEvidence !== true) {
     return {
       ...args,
       _resumeBlocked: {
@@ -1244,6 +1280,7 @@ function resumeContextArgs(store: CheckpointStateStore, args: Record<string, unk
     scopePlan,
     freshEvidence: true,
     resumeTaskId: taskId,
+    _loadedCheckpoint: loaded,
   });
 }
 
@@ -1338,21 +1375,58 @@ function buildScopeDiscoveryPacket(task: string, rawResult: Record<string, unkno
 
 function evaluateScopeRelevance(scopePlan: Record<string, unknown>, result: Record<string, unknown>): { targetMatched: boolean; missingRequirements: string[]; evidenceIds: Record<string, string[]> } {
   const target = String(scopePlan.target ?? '').toLowerCase();
-  const targetTokens = target.split(/[^a-z0-9_$./-]+/).filter(token => token.length >= 3);
-  const searchable = JSON.stringify(result).toLowerCase();
-  const targetMatched = targetTokens.length === 0 || targetTokens.some(token => searchable.includes(token));
+  const targetTokens = target.split(/[^a-z0-9_$./-]+/).filter(token => token.length >= 2 && !REQUIREMENT_STOP_WORDS.has(token));
   const requirements = Array.isArray(scopePlan.requirements) ? scopePlan.requirements.filter(isRecord) : [];
   const evidence = collectEvidenceRecords(result);
+  const targetMatched = targetTokens.length === 0 || evidence.some(item => {
+    const searchable = JSON.stringify(item).toLowerCase();
+    return targetTokens.some(token => searchable.includes(token));
+  });
   const evidenceIds: Record<string, string[]> = {};
   const missingRequirements: string[] = [];
   for (const requirement of requirements) {
     const id = String(requirement.id ?? 'requirement');
     const kinds = Array.isArray(requirement.kinds) ? requirement.kinds.map(String) : [];
-    const matches = evidence.filter(item => kinds.some(kind => evidenceKindMatches(kind, item)));
+    const description = String(requirement.description ?? '');
+    const matches = evidence.filter(item => kinds.some(kind => evidenceKindMatches(kind, item))
+      && requirementEvidenceMatches(description, item));
     evidenceIds[id] = matches.map(item => String(item.id ?? item.file ?? id)).slice(0, 8);
     if (matches.length === 0) missingRequirements.push(id);
   }
   return { targetMatched, missingRequirements, evidenceIds };
+}
+
+const REQUIREMENT_STOP_WORDS = new Set([
+  'a', 'an', 'and', 'are', 'cite', 'code', 'detail', 'describe', 'exact', 'explain',
+  'fact', 'file', 'fields', 'for', 'from', 'function', 'how', 'include', 'into',
+  'likely', 'of', 'or', 'path', 'related', 'source', 'state', 'test', 'tests',
+  'the', 'through', 'trace', 'with', 'within', 'request', 'requested', 'evidence',
+  'check', 'verify', 'validation',
+]);
+
+function requirementEvidenceMatches(description: string, item: Record<string, unknown>): boolean {
+  const tokens = description
+    .toLowerCase()
+    .replace(/[^a-z0-9_$./-]+/g, ' ')
+    .split(/\s+/)
+    .filter(token => token.length >= 2 && !REQUIREMENT_STOP_WORDS.has(token));
+  if (tokens.length === 0) return true;
+  const isSourceSlice = item.__source === 'evidenceSlices' || item.text !== undefined;
+  const searchable = Object.entries(item)
+    // A candidate filename alone must not satisfy a substantive source
+    // requirement (for example, `vn_momentum_alert_bot.py` contains the word
+    // "momentum" even when the returned slice is an unrelated alert helper).
+    // For non-source kinds (such as testsLikelyRelevant, candidateFiles, configs),
+    // the file path is the primary artifact and must be matched.
+    .filter(([key]) => !['id', '__source', 'hint', ...(isSourceSlice ? ['file'] : [])].includes(key))
+    .map(([, value]) => typeof value === 'string' ? value : JSON.stringify(value))
+    .join(' ')
+    .toLowerCase();
+  // A requirement is source-bound only when at least one substantive term
+  // occurs in the evidence record itself. Matching merely on its evidence
+  // kind (for example, any source slice) allowed unrelated snippets to make
+  // a packet look answerable.
+  return tokens.some(token => searchable.includes(token));
 }
 
 function collectEvidenceRecords(result: Record<string, unknown>): Array<Record<string, unknown>> {

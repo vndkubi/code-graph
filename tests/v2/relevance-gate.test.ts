@@ -61,6 +61,132 @@ describe('host-driven scope and relevance gate', () => {
     expect(result.allowedFollowups).toEqual([]);
   });
 
+  it('does not let an unrelated source slice satisfy a substantive requirement', () => {
+    process.env.CODEGRAPH_RELEVANCE_GATE = 'enforce';
+    const result = applyContextScopeGate({
+      task: 'Trace the signal',
+      scopePlan: {
+        intent: 'research',
+        target: 'build_signal',
+        requirements: [{ id: 'scoring', description: '252-day momentum and volatility scoring', kinds: ['source'] }],
+      },
+    }, {
+      answerable: true,
+      sufficientForAnswer: true,
+      evidenceSlices: [{ id: 'alert-1', file: 'vn_momentum_alert_bot.py', symbol: 'build_alert_message', text: 'formats the alert message and order plan' }],
+      callEdges: [{ id: 'edge-1', callee: 'build_signal', file: 'vn_momentum_alert_bot.py' }],
+    }) as Record<string, unknown>;
+
+    expect(result.answerable).toBe(false);
+    expect(result.relevanceGate).toMatchObject({ status: 'blocked', targetMatched: true });
+    expect(result.missing).toContain('scoring');
+  });
+
+  it('allows a session-deduplicated slice with retained terms to satisfy a substantive requirement', () => {
+    process.env.CODEGRAPH_RELEVANCE_GATE = 'enforce';
+    const result = applyContextScopeGate({
+      task: 'Trace the signal',
+      scopePlan: {
+        intent: 'research',
+        target: 'build_signal',
+        requirements: [{ id: 'scoring', description: '252-day momentum and volatility scoring', kinds: ['source'] }],
+      },
+    }, {
+      answerable: true,
+      sufficientForAnswer: true,
+      evidenceSlices: [{
+        id: 'signal-1',
+        file: 'vn_momentum_alert_bot.py',
+        symbol: 'build_signal',
+        reusedFromEarlierCall: true,
+        terms: ['momentum', 'volatility', 'scoring', 'signal'],
+      }],
+      callEdges: [{ id: 'edge-1', callee: 'build_signal', file: 'vn_momentum_alert_bot.py' }],
+    }) as Record<string, unknown>;
+
+    expect(result.answerable).toBe(true);
+    expect(result.relevanceGate).toMatchObject({ status: 'passed', targetMatched: true });
+  });
+
+  it('blocks an unrelated session-deduplicated slice that lacks the substantive terms', () => {
+    process.env.CODEGRAPH_RELEVANCE_GATE = 'enforce';
+    const result = applyContextScopeGate({
+      task: 'Trace the signal',
+      scopePlan: {
+        intent: 'research',
+        target: 'build_signal',
+        requirements: [{ id: 'scoring', description: '252-day momentum and volatility scoring', kinds: ['source'] }],
+      },
+    }, {
+      answerable: true,
+      sufficientForAnswer: true,
+      evidenceSlices: [{
+        id: 'alert-1',
+        file: 'vn_momentum_alert_bot.py',
+        symbol: 'build_alert_message',
+        reusedFromEarlierCall: true,
+        terms: ['formats', 'alert', 'message', 'order', 'plan'],
+      }],
+      callEdges: [{ id: 'edge-1', callee: 'build_signal', file: 'vn_momentum_alert_bot.py' }],
+    }) as Record<string, unknown>;
+
+    expect(result.answerable).toBe(false);
+    expect(result.relevanceGate).toMatchObject({ status: 'blocked', targetMatched: true });
+    expect(result.missing).toContain('scoring');
+  });
+
+  it('matches test requirements using the file path in testsLikelyRelevant', () => {
+    process.env.CODEGRAPH_RELEVANCE_GATE = 'enforce';
+    const result = applyContextScopeGate({
+      task: 'Implement PaymentService refund behavior',
+      scopePlan: {
+        intent: 'change',
+        target: 'PaymentService',
+        requirements: [
+          { id: 'payment-test', description: 'PaymentService test coverage', kinds: ['test'] },
+        ],
+      },
+    }, {
+      answerable: true,
+      sufficientForAnswer: true,
+      candidateFiles: [{ file: 'src/payment/PaymentService.java' }],
+      testsLikelyRelevant: [{ file: 'tests/payment/PaymentService.test.ts', score: 0.95 }],
+    }) as Record<string, unknown>;
+
+    expect(result.answerable).toBe(true);
+    expect(result.relevanceGate).toMatchObject({
+      status: 'passed',
+      targetMatched: true,
+      missingRequirements: [],
+    });
+  });
+
+  it('matches short 2-3 char domain acronyms such as jwt, vat, api, and sql in source requirements', () => {
+    process.env.CODEGRAPH_RELEVANCE_GATE = 'enforce';
+    const result = applyContextScopeGate({
+      task: 'Verify JWT authentication token',
+      scopePlan: {
+        intent: 'research',
+        target: 'jwt',
+        requirements: [
+          { id: 'jwt-check', description: 'JWT signature check', kinds: ['source'] },
+        ],
+      },
+    }, {
+      answerable: true,
+      sufficientForAnswer: true,
+      evidenceSlices: [{
+        id: 'jwt-1',
+        file: 'src/auth/jwt.ts',
+        symbol: 'verifyJWT',
+        text: 'function verifyJWT(token: string) { return decode(token); }',
+      }],
+    }) as Record<string, unknown>;
+
+    expect(result.answerable).toBe(true);
+    expect(result.relevanceGate).toMatchObject({ status: 'passed', targetMatched: true });
+  });
+
   it('does not route a generic evidence noun to evidence mode', () => {
     expect(inferCodeGraphContextMode('Assess where to add persistent checkpoint evidence', {})).toBe('change');
     expect(inferCodeGraphContextMode('Analyze PBI acceptance criteria against code', {})).toBe('evidence');

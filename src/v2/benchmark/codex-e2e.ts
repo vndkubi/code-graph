@@ -50,6 +50,10 @@ export interface CodexE2eBenchmarkOptions {
   mcpServerName?: string;
   mcpCommand?: string;
   mcpCommandArgs?: string[];
+  /** MCP profile used by the generated host config; client is the production default. */
+  mcpProfile?: 'client' | 'minimal' | 'research' | 'change' | 'review' | 'full';
+  /** Gate mode injected into the MCP child for reproducible release runs. */
+  relevanceGate?: 'off' | 'shadow' | 'enforce';
   timeoutSeconds?: number;
   skipIndex?: boolean;
   skipPreflight?: boolean;
@@ -281,6 +285,8 @@ export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): P
     serverName: options.mcpServerName,
     command: options.mcpCommand,
     args: options.mcpCommandArgs,
+    profile: options.mcpProfile,
+    relevanceGate: options.relevanceGate,
   });
     const plan = {
       root,
@@ -327,6 +333,7 @@ export async function runCodexE2eBenchmark(options: CodexE2eBenchmarkOptions): P
             codexCommand: options.codexCommand ?? 'codex',
             codexCommandArgs: options.codexCommandArgs ?? [],
             useUserConfig: options.useUserConfig ?? false,
+            relevanceGate: options.relevanceGate,
             timeoutSeconds: options.timeoutSeconds ?? 900,
           }));
         }
@@ -1044,6 +1051,7 @@ function runCodexTask(options: {
   codexCommand: string;
   codexCommandArgs: string[];
   useUserConfig: boolean;
+  relevanceGate?: 'off' | 'shadow' | 'enforce';
   timeoutSeconds: number;
 }): CodexRunResult {
   const prompt = promptForMode(options.task, options.mode);
@@ -1056,7 +1064,10 @@ function runCodexTask(options: {
     useUserConfig: options.useUserConfig,
     mcpConfigOverrides: modeUsesMcp(options.mode) ? options.mcpConfigOverrides : [],
   });
-  const env = { ...process.env };
+  const env = {
+    ...process.env,
+    ...(options.relevanceGate ? { CODEGRAPH_RELEVANCE_GATE: options.relevanceGate } : {}),
+  };
 
   const started = Date.now();
   const invocation = buildCodexSpawnInvocation(options.codexCommand, [...options.codexCommandArgs, ...args]);
@@ -1164,6 +1175,8 @@ function writeCodexMcpConfig(options: {
   serverName?: string;
   command?: string;
   args?: string[];
+  profile?: 'client' | 'minimal' | 'research' | 'change' | 'review' | 'full';
+  relevanceGate?: 'off' | 'shadow' | 'enforce';
 }): { path: string; overrides: string[]; serverName: string; command: string; args: string[] } {
   const codexHome = path.join(options.runDir, 'codex-home');
   fs.mkdirSync(codexHome, { recursive: true });
@@ -1183,12 +1196,13 @@ function writeCodexMcpConfig(options: {
       '--no-prewarm',
     ];
   if (envFlag('CODEGRAPH_CODEX_BENCH_AUTO_REFRESH')) args.push('--auto-refresh');
-  if (!options.command) args.push('--mcp-profile', 'full');
+  if (!options.command) args.push('--mcp-profile', options.profile ?? 'client');
   const config = `[mcp_servers.${serverName}]
 command = ${tomlString(cli.command)}
 args = [
 ${args.map(arg => `  ${tomlString(arg)},`).join('\n')}
 ]
+${options.relevanceGate ? `env = { CODEGRAPH_RELEVANCE_GATE = ${tomlString(options.relevanceGate)} }\n` : ''}
 `;
   const configPath = path.join(codexHome, 'config.toml');
   fs.writeFileSync(configPath, config, 'utf-8');
@@ -1197,6 +1211,10 @@ ${args.map(arg => `  ${tomlString(arg)},`).join('\n')}
     `mcp_servers.${serverName}.command=${tomlString(cli.command)}`,
     '--config',
     `mcp_servers.${serverName}.args=${tomlArray(args)}`,
+    ...(options.relevanceGate ? [
+      '--config',
+      `mcp_servers.${serverName}.env.CODEGRAPH_RELEVANCE_GATE=${tomlString(options.relevanceGate)}`,
+    ] : []),
   ];
   return { path: configPath, overrides, serverName, command: cli.command, args };
 }
@@ -1235,13 +1253,13 @@ export function promptForMode(task: CodexE2eTask, mode: CodexBenchmarkMode): str
       ].join('\n\n');
     case 'mcp-scope':
       return [
-        'Use CodeGraph MCP server codegraph_bench first. Call codegraph_context with the task verbatim. If it returns answerable=false with recommendedNextAction=refine_scope_with_luna, fill scopePlan with one exact intent, target, candidate files, and requirements, then call codegraph_context once more. Do not broaden beyond the returned candidates or use shell/search/read fallback.',
+        'Use CodeGraph MCP server codegraph_bench first. Call codegraph_context with only the task text below (do not include these benchmark instructions). If providing a first-call scopePlan, derive the intent (such as research, flow, or change), exact target symbol/file, candidateFiles, and evidence requirements directly from the task text. If it returns answerable=false with recommendedNextAction=refine_scope_with_luna, refine that same scopePlan once, then call codegraph_context again. Do not broaden beyond the returned candidates or use shell/search/read fallback.',
         POST_SLICE_STOP_RULE,
         prompt,
       ].join('\n\n');
     case 'mcp-phase-resume':
       return [
-        'Use CodeGraph MCP server codegraph_bench only. Start with codegraph_context, save a discovery or implementation checkpoint with codegraph_checkpoint, and resume only by the explicit taskId using a fresh codegraph_context call. Validate stale claims before answering; do not assume context from an earlier phase remains available.',
+        'Use CodeGraph MCP server codegraph_bench only. Pass only the task text below to codegraph_context (do not include these benchmark instructions). If providing a first-call scopePlan, derive the intent, exact target, and requirements directly from the task text. Start with codegraph_context, save a discovery or implementation checkpoint with codegraph_checkpoint, and resume only by the explicit taskId using a fresh codegraph_context call. Validate stale claims before answering; do not assume context from an earlier phase remains available.',
         POST_SLICE_STOP_RULE,
         prompt,
       ].join('\n\n');

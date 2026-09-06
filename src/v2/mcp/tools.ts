@@ -37,31 +37,42 @@ const DebugTimingOption = {
 // `freshEvidence: true` forces full bodies even within a session.
 const EvidenceLedgerOption = {
   sessionId: z.string().optional(),
+  actorId: z.string().optional(),
+  subagentId: z.string().optional(),
   freshEvidence: z.boolean().optional(),
 };
 
+const EvidenceKind = z.enum(['source', 'definition', 'reference', 'dependency', 'endpoint', 'config', 'test', 'validation']);
+
+const ScopeRequirementSchema = z.object({
+  id: z.string().regex(/^[a-z0-9][a-z0-9_-]*$/),
+  description: z.string().min(1),
+  kinds: z.array(EvidenceKind).min(1).max(8),
+});
+
+const ScopePlanSchema = z.object({
+  intent: z.enum(['research', 'flow', 'change', 'review', 'evidence']),
+  target: z.string().min(1),
+  candidateFiles: z.array(z.string()).max(20).optional(),
+  hypotheses: z.array(z.object({
+    statement: z.string(),
+    confidence: z.number().min(0).max(1).optional(),
+  })).max(8).optional(),
+  requirements: z.array(ScopeRequirementSchema).min(1).max(12),
+  attempt: z.number().int().min(1).max(2).optional(),
+}).refine(
+  data => new Set(data.requirements.map(r => r.id)).size === data.requirements.length,
+  { message: 'Requirement IDs must be unique within scopePlan.', path: ['requirements'] },
+);
+
 const ScopePlanOption = {
-  scopePlan: z.object({
-    intent: z.enum(['research', 'flow', 'change', 'review', 'evidence']),
-    target: z.string().min(1),
-    candidateFiles: z.array(z.string()).max(20).optional(),
-    hypotheses: z.array(z.object({
-      statement: z.string(),
-      confidence: z.number().min(0).max(1).optional(),
-    })).max(8).optional(),
-    requirements: z.array(z.object({
-      id: z.string().regex(/^[a-z0-9][a-z0-9_-]*$/),
-      description: z.string().min(1),
-      kinds: z.array(z.enum(['source', 'definition', 'reference', 'dependency', 'endpoint', 'config', 'test', 'validation'])).min(1).max(8),
-    })).min(1).max(12),
-    attempt: z.number().int().min(1).max(2).optional(),
-  }).optional(),
+  scopePlan: ScopePlanSchema.optional(),
   resumeTaskId: z.string().uuid().optional(),
 };
 
 const CheckpointStateSchema = z.object({
-  scopePlan: z.record(z.unknown()).optional(),
-  requirements: z.array(z.record(z.unknown())).max(20).optional(),
+  scopePlan: ScopePlanSchema.optional(),
+  requirements: z.array(ScopeRequirementSchema).max(20).optional(),
   constraints: z.array(z.string()).max(50).optional(),
   remainingWork: z.array(z.string()).max(50).optional(),
   evidenceClaims: z.array(z.object({
@@ -122,7 +133,10 @@ export const V2ToolSchemas = {
     })).max(20).optional(),
     maxChars: z.number().min(200).max(30000).default(3000),
     ...FreshnessOptions,
-  }),
+  }).refine(
+    args => Boolean(args.file || args.symbol || (args.slices && args.slices.length > 0)),
+    { message: 'codegraph_slice requires either file, symbol, or a non-empty slices array.' },
+  ),
   codegraph_checkpoint: z.object({
     action: z.enum(['save', 'load', 'list', 'complete']),
     taskId: z.string().uuid().optional(),
@@ -434,7 +448,41 @@ const SLIM_CODEGRAPH_CONTEXT_SCHEMA: Record<string, unknown> = {
     baseRef: { type: 'string', description: 'Review base branch/ref, paired with headRef (for example origin/main).' },
     headRef: { type: 'string', description: 'Review head branch/ref, paired with baseRef (defaults to HEAD).' },
     sessionId: { type: 'string', description: 'Any constant string per conversation. Enables evidence reuse so repeated calls skip source you already received.' },
-    scopePlan: { type: 'object', description: 'Luna refinement: intent, exact target, candidateFiles, and requirements with evidence kinds.' },
+    scopePlan: {
+      type: 'object',
+      description: 'Luna refinement: send this for a targeted or ambiguous task; target one symbol/file and require 1-12 evidence-backed requirements.',
+      properties: {
+        intent: { type: 'string', enum: ['research', 'flow', 'change', 'review', 'evidence'] },
+        target: { type: 'string', minLength: 1, description: 'One exact symbol, file, endpoint, or diff target.' },
+        candidateFiles: { type: 'array', maxItems: 20, items: { type: 'string' } },
+        hypotheses: {
+          type: 'array',
+          maxItems: 8,
+          items: {
+            type: 'object',
+            required: ['statement'],
+            properties: {
+              statement: { type: 'string' },
+              confidence: { type: 'number', minimum: 0, maximum: 1 },
+            },
+          },
+        },
+        requirements: {
+          type: 'array', minItems: 1, maxItems: 12,
+          items: {
+            type: 'object',
+            required: ['id', 'description', 'kinds'],
+            properties: {
+              id: { type: 'string', pattern: '^[a-z0-9][a-z0-9_-]*$' },
+              description: { type: 'string', minLength: 1 },
+              kinds: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'string', enum: ['source', 'definition', 'reference', 'dependency', 'endpoint', 'config', 'test', 'validation'] } },
+            },
+          },
+        },
+        attempt: { type: 'integer', minimum: 1, maximum: 2 },
+      },
+      required: ['intent', 'target', 'requirements'],
+    },
     resumeTaskId: { type: 'string', format: 'uuid', description: 'Explicit checkpoint task ID; loads scope and forces fresh evidence validation.' },
   },
   required: ['task'],
@@ -632,25 +680,78 @@ function envFlag(value: string | undefined, fallback = false): boolean {
   return /^(1|true|yes|on)$/i.test(value.trim());
 }
 
+function isZodOptional(schema: z.ZodType): boolean {
+  if (schema instanceof z.ZodOptional || schema instanceof z.ZodDefault) return true;
+  if (schema instanceof z.ZodEffects) return isZodOptional(schema.innerType());
+  if (schema instanceof z.ZodNullable) return isZodOptional(schema.unwrap());
+  return false;
+}
+
 function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
   const described = (value: Record<string, unknown>): Record<string, unknown> => schema.description
     ? { ...value, description: schema.description }
     : value;
+  if (schema instanceof z.ZodEffects) return described(zodToJsonSchema(schema.innerType()));
+  if (schema instanceof z.ZodNullable) {
+    const inner = zodToJsonSchema(schema.unwrap());
+    return described({ ...inner, nullable: true });
+  }
+  if (schema instanceof z.ZodUnion) {
+    return described({
+      anyOf: (schema.options as z.ZodType[]).map(opt => zodToJsonSchema(opt)),
+    });
+  }
   if (schema instanceof z.ZodObject) {
     const shape = schema.shape as Record<string, z.ZodType>;
     const properties: Record<string, unknown> = {};
     const required: string[] = [];
     for (const [key, value] of Object.entries(shape)) {
       properties[key] = zodToJsonSchema(value);
-      if (!(value instanceof z.ZodOptional) && !(value instanceof z.ZodDefault)) required.push(key);
+      if (!isZodOptional(value)) required.push(key);
     }
     return described({ type: 'object', properties, required });
   }
-  if (schema instanceof z.ZodString) return described({ type: 'string' });
-  if (schema instanceof z.ZodNumber) return described({ type: 'number' });
+  if (schema instanceof z.ZodRecord) {
+    return described({
+      type: 'object',
+      additionalProperties: zodToJsonSchema(schema.valueSchema),
+    });
+  }
+  if (schema instanceof z.ZodUnknown || schema instanceof z.ZodAny) {
+    return described({});
+  }
+  if (schema instanceof z.ZodString) {
+    const result: Record<string, unknown> = { type: 'string' };
+    const checks = (schema._def as { checks?: Array<{ kind: string; value?: number; regex?: RegExp }> }).checks ?? [];
+    for (const check of checks) {
+      if (check.kind === 'min' && typeof check.value === 'number') result.minLength = check.value;
+      if (check.kind === 'max' && typeof check.value === 'number') result.maxLength = check.value;
+      if (check.kind === 'regex' && check.regex instanceof RegExp) result.pattern = check.regex.source;
+    }
+    return described(result);
+  }
+  if (schema instanceof z.ZodNumber) {
+    const result: Record<string, unknown> = { type: 'number' };
+    const checks = (schema._def as { checks?: Array<{ kind: string; value?: number }> }).checks ?? [];
+    for (const check of checks) {
+      if (check.kind === 'min' && typeof check.value === 'number') result.minimum = check.value;
+      if (check.kind === 'max' && typeof check.value === 'number') result.maximum = check.value;
+      if (check.kind === 'int') result.type = 'integer';
+    }
+    return described(result);
+  }
   if (schema instanceof z.ZodBoolean) return described({ type: 'boolean' });
   if (schema instanceof z.ZodEnum) return described({ type: 'string', enum: schema.options });
-  if (schema instanceof z.ZodArray) return described({ type: 'array', items: zodToJsonSchema(schema.element) });
+  if (schema instanceof z.ZodArray) {
+    const result: Record<string, unknown> = {
+      type: 'array',
+      items: zodToJsonSchema(schema.element),
+    };
+    const def = schema._def as { minLength?: { value: number }; maxLength?: { value: number } };
+    if (def.minLength?.value !== undefined) result.minItems = def.minLength.value;
+    if (def.maxLength?.value !== undefined) result.maxItems = def.maxLength.value;
+    return described(result);
+  }
   if (schema instanceof z.ZodDefault) return described(zodToJsonSchema(schema._def.innerType));
   if (schema instanceof z.ZodOptional) return described(zodToJsonSchema(schema.unwrap()));
   return described({ type: 'string' });

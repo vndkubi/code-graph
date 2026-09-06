@@ -74,8 +74,8 @@ per-host hooks, and measurement lives in `codegraph benchmark …`.
 
 Tool exposure is unified under the CodeGraph profile, with a TokenOpt override:
 
-- `--mcp-profile client` (default) → **3 tools**: `codegraph_context`,
-  `codegraph_slice`, `codegraph_status`. Single-gate surface —
+- `--mcp-profile client` (default) → **4 facade tools**: `codegraph_context`,
+  `codegraph_slice`, `codegraph_checkpoint`, `codegraph_status`. Single-gate surface —
   `codegraph_context` routes into the TokenOpt evidence flow internally.
 - `--mcp-profile full` → full CodeGraph + full TokenOpt surface.
 - `TOKENOPT_MCP_MODE` — unset (default): embedded TokenOpt gate tools hidden on

@@ -310,6 +310,29 @@ describe('MCP full tool mode', () => {
       budgetTokens: 8000,
       includeSnippets: true,
     });
+
+    // Checkpoint decisions schema is advertised as an object array, not string array.
+    const checkpointDef = client.find(tool => tool.name === 'codegraph_checkpoint')!;
+    const stateProps = ((checkpointDef.inputSchema as Record<string, unknown>).properties as Record<string, unknown>).state as Record<string, unknown>;
+    const decisionsSchema = (stateProps.properties as Record<string, unknown>).decisions as Record<string, unknown>;
+    expect(decisionsSchema.type).toBe('array');
+    expect((decisionsSchema.items as Record<string, unknown>).type).toBe('object');
+
+    // codegraph_slice requires file, symbol, or slices.
+    expect(() => parseToolArgs('codegraph_slice', {})).toThrow(/requires either file, symbol, or a non-empty slices array/);
+
+    // scopePlan requires unique requirement IDs.
+    expect(() => parseToolArgs('codegraph_context', {
+      task: 'Check unique requirements',
+      scopePlan: {
+        intent: 'research',
+        target: 'targetSymbol',
+        requirements: [
+          { id: 'dup-id', description: 'desc 1', kinds: ['source'] },
+          { id: 'dup-id', description: 'desc 2', kinds: ['definition'] },
+        ],
+      },
+    })).toThrow(/Requirement IDs must be unique/);
   });
 
   it('routes natural-language Java field changes through the change pack', () => {

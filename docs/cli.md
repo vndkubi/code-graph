@@ -50,6 +50,7 @@ See [MCP Setup And Usage](mcp-setup-and-usage.md) for profiles, modes, and the
 
 ```text
 codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|
+                    release-gate|
                     quality-trend|evidence-audit|recall|affected-tests|
                     copilot-e2e|codex-e2e|claude-e2e
 ```
@@ -61,6 +62,9 @@ codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|
   (needed evidence never delivered) so packets can be right-sized.
 - `quality-trend [--out <report.md>]` — appends a dated correctness/token-saving
   row so ranking/resolver regressions surface over time.
+- `release-gate --report <matrix.json>` — evaluate the fail-closed A–D
+  release matrix; it recommends `shadow` unless every recall, freshness,
+  token, latency, schema, and regression threshold passes.
 - `codex-e2e` and `claude-e2e` — run the same quality suite in baseline and
   MCP-first modes with provider-specific token accounting. Claude fresh usage
   counts cache creation but excludes cache reads; use a cold run plus a repeated
@@ -70,6 +74,19 @@ codegraph benchmark generate|index|eval|proof|review|fallback|route-gate|
   tools, disables slash commands/session persistence/prompt suggestions, and
   disables auto-memory plus nonessential background traffic. Keep the standard
   profile when project skills or auto-memory are part of the workflow under test.
+
+For Codex host-driven scope/resume measurements, use the production facade and
+explicit gate mode, for example:
+
+```powershell
+node dist/cli.js benchmark codex-e2e --suite .\suite.json `
+  --modes baseline,mcp-scope,mcp-phase-resume `
+  --mcp-profile client --relevance-gate enforce
+```
+
+`mcp-scope`/`mcp-phase-resume` send a bounded `scopePlan`; the benchmark keeps
+the control instructions out of the task payload and records fresh-input token
+and MCP-call ledgers per task.
 
 ## `gate` subcommands
 

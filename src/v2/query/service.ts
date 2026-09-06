@@ -217,14 +217,15 @@ export class V2QueryService {
     return `${f}|${l}|${s}`;
   }
 
-  private deliveredEvidenceFor(sessionId: string, snapshotId: string): Set<string> {
-    const existing = this.deliveredEvidence.get(sessionId);
+  private deliveredEvidenceFor(sessionId: string, snapshotId: string, actorId?: string): Set<string> {
+    const sessionKey = actorId ? `${sessionId}::${actorId}` : sessionId;
+    const existing = this.deliveredEvidence.get(sessionKey);
     if (existing && existing.snapshotId === snapshotId) return existing.keys;
     // New session, or the index was refreshed under it: start a clean ledger.
     const fresh = { snapshotId, keys: new Set<string>() };
-    this.deliveredEvidence.set(sessionId, fresh);
-    // Bound memory: keep at most the 32 most recent sessions.
-    if (this.deliveredEvidence.size > 32) {
+    this.deliveredEvidence.set(sessionKey, fresh);
+    // Bound memory: keep at most the 64 most recent sessions.
+    if (this.deliveredEvidence.size > 64) {
       const oldest = this.deliveredEvidence.keys().next().value;
       if (oldest !== undefined) this.deliveredEvidence.delete(oldest);
     }
@@ -242,22 +243,29 @@ export class V2QueryService {
   private dedupePackEvidenceSlices(
     snapshotId: string,
     slices: Array<Record<string, unknown>>,
-    options: { sessionId?: string; disable?: boolean } = {},
+    options: { sessionId?: string; actorId?: string; disable?: boolean } = {},
   ): { slices: Array<Record<string, unknown>>; reusedCount: number } {
     const sessionId = typeof options.sessionId === 'string' ? options.sessionId.trim() : '';
     if (options.disable || !sessionId) return { slices, reusedCount: 0 };
-    const delivered = this.deliveredEvidenceFor(sessionId, snapshotId);
+    const delivered = this.deliveredEvidenceFor(sessionId, snapshotId, options.actorId);
     let reusedCount = 0;
     const out = slices.map(slice => {
       const key = this.evidenceLedgerKey(slice.file, slice.lines, slice.symbol);
       if (!key) return slice;
       if (delivered.has(key)) {
         reusedCount += 1;
-        const { text: _omitted, ...rest } = slice;
+        const { text: omittedText, ...rest } = slice;
+        const terms = typeof omittedText === 'string'
+          ? Array.from(new Set(
+              (omittedText.toLowerCase().match(/[a-z0-9_$./-]{2,}/g) ?? [])
+                .filter(term => !SEARCH_STOP_WORDS.has(term) && term.length >= 2)
+            )).slice(0, 16)
+          : [];
         return {
           ...rest,
           reusedFromEarlierCall: true,
           hint: 'Source already delivered earlier this session — reuse it from prior context; do not re-open. Re-fetch with get_file_slice only if it scrolled out of your context window.',
+          ...(terms.length > 0 ? { terms } : {}),
         };
       }
       delivered.add(key);
@@ -3721,6 +3729,7 @@ export class V2QueryService {
       slimEvidenceSlicesForPack(evidenceSlices, profile),
       {
         sessionId: typeof args.sessionId === 'string' ? args.sessionId : undefined,
+        actorId: typeof args.actorId === 'string' ? args.actorId : typeof args.subagentId === 'string' ? args.subagentId : undefined,
         disable: args.freshEvidence === true,
       },
     );

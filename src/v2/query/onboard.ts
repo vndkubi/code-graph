@@ -16,12 +16,20 @@ import { arrayRecords, isPlainObject, stringArray } from './util.js';
 export const ONBOARD_BEGIN_MARKER = '<!-- codegraph:begin generated -->';
 export const ONBOARD_END_MARKER = '<!-- codegraph:end generated -->';
 
-export type OnboardProfile = 'architecture' | 'claude' | 'copilot' | 'both';
+export type OnboardProfile = 'architecture' | 'claude' | 'copilot' | 'codex' | 'agents' | 'both' | 'all';
 
 export function normalizeOnboardProfile(value: string | undefined): OnboardProfile {
   const profile = (value ?? 'both').trim().toLowerCase();
-  if (profile === 'architecture' || profile === 'claude' || profile === 'copilot' || profile === 'both') return profile;
-  throw new Error(`Unknown onboard profile: ${value}. Use architecture, claude, copilot, or both.`);
+  if (
+    profile === 'architecture' ||
+    profile === 'claude' ||
+    profile === 'copilot' ||
+    profile === 'codex' ||
+    profile === 'agents' ||
+    profile === 'both' ||
+    profile === 'all'
+  ) return profile;
+  throw new Error(`Unknown onboard profile: ${value}. Use architecture, claude, copilot, codex, agents, both, or all.`);
 }
 
 export interface OnboardDirectoryStat {
@@ -456,11 +464,11 @@ export function composeArchitectureMarkdown(inputs: OnboardInputs): string {
 }
 
 /**
- * MCP routing policy for agent instruction files (CLAUDE.md and
- * .github/copilot-instructions.md). This is the highest-authority channel an
+ * MCP routing policy for agent instruction files (CLAUDE.md,
+ * .github/copilot-instructions.md, and AGENTS.md). This is the highest-authority channel an
  * agent reads — tool descriptions get deferred/truncated by clients, this
  * file does not. Hedged on availability so it stays harmless when the MCP
- * server is not configured. Keep it ≤10 lines.
+ * server is not configured.
  */
 function composeMcpRoutingLines(): string[] {
   return [
@@ -471,8 +479,10 @@ function composeMcpRoutingLines(): string[] {
     '- Any repo question, or before any edit → call `codegraph_context` with the task verbatim.',
     '- Ticket/PR/doc task (Jira, Confluence, GitHub) → fetch the artifact with that tool first, then pass its text to `codegraph_context` as the task; do not go from the ticket straight to grep.',
     '- The response says `answerable=true` → answer from that packet; do not re-grep/re-read the same ground.',
+    '- The response says `answerable=false` with `recommendedNextAction=refine_scope_with_luna` → call `codegraph_context` again with `scopePlan` ({ intent, target, candidateFiles, requirements }) filled from the returned `scopeCandidates`; do not abandon MCP for broad grep.',
     '- Need more source at an exact file/line the packet named → `codegraph_slice`.',
-    '- Pass the same `sessionId` string on every call in a conversation (dedupes evidence, saves tokens).',
+    '- Pass the same `sessionId` string on every call in a conversation (dedupes evidence, saves tokens). In multi-agent/subagent sessions, also pass `actorId`.',
+    '- Long multi-phase task → persist milestones with `codegraph_checkpoint`, resume via `codegraph_context` using `resumeTaskId`.',
     '- `workspace_not_indexed` error → run `codegraph index --root .` once, then retry.',
     '',
   ];
@@ -543,5 +553,13 @@ export function composeClaudeMarkdown(inputs: OnboardInputs): string {
  * adoption lever there. Same facts + routing policy as CLAUDE.md.
  */
 export function composeCopilotMarkdown(inputs: OnboardInputs): string {
+  return composeClaudeMarkdown(inputs);
+}
+
+/**
+ * `AGENTS.md` — universal instruction file for Codex CLI, Antigravity, Cursor,
+ * and multi-agent systems. Same facts + routing policy as CLAUDE.md.
+ */
+export function composeAgentsMarkdown(inputs: OnboardInputs): string {
   return composeClaudeMarkdown(inputs);
 }

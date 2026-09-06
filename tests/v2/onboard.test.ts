@@ -12,6 +12,7 @@ import {
   composeArchitectureMarkdown,
   composeClaudeMarkdown,
   composeCopilotMarkdown,
+  composeAgentsMarkdown,
   detectBuildCommands,
   normalizeOnboardProfile,
 } from '../../src/v2/query/onboard.js';
@@ -333,6 +334,14 @@ describe('composeCopilotMarkdown', () => {
   });
 });
 
+describe('composeAgentsMarkdown', () => {
+  it('mirrors the CLAUDE.md facts + routing policy for AGENTS.md', () => {
+    const doc = composeAgentsMarkdown(FIXTURE_INPUTS);
+    expect(doc).toContain('## Repo context: use the codegraph MCP first');
+    expect(doc).toContain('java codebase: 12 main-source files');
+  });
+});
+
 describe('test-fixture endpoint filtering', () => {
   it('drops endpoints and flows declared under test/fixture trees', () => {
     const atlas = JSON.parse(JSON.stringify(FIXTURE_ATLAS)) as Record<string, any>;
@@ -358,9 +367,13 @@ describe('test-fixture endpoint filtering', () => {
 });
 
 describe('normalizeOnboardProfile', () => {
-  it('accepts the three profiles and defaults to both', () => {
+  it('accepts all supported profiles and defaults to both', () => {
     expect(normalizeOnboardProfile(undefined)).toBe('both');
     expect(normalizeOnboardProfile('claude')).toBe('claude');
+    expect(normalizeOnboardProfile('copilot')).toBe('copilot');
+    expect(normalizeOnboardProfile('codex')).toBe('codex');
+    expect(normalizeOnboardProfile('agents')).toBe('agents');
+    expect(normalizeOnboardProfile('all')).toBe('all');
     expect(() => normalizeOnboardProfile('everything')).toThrow(/Unknown onboard profile/);
   });
 });

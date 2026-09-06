@@ -165,6 +165,34 @@ describe('Codex E2E benchmark preflight and token ledger', () => {
     expect(prompt).toContain('do not call search');
   });
 
+  it('keeps benchmark control instructions out of the MCP task payload', () => {
+    const prompt = promptForMode({
+      id: 'scope-task',
+      prompt: 'Trace build_signal and cite its risk-exit branches.',
+    }, 'mcp-scope');
+
+    expect(prompt).toContain('with only the task text below');
+    expect(prompt).toContain('Trace build_signal and cite its risk-exit branches.');
+    expect(prompt).toContain('do not include these benchmark instructions');
+  });
+
+  it('does not leak oracle methods or files into mcp-scope or mcp-phase-resume prompts', () => {
+    const task = {
+      id: 'scope-task',
+      prompt: 'Analyze trade execution signal.',
+      expectedMethods: ['execute_internal_order'],
+      expectedFiles: ['src/execution/internal_engine.py'],
+    };
+
+    const scopePrompt = promptForMode(task, 'mcp-scope');
+    expect(scopePrompt).not.toContain('execute_internal_order');
+    expect(scopePrompt).not.toContain('src/execution/internal_engine.py');
+
+    const resumePrompt = promptForMode(task, 'mcp-phase-resume');
+    expect(resumePrompt).not.toContain('execute_internal_order');
+    expect(resumePrompt).not.toContain('src/execution/internal_engine.py');
+  });
+
   it('supports natural tool-use prompts without naming CodeGraph or MCP', () => {
     const prompt = promptForMode({
       id: 'natural-trace',
